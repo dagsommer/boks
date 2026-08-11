@@ -1,9 +1,16 @@
-// Package sandbox drives containerd to run a command inside an isolated guest.
+// Package sandbox drives containerd to create, run and keep sandboxes.
 //
 // The isolation boundary comes from the containerd runtime handler: with the nerdbox
 // runtime, containerd launches a shim that boots a microVM and runs the process inside it.
 // This package owns the lifecycle around that — image, spec, task, IO and cleanup — and
 // deliberately contains no VM-specific logic of its own.
+//
+// A sandbox outlives a single command. `boks run` creates one if the workspace does not
+// have it yet, then executes the command as an additional process inside it; the sandbox
+// stays until `boks rm`. The container's own process is an idle keeper (see keeperCommand),
+// so the sandbox's lifetime does not depend on whatever the user happened to run first.
+// Ephemeral sandboxes, which are created and destroyed around one command, remain available
+// through Config.Ephemeral.
 package sandbox
 
 import (
@@ -41,13 +48,25 @@ const (
 // deleting it forcefully. Leaving a task behind leaks a VM, so this never blocks forever.
 const stopTimeout = 10 * time.Second
 
-// Config describes one sandbox invocation.
+// keeperCommand is the process a persistent sandbox runs as its own.
+//
+// containerd can only exec into a container that has a running task, so a sandbox that is
+// "up with nothing running" still needs one process. An idle shell is the cheapest thing
+// every usable image has, and making it — rather than the user's first command — the
+// container process means the sandbox does not disappear when that command exits.
+//
+// The trap makes `boks stop` a clean SIGTERM exit instead of a ten-second wait for SIGKILL;
+// sleeping in the background with `wait` is what lets the shell see the signal at all.
+var keeperCommand = []string{"/bin/sh", "-c", `trap 'exit 0' TERM INT; while :; do sleep 86400 & wait $!; done`}
+
+// Config describes a sandbox to create, and the command to run in it.
 type Config struct {
 	// Name identifies the sandbox. Must be unique within the namespace.
 	Name string
 	// Image is the OCI reference providing the guest root filesystem.
 	Image string
-	// Command is the argv to execute inside the guest. Empty uses the image default.
+	// Command is the argv to execute inside the guest. Empty uses the sandbox's
+	// recorded default command, which falls back to the image's.
 	Command []string
 	// Workspaces are host directories shared into the guest.
 	Workspaces []workspace.Workspace
@@ -65,31 +84,88 @@ type Config struct {
 	Address string
 	// TTY allocates a pseudo-terminal for the guest process.
 	TTY bool
+	// Ephemeral removes the sandbox, its task and its snapshot when the command exits.
+	Ephemeral bool
 
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 }
 
-// Run executes the configured command inside a sandbox and returns its exit code.
+// Run executes the configured command in the sandbox and returns its exit code.
 //
-// The sandbox is ephemeral: the container, its task and its snapshot are removed before Run
-// returns, whether the command succeeded, failed, or was interrupted.
-func Run(ctx context.Context, cfg Config) (exitCode int, err error) {
-	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
-
-	c, err := client.New(cfg.Address)
-	if err != nil {
-		return 1, fmt.Errorf("connecting to containerd at %s: %w", cfg.Address, err)
+// For a persistent sandbox (the default) it creates the sandbox if it does not exist,
+// starts it if it is stopped, and then runs the command as an additional process inside it.
+// Running again for the same workspace therefore re-attaches rather than duplicating.
+//
+// For an ephemeral sandbox the command *is* the container process, and the container, its
+// task and its snapshot are removed before Run returns — whether the command succeeded,
+// failed, or was interrupted.
+func Run(ctx context.Context, cfg Config) (int, error) {
+	if cfg.Ephemeral {
+		return runEphemeral(ctx, cfg)
 	}
-	defer c.Close()
 
-	image, err := ensureImage(ctx, c, cfg)
+	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
+	c, err := connect(ctx, cfg.Address)
 	if err != nil {
 		return 1, err
 	}
+	defer c.Close()
 
-	container, err := createContainer(ctx, c, image, cfg)
+	container, err := c.LoadContainer(ctx, cfg.Name)
+	if err != nil {
+		if !errdefs.IsNotFound(err) {
+			return 1, fmt.Errorf("looking up sandbox %q: %w", cfg.Name, err)
+		}
+		if container, err = create(ctx, c, cfg); err != nil {
+			return 1, err
+		}
+	} else if err := warnWorkspaceMismatch(ctx, container, cfg); err != nil {
+		return 1, err
+	}
+
+	if _, err := ensureRunning(ctx, container); err != nil {
+		return 1, err
+	}
+
+	command := cfg.Command
+	if len(command) == 0 {
+		labels, err := container.Labels(ctx)
+		if err != nil {
+			return 1, fmt.Errorf("reading sandbox %q: %w", cfg.Name, err)
+		}
+		command = decodeCommand(labels)
+	}
+	if len(command) == 0 {
+		return 1, fmt.Errorf("sandbox %q has no default command; pass one after '--'", cfg.Name)
+	}
+
+	return Exec(ctx, ExecConfig{
+		Address: cfg.Address,
+		Name:    cfg.Name,
+		Command: command,
+		Env:     cfg.Env,
+		TTY:     cfg.TTY,
+		Stdin:   cfg.Stdin,
+		Stdout:  cfg.Stdout,
+		Stderr:  cfg.Stderr,
+		client:  c,
+	})
+}
+
+// runEphemeral is the create-run-destroy path: the command is the container process and
+// nothing survives it.
+func runEphemeral(ctx context.Context, cfg Config) (exitCode int, err error) {
+	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
+
+	c, err := connect(ctx, cfg.Address)
+	if err != nil {
+		return 1, err
+	}
+	defer c.Close()
+
+	container, err := create(ctx, c, cfg)
 	if err != nil {
 		return 1, err
 	}
@@ -106,6 +182,17 @@ func Run(ctx context.Context, cfg Config) (exitCode int, err error) {
 	}()
 
 	return runTask(ctx, container, cfg)
+}
+
+// connect opens a containerd client, reporting a missing daemon plainly rather than as a
+// dial timeout.
+func connect(ctx context.Context, address string) (*client.Client, error) {
+	c, err := runtimecfg.Connect(ctx, address)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to containerd at %s: %w\n"+
+			"Run 'boks doctor' to check the host.", address, err)
+	}
+	return c, nil
 }
 
 // ensureImage returns the image, pulling it if it is not present locally.
@@ -148,8 +235,20 @@ func guestPlatform() string {
 	return "linux/" + runtime.GOARCH
 }
 
-// createContainer builds the OCI spec and registers the container with containerd.
-func createContainer(ctx context.Context, c *client.Client, image client.Image, cfg Config) (client.Container, error) {
+// create pulls the image if needed and registers the container with containerd.
+func create(ctx context.Context, c *client.Client, cfg Config) (client.Container, error) {
+	image, err := ensureImage(ctx, c, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// The container process differs by lifetime: an ephemeral sandbox exists to run one
+	// command, a persistent one has to stay up between commands.
+	processArgs := cfg.Command
+	if !cfg.Ephemeral {
+		processArgs = keeperCommand
+	}
+
 	specOpts := []oci.SpecOpts{
 		// Must come first: it resets the spec to the platform default, discarding
 		// anything applied before it.
@@ -157,13 +256,13 @@ func createContainer(ctx context.Context, c *client.Client, image client.Image, 
 		oci.WithImageConfig(image),
 		oci.WithAnnotations(resourceAnnotations(cfg)),
 	}
-	if len(cfg.Command) > 0 {
-		specOpts = append(specOpts, oci.WithProcessArgs(cfg.Command...))
+	if len(processArgs) > 0 {
+		specOpts = append(specOpts, oci.WithProcessArgs(processArgs...))
 	}
 	if len(cfg.Env) > 0 {
 		specOpts = append(specOpts, oci.WithEnv(cfg.Env))
 	}
-	if cfg.TTY {
+	if cfg.TTY && cfg.Ephemeral {
 		specOpts = append(specOpts, oci.WithTTY)
 	}
 	if mounts := workspaceMounts(cfg.Workspaces); len(mounts) > 0 {
@@ -173,17 +272,91 @@ func createContainer(ctx context.Context, c *client.Client, image client.Image, 
 		specOpts = append(specOpts, oci.WithProcessCwd(cfg.Workspaces[0].Root()))
 	}
 
+	labels, err := containerLabels(ctx, image, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	container, err := c.NewContainer(ctx, cfg.Name,
 		client.WithImage(image),
 		client.WithSnapshotter(cfg.Snapshotter),
 		client.WithNewSnapshot(cfg.Name, image),
 		client.WithRuntime(cfg.Runtime, nil),
+		client.WithContainerLabels(labels),
 		client.WithNewSpec(specOpts...),
 	)
 	if err != nil {
 		return nil, describeCreateError(cfg, err)
 	}
 	return container, nil
+}
+
+// containerLabels records what containerd's own container record cannot express.
+func containerLabels(ctx context.Context, image client.Image, cfg Config) (map[string]string, error) {
+	workspacesJSON, err := encodeLabel(workspaceRefs(cfg.Workspaces))
+	if err != nil {
+		return nil, err
+	}
+
+	// The default command is resolved once, at creation, because that is the only point
+	// where the image config is at hand. Later `boks run` invocations with no command of
+	// their own read it back from here.
+	command := cfg.Command
+	if len(command) == 0 {
+		command = imageCommand(ctx, image)
+	}
+	commandJSON, err := encodeLabel(command)
+	if err != nil {
+		return nil, err
+	}
+
+	labels := map[string]string{
+		LabelManaged:    "1",
+		LabelWorkspaces: workspacesJSON,
+		LabelCommand:    commandJSON,
+	}
+	if cfg.Ephemeral {
+		labels[LabelEphemeral] = "1"
+	}
+	return labels, nil
+}
+
+// imageCommand returns the image's own default argv, used when neither `create` nor `run`
+// was given a command. An unreadable image config is not fatal: the caller reports the
+// missing command instead, which is the more actionable message.
+func imageCommand(ctx context.Context, image client.Image) []string {
+	spec, err := image.Spec(ctx)
+	if err != nil {
+		return nil
+	}
+	return append(append([]string{}, spec.Config.Entrypoint...), spec.Config.Cmd...)
+}
+
+// warnWorkspaceMismatch tells the user when they re-attached to a sandbox that does not
+// share the directory they are standing in. Mounts are fixed when a sandbox is created, so
+// this is a real surprise and not a warning worth suppressing.
+func warnWorkspaceMismatch(ctx context.Context, container client.Container, cfg Config) error {
+	if len(cfg.Workspaces) == 0 || cfg.Stderr == nil {
+		return nil
+	}
+	labels, err := container.Labels(ctx)
+	if err != nil {
+		return fmt.Errorf("reading sandbox %q: %w", cfg.Name, err)
+	}
+	existing := decodeWorkspaces(labels)
+	for _, ws := range existing {
+		if ws.HostPath == cfg.Workspaces[0].HostPath {
+			return nil
+		}
+	}
+	if len(existing) == 0 {
+		return nil
+	}
+	fmt.Fprintf(cfg.Stderr,
+		"warning: sandbox %q shares %s, not %s. Workspaces are fixed when a sandbox is\n"+
+			"         created; remove it or use a different -name to change them.\n",
+		cfg.Name, existing[0].HostPath, cfg.Workspaces[0].HostPath)
+	return nil
 }
 
 // workspaceMounts turns workspaces into OCI bind mounts whose destination is the host path,
@@ -214,7 +387,8 @@ func resourceAnnotations(cfg Config) map[string]string {
 
 // runTask starts the guest process, streams its IO, and returns its exit code.
 func runTask(ctx context.Context, container client.Container, cfg Config) (int, error) {
-	creator := ioCreator(cfg)
+	stdin := watchStdin(cfg.Stdin)
+	creator := ioCreator(cfg.TTY, stdin.input(), cfg.Stdout, cfg.Stderr)
 
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
@@ -233,10 +407,13 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 		cleanupTask(ctx, task)
 		return 1, fmt.Errorf("starting sandbox process: %w", err)
 	}
+	defer stdin.closeGuestStdin(ctx, task)()
 
+	restore := attachTerminal(ctx, task, cfg.TTY, cfg.Stdin)
 	forwardSignals(ctx, task)
 
 	status := <-statusC
+	restore()
 	code, _, statusErr := status.Result()
 
 	cleanupTask(ctx, task)
@@ -247,9 +424,9 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 	return int(code), nil
 }
 
-func ioCreator(cfg Config) cio.Creator {
-	streams := []cio.Opt{cio.WithStreams(cfg.Stdin, cfg.Stdout, cfg.Stderr)}
-	if cfg.TTY {
+func ioCreator(tty bool, stdin io.Reader, stdout, stderr io.Writer) cio.Creator {
+	streams := []cio.Opt{cio.WithStreams(stdin, stdout, stderr)}
+	if tty {
 		streams = append(streams, cio.WithTerminal)
 	}
 	return cio.NewCreator(streams...)
@@ -257,7 +434,7 @@ func ioCreator(cfg Config) cio.Creator {
 
 // forwardSignals relays interrupt and termination to the guest process so that Ctrl-C
 // behaves as it would for a local command, and so cleanup still runs.
-func forwardSignals(ctx context.Context, task client.Task) {
+func forwardSignals(ctx context.Context, p client.Process) {
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -265,7 +442,7 @@ func forwardSignals(ctx context.Context, task client.Task) {
 		select {
 		case sig := <-sigC:
 			if s, ok := sig.(syscall.Signal); ok {
-				_ = task.Kill(ctx, s)
+				_ = p.Kill(ctx, s)
 			}
 		case <-ctx.Done():
 		}
@@ -280,26 +457,39 @@ func cleanupTask(ctx context.Context, task client.Task) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
 	defer cancel()
 
-	if status, err := task.Status(cleanupCtx); err == nil {
-		if status.Status == client.Running || status.Status == client.Paused {
-			if err := task.Kill(cleanupCtx, syscall.SIGKILL); err == nil {
-				if statusC, err := task.Wait(cleanupCtx); err == nil {
-					select {
-					case <-statusC:
-					case <-cleanupCtx.Done():
-					}
-				}
-			}
-		}
-	}
+	killAndWait(cleanupCtx, task, syscall.SIGKILL)
 	_, _ = task.Delete(cleanupCtx)
+}
+
+// killAndWait signals a running task and waits for it to exit, returning whether it did.
+func killAndWait(ctx context.Context, task client.Task, sig syscall.Signal) bool {
+	status, err := task.Status(ctx)
+	if err != nil {
+		return false
+	}
+	if status.Status != client.Running && status.Status != client.Paused {
+		return true
+	}
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		return false
+	}
+	if err := task.Kill(ctx, sig, client.WithKillAll); err != nil {
+		return false
+	}
+	select {
+	case <-statusC:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // describeCreateError turns containerd's low-level errors into guidance, since the common
 // causes are all host configuration rather than user mistakes.
 func describeCreateError(cfg Config, err error) error {
 	if errdefs.IsAlreadyExists(err) {
-		return fmt.Errorf("a sandbox named %q already exists; remove it or choose another name", cfg.Name)
+		return fmt.Errorf("a sandbox named %q already exists; remove it with 'boks rm %s' or choose another name", cfg.Name, cfg.Name)
 	}
 	return fmt.Errorf("creating sandbox %q: %w", cfg.Name, err)
 }
@@ -308,29 +498,77 @@ func describeCreateError(cfg Config, err error) error {
 // containerd's output: the runtime shim is missing from the host, or the requested command
 // is missing from the image.
 //
-// These are distinguished by looking for the shim ourselves rather than by matching on
-// error text, since "executable file not found" is produced for both.
+// Both are reported as "executable file not found", so the guidance is chosen by which name
+// the error carries — and offered only when the error actually says an executable was
+// missing. An earlier version decided this by looking the shim up on Boks' own PATH, which
+// is not the PATH containerd uses: every unrelated failure, a malformed annotation among
+// them, was then reported as a missing shim, sending the user after a problem that did not
+// exist while the real cause sat in the line above.
 func describeTaskError(cfg Config, err error) error {
-	shim := runtimecfg.ShimBinary(cfg.Runtime)
-	if shim != "" {
-		if _, lookErr := exec.LookPath(shim); lookErr != nil {
-			return fmt.Errorf("starting the %s runtime failed: %w\n\n"+
-				"Boks asked containerd for runtime %q, which containerd resolves to the\n"+
-				"executable %q on the containerd daemon's PATH. That binary was not found.\n"+
-				"Run 'boks doctor' for details.",
-				cfg.Runtime, err, cfg.Runtime, shim)
-		}
+	msg := err.Error()
+	if !mentionsMissingExecutable(msg) {
+		return fmt.Errorf("creating sandbox process: %w", err)
 	}
-	// Runtimes word this differently ("executable file not found", "stat ...: no such
-	// file or directory"), so key on the command name appearing alongside a
-	// not-found phrase rather than on any single wording.
-	if len(cfg.Command) > 0 && strings.Contains(err.Error(), cfg.Command[0]) {
-		msg := err.Error()
-		if strings.Contains(msg, "executable file not found") || strings.Contains(msg, "no such file or directory") {
-			return fmt.Errorf("the command %q was not found inside the guest image %s.\n"+
-				"Check the command exists in that image, or pass a different -image.\n\n"+
-				"underlying error: %w", cfg.Command[0], cfg.Image, err)
-		}
+
+	shim := runtimecfg.ShimBinary(cfg.Runtime)
+	if shim != "" && strings.Contains(msg, shim) {
+		return missingShimError(cfg, shim, err)
+	}
+	if len(cfg.Command) > 0 && mentionsCommand(msg, cfg.Command[0]) {
+		return fmt.Errorf("the command %q was not found inside the guest image %s.\n"+
+			"Check the command exists in that image, or pass a different -image.\n\n"+
+			"underlying error: %w", cfg.Command[0], cfg.Image, err)
+	}
+	if shim != "" {
+		return missingShimError(cfg, shim, err)
 	}
 	return fmt.Errorf("creating sandbox process: %w", err)
+}
+
+// missingShimError explains that containerd could not run the runtime's shim.
+//
+// It says where the executable is looked for rather than asserting it is absent: containerd
+// searches its daemon's PATH, which Boks cannot see. Whether the shim is on *our* PATH is
+// worth mentioning as corroboration, and nothing more.
+func missingShimError(cfg Config, shim string, err error) error {
+	corroboration := ""
+	if _, lookErr := exec.LookPath(shim); lookErr != nil {
+		corroboration = "\nIt is not on this command's PATH either, which makes that the likely cause."
+	}
+	return fmt.Errorf("starting the %s runtime failed: %w\n\n"+
+		"Boks asked containerd for runtime %q, which containerd resolves to the executable\n"+
+		"%q, looked up on the containerd daemon's PATH.%s\n"+
+		"Run 'boks doctor' for details.",
+		cfg.Runtime, err, cfg.Runtime, shim, corroboration)
+}
+
+// mentionsMissingExecutable reports whether an error is about a program that could not be
+// run. Runtimes word this differently, so several phrasings are matched.
+func mentionsMissingExecutable(msg string) bool {
+	for _, phrase := range []string{
+		"executable file not found",
+		"no such file or directory",
+		"not found in $PATH",
+	} {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// mentionsCommand reports whether an error names a specific command.
+//
+// Plain substring matching is not safe here: the common command "sh" occurs inside "shim"
+// and inside every shim binary name, so a missing shim would be misread as a missing guest
+// command. Runtimes quote the program they could not run, and absolute paths appear
+// verbatim; both are specific enough to key on.
+func mentionsCommand(msg, command string) bool {
+	if command == "" {
+		return false
+	}
+	if strings.Contains(msg, `"`+command+`"`) || strings.Contains(msg, "'"+command+"'") {
+		return true
+	}
+	return strings.HasPrefix(command, "/") && strings.Contains(msg, command)
 }
