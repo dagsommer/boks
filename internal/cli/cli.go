@@ -1,8 +1,13 @@
 // Package cli implements the boks command line.
 //
 // Dispatch is hand-written on top of the standard flag package: Boks has few commands, and
-// the argument grammar for `run` — a workspace, then flags, then `--`, then an arbitrary
-// guest command — is clearer to handle directly than to bend a framework around.
+// the argument grammar for `run` — an agent, then workspaces, with flags anywhere among
+// them and the agent's own arguments after `--` — is clearer to handle directly than to
+// bend a framework around.
+//
+// Flag names, their short aliases and the argument order follow sbx. Boks is meant to feel
+// like a drop-in alternative, and a user's muscle memory is part of that interface: `-t` is
+// sbx's template flag here for the same reason `ls` also answers to `list`.
 package cli
 
 import (
@@ -30,27 +35,33 @@ type Env struct {
 }
 
 type command struct {
-	name    string
+	name string
+	// alias is a second spelling sbx accepts, so a habit formed there works here.
+	alias   string
 	summary string
 	run     func(ctx context.Context, env Env) error
 }
 
+func (c command) matches(name string) bool {
+	return name == c.name || (c.alias != "" && name == c.alias)
+}
+
 func commands() []command {
 	return []command{
-		{"run", "Run a command inside a sandbox, creating or re-attaching to it", runCommand},
-		{"exec", "Run an additional command inside a running sandbox", execCommand},
-		{"create", "Create a sandbox without starting it", createCommand},
-		{"ls", "List sandboxes", lsCommand},
-		{"inspect", "Print sandbox details as JSON", inspectCommand},
-		{"start", "Start a stopped sandbox", startCommand},
-		{"stop", "Stop a sandbox without deleting it", stopCommand},
-		{"rm", "Delete a sandbox and its filesystem", rmCommand},
-		{"cp", "Copy files between the host and a sandbox", cpCommand},
-		{"policy", "Show network policy rules and recent decisions", policyCommand},
-		{"proxy", "Run the host forward proxy (experimental, not wired into run)", proxyCommand},
-		{"secret", "Manage host-side credentials the guest never receives", secretCommand},
-		{"doctor", "Check host prerequisites for running sandboxes", doctorCommand},
-		{"version", "Print the boks version", versionCommand},
+		{name: "run", summary: "Run an agent in a sandbox, creating or re-attaching to it", run: runCommand},
+		{name: "exec", summary: "Run an additional command inside a sandbox", run: execCommand},
+		{name: "create", summary: "Create a sandbox without starting it", run: createCommand},
+		{name: "ls", alias: "list", summary: "List sandboxes", run: lsCommand},
+		{name: "inspect", summary: "Print sandbox details as JSON", run: inspectCommand},
+		{name: "start", summary: "Start a stopped sandbox", run: startCommand},
+		{name: "stop", summary: "Stop a sandbox without deleting it", run: stopCommand},
+		{name: "rm", summary: "Delete a sandbox and its filesystem", run: rmCommand},
+		{name: "cp", summary: "Copy files between the host and a sandbox", run: cpCommand},
+		{name: "policy", summary: "Show network policy rules and recent decisions", run: policyCommand},
+		{name: "proxy", summary: "Run the host forward proxy (experimental, not wired into run)", run: proxyCommand},
+		{name: "secret", summary: "Manage host-side credentials the guest never receives", run: secretCommand},
+		{name: "doctor", summary: "Check host prerequisites for running sandboxes", run: doctorCommand},
+		{name: "version", summary: "Print the boks version", run: versionCommand},
 	}
 }
 
@@ -72,7 +83,7 @@ func Main(ctx context.Context, env Env) int {
 	}
 
 	for _, cmd := range commands() {
-		if cmd.name != name {
+		if !cmd.matches(name) {
 			continue
 		}
 		err := cmd.run(ctx, Env{
@@ -108,11 +119,16 @@ func usage(w io.Writer) {
 
 Usage:
   boks <command> [flags]
+  boks run [agent] [workspace...]     the common case: an agent in a directory
 
 Commands:
 `)
 	for _, cmd := range commands() {
-		fmt.Fprintf(w, "  %-10s %s\n", cmd.name, cmd.summary)
+		name := cmd.name
+		if cmd.alias != "" {
+			name += ", " + cmd.alias
+		}
+		fmt.Fprintf(w, "  %-10s %s\n", name, cmd.summary)
 	}
 	fmt.Fprint(w, `
 Run 'boks <command> -h' for details.

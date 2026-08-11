@@ -32,43 +32,75 @@ Last reviewed against Docker's docs: 2026-08-11.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| `run` | Creates or re-attaches, then attaches to the agent | `boks run <ws> -- <cmd>`, persistent by default | P0 | partial | Re-attach implemented; exit codes propagate and Ctrl-C exits 128+signal; verified on the non-VM runtime only |
-| Re-attach by workspace | Running again from the same workspace path reconnects instead of duplicating | Sandbox name derived from the workspace path digest | P1 | partial | No host state store: containerd's container record is the state |
+| `run` | Creates or re-attaches, then attaches to the agent | `boks run [agent] [ws...] [-- args]`, persistent by default | P0 | partial | Agent-first grammar; re-attach implemented; exit codes propagate and Ctrl-C exits 128+signal; verified on the non-VM runtime only |
+| Re-attach by workspace | Running again from the same workspace path reconnects instead of duplicating | Same: the derived name **is** the re-attach key | P1 | partial | Name is `<agent>-<workspace dir>`, so naming and re-attach are one mechanism. No host state store: containerd's container record is the state |
 | `create` | Builds in background without attaching | `boks create` | P1 | partial | Creates without starting; verified on the non-VM runtime |
-| `start` / `stop` | Stop pauses; state survives | Same | P1 | partial | Stop kills the task, keeps container + snapshot; verified on the non-VM runtime |
+| `start` / `stop` | `stop` exists; **no top-level `start`** — run and exec start a sandbox implicitly | `boks stop`; `boks start` is a Boks addition | P1 | partial | Stop kills the task, keeps container + snapshot, and TERMs every process in the guest first; verified on the non-VM runtime |
 | `rm` | Deletes sandbox and everything in it; `--force` for active | `boks rm`, `-f` | P1 | partial | Deletes the snapshot too; verified on the non-VM runtime |
-| `ls` | Lists sandboxes with status and port mappings | `boks ls`, `-q`, `-json` | P1 | partial | No port mappings yet — none exist |
-| `inspect` | Sandbox details | `boks inspect`, JSON output | P2 | partial | Verified on the non-VM runtime |
-| `exec` | `sbx exec -it <name> bash` into a running sandbox | `boks exec [-i] [-t] [-it]` | P1 | partial | Streams IO, propagates the exit code; raw mode and resize unverified in a VM |
+| `ls` | Lists sandboxes with status and port mappings | `boks ls`/`boks list`, `-q`, `-json` | P1 | partial | sbx's columns exactly: SANDBOX AGENT STATUS PORTS WORKSPACE. PORTS renders empty — nothing publishes ports yet |
+| `inspect` | **Not a top-level command** — sbx has only `policy inspect` | `boks inspect`, JSON output | P2 | partial | A deliberate Boks addition, not parity: the detail `ls` no longer shows has to be reachable |
+| `exec` | `sbx exec [flags] SANDBOX COMMAND [ARG...]`, docker-exec flags; starts a stopped sandbox first | `boks exec [-i] [-t] [-it] [-e] [-w] [-u]` | P1 | partial | Starts a stopped sandbox, as sbx does. Streams IO, propagates the exit code; raw mode and resize unverified in a VM. `-u` takes numeric ids only; `--detach`, `--detach-keys`, `--env-file`, `--privileged` not implemented |
 | Persistence across stop/start | Packages, Docker images, config, shell history persist until `rm` | Same, via the container's writable snapshot | P1 | partial | Confirmed across stop/start on the non-VM runtime |
-| Naming | `--name`; reconnect from any directory | Same, `-name` | P1 | partial | An explicit name overrides the derived one |
+| Naming | `--name`; reconnect from any directory | Same, `-name` | P1 | done | An explicit name overrides the derived one, and a `-name` run with no workspace argument does not re-mount the current directory — it reaches that sandbox from anywhere |
 | `reset` | Stops sandboxes gracefully (30s), clears image cache, registries, all sandbox state, policies and stored secrets, signs out, stops the daemon, removes state/cache/config dirs. Prompts `y/N`; `-f/--force` skips it, `--preserve-secrets` keeps credentials | `boks reset`, minus the account and daemon steps | P2 | none | Copy the confirmation prompt and `--preserve-secrets`: losing every stored credential to a cleanup command is a bad surprise |
 
-## 2a. CLI surface — where Boks currently diverges
+## 2a. CLI surface — where Boks matches sbx, and where it does not
 
 Boks grew command-first because that is what proved the runtime. sbx is **agent-first**, and
-the difference shows up in almost every command. These are the gaps to close, kept separate
-from the table above because they are shape mismatches rather than missing features.
+the difference showed up in almost every command. Most of that is now closed; what is left
+is listed as such. Rows are kept separate from the table above because they are shape
+questions rather than missing features.
+
+The reference for this section is real `sbx --help`, `sbx run --help` and `sbx exec --help`
+output, plus a live `sbx ls`.
 
 | Aspect | Docker behavior | Boks today | Prio | Status |
 |---|---|---|---|---|
-| `run` argument order | `sbx run [flags] AGENT [workspace...]` — the agent is the first positional, workspaces follow, and the primary workspace defaults to the current directory | `boks run [flags] <workspace> -- <cmd>` — inverted, and a command is mandatory | P0 | none |
-| Agents as a concept | A named set: Claude Code, Codex, Copilot, Cursor, Droid, Gemini, Kiro, OpenCode, Docker Agent, and **Shell**. Each selects an image and a startup command | No concept of an agent; `-image` plus an explicit command | P0 | none |
-| Arbitrary commands | `Shell` is an agent, so a plain shell is reachable within the same grammar | The only mode there is | P1 | partial |
-| Default sandbox name | `<agent>-<workspace directory name>` — confirmed against a live `sbx ls`. Case, dots and existing hyphens are preserved: `claude` in `~/git_repos/finndato.no` gives `claude-finndato.no`; a `udi-copilot-yolo` agent in `efm-integrasjonspunkt` gives `udi-copilot-yolo-efm-integrasjonspunkt` | `boks-<12 hex of a path digest>` — stable and collision-free, but unreadable and impossible to guess | P0 | none |
-| `-name` without an agent | When the named sandbox already exists, the agent positional is optional and is read back from the sandbox | `-name` requires the full invocation | P1 | none |
-| Bare `sbx` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` switches to the network governance panel, `?` lists shortcuts | Prints usage and exits 2 | P1 | none |
-| `ls` columns | `SANDBOX  AGENT  STATUS  PORTS  WORKSPACE` — confirmed from a live run | name, status, image, workspace, age | P1 | partial |
+| `run` argument order | `sbx run [flags] [AGENT] [PATH...] [-- AGENT_ARGS...]` — the agent is the first positional, workspaces follow, and the primary workspace defaults to the current directory | Same grammar, same defaults: `boks run`, `boks run shell`, `boks run shell . ~/lib:ro` | P0 | done |
+| Meaning of `--` | Arguments for the agent, appended to its command (`sbx run claude -- --continue`) | Same. Per-agent: an agent with its own command gets them appended, the shell agent takes them *as* the command, since that is what arguments to a shell are | P0 | done |
+| Agents as a concept | A named set: `claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode, shell`. Each selects an image and a startup command | `internal/agent`: all ten names registered, **only `shell` has an image**. The rest report "no image yet" and run with an explicit `-template` | P0 | partial |
+| User-defined agents | Real and in use: a live `sbx ls` shows `udi-copilot-default` and `udi-copilot-yolo` beside the built-ins | `Registry.Add` is the seam, including override-a-built-in. **No loader and no file format** — deliberately not designed until there are runtime features worth declaring | P1 | partial |
+| Arbitrary commands | `shell` is an agent, so a plain shell is inside the same grammar | Same: `boks run shell . -- uname -a` | P1 | done |
+| Default sandbox name | `<agent>-<workspace directory name>`, case, dots and hyphens preserved: `claude-finndato.no`, `udi-copilot-yolo-efm-integrasjonspunkt` | Same, plus the decisions sbx's rule leaves open (see below) | P0 | done |
+| `-name` without an agent | The agent positional is optional when the named sandbox exists, and is read from its spec; passing both re-attaches *and* asserts the agent | Same, including the assertion: a mismatch is an error naming both agents | P1 | done |
+| `ls` columns | `SANDBOX  AGENT  STATUS  PORTS  WORKSPACE` | Identical. PORTS is rendered empty rather than omitted — nothing publishes ports yet | P1 | done |
+| `ls` alias | `sbx list` | `boks list` | P2 | done |
+| Image flag | `-t, --template` — "Container image to use for the sandbox (default: agent-specific image)" | Same name and alias. Was `-image` | P1 | done |
+| Sizing defaults | `--cpus` 0 = all host CPUs; `-m, --memory` in binary units, default half the host's memory capped at 32 GiB | Same, including the unit parser. A bare number is bytes, as for `docker --memory`, and a value too small to boot is refused with the spelling the user meant | P1 | done |
+| Detached run | `-d, --detached` prints the sandbox and exits without an interactive session | Same | P1 | done |
+| Interactive by default | `sbx run` attaches an interactive session | Boks allocates a pty when stdin *and* stdout are terminals, and none when either is a pipe. There is no `-t` for it: `-t` is the template flag | P1 | done |
+| Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
+| `--clone`, `--kit`, `--profile`, `-p/--publish` | Run flags for clone mode, kits, profiles and port publishing | Not implemented; nothing in the current design blocks them | P1 | none |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
-| `daemon` | `sbx daemon start|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
+| `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
+| Boks-only commands | — | `boks start`, `boks inspect`, `boks run -rm`, `boks doctor`, `boks proxy`, `boks secret`, `boks policy` have no sbx equivalent at that spelling. Kept deliberately; none of them contradicts sbx's shape | — | done |
 
-**Agents are user-extensible.** The same live listing shows agents named
-`udi-copilot-default` and `udi-copilot-yolo` alongside the built-in `claude`. Custom agents
-are therefore a real, in-use capability rather than a fixed menu, and since a kit is the
-documented way to "define a new agent from scratch", agents and kits are almost certainly
-the same mechanism seen from two directions. That raises the priority of kits from "later"
-to "the thing that makes agents extensible", and means the agent registry Boks builds should
-be data-driven from the start rather than a hardcoded switch.
+**What the naming rule leaves open, and what Boks decided.** sbx's `<agent>-<workspace>` is
+confirmed, but three cases follow from it that a listing cannot show:
+
+- *Characters containerd will not take.* containerd identifiers are alphanumeric runs joined
+  by single `.`, `_` or `-`, capped at 76 characters — exactly the characters sbx's rule
+  preserves, so ordinary directories pass through unchanged. Anything else becomes a single
+  `-`, runs of separators collapse, and separators at either end are dropped: `my  project`
+  and `my--project` both give `my-project`. A basename with nothing usable left — `...`, or
+  a name written entirely in non-ASCII script — falls back to a six-hex-character digest of
+  the path, which is unreadable but still correct and still re-attaches.
+- *Two directories with the same basename.* Now possible, where the old path digest made it
+  impossible. Boks does not reuse (the second project would silently attach to the first
+  project's sandbox, with the wrong workspace mounted) and does not refuse (that leaves the
+  user stuck at a name they never chose). The second directory deterministically gets
+  `<agent>-<dir>-<digest>` and is told on stderr why its name is not the obvious one. The
+  qualified name is checked first on later runs, so a sandbox that was bumped keeps its name
+  even after the sandbox that bumped it is removed.
+- *Roots and long paths.* A workspace at a filesystem root has no basename worth using and
+  becomes `<agent>-root`; there is one per machine, so it stays unique. A name over
+  containerd's 76-character limit is truncated — and truncation is exactly what could make
+  two directories collide, so it always brings the path digest with it.
+
+**Naming and re-attach are the same mechanism.** There is no separate identity: running the
+same agent in the same directory derives the same name, and that name is what finds the
+sandbox. `-name` overrides the derivation, which is what lets one workspace hold several
+sandboxes and lets a sandbox be reached from any directory.
 
 ### 2b. Command inventory
 
@@ -311,7 +343,7 @@ silently.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Bundled agents | Named agents (e.g. `sbx run claude`) with prepared images | Boks runs any command; agent images later | P1 | none | Boks is agent-agnostic by design |
+| Bundled agents | Named agents (e.g. `sbx run claude`) with prepared images | Same names, data-driven registry; only `shell` has an image | P1 | partial | `internal/agent`. An agent is a name, an image, a command and an args mode — never a branch in the CLI. See 2a |
 | MCP gateway | Single endpoint per sandbox, brokered on the **host** side | Not near-term | P2 | none | Note: local MCP servers run outside the VM |
 | Shared skills store | Host-side store mounted read-write; one sandbox can affect another | Deliberately **not** replicating the shared mutable store | P2 | Won't | Docker documents this as a cross-sandbox trust issue |
 | IDE integrations | Various | Out of scope | P2 | Won't | |
@@ -340,7 +372,7 @@ silently.
 ## Answered
 
 1. **Exact-path mounting for non-existent guest parents.** *(2026-08-11)* The runtime creates
-   them. `boks run /private/tmp/probe/deep/a/b/c/project -- pwd` printed that exact path, and
+   them. `boks run shell /private/tmp/probe/deep/a/b/c/project -- pwd` printed that exact path, and
    each intermediate directory contained only the next component. Boks does not need to
    pre-create anything. One nuance worth documenting for users: Boks resolves symlinks when
    parsing a workspace, so `/tmp/x` becomes `/private/tmp/x` on macOS — correct, but not
@@ -363,18 +395,20 @@ silently.
 2. **Exact-path mounting for non-existent guest parents.** Whether the guest runtime creates
    `/home/alice/src` implicitly for the mount point, or whether Boks must pre-create it, is
    unverified pending a working VM.
-3. ~~**Re-attach identity.**~~ **Answered.** Both, with the path as the default. A sandbox's
-   containerd identifier is `boks-<first 12 hex of sha256(workspace host path)>` unless
-   `-name` is given, in which case that name is used verbatim. The path digest is what makes
-   `boks run .` twice from one directory reach one sandbox — the path is the only thing two
-   invocations share, and it cannot be the identifier itself because containerd identifiers
-   allow neither slashes nor 76+ characters. An explicit name is what lets one workspace hold
-   several sandboxes and lets a sandbox be reached from any directory, matching `sbx --name`.
-   The readable path is kept in a container label, so `boks ls` shows it.
+3. ~~**Re-attach identity.**~~ **Answered, then revised 2026-08-11.** The name is the
+   identity. A sandbox is called `<agent>-<workspace directory name>` — sbx's rule,
+   confirmed against a live `sbx ls` and against `sbx run --help` — and that derived name is
+   what a second invocation looks up, so naming and re-attach are one mechanism rather than
+   two. The earlier answer, a `boks-<12 hex path digest>` identifier, was collision-free but
+   unreadable and impossible to guess; it is gone. `-name` still overrides the derivation,
+   which is what lets one workspace hold several sandboxes and lets a sandbox be reached from
+   any directory. Section 2a records the three cases the readable rule leaves open —
+   characters containerd rejects, two directories sharing a basename, roots and long paths —
+   and what Boks decided about each.
 
    Consequences worth knowing: renaming or moving a workspace directory orphans its sandbox
-   (it is still listed, still removable, but a new one is created for the new path), and a
-   symlinked workspace resolves to its target before hashing, so two paths to the same
+   (it is still listed, still removable, but a new one is created for the new name), and a
+   symlinked workspace resolves to its target before naming, so two paths to the same
    directory share one sandbox.
 4. **Kit schema.** Deliberately unanswered until real runtime features exist to configure.
 5. ~~**TSI vs external network provider.**~~ **Answered 2026-08-11.** The external provider
