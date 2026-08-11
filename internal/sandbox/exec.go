@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/errdefs"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/dagsommer/boks/internal/runtimecfg"
 )
@@ -24,6 +26,9 @@ type ExecConfig struct {
 	Env []string
 	// Cwd overrides the working directory; empty keeps the sandbox's own.
 	Cwd string
+	// User overrides the user the process runs as, as UID or UID:GID. Empty keeps the
+	// sandbox's own.
+	User string
 	// TTY allocates a pseudo-terminal for the process.
 	TTY bool
 
@@ -58,26 +63,16 @@ func Exec(ctx context.Context, cfg ExecConfig) (int, error) {
 		return 1, err
 	}
 
-	task, err := container.Task(ctx, nil)
+	// A stopped sandbox is started rather than refused. Requiring `boks start` first was
+	// a step that existed only because Boks made the user aware of it: the sandbox has
+	// to be running for the command to run, and there is no other answer the user could
+	// give. sbx starts it too. Only a sandbox that cannot be started is an error.
+	task, err := ensureRunning(ctx, container)
 	if err != nil {
-		if errdefs.IsNotFound(err) {
-			return 1, stoppedError(cfg.Name)
-		}
-		return 1, fmt.Errorf("reading sandbox %q: %w", cfg.Name, err)
-	}
-	status, err := task.Status(ctx)
-	if err != nil {
-		return 1, fmt.Errorf("reading the state of sandbox %q: %w", cfg.Name, err)
-	}
-	if status.Status != client.Running {
-		return 1, stoppedError(cfg.Name)
+		return 1, err
 	}
 
 	return execProcess(ctx, container, task, cfg)
-}
-
-func stoppedError(name string) error {
-	return fmt.Errorf("sandbox %q is not running; start it with 'boks start %s'", name, name)
 }
 
 // execProcess builds the process spec from the sandbox's own, so an exec'd command sees the
@@ -97,6 +92,13 @@ func execProcess(ctx context.Context, container client.Container, task client.Ta
 	process.Env = append(slices.Clone(spec.Process.Env), cfg.Env...)
 	if cfg.Cwd != "" {
 		process.Cwd = cfg.Cwd
+	}
+	if cfg.User != "" {
+		user, err := parseUser(cfg.User)
+		if err != nil {
+			return 1, err
+		}
+		process.User = user
 	}
 
 	id, err := execID()
@@ -140,6 +142,30 @@ func execProcess(ctx context.Context, container client.Container, task client.Ta
 		return 1, fmt.Errorf("the command in sandbox %q failed: %w", cfg.Name, statusErr)
 	}
 	return int(code), nil
+}
+
+// parseUser turns a -u argument into an OCI user.
+//
+// Only numeric ids are accepted. Resolving a name would mean reading the guest's
+// /etc/passwd through the sandbox's own filesystem, and a name silently resolved against the
+// *host's* users would run the process as the wrong one — so the limitation is stated rather
+// than approximated.
+func parseUser(spec string) (specs.User, error) {
+	uidText, gidText, hasGID := strings.Cut(spec, ":")
+	uid, err := strconv.ParseUint(uidText, 10, 32)
+	if err != nil {
+		return specs.User{}, fmt.Errorf("user %q is not a numeric id; Boks cannot resolve names "+
+			"inside the guest, so pass UID or UID:GID", spec)
+	}
+	user := specs.User{UID: uint32(uid), GID: uint32(uid)}
+	if hasGID {
+		gid, err := strconv.ParseUint(gidText, 10, 32)
+		if err != nil {
+			return specs.User{}, fmt.Errorf("group %q in user %q is not a numeric id", gidText, spec)
+		}
+		user.GID = uint32(gid)
+	}
+	return user, nil
 }
 
 // describeExecError names the likely cause: an exec that fails immediately almost always
