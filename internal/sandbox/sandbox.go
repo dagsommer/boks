@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -89,6 +90,11 @@ type Config struct {
 	Command []string
 	// Workspaces are host directories shared into the guest.
 	Workspaces []workspace.Workspace
+	// Mounts are further host directories shared into the guest that are not the user's
+	// workspaces — the public half of the interception CA, today. They are kept apart
+	// because a workspace is part of the sandbox's identity, recorded in its labels and
+	// shown by `boks ls`, and a directory Boks put there for its own plumbing is not.
+	Mounts []workspace.Workspace
 	// Env are additional environment variables, in KEY=VALUE form.
 	Env []string
 	// CPUs is the number of vCPUs for the guest.
@@ -317,10 +323,13 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	if cfg.TTY && cfg.Ephemeral {
 		specOpts = append(specOpts, oci.WithTTY)
 	}
-	if mounts := workspaceMounts(cfg.Workspaces); len(mounts) > 0 {
+	if mounts := workspaceMounts(append(slices.Clone(cfg.Workspaces), cfg.Mounts...)); len(mounts) > 0 {
 		specOpts = append(specOpts, oci.WithMounts(mounts))
+	}
+	if len(cfg.Workspaces) > 0 {
 		// Start in the primary workspace so relative paths behave as they would on
-		// the host.
+		// the host. Only a workspace can be that: the plumbing mounts are not places a
+		// user asked to be.
 		specOpts = append(specOpts, oci.WithProcessCwd(cfg.Workspaces[0].Root()))
 	}
 
