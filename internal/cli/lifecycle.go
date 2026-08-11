@@ -4,7 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 
+	"github.com/dagsommer/boks/internal/enforce"
+	"github.com/dagsommer/boks/internal/network"
+	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
@@ -29,6 +33,14 @@ Flags:
 		return err
 	}
 	return eachSandbox(names, env, func(name string) error {
+		// A sandbox that is about to boot needs its link socket held before it does, so
+		// the network comes up first. `start` has no policy flags of its own, so it
+		// serves the sandbox with the default policy and says so — the rules a `boks
+		// run` was given are not recorded anywhere, deliberately: there is no host-side
+		// state store, and inventing one for this would be the wrong place to start.
+		if err := ensureNetworkForExisting(ctx, name, *address, env.Stderr); err != nil {
+			return err
+		}
 		return sandbox.Start(ctx, *address, name)
 	})
 }
@@ -54,7 +66,14 @@ Flags:
 		return err
 	}
 	return eachSandbox(names, env, func(name string) error {
-		return sandbox.Stop(ctx, *address, name)
+		if err := sandbox.Stop(ctx, *address, name); err != nil {
+			return err
+		}
+		// The supervisor would notice the task going away and exit by itself within a
+		// poll interval. Ending it here makes `stop` mean the same thing for the network
+		// as it does for the sandbox — gone when the command returns — so that a stop
+		// followed immediately by a start cannot race for the link socket.
+		return enforce.Stop(policy.StateDir(), name)
 	})
 }
 
@@ -81,8 +100,53 @@ Flags:
 		return err
 	}
 	return eachSandbox(names, env, func(name string) error {
-		return sandbox.Remove(ctx, *address, name, *force)
+		if err := sandbox.Remove(ctx, *address, name, *force); err != nil {
+			return err
+		}
+		// A removed sandbox must leave nothing behind: not its snapshot, not its link
+		// socket, and not the process holding it. The certificate directory goes too —
+		// it exists only to be shared into that sandbox.
+		if err := enforce.Stop(policy.StateDir(), name); err != nil {
+			return err
+		}
+		return enforce.Forget(policy.StateDir(), name)
 	})
+}
+
+// ensureNetworkForExisting brings up the network of a sandbox that already exists and is
+// about to be started by a command with no policy flags of its own — `boks start`, and
+// `boks exec` on a stopped sandbox.
+//
+// The mode is read back from the container: it was fixed when the sandbox was created, and
+// a stack that disagrees with the container's wiring is worse than none.
+func ensureNetworkForExisting(ctx context.Context, name, address string, stderr io.Writer) error {
+	info, exists, err := sandbox.Find(ctx, address, name)
+	if err != nil || !exists {
+		// A sandbox that is not there is the next command's error to report, with a
+		// better message than this one could give.
+		return nil
+	}
+	if _, alive := enforce.Lookup(policy.StateDir(), name); alive {
+		return nil
+	}
+	mode, wired := network.ModeFromAnnotations(info.Annotations)
+	if !wired {
+		fmt.Fprint(stderr, unwiredSandboxWarning(name))
+		return nil
+	}
+
+	var flags policyFlags
+	spec, err := flags.enforceSpec(ctx, name, address, mode)
+	if err != nil {
+		return err
+	}
+	if mode != network.ModeNone {
+		fmt.Fprintf(stderr, "network: starting a %s stack for %s with the default policy (%s); "+
+			"per-run rules are not recorded, so 'boks run -allow ...' is where they belong.\n",
+			mode, name, policy.DefaultPreset)
+	}
+	_, _, err = attachNetwork(ctx, spec, info.Status == sandbox.StatusRunning, stderr)
+	return err
 }
 
 // sandboxNames parses flags and returns the sandbox names a command was given.

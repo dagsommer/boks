@@ -110,13 +110,27 @@ injection, described under [TLS interception](#tls-interception-and-the-boks-ca)
 | Host forward proxy — HTTP, `CONNECT`, SNI cross-check (`internal/proxy`) | built, exercised end to end against real TLS origins |
 | TLS interception for credential-bearing hosts only, local CA (`internal/ca`) | built, demonstrated end to end with a real client, two real HTTPS origins and certificate comparison |
 | Credential injection, encrypted host-side store (`internal/secret`) | built, unit-tested |
-| Network annotations and host-stack supervision (`internal/network`) | built, unit-tested |
-| Any of it applied to a running sandbox | **not done** |
+| Network annotations and host-stack supervision (`internal/network`, `internal/enforce`) | built, unit-tested |
+| All of it applied to a running sandbox (`boks run`) | **done**, and exercised against a *simulated* guest only |
+| Any of it enforcing against a real guest | **never observed** — no hypervisor here |
 
-**The proxy is not an enforcement boundary.** It filters only traffic a client chooses to
-send it. Nothing is wired into `boks run`, and even when it is, a proxy alone would remain a
-cooperating-client mechanism. `boks run -allow …` today validates the rules, prints them,
-and says plainly that they are not applied.
+**The proxy is not the enforcement boundary; the stack behind it is.** A forward proxy
+filters only traffic a client chooses to send it, so if `HTTP_PROXY` were all Boks did, a
+three-line program in the guest would walk past it. What `boks run` now builds is a host-side
+network stack terminating the guest's NIC, with the proxy listening *inside* that virtual
+network. A guest that ignores the proxy loses hostname rules, credential injection and
+readable refusals; it does not gain a route. **This has been tested against a simulated guest
+on the real link socket, and never against a real VM.**
+
+Two properties of the listener are worth stating because they were design choices, not
+accidents:
+
+- **Nothing is bound on the host.** The proxy's listener comes from the sandbox's own virtual
+  network, so it is reachable from that one sandbox and from nowhere else — not the host, not
+  another sandbox, not the LAN — and two sandboxes cannot collide on a port.
+- **The stack runs in a process whose life is the VM's life**, not the CLI's. See
+  [The network supervisor](#the-network-supervisor) below for what that process is trusted
+  with.
 
 #### What the enforcement path now rests on
 
@@ -141,6 +155,30 @@ Three things that verification changed, all of them reflected in the code:
   the container to it turns TSI off and leaves the container with loopback only. That is
   `-net none`, and it is the strongest containment Boks can currently offer — the only
   posture that does not depend on unfinished enforcement code.
+
+#### The network supervisor
+
+A sandbox's network is served by one `boks net serve` process per *running* sandbox, started
+on demand by whichever command starts the VM and ending when the sandbox's task ends. What it
+is trusted with, and what bounds it:
+
+- It holds the **policy** for one sandbox, the **credential values** for that sandbox only,
+  and the CA's signing key if that sandbox intercepts anything.
+- It is given those values **on a pipe at startup, never in its command line or environment**,
+  and it is never given the passphrase to the encrypted store. A supervisor cannot obtain a
+  credential the run was not configured with.
+- It runs as the user, with no privilege the CLI does not already have, and it exposes **no
+  API**: it listens inside one sandbox's virtual network and on nothing else. There is no
+  host socket for a guest, or for another process, to talk to.
+- It ends with the sandbox. `boks stop` and `boks rm` take it down explicitly, and it also
+  watches the sandbox's containerd task so that a VM dying takes its supervisor with it.
+- Liveness is a held file lock rather than a recorded PID, so a stale record can never cause
+  a signal to be sent to a process that inherited that number.
+
+The trade-off against a single always-on daemon is deliberate: a daemon would hold *every*
+sandbox's credentials and CA for as long as the machine is up, and one compromise or crash
+would reach every sandbox at once. One short-lived process per sandbox has a blast radius of
+one sandbox and a lifetime of one VM.
 
 #### TLS interception and the Boks CA
 
@@ -208,6 +246,16 @@ ls` and `boks proxy` both state, unprompted, which hosts will be decrypted.
 
 #### Known limits, stated up front
 
+- **Nothing here has been demonstrated against a real guest.** The strongest honest claim is
+  that a simulated guest on the real link socket is filtered exactly as designed.
+- **A sandbox created before this existed, or by something else, has no wiring** and runs on
+  the runtime's default transport, where the guest's `127.0.0.1` is the host's. Boks warns
+  loudly when it meets one; the fix is to recreate it, because the mode lives in annotations
+  that are fixed when a container is created.
+- **If a supervisor is killed, that sandbox's network is gone until something restarts it.**
+  The next `boks run` or `boks exec` starts a fresh one, but whether a *running* VM re-attaches
+  to a new link socket is unverified; if it does not, the sandbox needs a restart. A guest
+  whose network vanishes fails closed, which is the right direction for the failure to go.
 - SNI-based filtering can be evaded by clients that omit or lie about SNI; the netstack's
   destination-IP rules are the backstop. The proxy checks the SNI against policy and drops
   the tunnel on a mismatch, but it can only do so *after* answering `200`, so the client
@@ -253,6 +301,10 @@ This is the single largest gap between Boks today and its stated goals, and it i
 argument for the external-network-provider direction above: with TSI there is no point at
 which Boks can see or drop a flow.
 
+**This baseline is what a sandbox gets when Boks does *not* wire it** — the runtime's own
+default. Every sandbox `boks run` creates now carries the annotations that replace it, and
+`-net none` is the same replacement without the container being wired to the NIC at all.
+
 The same probes with an external network provider attached *(verified 2026-08-11, same
 host)*:
 
@@ -264,13 +316,19 @@ host)*:
 | IPv6 | absent entirely | guest emits link-local traffic |
 
 The refusal is the discriminator: the call is being handled by the guest's own loopback
-stack, where nothing listens, rather than performed on the host. That is the whole reason
-the provider is worth its complexity — and it is *all* that has been shown. Boks still
-applies no policy to a running sandbox.
+stack, where nothing listens, rather than performed on the host. That is the whole reason the
+provider is worth its complexity — and it remains all that has been shown *about a real
+guest*. Boks now applies a policy to a running sandbox; nobody has yet watched a real guest
+be refused by it.
 
 ### Host services
 
-Boks exposes no listening service to the guest, and no host API the guest can call. Port
+Boks exposes no listening service **on the host** to the guest, and no host API the guest can
+call. The one thing a guest can talk to is the filtering proxy, which listens inside that
+sandbox's own virtual network — reachable from that sandbox alone, offering no way to
+enumerate host state, and refusing anything the policy does not permit. It cannot be used to
+request a secret: the guest names a destination, and the host decides on its own whether a
+credential is attached. Port
 forwarding, when implemented, is explicit and host-initiated. The guest cannot ask for a
 port to be published, cannot enumerate host state, and cannot request secrets.
 
@@ -347,11 +405,15 @@ in the sandbox.)*
    just a malicious `Makefile` you later run. Mitigated by review, and eventually clone mode.
 4. **containerd configuration** — a misconfigured or over-privileged containerd undermines
    everything above it.
-5. **Network policy gaps** — currently total in the datapath: a policy engine and proxy
-   exist, but nothing applies them to a sandbox, and the default runtime configuration still
-   reaches host loopback.
-6. **Terminal escape sequences** in guest output.
-7. **The interception CA** — a signing key on your machine. Its blast radius is bounded by
+5. **Network policy gaps** — the policy is now in the datapath, so the gaps are narrower and
+   more specific: enforcement has never been observed against a real guest, a sandbox created
+   without Boks' annotations still runs on a transport that reaches host loopback, and a
+   sandbox whose supervisor is killed loses its network until something restarts it.
+6. **The network supervisor** — a host process holding one sandbox's credentials and, if that
+   sandbox intercepts anything, the CA's signing key. It exposes no API and ends with the
+   sandbox, which is what bounds it.
+7. **Terminal escape sequences** in guest output.
+8. **The interception CA** — a signing key on your machine. Its blast radius is bounded by
    what trusts it, which should be sandboxes and nothing else. A key stolen off the host is
    worth a MITM against anything that was told to trust it; that is why it is owner-only, why
    Boks refuses to use a key others can read, and why `boks ca regenerate` exists.
@@ -360,11 +422,13 @@ in the sandbox.)*
 
 - It has **not** been security-reviewed or audited.
 - It has **not** demonstrated the VM boundary in this project's own testing.
-- It provides **no** network isolation in a running sandbox today. A policy engine, a host
-  proxy and a host network stack configuration exist and are tested; none is wired into
-  `boks run`.
-- It provides **no** credential protection in a running sandbox today. Injection works
-  through `boks proxy`, which nothing wires into `boks run`.
+- It has **not** demonstrated its network enforcement against a real guest. The policy, the
+  stack, the proxy and the credential injection are wired into `boks run` and tested against
+  a simulated guest on the real link socket; no VM has ever been refused a destination by
+  Boks.
+- It does **not** claim that a sandbox created before this wiring existed is contained. Such
+  a sandbox runs on the runtime's default transport and reaches host loopback; Boks says so
+  when it sees one, and recreating it is the only fix.
 - It does **not** claim end-to-end TLS to every destination any more. Hosts you configure a
   credential for are decrypted by Boks, by design; everything else is not.
 - It has **no** defence against hypervisor vulnerabilities beyond keeping libkrun current.
