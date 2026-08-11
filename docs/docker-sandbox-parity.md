@@ -42,8 +42,30 @@ Last reviewed against Docker's docs: 2026-08-11.
 | `exec` | `sbx exec -it <name> bash` into a running sandbox | `boks exec [-i] [-t] [-it]` | P1 | partial | Streams IO, propagates the exit code; raw mode and resize unverified in a VM |
 | Persistence across stop/start | Packages, Docker images, config, shell history persist until `rm` | Same, via the container's writable snapshot | P1 | partial | Confirmed across stop/start on the non-VM runtime |
 | Naming | `--name`; reconnect from any directory | Same, `-name` | P1 | partial | An explicit name overrides the derived one |
-| Dashboard TUI | Interactive dashboard with live CPU/memory, shells, attach | Not planned near-term | P2 | none | Nice UX, not a correctness feature |
-| `reset` | Stops VMs, deletes data, can preserve secrets | `boks reset` | P2 | none | |
+| `reset` | Stops VMs, deletes data, can preserve secrets | `boks reset`, same secret-preserving default | P2 | none | |
+
+## 2a. CLI surface — where Boks currently diverges
+
+Boks grew command-first because that is what proved the runtime. sbx is **agent-first**, and
+the difference shows up in almost every command. These are the gaps to close, kept separate
+from the table above because they are shape mismatches rather than missing features.
+
+| Aspect | Docker behavior | Boks today | Prio | Status |
+|---|---|---|---|---|
+| `run` argument order | `sbx run [flags] AGENT [workspace...]` — the agent is the first positional, workspaces follow, and the primary workspace defaults to the current directory | `boks run [flags] <workspace> -- <cmd>` — inverted, and a command is mandatory | P0 | none |
+| Agents as a concept | A named set: Claude Code, Codex, Copilot, Cursor, Droid, Gemini, Kiro, OpenCode, Docker Agent, and **Shell**. Each selects an image and a startup command | No concept of an agent; `-image` plus an explicit command | P0 | none |
+| Arbitrary commands | `Shell` is an agent, so a plain shell is reachable within the same grammar | The only mode there is | P1 | partial |
+| Default sandbox name | Derived from the workspace directory name, so `~/src/foo` yields a readable, guessable name | `boks-<12 hex of a path digest>` — stable and collision-free, but unreadable and impossible to guess | P0 | none |
+| `-name` without an agent | When the named sandbox already exists, the agent positional is optional and is read back from the sandbox | `-name` requires the full invocation | P1 | none |
+| Bare `sbx` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` switches to the network governance panel, `?` lists shortcuts | Prints usage and exits 2 | P1 | none |
+| `ls` columns | agent, status, published ports, workspace | name, status, image, workspace, age | P1 | partial |
+| `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
+
+Open item: the exact default-naming rule is **not stated in Docker's documentation**. Two
+readings are consistent with what has been observed — the workspace directory name, or the
+agent name combined with it (a live sandbox for the `boks` directory running Claude is named
+`claude-boks`, which fits either reading if the agent prefix is included). Confirm against
+`sbx ls` on a machine running several sandboxes before copying the rule.
 
 ## 3. Workspace and filesystem
 
