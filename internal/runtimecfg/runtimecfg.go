@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/defaults"
 )
 
 const (
@@ -35,14 +36,16 @@ const (
 
 // DefaultAddress returns the containerd socket Boks talks to, honouring
 // BOKS_CONTAINERD_ADDRESS.
+//
+// The default comes from containerd's own defaults rather than a literal, because it is
+// platform-specific: /run/containerd on Linux, /var/run/containerd on macOS (which has no
+// /run at all), and a named pipe on Windows. Hardcoding the Linux path made every macOS
+// run fail to connect.
 func DefaultAddress() string {
 	if addr := os.Getenv("BOKS_CONTAINERD_ADDRESS"); addr != "" {
 		return addr
 	}
-	if runtime.GOOS == "windows" {
-		return `\\.\pipe\containerd-containerd`
-	}
-	return "/run/containerd/containerd.sock"
+	return defaults.DefaultAddress
 }
 
 // connectTimeout bounds how long a containerd dial may take. Diagnostics should be fast:
