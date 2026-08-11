@@ -42,7 +42,7 @@ Last reviewed against Docker's docs: 2026-08-11.
 | `exec` | `sbx exec -it <name> bash` into a running sandbox | `boks exec [-i] [-t] [-it]` | P1 | partial | Streams IO, propagates the exit code; raw mode and resize unverified in a VM |
 | Persistence across stop/start | Packages, Docker images, config, shell history persist until `rm` | Same, via the container's writable snapshot | P1 | partial | Confirmed across stop/start on the non-VM runtime |
 | Naming | `--name`; reconnect from any directory | Same, `-name` | P1 | partial | An explicit name overrides the derived one |
-| `reset` | Stops VMs, deletes data, can preserve secrets | `boks reset`, same secret-preserving default | P2 | none | |
+| `reset` | Stops sandboxes gracefully (30s), clears image cache, registries, all sandbox state, policies and stored secrets, signs out, stops the daemon, removes state/cache/config dirs. Prompts `y/N`; `-f/--force` skips it, `--preserve-secrets` keeps credentials | `boks reset`, minus the account and daemon steps | P2 | none | Copy the confirmation prompt and `--preserve-secrets`: losing every stored credential to a cleanup command is a bad surprise |
 
 ## 2a. CLI surface — where Boks currently diverges
 
@@ -119,6 +119,56 @@ policy testable instead of something you discover by being blocked.
 **Resource defaults differ, and ours are worse.** sbx defaults to all host CPUs, and to half
 of host memory capped at 32 GiB, with memory given in binary units (`8g`). Boks hardcodes
 2 vCPUs and 2048 MiB, which will feel broken on a real workload.
+
+### 2d. The kit format, from a real kit and the v2 reference
+
+A working production kit (`schemaVersion: "1"`) and the documented v2 grammar together give a
+clear picture. **Boks should not copy this schema**, but it should understand it, because it
+is a mature answer to the same problem and it reveals requirements we would otherwise
+discover late.
+
+Top-level v2 shape: `schemaVersion`, `kind` (`sandbox` or `mixin`), `name`, `version`,
+`displayName`, `description`, `sourceURL`, `licenses`, `locked`, `security`,
+`agentInstructions`, `permissions`, `ports`, `credentials`, `environment`, `setup`,
+`volumes`, and either `sandbox` or `extends` (with `requires` for mixins).
+
+What matters for Boks' own design:
+
+- **Kits are the agent mechanism.** A `kind: sandbox` kit names an image and an entrypoint,
+  which is exactly what "an agent" is. Agents cannot be user-extensible without something
+  kit-shaped, which is why kits move from P2 to P1.
+- **Composition is first class.** `extends` inherits from a parent sandbox kit, `mixin` +
+  `requires` layers onto an existing agent, and `locked` lists dotted paths a child may not
+  override. That last one is a governance primitive worth remembering: it is how an
+  organisation pins a network rule that a derived kit cannot loosen.
+- **Credentials carry injection rules.** `credentials[].apiKey` has `name` (the guest
+  environment variable), `proxyManaged`, and an `inject` array of `{domain, header, format |
+  scheme, username}`. One credential, many domains — see `internal/secret`.
+- **OAuth is handled without the token entering the guest.** `oauth` defines
+  `tokenEndpoint`, `sentinels.{accessToken,refreshToken}`, `resourceHosts`, and a
+  `credentialFile.{path,template}` Go template. The guest gets a credential file full of
+  sentinel values; the proxy substitutes real tokens on requests to `resourceHosts`. This is
+  how an interactive login works in a sandbox, and it means a credential is not always a
+  single header value.
+- **Setup has phases with different privileges.** `setup.install[]` runs as `user: "0"` by
+  default, `setup.startup[]` as `user: "1000"` with an optional `background` flag, and
+  `setup.files[]` writes content with a mode and `onlyIfMissing`. Static files can also be
+  laid out on disk, with `files/home/` mapping to the agent's home and `files/workspace/` to
+  the primary workspace.
+- **`agentInstructions.{filename,content}`** injects instructions the agent will read — the
+  v1 file called this `agentContext` with `sandbox.aiFilename`. Worth noting that a kit can
+  shape agent *behaviour*, not just its environment; the real kit used it to forbid commits
+  and warn against printing a token.
+- **`volumes[]`** declares block-backed or `tmpfs` storage with a size, which is how the
+  nested Docker data disk is expressed rather than being a special case.
+- **`ports[]`**, `security.privileged`, and `sandbox.resources.{cpu,memory,gpu}` round it out.
+- `sandbox.command` splits `default` from `interactive`, so an agent can behave differently
+  with and without a TTY.
+
+`permissions.network.{allow,deny}` documents the pattern forms supported: exact host, host
+with port, single-label wildcard, **multi-label wildcard**, port ranges, port wildcard and
+CIDR. Boks' policy engine implements one wildcard form, not two — a real gap, recorded here
+rather than silently absent.
 
 ### 2c. Proxy modes, inferred from a real decision log
 
@@ -208,7 +258,8 @@ exists. See [security-model.md](security-model.md#network).
 | DNS mediation | Not documented | Guest resolver pointed at the host-side gateway | P1 | partial | `io.containerd.nerdbox.ctr.dns`; the hook for name policy, not yet a closed channel |
 | Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | partial | **Live regression vs Docker until the netstack is wired into `run`**: the default path is still TSI, where the guest's `127.0.0.1` is the host's. `-net none` and the presets close it; nothing applies them yet |
 | Upstream proxy | Honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`; `DOCKER_SANDBOXES_PROXY` supports http/https/socks5/socks5h | Support an upstream proxy env var | P2 | none | socks5h delegates DNS to the proxy |
-| Port publishing | `--publish` at creation; `sbx ports` add/remove later; ignored when re-attaching | `boks ports` equivalent | P1 | none | The netstack can forward, and Boks explicitly asserts it does not |
+| Port publishing | `--publish` at creation; `sbx ports SANDBOX --publish/--unpublish/--json` later; ignored when re-attaching | `boks ports` equivalent | P1 | none | The netstack can forward, and Boks explicitly asserts it does not. Spec `[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]`; omitting HOST_PORT allocates an ephemeral one |
+| Port binding defaults | Binds **loopback** by default, expanded per address family: `tcp`/`udp` bind both `127.0.0.1` and `::1`, or v4 only for a v4-only sandbox; `tcp4`/`udp4` v4 only; `tcp6`/`udp6` v6 only. Protocols: tcp, tcp4, tcp6, udp, udp4, udp6 | Same | P1 | none | Defaulting to loopback rather than all interfaces is the safe choice and should be copied exactly |
 | Guest binding requirement | Service must listen on the VM's external interface, not just loopback | Same constraint | P1 | none | |
 
 ## 5. Credentials and secrets
@@ -248,7 +299,9 @@ silently.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Kits | Declarative YAML applied at creation: install commands, files, network rules, credential rules; can define a new agent or mix into an existing one | Boks equivalent, schema derived from our own runtime | P2 | none | Docker labels kits experimental and subject to change |
+| Kits | Declarative YAML applied at creation: install commands, files, network rules, credential rules; can define a new agent or mix into an existing one | Boks equivalent, schema derived from our own runtime | P1 | none | Docker labels kits experimental and subject to change. Raised from P2: kits *are* the agent mechanism, so agents cannot be extensible without them. See below |
+| Kit distribution | `sbx kit pack/push/pull/inspect/validate/add` — packaged as **OCI artifacts** in a registry | Local files first; OCI packaging later if it earns its place | P2 | none | Reusing OCI registries rather than inventing distribution is worth copying eventually |
+| Templates | `sbx template save/load/ls/rm` — a template is a **saved snapshot of a sandbox**, reusable as the base for new ones, selected with `sbx run -t TAG`. Listed with a `FLAVOR` column naming the underlying agent type | Not started; `-image` takes a plain reference | P2 | none | Snapshot-and-reuse is a distinct feature from "pick an image", and a genuinely good one: configure a sandbox interactively, then freeze it |
 | Templates | Base image a kit builds on (`sandbox.image`) | Base image reference | P2 | none | |
 | Mixin composition | Kits layer onto agent runs | Layering wanted; semantics TBD | P2 | none | |
 | Distribution | Kit install restricted to an allowlist, Docker Hub by default | Local files first; no registry near-term | P2 | none | Avoid a premature kit registry |
