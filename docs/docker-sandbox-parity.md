@@ -55,17 +55,28 @@ from the table above because they are shape mismatches rather than missing featu
 | `run` argument order | `sbx run [flags] AGENT [workspace...]` — the agent is the first positional, workspaces follow, and the primary workspace defaults to the current directory | `boks run [flags] <workspace> -- <cmd>` — inverted, and a command is mandatory | P0 | none |
 | Agents as a concept | A named set: Claude Code, Codex, Copilot, Cursor, Droid, Gemini, Kiro, OpenCode, Docker Agent, and **Shell**. Each selects an image and a startup command | No concept of an agent; `-image` plus an explicit command | P0 | none |
 | Arbitrary commands | `Shell` is an agent, so a plain shell is reachable within the same grammar | The only mode there is | P1 | partial |
-| Default sandbox name | Derived from the workspace directory name, so `~/src/foo` yields a readable, guessable name | `boks-<12 hex of a path digest>` — stable and collision-free, but unreadable and impossible to guess | P0 | none |
+| Default sandbox name | `<agent>-<workspace directory name>` — confirmed against a live `sbx ls`. Case, dots and existing hyphens are preserved: `claude` in `~/git_repos/finndato.no` gives `claude-finndato.no`; a `udi-copilot-yolo` agent in `efm-integrasjonspunkt` gives `udi-copilot-yolo-efm-integrasjonspunkt` | `boks-<12 hex of a path digest>` — stable and collision-free, but unreadable and impossible to guess | P0 | none |
 | `-name` without an agent | When the named sandbox already exists, the agent positional is optional and is read back from the sandbox | `-name` requires the full invocation | P1 | none |
 | Bare `sbx` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` switches to the network governance panel, `?` lists shortcuts | Prints usage and exits 2 | P1 | none |
-| `ls` columns | agent, status, published ports, workspace | name, status, image, workspace, age | P1 | partial |
+| `ls` columns | `SANDBOX  AGENT  STATUS  PORTS  WORKSPACE` — confirmed from a live run | name, status, image, workspace, age | P1 | partial |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
+| `daemon` | `sbx daemon start|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
 
-Open item: the exact default-naming rule is **not stated in Docker's documentation**. Two
-readings are consistent with what has been observed — the workspace directory name, or the
-agent name combined with it (a live sandbox for the `boks` directory running Claude is named
-`claude-boks`, which fits either reading if the agent prefix is included). Confirm against
-`sbx ls` on a machine running several sandboxes before copying the rule.
+**Agents are user-extensible.** The same live listing shows agents named
+`udi-copilot-default` and `udi-copilot-yolo` alongside the built-in `claude`. Custom agents
+are therefore a real, in-use capability rather than a fixed menu, and since a kit is the
+documented way to "define a new agent from scratch", agents and kits are almost certainly
+the same mechanism seen from two directions. That raises the priority of kits from "later"
+to "the thing that makes agents extensible", and means the agent registry Boks builds should
+be data-driven from the start rather than a hardcoded switch.
+
+**`forward` vs `forward-proxy` in the network log.** sbx's decision log distinguishes these
+two, which is a strong hint about where it terminates TLS: a plain `forward` is a TCP tunnel
+it cannot read, while `forward-proxy` is a flow it terminates and re-originates and therefore
+*can* read and modify. That split is what makes header injection into HTTPS possible at all,
+and Boks should reproduce the distinction explicitly — every logged flow saying whether it
+was inspected or merely tunnelled. A user is entitled to know which of their traffic was
+decrypted.
 
 ## 3. Workspace and filesystem
 
