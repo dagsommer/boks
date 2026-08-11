@@ -235,19 +235,93 @@ func TestIntegrationExecUsesWorkspace(t *testing.T) {
 	}
 }
 
-// Expected-failure paths. The message is the feature here: it has to say what to do next.
-func TestIntegrationExecIntoStoppedSandbox(t *testing.T) {
+// A stopped sandbox is started by the command that needs it. Refusing and telling the user
+// to run 'boks start' first was a step only Boks cared about.
+func TestIntegrationExecStartsAStoppedSandbox(t *testing.T) {
 	cfg := newSandbox(t, tempWorkspace(t))
 	if _, err := sandbox.Create(context.Background(), cfg); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	_, _, err := execIn(t, cfg, "true")
-	if err == nil {
-		t.Fatal("exec into a stopped sandbox succeeded")
+	code, out, err := execIn(t, cfg, "echo", "started")
+	if err != nil || code != 0 {
+		t.Fatalf("exec into a stopped sandbox: code=%d err=%v", code, err)
 	}
-	if !strings.Contains(err.Error(), "boks start") {
-		t.Errorf("error = %q, want it to suggest 'boks start'", err)
+	if strings.TrimSpace(out) != "started" {
+		t.Errorf("stdout = %q, want %q", out, "started")
+	}
+	if info, _ := find(t, cfg.Address, cfg.Name); info.Status != sandbox.StatusRunning {
+		t.Errorf("status = %q, want the sandbox left running", info.Status)
+	}
+}
+
+// The agent is part of a sandbox's identity, and containerd's record is where it lives.
+func TestIntegrationAgentIsRecorded(t *testing.T) {
+	cfg := newSandbox(t, tempWorkspace(t))
+	cfg.Agent = "shell"
+	if _, err := sandbox.Create(context.Background(), cfg); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	info, ok := find(t, cfg.Address, cfg.Name)
+	if !ok {
+		t.Fatal("the sandbox is not listed")
+	}
+	if info.Agent != "shell" {
+		t.Errorf("agent = %q, want %q", info.Agent, "shell")
+	}
+}
+
+// The name derived for an agent and a workspace is the name the sandbox gets, and running
+// again finds it. Naming and re-attach are the same mechanism, so this is one test.
+func TestIntegrationDerivedNameIsTheReattachKey(t *testing.T) {
+	ws := tempWorkspace(t)
+	name, err := sandbox.DeriveName("shell", ws.HostPath)
+	if err != nil {
+		t.Fatalf("DeriveName: %v", err)
+	}
+
+	cfg := testConfig(t)
+	cfg.Name = name
+	cfg.Agent = "shell"
+	cfg.Workspaces = []workspace.Workspace{ws}
+	cfg.Command = []string{"true"}
+	cfg.Stdout, cfg.Stderr = &bytes.Buffer{}, &bytes.Buffer{}
+	t.Cleanup(func() {
+		if err := sandbox.Remove(context.Background(), cfg.Address, cfg.Name, true); err != nil &&
+			!strings.Contains(err.Error(), "no sandbox named") {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	if _, err := sandbox.Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	choice, err := sandbox.Choose(context.Background(), cfg.Address, "shell", ws.HostPath)
+	if err != nil {
+		t.Fatalf("Choose: %v", err)
+	}
+	if choice.Name != name || !choice.Exists {
+		t.Errorf("Choose = %+v, want the existing sandbox %q", choice, name)
+	}
+
+	// A different directory with the same basename must not land in this sandbox.
+	other := filepath.Join(t.TempDir(), filepath.Base(ws.HostPath))
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	otherWS, err := workspace.Parse(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherChoice, err := sandbox.Choose(context.Background(), cfg.Address, "shell", otherWS.HostPath)
+	if err != nil {
+		t.Fatalf("Choose: %v", err)
+	}
+	if otherChoice.Name == name {
+		t.Errorf("a second directory named %q reused the sandbox %q", filepath.Base(other), name)
+	}
+	if otherChoice.CollidedWith != ws.HostPath {
+		t.Errorf("collided with = %q, want %q", otherChoice.CollidedWith, ws.HostPath)
 	}
 }
 
@@ -361,8 +435,8 @@ func TestIntegrationCopy(t *testing.T) {
 	}
 }
 
-// A sandbox that is stopped cannot be copied into, and the error has to say so rather than
-// failing somewhere inside tar.
+// Copying into a stopped sandbox starts it, for the same reason exec does: it is the only
+// way the copy can happen, so there is nothing to ask the user.
 func TestIntegrationCopyIntoStoppedSandbox(t *testing.T) {
 	cfg := newSandbox(t, tempWorkspace(t))
 	if _, err := sandbox.Create(context.Background(), cfg); err != nil {
@@ -373,17 +447,55 @@ func TestIntegrationCopyIntoStoppedSandbox(t *testing.T) {
 	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := sandbox.Copy(context.Background(), sandbox.CopyConfig{
+	if err := sandbox.Copy(context.Background(), sandbox.CopyConfig{
 		Address:   cfg.Address,
 		Name:      cfg.Name,
 		ToSandbox: true,
 		HostPath:  src,
 		GuestPath: "/root/f.txt",
-	})
-	if err == nil {
-		t.Fatal("copying into a stopped sandbox succeeded")
+	}); err != nil {
+		t.Fatalf("copying into a stopped sandbox: %v", err)
 	}
-	if !strings.Contains(err.Error(), "boks start") {
-		t.Errorf("error = %q, want it to suggest 'boks start'", err)
+	code, out, err := execIn(t, cfg, "cat", "/root/f.txt")
+	if err != nil || code != 0 {
+		t.Fatalf("reading the copied file: code=%d err=%v", code, err)
+	}
+	if strings.TrimSpace(out) != "x" {
+		t.Errorf("copied file = %q, want %q", out, "x")
+	}
+}
+
+// A graceful stop asks everything in the sandbox to exit, not only the keeper process.
+// Without that, a build or server started with exec is killed abruptly.
+func TestIntegrationStopSignalsProcessesInTheSandbox(t *testing.T) {
+	cfg := newSandbox(t, tempWorkspace(t))
+	ctx := context.Background()
+	if _, err := sandbox.Create(ctx, cfg); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// A process that records having been asked to stop, in the sandbox's own
+	// filesystem so the evidence survives the stop.
+	if code, _, err := execIn(t, cfg, "sh", "-c",
+		`nohup sh -c "trap 'echo terminated > /root/signal; exit 0' TERM; while :; do sleep 1 & wait \$!; done" >/dev/null 2>&1 &
+		 sleep 1`); err != nil || code != 0 {
+		t.Fatalf("starting the background process: code=%d err=%v", code, err)
+	}
+
+	if err := sandbox.Stop(ctx, cfg.Address, cfg.Name); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+		t.Fatalf("Start after Stop: %v", err)
+	}
+	code, out, err := execIn(t, cfg, "cat", "/root/signal")
+	if err != nil || code != 0 {
+		t.Fatalf("the background process was not asked to stop: code=%d err=%v", code, err)
+	}
+	if strings.TrimSpace(out) != "terminated" {
+		t.Errorf("signal record = %q, want %q", out, "terminated")
 	}
 }
