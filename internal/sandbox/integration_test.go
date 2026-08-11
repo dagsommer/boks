@@ -43,6 +43,13 @@ func testConfig(t *testing.T) sandbox.Config {
 	}
 }
 
+// testName gives each test its own sandbox name, so a failure in one cannot be inherited by
+// another through a re-attached sandbox.
+func testName(t *testing.T) string {
+	t.Helper()
+	return "boks-test-" + strings.ToLower(strings.NewReplacer("/", "-", " ", "-", "_", "-").Replace(t.Name()))
+}
+
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -51,12 +58,17 @@ func envOr(key, fallback string) string {
 }
 
 // run executes a command in a fresh sandbox and returns its exit code and stdout.
+//
+// These tests are about what a single command observes, so they use an ephemeral sandbox:
+// the command is the container process and nothing survives it. The persistent lifecycle is
+// covered in lifecycle_integration_test.go.
 func run(t *testing.T, ws workspace.Workspace, command ...string) (int, string) {
 	t.Helper()
 
 	var stdout, stderr bytes.Buffer
 	cfg := testConfig(t)
-	cfg.Name = "boks-test-" + strings.ToLower(strings.NewReplacer("/", "-", " ", "-").Replace(t.Name()))
+	cfg.Name = testName(t)
+	cfg.Ephemeral = true
 	cfg.Command = command
 	cfg.Stdout = &stdout
 	cfg.Stderr = &stderr
