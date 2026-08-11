@@ -2,7 +2,6 @@ package cli
 
 import (
 	"flag"
-	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -61,6 +60,16 @@ func (f *policyFlags) networkPlan(sandbox string) (network.Plan, error) {
 	if err != nil {
 		return network.Plan{}, err
 	}
+	return f.planFor(sandbox, mode)
+}
+
+// planFor computes the plan for a mode that has already been decided — by the flags, or by
+// what an existing sandbox was created with.
+//
+// The runtime directory is the one the network supervisor looks in, and that is not a
+// coincidence to be maintained by hand: a plan whose socket lands somewhere else would
+// produce a VM connected to a socket nobody is holding.
+func (f *policyFlags) planFor(sandbox string, mode network.Mode) (network.Plan, error) {
 	return network.NewPlan(network.Config{
 		Mode:       mode,
 		Sandbox:    sandbox,
@@ -80,53 +89,38 @@ func (f *policyFlags) resolve() (policy.Policy, error) {
 // credentialRules assembles the credentials from the flags. Values are not touched here: a
 // credential names a secret, and the value is fetched from the provider at request time.
 //
-// Injection rules for the same service accumulate onto one credential, which is the point
-// of the two-level model: four hosts sharing one enterprise token are four rules and one
-// secret, not four copies of the same scheme.
+// The assembly lives in internal/secret because the process that runs the proxy builds the
+// same credentials from the same strings, and the two must not be able to disagree about
+// what the user asked for.
 func (f *policyFlags) credentialRules() ([]secret.Credential, error) {
-	var order []string
-	byService := map[string]*secret.Credential{}
-	for _, spec := range f.inject {
-		service, rules, err := secret.ParseInject(spec)
-		if err != nil {
-			return nil, err
-		}
-		if _, ok := byService[service]; !ok {
-			byService[service] = &secret.Credential{Service: service}
-			order = append(order, service)
-		}
-		byService[service].Inject = append(byService[service].Inject, rules...)
-	}
-	for _, spec := range f.guest {
-		service, env, placeholder, err := secret.ParseGuestCredential(spec)
-		if err != nil {
-			return nil, err
-		}
-		c, ok := byService[service]
-		if !ok {
-			return nil, fmt.Errorf("-guest-credential %s: no -inject rule mentions service %q, so nothing would ever replace that placeholder", spec, service)
-		}
-		c.EnvName, c.Placeholder, c.ProxyManaged = env, placeholder, true
-	}
-	out := make([]secret.Credential, 0, len(order))
-	for _, name := range order {
-		out = append(out, *byService[name])
-	}
-	return out, nil
+	return secret.ParseCredentials(f.inject, f.guest)
 }
 
-// notEnforcedWarning is printed wherever a policy is accepted but cannot yet be applied to
-// a sandbox. It is deliberately blunt. A user who believes a flag is protecting them when
-// it is not is worse off than a user with no flag at all.
-const notEnforcedWarning = `WARNING: network policy is NOT enforced yet.
-         These flags are parsed and validated, and 'boks policy ls' shows what they
-         resolve to, but nothing applies them to a running sandbox.
-         The transport that makes enforcement possible — a host-side network stack
-         terminating the guest's NIC instead of libkrun's TSI — has been verified on
-         real hardware, and internal/network builds the configuration for it. The
-         path from a policy to a dropped packet is not finished.
-         Until it is, treat these flags as documentation of intent.
-         See docs/security-model.md.
+// enforcementNote replaces the warning that used to say a policy was not applied to a
+// running sandbox. It now is — so what a user needs from this text has changed, from "do
+// not trust this" to "here is precisely how far the trust goes".
+//
+// The distinction it draws is the one that matters: the network stack is the control, and
+// it holds whether or not the guest cooperates; the proxy variables are how a cooperating
+// guest gets hostname rules, credentials and a readable refusal instead of a socket that
+// fails. What is still unproven is stated in the same breath, because this project has
+// never seen a policy applied to a real VM.
+const enforcementNote = `The sandbox's network is terminated on the host: the guest's NIC ends in a network
+stack in a boks process, and destinations no rule permits have nothing to answer them.
+HTTP_PROXY and HTTPS_PROXY point the guest at the filtering proxy inside its own
+virtual network; ignoring them costs the guest hostname rules, credential injection
+and readable refusals, and gains it nothing.
+
+Not yet demonstrated: no policy has been enforced against a real guest anywhere in
+this project — that needs a hypervisor. The datapath is tested against a simulated
+guest on the link. See docs/security-model.md.`
+
+// noNetworkNotice is what -net none says for itself. It is the strongest containment Boks
+// offers and the only one whose enforcement does not depend on code that has yet to meet a
+// real guest, so it is worth stating plainly rather than passing over in silence.
+const noNetworkNotice = `NETWORK: none. The VM gets a NIC — which is what turns the runtime's own transport
+         off, and with it the guest's access to the host's loopback — and the container
+         is never wired to it. No stack, no proxy, no listener, nothing to reach.
 `
 
 // interceptionNotice says, in as many words, which traffic Boks will decrypt.
