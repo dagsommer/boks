@@ -49,6 +49,15 @@ type Agent struct {
 	// means Boks knows the agent's name but has no environment for it yet; such an agent
 	// is still usable with an explicit -template.
 	Image string
+	// Init is a prefix put in front of everything else in Argv — an init and whatever
+	// preparation the image needs before the agent runs.
+	//
+	// It exists because a sandbox does not use the image's ENTRYPOINT: the OCI spec is
+	// built with containerd's WithProcessArgs, which replaces the whole argv. An image
+	// that installs the Boks CA on the way in would therefore be bypassed. Carrying the
+	// prefix in the definition puts it back on every path that goes through Argv,
+	// including `boks run shell . -- cmd`, where the user supplies the command.
+	Init []string
 	// Command is the argv the sandbox starts with. Empty means the image's own default.
 	Command []string
 	// Args says how arguments after `--` combine with Command.
@@ -61,15 +70,24 @@ type Agent struct {
 // Runnable reports whether Boks can start this agent without being told an image.
 func (a Agent) Runnable() bool { return a.Image != "" }
 
+// Bare returns the agent without its Init prefix, for running it somewhere other than the
+// image Boks ships for it. The prefix names paths that only a Boks image has, so an image
+// supplied with -template must not inherit it.
+func (a Agent) Bare() Agent {
+	a.Init = nil
+	return a
+}
+
 // Argv is the command a sandbox running this agent should execute.
 func (a Agent) Argv(extra []string) []string {
+	argv := slices.Clone(a.Init)
 	if len(extra) == 0 {
-		return slices.Clone(a.Command)
+		return append(argv, a.Command...)
 	}
 	if a.Args == ArgsCommand || len(a.Command) == 0 {
-		return slices.Clone(extra)
+		return append(argv, extra...)
 	}
-	return append(slices.Clone(a.Command), extra...)
+	return append(append(argv, a.Command...), extra...)
 }
 
 // Registry is an ordered set of agents. Order is preserved so that help and listings are
@@ -173,35 +191,72 @@ func RequireRunnable(a Agent) error {
 		a.Name, a.Name, a.Name, Default)
 }
 
+// ImageRepo is where the Boks agent images are published. The images are built from
+// images/<name>/Dockerfile in this repository; see images/README.md.
+const ImageRepo = "ghcr.io/dagsommer/boks"
+
+// ImageTag is the tag every Boks agent image is published under.
+//
+// One constant, moved by a release, rather than a version spelled ten times: the images are
+// built and pushed together from a single workflow, so a tag that differed between them
+// could only ever be a mistake. It is exported because the build tooling and the release
+// workflow need the same value, and deriving it from one place is what keeps them in step.
+const ImageTag = "0.1.0"
+
+// Image returns the published reference for one of the images in this repository. The name
+// is the agent's, except for the shell agent, which runs the base image itself.
+func Image(name string) string { return ImageRepo + "/" + name + ":" + ImageTag }
+
+// initArgv is what every Boks agent image expects in front of the agent's own command.
+//
+// tini is there to be PID 1: a sandbox that lives for hours accumulates zombies without one,
+// and a real Docker Sandboxes guest was observed running tini as PID 1 for the same reason.
+// boks-entrypoint installs the Boks CA — see internal/ca — when BOKS_CA_CERT_B64 is in the
+// environment, and execs straight through when it is not.
+//
+// This is a property of the images in images/, so an agent pointed at some other image with
+// -template gets whatever that image does instead.
+var initArgv = []string{"/usr/bin/tini", "--", "/usr/local/bin/boks-entrypoint"}
+
 // Builtin returns the agents Boks knows about.
 //
-// The names are sbx's, so that a habit formed there works here. Only the shell agent has an
-// image: the others are placeholders that make `boks run claude` fail with an explanation
-// rather than with "unknown agent", and that become real by giving them an image — which is
-// also exactly what a user-defined agent will do.
+// The names are sbx's, so that a habit formed there works here. Nine of the ten have an
+// image; `kiro` does not, and is registered anyway so that asking for it says "no image yet"
+// rather than "unknown agent" — which is also the shape a user-defined agent overrides.
 func Builtin() *Registry {
 	r := &Registry{}
 	for _, a := range []Agent{
 		{
 			Name:    "shell",
-			Summary: "a plain shell in a minimal Linux image",
-			// Alpine is small, widely mirrored and has a shell at a known path.
-			// It is a starting point for proving the runtime works, not a curated
-			// development environment.
-			Image:   "docker.io/library/alpine:latest",
-			Command: []string{"/bin/sh"},
+			Summary: "a plain shell in the Boks base image",
+			// The shell agent is the base image itself: it is the one agent whose
+			// environment is "everything the others share and nothing more".
+			Image:   Image("base"),
+			Command: []string{"/bin/bash"},
 			Args:    ArgsCommand,
 		},
-		{Name: "claude", Summary: "Claude Code"},
-		{Name: "codex", Summary: "OpenAI Codex"},
-		{Name: "copilot", Summary: "GitHub Copilot CLI"},
-		{Name: "cursor", Summary: "Cursor CLI"},
-		{Name: "docker-agent", Summary: "Docker Agent"},
-		{Name: "droid", Summary: "Factory Droid"},
-		{Name: "gemini", Summary: "Google Gemini CLI"},
+		{Name: "claude", Summary: "Claude Code", Image: Image("claude"), Command: []string{"claude"}},
+		{Name: "codex", Summary: "OpenAI Codex", Image: Image("codex"), Command: []string{"codex"}},
+		{Name: "copilot", Summary: "GitHub Copilot CLI", Image: Image("copilot"), Command: []string{"copilot"}},
+		{Name: "cursor", Summary: "Cursor CLI", Image: Image("cursor"), Command: []string{"cursor-agent"}},
+		{Name: "docker-agent", Summary: "Docker Agent", Image: Image("docker-agent"), Command: []string{"docker-agent"}},
+		{Name: "droid", Summary: "Factory Droid", Image: Image("droid"), Command: []string{"droid"}},
+		{Name: "gemini", Summary: "Google Gemini CLI", Image: Image("gemini"), Command: []string{"gemini"}},
+		// Kiro is the one name here Boks ships nothing for. Its CLI is distributed as a
+		// ~500 MB archive per architecture, which would roughly triple the size of an
+		// agent image, and its installer resolves the download through a "latest"
+		// manifest with no documented version-pinned URL — so there is no artifact to
+		// pin and checksum the way every other image here does. Both would have to
+		// change before this becomes an image.
 		{Name: "kiro", Summary: "Kiro"},
-		{Name: "opencode", Summary: "OpenCode"},
+		{Name: "opencode", Summary: "OpenCode", Image: Image("opencode"), Command: []string{"opencode"}},
 	} {
+		// Every image Boks ships carries the same init and entrypoint, so the prefix is
+		// applied here rather than repeated in ten definitions. An agent with no image
+		// gets none: it will run in an image Boks knows nothing about.
+		if a.Image != "" {
+			a.Init = initArgv
+		}
 		if err := r.Add(a); err != nil {
 			// A built-in definition is ours, so a bad one is a programming error.
 			panic("agent: invalid built-in definition: " + err.Error())
