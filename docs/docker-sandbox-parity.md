@@ -120,13 +120,49 @@ policy testable instead of something you discover by being blocked.
 of host memory capped at 32 GiB, with memory given in binary units (`8g`). Boks hardcodes
 2 vCPUs and 2048 MiB, which will feel broken on a real workload.
 
-**`forward` vs `forward-proxy` in the network log.** sbx's decision log distinguishes these
-two, which is a strong hint about where it terminates TLS: a plain `forward` is a TCP tunnel
-it cannot read, while `forward-proxy` is a flow it terminates and re-originates and therefore
-*can* read and modify. That split is what makes header injection into HTTPS possible at all,
-and Boks should reproduce the distinction explicitly — every logged flow saying whether it
-was inspected or merely tunnelled. A user is entitled to know which of their traffic was
-decrypted.
+### 2c. Proxy modes, inferred from a real decision log
+
+Real `sbx policy log` output shows a `PROXY` column with **three** values — `forward`,
+`forward-bypass` and `transparent` — and their distribution across hosts is diagnostic:
+
+| Mode | Hosts observed |
+|---|---|
+| `forward` | `api.anthropic.com`, `platform.claude.com`, `mcp-proxy.anthropic.com`, `github.com`, `api.github.com`, `raw.githubusercontent.com`, `auth.docker.io`, `registry-1.docker.io`, `ports.ubuntu.com:80` |
+| `forward-bypass` | `proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`, `docs.docker.com`, `download.docker.com`, `production.cloudfront.docker.com`, `downloads.claude.ai`, `www.apache.org`, a Datadog log intake |
+| `transparent` | `example.com:443`, `github.com:22` |
+
+Every `forward` host is one with a credential to inject — Anthropic, GitHub, Docker registry
+auth — plus one plaintext HTTP host. Every `forward-bypass` host has no credential: module
+proxies, checksum databases, CDNs, telemetry, documentation. `transparent` covers flows that
+never used the proxy at all, including SSH on port 22, which cannot traverse a `CONNECT`.
+
+The reading Boks builds on — **inference from correlation, not documented fact**:
+
+- **`forward`** — handled at HTTP level: plaintext HTTP directly, or HTTPS terminated and
+  re-originated. Readable, and therefore injectable. The intercepted case.
+- **`forward-bypass`** — tunnelled via `CONNECT` without terminating. Unreadable. "Bypass"
+  means bypassing *inspection*, not bypassing the proxy.
+- **`transparent`** — caught at the network layer without proxy cooperation. TCP-level policy
+  only, so hostname rules cannot apply and IP/port rules are all there is.
+
+Boks adopts these three names. Matching the reference vocabulary is worth more than inventing
+clearer terms, and the semantics coincide with the design already chosen: interception is
+opt-in per destination, and the mode is precisely "did this host have a credential rule".
+
+**Log shape.** Columns are `SANDBOX  TYPE  HOST  PROXY  RULE  REASON  LAST SEEN  COUNT`,
+split into blocked and allowed sections, and **aggregated** rather than one line per request —
+one host showed 480 hits on a single row. `TYPE` is `network`, leaving room for the MCP and
+filesystem policies documented elsewhere.
+
+**Structured decisions.** A blocked row's rule reads:
+
+```
+no applicable policies for op(action=net:connect:tcp, resource=net:domain:api.anthropic.com:443)
+```
+
+So decisions are expressed over a typed action/resource vocabulary rather than free text,
+which generalises to non-network policy cleanly. Boks' decision log should record an action
+and a typed resource, leaving formatting and aggregation to the display layer.
 
 ## 3. Workspace and filesystem
 
