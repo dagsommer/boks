@@ -70,6 +70,56 @@ the same mechanism seen from two directions. That raises the priority of kits fr
 to "the thing that makes agents extensible", and means the agent registry Boks builds should
 be data-driven from the start rather than a hardcoded switch.
 
+### 2b. Command inventory
+
+Taken from real `sbx --help` output, so this is the actual surface rather than what the
+website documents.
+
+| sbx command | Purpose | Boks |
+|---|---|---|
+| *(bare)* / `tui` | Interactive dashboard; `tui` also opens it explicitly | none |
+| `run` | Run an agent in a sandbox | `run`, command-first — realignment in progress |
+| `create` | Create a sandbox for an agent | `create` |
+| `exec` | Execute a command in a sandbox; **starts it first if stopped** | `exec`, but errors instead of auto-starting |
+| `ls` / `list` | List sandboxes | `ls` (no `list` alias) |
+| `stop` | Stop without removing | `stop` |
+| `rm` | Remove sandboxes | `rm` |
+| `cp` | Copy between sandbox and host | `cp` |
+| `ports` | Manage port publishing | none |
+| `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | `policy ls`, `policy log` only |
+| `secret` | Manage stored secrets | `secret set/ls/rm` |
+| `kit` | (Experimental) Manage kit artifacts | none |
+| `template` | Manage sandbox templates (the image an agent runs in) | none; `-image` flag only |
+| `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
+| `daemon` | `start`, `stop`, `status`, `log-level` for the `sandboxd` daemon | none, and none needed — see below |
+| `diagnose` | Diagnose installation issues | `doctor` (same job, different name) |
+| `setup` | (Experimental) Detect host configuration and prepare | partly `doctor`'s remedies |
+| `reset` | Reset all sandboxes and clean up state | none |
+| `login` / `logout` | Sign in to Docker | **won't** — no accounts, ever |
+| `completion` | Shell autocompletion | none |
+| `version` | Version information | `version` |
+
+Boks additionally has `start` and `inspect`, which sbx does not: sbx starts implicitly via
+`run`/`exec`, and its only `inspect` is `policy inspect`. These are deliberate additions, not
+parity gaps.
+
+**sbx runs a daemon; Boks does not.** `sandboxd` presumably owns VM supervision and state,
+which is the natural consequence of managing hypervisors directly. Boks delegates that to
+containerd and its shims, so there is nothing left for a daemon to own. This is a genuine
+architectural divergence and the better position for a local-first tool — one less privileged
+long-lived process — but it does mean anything sbx does *between* CLI invocations has no
+equivalent here, and that needs watching as features land.
+
+**Persistent, scoped policy is a bigger gap than it looked.** `sbx policy allow/deny/rm` write
+rules that survive the invocation, and rules are either global or scoped to a single sandbox.
+Boks only has per-run flags. `policy check` — asking whether a given access *would* be
+permitted, without making the request — is a genuinely good idea worth copying: it makes a
+policy testable instead of something you discover by being blocked.
+
+**Resource defaults differ, and ours are worse.** sbx defaults to all host CPUs, and to half
+of host memory capped at 32 GiB, with memory given in binary units (`8g`). Boks hardcodes
+2 vCPUs and 2048 MiB, which will feel broken on a real workload.
+
 **`forward` vs `forward-proxy` in the network log.** sbx's decision log distinguishes these
 two, which is a strong hint about where it terminates TLS: a plain `forward` is a TCP tunnel
 it cannot read, while `forward-proxy` is a flow it terminates and re-originates and therefore
