@@ -21,18 +21,18 @@ Last reviewed against Docker's docs: 2026-08-11.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Per-sandbox microVM | Each sandbox is a microVM with its own kernel; guest processes invisible to host | Same, one VM per sandbox via nerdbox + libkrun | P0 | partial | Orchestration built; VM boot unverified on our hardware |
-| Hypervisor per platform | Apple Virtualization Framework on Apple silicon; KVM on Linux | libkrun: Hypervisor.framework on macOS, KVM on Linux | P0 | partial | Same underlying OS facilities, different VMM |
-| Guest OS | Ubuntu-based Linux image | Any OCI image; Debian/Ubuntu base for the agent image | P0 | partial | Boks takes an image reference, not a fixed distro |
-| Root in guest | Agent has full control incl. `sudo` inside the VM | Same — the VM is the boundary, not in-guest permissions | P0 | partial | |
-| Resource sizing | Not documented in detail; root fs defaults to 20 GB | vCPU/memory via flags → nerdbox annotations | P1 | partial | `io.containerd.nerdbox.resources.{cpu,memory}` |
+| Per-sandbox microVM | Each sandbox is a microVM with its own kernel; guest processes invisible to host | Same, one VM per sandbox via nerdbox + libkrun | P0 | done | Verified 2026-08-11: guest Linux 6.12.44 on a Darwin host, own boot_id and uptime |
+| Hypervisor per platform | Apple Virtualization Framework on Apple silicon; KVM on Linux | libkrun: Hypervisor.framework on macOS, KVM on Linux | P0 | partial | macOS path verified; Linux/KVM path still unexercised |
+| Guest OS | Ubuntu-based Linux image | Any OCI image; Debian/Ubuntu base for the agent image | P0 | partial | Boks takes an image reference, not a fixed distro; only alpine exercised so far |
+| Root in guest | Agent has full control incl. `sudo` inside the VM | Same — the VM is the boundary, not in-guest permissions | P0 | done | Guest sees only its own processes; PID 1 is the sandboxed command |
+| Resource sizing | Not documented in detail; root fs defaults to 20 GB | vCPU/memory via flags → nerdbox annotations | P1 | done | Verified: guest `nproc`/`MemTotal` track `-cpus`/`-memory` |
 | Multiple containers per VM | Not exposed | Not planned; one VM per sandbox | P2 | none | nerdbox lists multi-container-per-VM as future work |
 
 ## 2. Lifecycle
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| `run` | Creates or re-attaches, then attaches to the agent | `boks run <ws> -- <cmd>`; ephemeral first | P0 | done | Re-attach semantics deferred |
+| `run` | Creates or re-attaches, then attaches to the agent | `boks run <ws> -- <cmd>`; ephemeral first | P0 | done | Exit codes propagate; Ctrl-C exits 128+signal; no leaked VMs |
 | Re-attach by workspace | Running again from the same workspace path reconnects instead of duplicating | Planned once sandboxes are named/persistent | P1 | none | Requires host state store |
 | `create` | Builds in background without attaching | `boks create` | P1 | none | |
 | `start` / `stop` | Stop pauses; state survives | Same | P1 | none | Needs persistent snapshot |
@@ -49,11 +49,11 @@ Last reviewed against Docker's docs: 2026-08-11.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Exact-path mounting | Workspace appears at the same absolute path as on host | Same | P0 | partial | Implemented via OCI mount destination; unverified in VM |
-| Passthrough mechanism | virtiofs, caching on by default (`DOCKER_SANDBOXES_ENABLE_VIRTIOFS_CACHE=0` disables) | virtiofs via nerdbox | P0 | partial | Cache tuning not exposed yet |
-| Only workspace exposed | Parent directories are not shared | Same; parents exist as empty guest dirs | P0 | partial | nerdbox shares only the named directory |
+| Exact-path mounting | Workspace appears at the same absolute path as on host | Same | P0 | done | Verified in a VM, including deep paths; symlinks are resolved first, so `/tmp/x` becomes `/private/tmp/x` on macOS |
+| Passthrough mechanism | virtiofs, caching on by default (`DOCKER_SANDBOXES_ENABLE_VIRTIOFS_CACHE=0` disables) | virtiofs via nerdbox | P0 | done | Cache tuning not exposed yet |
+| Only workspace exposed | Parent directories are not shared | Same; parents exist as empty guest dirs | P0 | done | Verified: intermediate dirs auto-created, each holding only the next path component |
 | Multiple workspaces | Extra paths mount alongside the primary one | `--mount` repeated | P1 | none | |
-| Read-only mounts | `path:ro` suffix | Same suffix | P1 | partial | Spec supports `ro`; CLI parsing pending |
+| Read-only mounts | `path:ro` suffix | Same suffix | P1 | done | Verified: guest writes rejected, nothing reaches the host |
 | Clone mode | `--clone` makes an in-VM Git clone; host repo read-only at `/run/sandbox/source`; fixed at creation | Equivalent planned; keep the read-only host mount idea | P1 | none | Good default for hostile code |
 | Live host writes | Direct mode changes are immediately live on the host | Same, and documented as a real risk | P0 | done | See security-model.md |
 | Large-repo slowness | `git status` etc. can be slow over passthrough | Expected; measure before optimizing | P2 | none | |
@@ -64,7 +64,7 @@ Last reviewed against Docker's docs: 2026-08-11.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor-tap-vsock) | P0 | planned | Env vars alone are not a boundary |
+| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor-tap-vsock) | P0 | planned | **Today there is no enforcement at all**, and TSI makes it worse than absent — see below |
 | Egress via proxy | All outbound HTTP/HTTPS routed through a host proxy | Same | P0 | planned | |
 | Default deny | Deny-by-default with an allowlist | Same | P0 | planned | |
 | Policy presets | Open / Balanced / Locked Down, chosen at first run | Equivalent presets, names TBD | P1 | none | Balanced is Docker's recommended start |
@@ -73,9 +73,9 @@ Last reviewed against Docker's docs: 2026-08-11.
 | Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `log` | P1 | none | Observability is what makes policy usable |
 | Per-run allow flags | Policy configured per sandbox/host | `--allow host` repeatable | P0 | planned | |
 | TLS interception | Not used for filtering; HTTPS filtered without MITM | No MITM; filter on CONNECT host + SNI | P0 | planned | Avoids a custom CA in the guest |
-| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | planned | Simplifies the enforcement surface |
+| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | partial | ICMP already fails under TSI (`Network unreachable`); raw TCP connects freely |
 | Hostname rules for non-HTTP | Don't work; IP addresses required | Same limitation, documented | P1 | planned | Inherent: no hostname on a raw socket |
-| Host-local services | `127.0.0.1` and LAN services may be unreachable | Same; explicit opt-in later | P2 | none | |
+| Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | none | **Regression vs Docker**: under TSI the guest's `127.0.0.1` is the host's, verified against a live host service |
 | Upstream proxy | Honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`; `DOCKER_SANDBOXES_PROXY` supports http/https/socks5/socks5h | Support an upstream proxy env var | P2 | none | socks5h delegates DNS to the proxy |
 | Port publishing | `--publish` at creation; `sbx ports` add/remove later; ignored when re-attaching | `boks ports` equivalent | P1 | none | |
 | Guest binding requirement | Service must listen on the VM's external interface, not just loopback | Same constraint | P1 | none | |
@@ -136,24 +136,38 @@ Last reviewed against Docker's docs: 2026-08-11.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| macOS | Sonoma 14+, Apple silicon only | Supported target, second | P1 | none | libkrun + nerdbox support macOS |
-| Linux | Ubuntu 24.04+, x86_64/aarch64, KVM required, user in `kvm` group, nested virt if in a VM | First target, same requirements | P0 | partial | `doctor` checks these |
+| macOS | Sonoma 14+, Apple silicon only | Supported; **the verified platform** | P1 | done | Needs the shim codesigned with `com.apple.security.hypervisor` and a user-owned `/var/run/containerd` |
+| Linux | Ubuntu 24.04+, x86_64/aarch64, KVM required, user in `kvm` group, nested virt if in a VM | Supported, same requirements | P0 | partial | `doctor` checks these, but no VM has been booted on Linux yet |
 | Windows | Windows 11 x86_64, Hypervisor Platform enabled | Blocked on nerdbox | P2 | none | nerdbox lists Windows as future work |
 | Docker Desktop | Not required | Not required | — | done | |
 
 ---
 
+## Answered
+
+1. **Exact-path mounting for non-existent guest parents.** *(2026-08-11)* The runtime creates
+   them. `boks run /private/tmp/probe/deep/a/b/c/project -- pwd` printed that exact path, and
+   each intermediate directory contained only the next component. Boks does not need to
+   pre-create anything. One nuance worth documenting for users: Boks resolves symlinks when
+   parsing a workspace, so `/tmp/x` becomes `/private/tmp/x` on macOS — correct, but not
+   literally the string typed.
+2. **TSI vs external network provider.** *(2026-08-11)* Settled, and not on the axis it was
+   framed on. TSI is not merely "simpler but less controllable": because libkrun performs the
+   guest's connections on the host, the guest's `127.0.0.1` **is the host's**, verified
+   against a live host service. That is a containment failure, not an ergonomics trade-off,
+   so an external network provider is required rather than preferred.
+3. **Docker's enforcement mechanics.** Still inference, but better supported: Docker
+   documents that hostname rules do not work for non-HTTP connections and that IP addresses
+   are required there, which is what a host-side netstack plus an HTTP-aware proxy would
+   produce. Boks is designing to the same shape.
+
 ## Open questions
 
-1. **Enforcement mechanics.** Docker states raw TCP/UDP/ICMP are blocked at the network
-   layer, but not how. A host userspace netstack is the natural fit and what Boks plans;
-   this is inference, not documented fact.
-2. **Exact-path mounting for non-existent guest parents.** Whether the guest runtime creates
-   `/home/alice/src` implicitly for the mount point, or whether Boks must pre-create it, is
-   unverified pending a working VM.
-3. **Re-attach identity.** Docker keys sandbox reuse on workspace path. Boks needs to decide
+1. **Re-attach identity.** Docker keys sandbox reuse on workspace path. Boks needs to decide
    between path-hash identity and explicit names before building persistence.
-4. **Kit schema.** Deliberately unanswered until real runtime features exist to configure.
-5. **TSI vs external network provider.** TSI is the nerdbox default and simpler, but places
-   the policy decision inside libkrun. Confirm gvisor-tap-vsock is workable before
-   committing.
+2. **Kit schema.** Deliberately unanswered until real runtime features exist to configure.
+3. **DNS mediation.** Under TSI the guest inherits a copy of the host's `resolv.conf`, so the
+   host's nameserver leaks in. Once a host netstack exists, DNS has to be resolved by the
+   policy layer rather than passed through, or it becomes the obvious covert channel.
+4. **Linux parity.** Everything verified so far is macOS. Whether the KVM path behaves
+   identically — particularly virtiofs semantics and mount-point creation — is untested.
