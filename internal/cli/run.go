@@ -43,6 +43,12 @@ func runCommand(ctx context.Context, env Env) error {
 	fs.Var(&envVars, "env", "extra environment variable KEY=VALUE (repeatable)")
 	fs.Var(&mounts, "mount", "extra host directory to share, PATH or PATH:ro (repeatable)")
 
+	// Network policy flags are accepted and validated here, but not applied: see
+	// netflags.go and the warning below. Their definitions live in netflags.go so that
+	// `run`, `proxy` and `policy ls` cannot drift apart.
+	var netFlags policyFlags
+	netFlags.register(fs)
+
 	fs.Usage = func() {
 		fmt.Fprint(env.Stderr, `Usage: boks run [flags] <workspace> [-- command [args...]]
 
@@ -89,6 +95,21 @@ Flags:
 			return err
 		}
 		workspaces = append(workspaces, ws)
+	}
+
+	// Fail on a malformed rule now, so a policy that will one day be enforced is known to
+	// be well-formed today; then say plainly that nothing applies it yet.
+	if _, err := netFlags.resolve(); err != nil {
+		return err
+	}
+	if _, err := netFlags.credentialRules(); err != nil {
+		return err
+	}
+	if _, err := netFlags.networkPlan(sandboxNameFor(*name)); err != nil {
+		return err
+	}
+	if netFlags.specified() {
+		fmt.Fprintf(env.Stderr, "%s\n", notEnforcedWarning)
 	}
 
 	if !runtimecfg.IsolatedRuntime(*runtimeID) {

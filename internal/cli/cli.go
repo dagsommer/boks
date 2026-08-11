@@ -38,6 +38,9 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"run", "Run a command inside a sandbox", runCommand},
+		{"policy", "Show network policy rules and recent decisions", policyCommand},
+		{"proxy", "Run the host forward proxy (experimental, not wired into run)", proxyCommand},
+		{"secret", "Manage host-side credentials the guest never receives", secretCommand},
 		{"doctor", "Check host prerequisites for running sandboxes", doctorCommand},
 		{"version", "Print the boks version", versionCommand},
 	}
