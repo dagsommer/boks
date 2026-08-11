@@ -83,9 +83,12 @@ Two real risks remain, both inherited from the "mount the live workspace" model:
   diffs before running anything from a workspace a sandbox touched.** Docker documents this
   same risk for direct mode; a clone mode that keeps writes inside the VM is the mitigation,
   and Boks has not implemented it yet.
-- **Symlinks.** A workspace symlink pointing outside the shared directory is resolved by
-  virtiofs on the host side. Whether that escapes the share depends on the implementation;
-  Boks has not tested it. Treat as unverified.
+- **Symlinks.** *(verified 2026-08-11, macOS host.)* A workspace symlink pointing outside
+  the shared directory does **not** escape. Symlinks are resolved against the guest's own
+  root, not the host's: a link to `/etc` read the guest's `/etc`, and links to
+  `~/.ssh` and to a sibling file outside the workspace both failed with
+  `No such file or directory`, because those paths do not exist in the guest. A link
+  therefore reaches host data only if its target is itself inside a shared workspace.
 
 ### Network
 
@@ -104,8 +107,31 @@ Known limits of that approach, stated up front:
 - Hostname rules are meaningless for raw sockets — only IP/port rules apply there.
 - DNS is a covert channel unless resolution is also mediated.
 
-*(unverified: none of this is implemented. Boks currently applies **no** network policy —
-a sandbox has whatever access the runtime gives it.)*
+*(none of this is implemented. Boks currently applies **no** network policy.)*
+
+### The measured baseline today
+
+*(verified 2026-08-11, macOS host, nerdbox defaults.)* What a sandbox can actually reach
+with no policy in place:
+
+| Probe | Result |
+|---|---|
+| virtio-net device in guest | **none** — `/sys/class/net` lists only `lo` |
+| DNS | resolves (host's nameserver, via a `/etc/resolv.conf` copied from the host) |
+| outbound HTTPS / HTTP | succeeds |
+| raw TCP to an arbitrary host:port | connects |
+| ICMP | fails — `Network unreachable` |
+| **host loopback services** | **reachable** — a host listener on `127.0.0.1` answered the guest |
+
+The absent NIC is the important detail: this is libkrun's TSI, which rewrites the guest's
+`AF_INET` socket calls and performs the connection **on the host**. So the guest's
+`127.0.0.1` is *the host's* `127.0.0.1`. Anything bound to host loopback — a database, a
+model server, a debug endpoint, an unauthenticated dev server — is inside the sandbox's
+reach, and no `HTTP_PROXY` setting changes that because the guest never has to cooperate.
+
+This is the single largest gap between Boks today and its stated goals, and it is the
+argument for the external-network-provider direction above: with TSI there is no point at
+which Boks can see or drop a flow.
 
 ### Host services
 
