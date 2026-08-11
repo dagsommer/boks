@@ -43,9 +43,12 @@ func TestPolicyLsShowsResolvedRules(t *testing.T) {
 			t.Errorf("output does not contain %q:\n%s", want, out)
 		}
 	}
-	// The user must not be able to read this output and conclude they are protected.
-	if !strings.Contains(out, "NOT enforced") {
-		t.Errorf("output does not say the policy is unenforced:\n%s", out)
+	// The user must be able to read this output and know exactly how far the protection
+	// goes: what enforces it, and what has never been demonstrated.
+	for _, want := range []string{"terminated on the host", "Not yet demonstrated"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not say %q:\n%s", want, out)
+		}
 	}
 }
 

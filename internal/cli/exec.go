@@ -66,6 +66,14 @@ Flags:
 		*interactive, *tty = true, true
 	}
 
+	// `boks exec` starts a stopped sandbox, so it can be the command that boots the VM —
+	// and a VM that boots without something holding its link socket comes up with a NIC
+	// connected to nothing. The stack it starts outlives this command, as the sandbox
+	// does.
+	if err := ensureNetworkForExisting(ctx, name, *address, env.Stderr); err != nil {
+		return err
+	}
+
 	cfg := sandbox.ExecConfig{
 		Address: *address,
 		Name:    name,
