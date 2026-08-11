@@ -65,6 +65,37 @@ func (g *gateway) start(ctx context.Context, plan Plan, logger io.Writer) error 
 	return nil
 }
 
+// listen returns a listener inside the virtual network. gvisor's stack is the only thing
+// that can answer on the gateway address, so a listener from here is unreachable from the
+// host's own network stack — which is exactly the property the proxy wants.
+func (g *gateway) listen(addr string) (net.Listener, error) {
+	g.mu.Lock()
+	vn := g.vn
+	g.mu.Unlock()
+	if vn == nil {
+		return nil, fmt.Errorf("%w: the stack is not running", ErrNoNetwork)
+	}
+	l, err := vn.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("network: listening on %s inside the sandbox network: %w", addr, err)
+	}
+	return l, nil
+}
+
+func (g *gateway) dial(ctx context.Context, addr string) (net.Conn, error) {
+	g.mu.Lock()
+	vn := g.vn
+	g.mu.Unlock()
+	if vn == nil {
+		return nil, fmt.Errorf("%w: the stack is not running", ErrNoNetwork)
+	}
+	conn, err := vn.DialContextTCP(ctx, addr)
+	if err != nil {
+		return nil, fmt.Errorf("network: dialling %s inside the sandbox network: %w", addr, err)
+	}
+	return conn, nil
+}
+
 func (g *gateway) stop() error {
 	g.mu.Lock()
 	conn := g.conn
