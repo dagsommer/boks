@@ -245,8 +245,12 @@ func withNetworkAnnotations(fromNetwork, user map[string]string) map[string]stri
 // It must be called before the sandbox's task starts: the VM connects to the link socket
 // while it boots, so a socket that appears afterwards is a boot failure rather than a retry.
 func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr io.Writer) (enforce.State, bool, error) {
-	if _, alive := enforce.Lookup(spec.StateDir, spec.Sandbox); alive {
-		return reuseNetwork(spec, stderr)
+	if state, alive := enforce.Lookup(spec.StateDir, spec.Sandbox); alive {
+		// Reuse, and say nothing: this is the ordinary case of a second command
+		// attaching to a sandbox that is already up. The rules it is running under are
+		// the ones it was started with, which `boks policy log` and `boks net ls` can
+		// both be asked about.
+		return state, false, nil
 	}
 	if running {
 		// The sandbox is up but its stack is not: the process that served it is gone.
@@ -264,11 +268,6 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 		return enforce.State{}, false, err
 	}
 	return state, true, nil
-}
-
-func reuseNetwork(spec enforce.Spec, stderr io.Writer) (enforce.State, bool, error) {
-	state, _ := enforce.Lookup(spec.StateDir, spec.Sandbox)
-	return state, false, nil
 }
 
 // enforceSpec turns the policy flags into the specification the network stack runs from.
