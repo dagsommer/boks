@@ -30,11 +30,11 @@ type testProxy struct {
 	logBuf *bytes.Buffer
 }
 
-func newTestProxy(t *testing.T, p policy.Policy, inj *secret.Injector) *testProxy {
+func newTestProxy(t *testing.T, p policy.Policy, inj *secret.Injector, opts ...func(*Config)) *testProxy {
 	t.Helper()
 
 	logBuf := &bytes.Buffer{}
-	srv, err := New(Config{
+	cfg := Config{
 		Engine:   policy.NewEngine(p, policy.NewLog(64)),
 		Injector: inj,
 		ErrorLog: log.New(logBuf, "proxy: ", 0),
@@ -42,7 +42,11 @@ func newTestProxy(t *testing.T, p policy.Policy, inj *secret.Injector) *testProx
 			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 		},
 		ClientHelloTimeout: 2 * time.Second,
-	})
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	srv, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -344,14 +348,7 @@ func TestCredentialInjectionOnlyForConfiguredHosts(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	rule, err := secret.ParseRule("api.creds.test=apikey:header:x-api-key")
-	if err != nil {
-		t.Fatalf("ParseRule: %v", err)
-	}
-	inj, err := secret.NewInjector(secret.MapProvider{"apikey": "sk-live-DO-NOT-LOG"}, rule)
-	if err != nil {
-		t.Fatalf("NewInjector: %v", err)
-	}
+	inj := mustInjector(t, secret.MapProvider{"apikey": "sk-live-DO-NOT-LOG"}, "apikey@api.creds.test=x-api-key")
 
 	p := newTestProxy(t, mustPolicy(t, policy.Deny, "allow api.creds.test", "allow other.test"), inj)
 	client := p.client(nil)
@@ -379,14 +376,7 @@ func TestPlaceholderIsReplacedNotAppended(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	rule, err := secret.ParseRule("api.creds.test=tok:bearer")
-	if err != nil {
-		t.Fatalf("ParseRule: %v", err)
-	}
-	inj, err := secret.NewInjector(secret.MapProvider{"tok": "real-token"}, rule)
-	if err != nil {
-		t.Fatalf("NewInjector: %v", err)
-	}
+	inj := mustInjector(t, secret.MapProvider{"tok": "real-token"}, "tok@api.creds.test=bearer")
 	p := newTestProxy(t, mustPolicy(t, policy.Deny, "allow api.creds.test"), inj)
 
 	req, err := http.NewRequest("GET", hostPort(t, origin.URL, "api.creds.test"), nil)
@@ -435,14 +425,7 @@ func TestSecretsNeverAppearInLogs(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer origin.Close()
 
-	rule, err := secret.ParseRule("api.creds.test=anthropic:header:x-api-key")
-	if err != nil {
-		t.Fatalf("ParseRule: %v", err)
-	}
-	inj, err := secret.NewInjector(secret.MapProvider{"anthropic": value}, rule)
-	if err != nil {
-		t.Fatalf("NewInjector: %v", err)
-	}
+	inj := mustInjector(t, secret.MapProvider{"anthropic": value}, "anthropic@api.creds.test=x-api-key")
 	p := newTestProxy(t, mustPolicy(t, policy.Deny, "allow api.creds.test"), inj)
 
 	resp, err := p.client(nil).Get(hostPort(t, origin.URL, "api.creds.test"))

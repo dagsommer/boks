@@ -25,6 +25,8 @@ func runCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, 
 		err = policyCommand(context.Background(), env)
 	case "secret":
 		err = secretCommand(context.Background(), env)
+	case "ca":
+		err = caCommand(context.Background(), env)
 	default:
 		t.Fatalf("unknown command %q", args[0])
 	}
@@ -64,8 +66,11 @@ func TestPolicyLsRejectsBadRules(t *testing.T) {
 	if _, _, err := runCLI(t, "", "policy", "ls", "-policy", "balanced"); err == nil {
 		t.Error("an unknown preset was accepted")
 	}
-	if _, _, err := runCLI(t, "", "policy", "ls", "-secret", "*=tok:bearer"); err == nil {
-		t.Error("a catch-all credential rule was accepted")
+	if _, _, err := runCLI(t, "", "policy", "ls", "-inject", "tok@*=bearer"); err == nil {
+		t.Error("a catch-all injection rule was accepted")
+	}
+	if _, _, err := runCLI(t, "", "policy", "ls", "-guest-credential", "unknown=placeholder"); err == nil {
+		t.Error("a placeholder for a service with no injection rule was accepted")
 	}
 }
 
@@ -93,15 +98,31 @@ func TestPolicyLogReadsDecisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseTarget: %v", err)
 	}
-	engine.Check(policy.StageConnect, target)
+	engine.CheckMode(policy.StageConnect, target, policy.ModeForwardBypass)
+	engine.CheckMode(policy.StageConnect, target, policy.ModeForwardBypass)
 	sink.Close()
 
 	out, _, err := runCLI(t, "", "policy", "log", "-file", path)
 	if err != nil {
 		t.Fatalf("policy log: %v", err)
 	}
-	if !strings.Contains(out, "blocked.test") || !strings.Contains(out, "DENY") {
-		t.Errorf("output = %q", out)
+	// Aggregated: one row for the destination, a count of two, and the mode that says
+	// whether boks could read it.
+	for _, want := range []string{"Blocked requests:", "blocked.test:443", "forward-bypass", "COUNT"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "  2\n") {
+		t.Errorf("two identical decisions were not collapsed into a count of 2:\n%s", out)
+	}
+
+	raw, _, err := runCLI(t, "", "policy", "log", "-file", path, "-raw")
+	if err != nil {
+		t.Fatalf("policy log -raw: %v", err)
+	}
+	if !strings.Contains(raw, "DENY") || strings.Count(raw, "blocked.test") != 2 {
+		t.Errorf("-raw should print every decision:\n%s", raw)
 	}
 }
 
