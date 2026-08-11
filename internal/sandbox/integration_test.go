@@ -172,6 +172,43 @@ func TestIntegrationNoHostDockerSocket(t *testing.T) {
 	}
 }
 
+// Extra workspaces mount alongside the primary one, each at its own host path, and the
+// process starts in the primary.
+func TestIntegrationMultipleWorkspaces(t *testing.T) {
+	primary := tempWorkspace(t)
+	secondary := tempWorkspace(t)
+	if err := os.WriteFile(filepath.Join(secondary.HostPath, "extra.txt"), []byte("second"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cfg := testConfig(t)
+	cfg.Name = "boks-test-multiworkspace"
+	cfg.Command = []string{"sh", "-c", "pwd && cat " + filepath.Join(secondary.GuestPath, "extra.txt")}
+	cfg.Workspaces = []workspace.Workspace{primary, secondary}
+	cfg.Stdout = &stdout
+	cfg.Stderr = &stderr
+
+	code, err := sandbox.Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("sandbox.Run: %v\nstderr: %s", err, stderr.String())
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\nstderr: %s", code, stderr.String())
+	}
+
+	lines := strings.Fields(strings.TrimSpace(stdout.String()))
+	if len(lines) < 2 {
+		t.Fatalf("stdout = %q, want the working directory and the second workspace's file", stdout.String())
+	}
+	if lines[0] != primary.GuestPath {
+		t.Errorf("guest pwd = %q, want the primary workspace %q", lines[0], primary.GuestPath)
+	}
+	if lines[1] != "second" {
+		t.Errorf("second workspace contents = %q, want %q", lines[1], "second")
+	}
+}
+
 // A read-only workspace must reject writes.
 func TestIntegrationReadOnlyWorkspace(t *testing.T) {
 	dir := t.TempDir()
