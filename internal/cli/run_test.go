@@ -53,9 +53,9 @@ func TestParseInterspersed(t *testing.T) {
 		wantFlag       string
 		wantBool       bool
 	}{
-		{"flags first", []string{"-image", "img", "."}, []string{"."}, "img", false},
-		{"flags after positional", []string{".", "-image", "img"}, []string{"."}, "img", false},
-		{"flags on both sides", []string{"-t", ".", "-image", "img"}, []string{"."}, "img", true},
+		{"flags first", []string{"-template", "img", "."}, []string{"."}, "img", false},
+		{"flags after positional", []string{".", "-template", "img"}, []string{"."}, "img", false},
+		{"flags on both sides", []string{"-t", ".", "-template", "img"}, []string{"."}, "img", true},
 		{"positional only", []string{"."}, []string{"."}, "", false},
 		{"multiple positionals", []string{"a", "-t", "b"}, []string{"a", "b"}, "", true},
 	}
@@ -63,7 +63,7 @@ func TestParseInterspersed(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)
-			image := fs.String("image", "", "")
+			image := fs.String("template", "", "")
 			tty := fs.Bool("t", false, "")
 
 			positional, err := parseInterspersed(fs, tt.args)
@@ -74,7 +74,7 @@ func TestParseInterspersed(t *testing.T) {
 				t.Errorf("positional = %v, want %v", positional, tt.wantPositional)
 			}
 			if *image != tt.wantFlag {
-				t.Errorf("-image = %q, want %q", *image, tt.wantFlag)
+				t.Errorf("-template = %q, want %q", *image, tt.wantFlag)
 			}
 			if *tty != tt.wantBool {
 				t.Errorf("-t = %v, want %v", *tty, tt.wantBool)
