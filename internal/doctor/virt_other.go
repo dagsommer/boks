@@ -23,5 +23,6 @@ func virtualizationCheck() Check {
 	}
 }
 
+func extraChecks() []Check                   { return nil }
 func hypervisorLibraryNames() []string       { return nil }
 func hypervisorLibrarySearchPaths() []string { return nil }
