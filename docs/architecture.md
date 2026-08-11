@@ -57,9 +57,9 @@ open-source software. Boks does not implement a VMM, a kernel or a shim.
 | Host prerequisite diagnosis (`doctor`) | **Boks** | |
 | Sandbox naming, state, lifecycle | **Boks** | the derived name is the identity; see *Persistence and sandbox state* |
 | Agent definitions | **Boks** — `internal/agent` | data, not code: name, image, command, args mode. `Registry.Add` is where user-defined agents will arrive |
-| Network policy engine | **Boks** — `internal/policy` *(built, not enforcing)* | see *Networking* |
-| Host network stack config + supervision | **Boks** — `internal/network` *(built, not wired)* | gvisor-tap-vsock, embedded |
-| Host proxy + credential injection | **Boks** — `internal/proxy`, `internal/secret` *(built, cooperating-client only)* | |
+| Network policy engine | **Boks** — `internal/policy` | applied to every sandbox `run` creates; see *Networking* |
+| Host network stack config + supervision | **Boks** — `internal/network`, `internal/enforce` | gvisor-tap-vsock, embedded, one stack per running sandbox |
+| Host proxy + credential injection | **Boks** — `internal/proxy`, `internal/secret` | listens *inside* the sandbox's virtual network |
 | Port forwarding | **Boks** *(unverified)* | |
 | Kits / declarative config | **Boks** *(not started)* | the loader that will feed `Registry.Add`; no schema yet, by choice |
 | Nested Docker daemon | guest image + **Boks** *(not started)* | |
@@ -213,9 +213,84 @@ Consequences Boks' design has to carry:
   The container then has `lo` and nothing else, and host loopback is refused. That is
   `-net none`, and it is the strongest containment Boks can currently offer.
 
-*(implemented in `internal/network`, unit-tested, **not yet wired into `boks run`'s
-datapath**. The transport change is verified; no policy has yet been enforced against a real
-guest.)*
+### How it is wired into a run (`internal/enforce`)
+
+`boks run` decides, describes and starts the network *before* the sandbox, because the order
+is forced by the runtime: the annotations have to be on the container when it is created,
+and the host-side stack has to be holding the link socket before the VM boots, since the VM
+connects to it during boot.
+
+```
+boks run ─┬─ Plan            socket path, addressing, MACs (deterministic per sandbox)
+          ├─ annotations  ─> the container, so the VM gets a NIC wired to that socket
+          ├─ guest env    ─> HTTP_PROXY/HTTPS_PROXY/NO_PROXY, the CA, credential placeholders
+          └─ boks net serve   one process per running sandbox:
+                                gvisor netstack on the link
+                                + proxy listening at 192.168.127.1:3128 *inside* it
+```
+
+**The proxy listens inside the virtual network, not on the host.** `virtualnetwork.Listen`
+returns a listener that exists only in one sandbox's network, so nothing is bound on the
+host: no other process, no other sandbox and nothing on the LAN can reach it, and two
+sandboxes cannot collide on a port. A host port would have failed all three.
+
+**The guest environment is a convenience, not the control.** `HTTP_PROXY`, `HTTPS_PROXY`,
+`NO_PROXY`, the CA (as `BOKS_CA_CERT_B64`, as a read-only mount at `/etc/boks`, and through
+`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` for the
+runtimes that ignore the system trust store) let a cooperating client get hostname rules,
+credential injection and readable refusals. A guest that ignores all of it loses the
+diagnostics and keeps the restrictions, because the stack is what enforces. Two details
+follow from that distinction and are worth stating: the replacing variables are set only when
+Boks could bundle the CA with a public root store, since pointing `SSL_CERT_FILE` at a
+Boks-only file would break every host Boks does *not* intercept; and the placeholder a guest
+holds for a credential is set from the credential's own configuration, never the secret.
+
+### The stack has to outlive the command, so it lives in its own process
+
+A persistent sandbox outlives the command that created it — that is the point of it. But
+whoever holds the link socket *is* the sandbox's network, so a stack living in the CLI
+invocation would mean Ctrl-C silently disconnecting a background build, and `boks run -d`
+producing a sandbox with no network at all. The stack's lifetime has to be the *VM's*
+lifetime, and no CLI invocation has that lifetime.
+
+Boks therefore runs **one supervisor process per running sandbox** (`boks net serve`), not a
+daemon:
+
+- started on demand by whichever command starts the VM (`run`, `exec`, `start`), never at
+  boot and never by an installer. A host with no running sandbox runs no Boks process.
+- no privilege beyond the CLI's own: it binds a UNIX socket under the user's state directory
+  and talks to the same containerd.
+- its life is bounded by the sandbox's task, which it watches through containerd. A VM that
+  exits, is stopped or is removed takes its supervisor with it — there is nothing to reap and
+  no `boks daemon stop` to remember.
+- liveness is a held `flock`, not a recorded PID, so a crashed supervisor is detected without
+  the risk of signalling a process that inherited its number.
+- it is handed the credential *values* it needs on a pipe, and never the passphrase to the
+  store, so it can attach the credentials one sandbox was configured with and obtain no
+  others.
+
+A **global daemon** was the alternative — it is what Docker Sandboxes runs as `sandboxd`, and
+it would be the natural home for port forwarding and live statistics. It was rejected for
+this: an always-on service the user did not ask for, holding every sandbox's credentials and
+CA, whose crash takes out every sandbox at once, with its own start/stop/status surface and
+its own state store. containerd already supervises the VMs; the only thing left needing a
+process is the socket at the end of one VM's NIC, and that is exactly what this is. An
+**attach-only** stack was also considered and rejected: it is simpler, but it ties the
+network to the wrong object, and it stakes everything on an assumption nobody here can test
+— that a running VM re-attaches to a fresh socket at the same path once the previous holder
+is gone.
+
+A second, unplanned argument arrived from measurement: gvisor-tap-vsock v0.8.9 exposes no way
+to shut a `VirtualNetwork` down, so each stack leaves about twenty goroutines behind for the
+life of its process (2 → 23 → 44 over two open/close cycles). A supervisor that exits with
+its sandbox releases everything; a long-lived process would accumulate a stack's worth per
+sandbox it ever served.
+
+*(implemented in `internal/network` and `internal/enforce`, and exercised end to end against
+a **simulated** guest — a second stack on the far end of the real link socket, speaking real
+Ethernet, ARP, TCP and HTTP through the proxy, with an allowed host fetched and a denied one
+refused. **No policy has been enforced against a real guest**, because that needs a
+hypervisor and the machine this was built on has none.)*
 
 ## Credential injection
 
@@ -265,7 +340,10 @@ apart. `boks ca show|export|env|regenerate` inspects, distributes and retires th
 the certificate goes to a guest as a file and as `BOKS_CA_CERT_B64`, because Node and Python
 carry their own trust stores and ignore the system one.
 
-*(implemented and unit-tested; not wired into `boks run`.)*
+*(implemented, unit-tested, and applied by `boks run`: the credential values are resolved
+from the store by the foreground command and handed to the sandbox's network process on a
+pipe, so the passphrase never reaches a long-lived process. The guest is given the
+placeholder, in the environment variable the credential names.)*
 
 ## Nested Docker
 
@@ -309,7 +387,15 @@ containerd's length limit. Each of those decisions, and their consequences, is i
 of [docker-sandbox-parity.md](docker-sandbox-parity.md).
 
 `boks run -rm` keeps the original ephemeral behaviour: the command is the container process
-and the container, task and snapshot are gone when it exits.
+and the container, task and snapshot are gone when it exits — and so are its network stack,
+its link socket and the copy of the CA that was shared into it.
+
+The one piece of host-side state a sandbox now does have is its network: a directory under
+the state directory holding the link socket, the supervisor's lock and its record
+(`<state>/net/<sandbox>/`), plus the public certificate shared into it
+(`<state>/certs/<sandbox>/`). Both are derived from the sandbox's name and are removed with
+it. That is not a state store creeping in through the back door — nothing in them is
+authoritative, and deleting them while the sandbox is stopped costs the sandbox nothing.
 
 ## Platform direction
 
@@ -345,8 +431,9 @@ The overall picture is that Docker Sandboxes and Boks are converging on the same
 architecture from different starting points: a containerd-family shim, a microVM per sandbox,
 virtiofs for exact-path workspaces, a real NIC into host-controlled networking, and a keeper
 process so the sandbox outlives any single command. The substantive differences left are that
-Docker runs a daemon and Boks does not, and that Docker ships the agent images and kit
-tooling that Boks has yet to build.
+Docker runs a single always-on daemon where Boks runs one short-lived supervisor per running
+sandbox (see *Networking*), and that Docker ships the agent images and kit tooling that Boks
+has yet to build.
 
 ## Verification status
 
@@ -378,8 +465,22 @@ Honest statement of what has actually been observed, as of this commit:
   credential-bearing hosts only), credential injection, network annotation generation and
   host-stack supervision: **unit-tested on the host**, and the proxy exercised end to end
   against real TLS origins — including a demonstration that an intercepted host presents a
-  Boks certificate while an unconfigured one keeps the origin's own chain. None of it is
-  connected to a sandbox.
+  Boks certificate while an unconfigured one keeps the origin's own chain.
+- the datapath from a guest to the proxy: **tested against a simulated guest** — a second
+  gvisor stack on the far end of the real link socket, with real Ethernet frames, ARP, a TCP
+  handshake and HTTP through the proxy at the gateway address. An allowed destination was
+  fetched, a denied one was refused with a reason, and both were recorded in the decision log
+  under the sandbox's name.
+- the wiring into `boks run`: **exercised against a real containerd on the non-VM dev
+  runtime**. The annotations and the guest environment were read back from the container
+  spec, `-net none` produced the VM NIC annotation and nothing else, the CA reached the guest
+  as a read-only mount, and stopping or removing a sandbox left no socket, no supervisor
+  process and no state behind. The runc runtime ignores the nerdbox annotations, so this says
+  the spec is correct — **not** that a NIC was ever attached.
+- **any of it enforcing against a real guest: not observed.** No VM has been refused a
+  destination by Boks. That needs a hypervisor; this machine has none.
+- whether a running VM re-attaches to a link socket that was restarted under it: **unknown**,
+  and it decides how gracefully a crashed supervisor recovers.
 
 See [docs/verification.md](verification.md) for the procedure that will confirm the VM
 boundary on capable hardware, and for what evidence counts.

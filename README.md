@@ -8,9 +8,11 @@ account, no cloud service, no telemetry.
 
 > [!WARNING]
 > **Boks is experimental and incomplete.** The VM boundary is real and has been measured
-> (see [Status](#status)), but **no network policy is enforced on a running sandbox**: it
-> reaches the internet *and* your host's own loopback services. Do not rely on Boks to
-> contain hostile code today.
+> (see [Status](#status)). Network policy is now applied to a running sandbox — the guest's
+> NIC is terminated by a host-side stack that drops what no rule permits — but **that has
+> never been demonstrated against a real guest**, because it was built on a machine with no
+> hypervisor. Treat it as designed and tested, not proven. Do not rely on Boks to contain
+> hostile code today.
 
 ## Status
 
@@ -48,19 +50,25 @@ What works, tested locally:
 - **Symlinks do not escape.** A symlink inside the workspace pointing at `/etc` or `~/.ssh`
   resolves inside the guest, not on the host.
 
+- **Network policy is applied to a sandbox.** `boks run` gives the sandbox a virtual NIC
+  whose far end is a userspace network stack in a Boks process, and points the guest at a
+  filtering proxy *inside* that virtual network. Destinations no rule permits have nothing
+  to answer them; `-net none` gives a sandbox no network at all. The stack lives in a small
+  per-sandbox process so that it lasts as long as the sandbox's VM rather than as long as
+  your command — a build running in a sandbox does not lose the network when you press
+  Ctrl-C. `boks net ls` shows them, `boks stop` takes them down.
+  **Not demonstrated against a real guest:** see the warning above.
+- **Credential injection in a sandbox**, over HTTP and HTTPS. The guest holds a placeholder
+  in the environment variable its tooling reads; the real secret stays on the host and is
+  attached to requests for the hosts you named. Those hosts — and only those — have their
+  TLS terminated, which `boks run` says out loud when you configure it.
+
 What is **not** done:
 
-- **No network policy in the datapath — and the default is more open than you may expect.**
-  The guest has no virtual NIC, but libkrun's TSI performs its connections on the host, so
-  the sandbox reaches the internet *and* anything listening on your host's `127.0.0.1`.
-  A policy engine, a host forward proxy (`boks proxy`, `boks policy ls|log`) and the
-  host-side network configuration now exist and are tested, but **nothing is applied to a
-  running sandbox yet**. This is still the biggest gap.
-- **No credential injection in a sandbox.** The mechanism exists and works through
-  `boks proxy`; `boks run` does not use it. Any secret you put in a sandbox is in the
-  sandbox.
-- **Credentials cannot be injected into HTTPS at all** without terminating TLS, which Boks
-  deliberately does not do. Only plaintext HTTP injection works today.
+- **None of the enforcement has met a real guest.** Everything above is exercised against a
+  simulated guest attached to the real link socket, on a host with no hypervisor. The
+  transport it rests on *was* verified on real hardware; the enforcement built on it was
+  not.
 - **No nested Docker**, no kits, no port publishing.
 - **The agent images have never run in a microVM.** They were built and exercised with
   `docker run`, which proves each CLI is installed and starts — and nothing at all about
@@ -153,21 +161,35 @@ Useful flags, named after sbx's:
 | `-cpus` | guest vCPUs (0: all host CPUs) |
 | `-m`, `-memory` | guest memory, binary units (`1024m`, `8g`; default half the host's, max 32g) |
 | `-env KEY=VALUE` | set an environment variable (repeatable) |
+| `-net none\|nat` | no network at all, or a policed one (default `nat`) |
+| `-policy`, `-allow`, `-deny` | the network policy the sandbox runs under |
+| `-inject`, `-guest-credential` | attach a host-held credential to named hosts |
 
 A pseudo-terminal is allocated when stdin and stdout are both terminals, and never when
-either is a pipe, so there is no flag for it.
-| `-policy`, `-allow`, `-deny`, `-net`, `-secret` | network policy — **validated and printed, not yet applied** |
+either is a pipe, so there is no flag for it. A workspace argument may carry a `:ro` suffix
+for a read-only share.
 
-A workspace argument may carry a `:ro` suffix for a read-only share.
-
-Network policy has its own commands while it is not part of a run:
+### The network a sandbox gets
 
 ```bash
+./bin/boks run -net none shell .                    # no network at all: the strongest containment
+./bin/boks run -policy locked -allow api.example.com:443 shell .
+./bin/boks run -inject 'anthropic@api.anthropic.com=x-api-key' \
+               -guest-credential 'anthropic=ANTHROPIC_API_KEY=sk-ant-placeholder' shell .
+
+./bin/boks net ls                            # the stacks currently serving sandboxes
 ./bin/boks policy ls -policy standard        # what a preset resolves to, and why
-./bin/boks proxy -policy locked -allow api.example.com:443 -v
 ./bin/boks policy log                        # what was allowed or denied, and why
 ./bin/boks secret set github                 # a credential the guest never receives
+./bin/boks proxy -policy locked -v           # the same proxy, standalone, for anything
 ```
+
+The mode is fixed when a sandbox is created, because it is expressed in annotations the
+runtime reads at boot: `-net` on a sandbox that already exists is reported, not obeyed.
+
+**A sandbox with nothing attached still has its network.** It lives in a `boks net serve`
+process, one per running sandbox, started on demand and never at boot; it exits when the
+sandbox's task exits, so `boks stop` and `boks rm` take it with them.
 
 ## Architecture
 
@@ -194,9 +216,11 @@ Two things to understand before using Boks:
 - **Workspace writes are live on your host.** A sandbox can modify `Makefile`,
   `package.json` scripts, Git hooks or CI config, which then run on *your* machine. Review
   diffs before running anything from a workspace a sandbox touched.
-- **No network policy is enforced yet.** A guest can reach whatever the runtime permits.
-  `boks policy ls` shows what a policy would resolve to and `boks proxy` filters traffic
-  sent through it, but nothing constrains a running sandbox.
+- **The network enforcement has never met a real guest.** A sandbox is wired to a host-side
+  stack that drops what policy forbids, and that path is tested — against a simulated guest,
+  on a machine with no hypervisor. Nobody has yet watched a real VM be refused.
+- **Hosts you configure a credential for are decrypted by Boks**, by design, and `boks run`
+  tells you which. Everything else is tunnelled with the origin's own certificate chain.
 
 Boks will never mount the host's Docker or containerd socket into a guest.
 
@@ -217,8 +241,8 @@ public documentation using open-source components; it is not derived from Docker
 | agent-first CLI, readable sandbox names | yes | **yes** — same grammar, same naming rule |
 | prepared agent images | yes, ten of them | **nine of ten**, multi-arch on a shared base; `kiro` needs `-template` |
 | terminal dashboard for bare `sbx` | yes | no — see the parity matrix |
-| network policy enforced outside the guest | yes | engine + proxy built, not wired into `run` |
-| credential injection by host proxy | yes | HTTP only, and not wired into `run` |
+| network policy enforced outside the guest | yes | **yes** — host-side netstack per sandbox; never seen a real guest |
+| credential injection by host proxy | yes | **yes**, HTTP and HTTPS; same caveat |
 | Docker daemon inside the sandbox | yes | planned |
 | kits / declarative config | yes | planned |
 | account required | yes | **never** |
@@ -230,11 +254,12 @@ Feature-by-feature detail with priorities:
 
 ## Roadmap
 
-Ordered by what unblocks the most. The VM boundary is done — networking is now the gap
-that matters, because today a sandbox can reach your host's own services.
+Ordered by what unblocks the most. The VM boundary is done and the network datapath is
+wired — what matters now is watching it work against a real guest.
 
-1. **Wire the netstack, proxy and credential injection into `boks run`** — all three are
-   built and tested, and none of them applies to a running sandbox yet
+1. **Confirm the enforcement against a real hypervisor.** Does the guest reach the gateway,
+   is a denied host refused, does a running VM re-attach if its stack is restarted? See
+   [docs/verification.md](docs/verification.md)
 2. Confirm the lifecycle against a real hypervisor — it has so far only been exercised
    without one, so stop/start over a live microVM is unverified
 3. The interactive dashboard that bare `boks` should open

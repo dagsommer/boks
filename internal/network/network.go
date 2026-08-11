@@ -117,6 +117,30 @@ const (
 	unixPathMaxDarwin = 104 // sun_path on macOS/BSD; Linux allows 108
 )
 
+// ModeFromAnnotations reads back the mode a container was created with, and whether Boks
+// wired its network at all.
+//
+// A sandbox's mode is fixed when it is created, because it is expressed in annotations the
+// runtime reads at boot. A later command that has to bring the sandbox up — `boks exec` on a
+// stopped sandbox, `boks start` — must serve the network the container was wired for rather
+// than the one its own flags default to, or it would attach a stack to a container that is
+// not connected to it, or none to a container that is.
+//
+// The second return value matters more than it looks. A container with no VM NIC annotation
+// was not merely given "no network": it falls back to the runtime's own transport, which is
+// libkrun's TSI, where the guest's 127.0.0.1 is *the host's*. That is the opposite of
+// containment, and it is what every sandbox created before this wiring existed looks like,
+// so it has to be distinguishable from ModeNone rather than folded into it.
+func ModeFromAnnotations(annotations map[string]string) (mode Mode, wired bool) {
+	if _, ok := annotations[annotationVMNet+".0"]; !ok {
+		return ModeNone, false
+	}
+	if _, ok := annotations[annotationCtrNet+".0"]; ok {
+		return ModeNAT, true
+	}
+	return ModeNone, true
+}
+
 // Config describes the network a sandbox should get.
 type Config struct {
 	Mode Mode

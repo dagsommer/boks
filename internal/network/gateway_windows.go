@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 )
 
 // gateway on Windows exists only so the package compiles there.
@@ -17,5 +18,9 @@ func (g *gateway) start(context.Context, Plan, io.Writer) error {
 	return errors.New("network: sandbox networking is not available on Windows; " +
 		"the VM runtime does not support Windows yet")
 }
+
+func (g *gateway) listen(string) (net.Listener, error) { return nil, ErrNoNetwork }
+
+func (g *gateway) dial(context.Context, string) (net.Conn, error) { return nil, ErrNoNetwork }
 
 func (g *gateway) stop() error { return nil }
