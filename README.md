@@ -133,9 +133,10 @@ public documentation using open-source components; it is not derived from Docker
 
 | | Docker Sandboxes | Boks |
 |---|---|---|
-| microVM per sandbox | yes | designed, unverified |
-| exact-path workspace | yes | yes (unverified in a VM) |
-| network policy enforced outside the guest | yes | planned |
+| microVM per sandbox | yes | **yes**, verified on macOS |
+| exact-path workspace | yes | **yes**, verified |
+| workspace `:ro`, no parent exposure | yes | **yes**, verified |
+| network policy enforced outside the guest | yes | no — guest reaches host loopback |
 | credential injection by host proxy | yes | planned |
 | Docker daemon inside the sandbox | yes | planned |
 | persistent sandboxes, `ls`/`stop`/`rm`/`exec` | yes | planned |
@@ -149,17 +150,19 @@ Feature-by-feature detail with priorities:
 
 ## Roadmap
 
-Ordered by what unblocks the most:
+Ordered by what unblocks the most. The VM boundary is done — networking is now the gap
+that matters, because today a sandbox can reach your host's own services.
 
-1. Confirm the VM boundary on hardware with virtualisation, and record the evidence
-2. Network isolation: host-side userspace netstack, deny-by-default, allowlist
-3. Host forward proxy with hostname filtering (no TLS interception)
-4. Credential injection — real secrets stay on the host
+1. Network isolation: replace TSI with a virtio-net link into a host-side userspace
+   netstack, giving deny-by-default and an allowlist that the guest cannot opt out of
+2. Host forward proxy with hostname filtering (no TLS interception)
+3. Credential injection — real secrets stay on the host
+4. Verify the Linux/KVM path end to end, as macOS has been
 5. Persistent sandboxes and the `ls`/`stop`/`rm`/`exec` lifecycle
 6. Clone mode, so guest writes do not land on the host by default
 7. Docker daemon inside the guest
 8. Kits / declarative configuration
-9. macOS, then Windows
+9. Windows, once the runtime supports it
 
 ## Development
 
