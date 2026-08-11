@@ -16,14 +16,44 @@
 // `boks proxy`, so the policy engine and credential path can be built and tested while the
 // netstack question is settled.
 //
-// # No TLS interception
+// # Two kinds of flow, and the difference is user-visible
 //
-// The proxy never terminates TLS. There is no custom CA, the guest validates the real
-// certificate chain of the real origin, and the proxy cannot read request or response
-// bodies. HTTPS is filtered on two things it can see without decrypting: the CONNECT
-// target, and the server name in the TLS ClientHello.
+// Every connection through this proxy is one of two things, recorded on every entry in the
+// decision log under the names Docker Sandboxes uses for the same distinction:
 //
-// The cost of that choice is stated plainly here and in docs/security-model.md:
+//   - **forward-bypass** — the default, and what happens to all but a handful of
+//     destinations. The CONNECT is spliced byte-for-byte: the flow used the proxy but
+//     bypassed inspection. TLS is end-to-end, the client validates the origin's own
+//     certificate chain, and the proxy sees ciphertext. Filtering is on the two things
+//     visible without decrypting: the CONNECT target and the ClientHello's server name.
+//   - **forward** — the proxy handled the flow at the HTTP level and could read it. That
+//     is either plaintext HTTP, where there was never anything to break, or HTTPS that
+//     the proxy terminated and re-originated, presenting a leaf signed by the local Boks
+//     CA (internal/ca) and verifying the origin's real certificate itself.
+//
+// (A third mode, **transparent**, belongs to flows judged at the network layer without
+// using the proxy at all. Boks cannot produce it yet; see policy.ModeTransparent.)
+//
+// An HTTPS flow is terminated **only if the destination host has a credential rule
+// configured for it** (internal/secret). There is no flag, preset or default that
+// intercepts anything else, and adding one would be a mistake: interception is the price of
+// credential injection over HTTPS, not a capability worth having on its own. Without a CA
+// configured, nothing is ever terminated and HTTPS credential rules simply do not fire.
+//
+// What inspection costs, stated plainly here and in docs/security-model.md:
+//
+//   - For those hosts the guest no longer has end-to-end confidentiality with the origin.
+//     Boks *can* read the traffic. It does not retain it: no body, header value or URL is
+//     copied into a log, an error or a metric, and tests assert that.
+//   - The guest validates a Boks certificate instead of the origin's, so certificate
+//     pinning in the guest breaks — visibly, which is the correct failure.
+//   - Boks becomes responsible for verifying the origin: it does full verification against
+//     the host's trust store and refuses the flow if that fails.
+//   - HTTP/2 is not carried inside an inspected flow. ALPN offers http/1.1 only, so
+//     clients negotiate down rather than break; tunnelled flows are untouched and can use
+//     whatever they like.
+//
+// What tunnelling costs, unchanged:
 //
 //   - SNI can be omitted, or can name a host the client never talks to. It is a
 //     cross-check on the CONNECT target, not an independent guarantee. Encrypted Client
@@ -33,12 +63,11 @@
 //   - DNS is a covert channel unless resolution is mediated too. Traffic through this
 //     proxy carries names rather than resolving them in the guest, which helps; a guest
 //     that can send its own UDP does not have to cooperate.
-//   - Credentials can only be injected into requests the proxy can read, which today
-//     means plaintext HTTP. See internal/secret.
 package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +79,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dagsommer/boks/internal/ca"
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
 )
@@ -60,7 +90,20 @@ type Config struct {
 	Engine *policy.Engine
 
 	// Injector attaches credentials to permitted requests. Optional.
+	//
+	// It also decides, on its own, which HTTPS flows are inspected: a host with a
+	// credential rule, and no other. See shouldInspect.
 	Injector *secret.Injector
+
+	// CA signs the certificates presented on inspected flows. Optional, and without it
+	// no flow is ever inspected — an HTTPS credential rule then never fires, which is
+	// reported rather than silently ignored.
+	CA *ca.Authority
+
+	// UpstreamRootCAs verifies origin certificates on inspected flows. Nil means the
+	// host's own trust store, which is what production uses; tests set it so that a
+	// throwaway origin can be verified as strictly as a real one.
+	UpstreamRootCAs *x509.CertPool
 
 	// Resolver turns a hostname into addresses. Defaults to the host resolver.
 	// Overridable so tests need no DNS and no /etc/hosts.
@@ -124,7 +167,7 @@ func New(cfg Config) (*Server, error) {
 			if err != nil {
 				return nil, err
 			}
-			return s.dial(ctx, t)
+			return s.dial(ctx, t, policy.ModeForward)
 		},
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          32,
@@ -190,7 +233,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision := s.cfg.Engine.Check(policy.StageHTTP, target)
+	// Plaintext HTTP is readable by everything on the path, Boks included. Recording it
+	// as a distinct flow keeps "we read this" true in the log without implying that a TLS
+	// session was broken to do it.
+	decision := s.cfg.Engine.CheckMode(policy.StageHTTP, target, policy.ModeForward)
 	if !decision.Allowed {
 		writeDenied(w, decision)
 		return
@@ -238,6 +284,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleConnect establishes a tunnel, after checking the CONNECT target, the address it
 // resolves to, and the server name in the client's ClientHello.
+//
+// The tunnel is spliced blind unless the destination has a credential rule, in which case
+// it is handed to inspect() instead. That decision is taken here, from the CONNECT target
+// alone, before the client has said anything: nothing a guest sends can widen it.
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	target, err := policy.ParseTarget(r.Host, 443)
 	if err != nil {
@@ -245,15 +295,27 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision := s.cfg.Engine.Check(policy.StageConnect, target)
+	mode := policy.ModeForwardBypass
+	if s.shouldInspect(target) {
+		mode = policy.ModeForward
+	}
+
+	decision := s.cfg.Engine.CheckMode(policy.StageConnect, target, mode)
 	if !decision.Allowed {
 		writeDenied(w, decision)
 		return
 	}
+	if mode == policy.ModeForwardBypass && s.cfg.Injector.Handles(target) {
+		// A credential rule that cannot fire is worse than no rule: the request goes out
+		// unauthenticated and the guest's placeholder is what the origin sees. Say so
+		// where the user is already looking.
+		s.cfg.Engine.Note(policy.StageConnect, target, policy.ModeForwardBypass,
+			"a credential rule names this host, but no certificate authority is configured, so the flow is carried blind and nothing is injected")
+	}
 
 	// Dial before answering, so that a refusal or a failure is reportable as HTTP
 	// instead of a tunnel that dies for no visible reason.
-	upstream, err := s.dial(r.Context(), target)
+	upstream, err := s.dial(r.Context(), target, mode)
 	if err != nil {
 		var denied *deniedError
 		if errors.As(err, &denied) {
@@ -288,7 +350,8 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.logf("reading ClientHello for %s: %v", target, err)
 		return
 	}
-	if sni != "" && !strings.EqualFold(sni, target.Host) {
+	sniMatches := sni == "" || strings.EqualFold(sni, target.Host)
+	if !sniMatches {
 		// The client asked to tunnel to one host and then greeted another. Judge what
 		// it actually greeted.
 		sniTarget, err := policy.NewTarget(sni, target.Port)
@@ -296,13 +359,26 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 			s.logf("CONNECT %s carried an unparseable server name: %v", target, err)
 			return
 		}
-		if d := s.cfg.Engine.Check(policy.StageSNI, sniTarget); !d.Allowed {
+		if d := s.cfg.Engine.CheckMode(policy.StageSNI, sniTarget, mode); !d.Allowed {
 			// The 200 is already on the wire, so the only refusal left is to drop the
 			// tunnel. The client sees a broken handshake; the reason is in the
 			// decision log, which is why the log is not optional.
 			s.logf("closing tunnel to %s: %s", target, d.Reason)
 			return
 		}
+	}
+
+	// Inspection needs the flow to be TLS for the host that was judged. A ClientHello for
+	// some other name, or bytes that are not TLS at all, fall back to a blind splice: the
+	// destination was still checked, and terminating something we cannot name would be
+	// interception nobody asked for.
+	if mode == policy.ModeForward && sniMatches && looksLikeTLS(head) {
+		s.inspect(r.Context(), target, client, buffered, head, upstream)
+		return
+	}
+	if mode == policy.ModeForward {
+		s.cfg.Engine.Note(policy.StageConnect, target, policy.ModeForwardBypass,
+			"marked for inspection, but the tunnel is not TLS for this name; carried blind and no credential attached")
 	}
 
 	if len(head) > 0 {
@@ -383,7 +459,7 @@ func (e *deniedError) Error() string { return e.decision.Reason }
 // host: `allowed.example A 127.0.0.1` passes a hostname allow and would otherwise reach
 // whatever is listening on the host's loopback. Deny rules apply to the address that will
 // actually be contacted, not to the name that was asked for.
-func (s *Server) dial(ctx context.Context, t policy.Target) (net.Conn, error) {
+func (s *Server) dial(ctx context.Context, t policy.Target, mode policy.Mode) (net.Conn, error) {
 	var candidates []netip.Addr
 	if t.IsIP() {
 		candidates = []netip.Addr{t.Addr}
@@ -408,7 +484,7 @@ func (s *Server) dial(ctx context.Context, t policy.Target) (net.Conn, error) {
 		// An address literal was already judged by Check; judging it again would put a
 		// duplicate in the log for every connection.
 		if !t.IsIP() {
-			if d := s.cfg.Engine.CheckResolved(resolved); !d.Allowed {
+			if d := s.cfg.Engine.CheckResolved(resolved, mode); !d.Allowed {
 				dc := d
 				lastDenied = &dc
 				continue
@@ -451,7 +527,13 @@ func writeDenied(w http.ResponseWriter, d policy.Decision) {
 	h.Set("Boks-Policy", "deny")
 	h.Set("Boks-Policy-Reason", d.Reason)
 	w.WriteHeader(http.StatusForbidden)
-	fmt.Fprintf(w, `boks: blocked by network policy
+	fmt.Fprint(w, denialText(d))
+}
+
+// denialText is the body of a refusal, shared by the plain-HTTP path and the inspected
+// path, which has no http.ResponseWriter to write through.
+func denialText(d policy.Decision) string {
+	return fmt.Sprintf(`boks: blocked by network policy
 
   destination: %s:%d
   stage:       %s

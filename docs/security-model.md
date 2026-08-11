@@ -98,15 +98,17 @@ ignores `HTTP_PROXY` and opens a raw socket must still be stopped.
 Intended enforcement is a host-side userspace network stack terminating the guest's
 virtio-net link, so every packet is examined on the host and unapproved flows are dropped
 regardless of guest cooperation. HTTP/HTTPS is steered to a host forward proxy that filters
-on the `CONNECT` target and TLS SNI, without interception — no custom CA in the guest, so
-end-to-end TLS is preserved and the proxy cannot read request bodies.
+on the `CONNECT` target and TLS SNI. Almost all traffic is tunnelled without interception,
+so end-to-end TLS is preserved and the proxy cannot read it; the exception is credential
+injection, described under [TLS interception](#tls-interception-and-the-boks-ca) below.
 
 #### What exists today
 
 | Piece | State |
 |---|---|
 | Policy engine — exact/wildcard hosts, IP and CIDR rules, ports, deny precedence, presets, decision log (`internal/policy`) | built, unit-tested |
-| Host forward proxy — HTTP, `CONNECT`, SNI cross-check, no TLS interception (`internal/proxy`) | built, exercised end to end against real TLS origins |
+| Host forward proxy — HTTP, `CONNECT`, SNI cross-check (`internal/proxy`) | built, exercised end to end against real TLS origins |
+| TLS interception for credential-bearing hosts only, local CA (`internal/ca`) | built, demonstrated end to end with a real client, two real HTTPS origins and certificate comparison |
 | Credential injection, encrypted host-side store (`internal/secret`) | built, unit-tested |
 | Network annotations and host-stack supervision (`internal/network`) | built, unit-tested |
 | Any of it applied to a running sandbox | **not done** |
@@ -140,6 +142,70 @@ Three things that verification changed, all of them reflected in the code:
   `-net none`, and it is the strongest containment Boks can currently offer — the only
   posture that does not depend on unfinished enforcement code.
 
+#### TLS interception and the Boks CA
+
+**This is a real reduction in the guarantee, and it is the deliberate cost of credential
+injection over HTTPS.** Attaching a header to a request means reading the request; reading
+an HTTPS request means terminating the TLS session. Every credential worth injecting —
+model APIs, Git hosts, package registries — is HTTPS-only, so "we never intercept" and "we
+inject credentials" cannot both be true. Boks chooses to intercept, narrowly, and to say so
+loudly.
+
+**What is intercepted.** A flow is terminated **only if its destination host has a
+credential injection rule configured for it**. Nothing else: no flag, preset or default
+turns on wider interception, and the decision is taken from the `CONNECT` target before the
+guest has sent a byte. Interception scope and credential scope are the same set by
+construction — one predicate (`Injector.Handles`) answers both questions, so a host cannot
+be decrypted for no reason. With no CA configured, nothing is ever intercepted and HTTPS
+credential rules simply do not fire, which the log records rather than passing over.
+
+**What Boks can read, for those hosts.** Everything: request line, headers, request and
+response bodies, in both directions. What it does with that is bounded by what the code
+does, not by what it could do:
+
+- nothing derived from traffic is logged. No body, header value or URL reaches the decision
+  log, the operational log, or an error message. Parse errors from `net/http` are
+  deliberately *not* printed verbatim, because they quote the bytes they choked on and a
+  request line can carry a token in a query string. Tests drive canaries through a
+  credential, a request body, a response body and a URL query, including the malformed-input
+  path, and assert none of them appears anywhere.
+- bodies stream through and are never buffered, decoded or examined.
+- Boks becomes responsible for verifying the origin, and does: full verification against the
+  host's trust store, with the flow refused and a readable `502` returned if it fails.
+
+**What the guest loses.** For intercepted hosts only: end-to-end confidentiality with the
+origin, and certificate pinning — a pinned client will fail, visibly, which is the correct
+failure. HTTP/2 is not carried inside an intercepted flow; ALPN offers `http/1.1` so clients
+negotiate down rather than break. Tunnelled flows are untouched and may use whatever they
+like.
+
+**The CA.**
+
+- Generated on this machine, on first use. Key and certificate live under the state
+  directory, owner-only (`0600`, in a `0700` directory), and Boks refuses to sign with a key
+  other users can read.
+- **The private key never leaves the host.** No guest, image, mount or annotation carries
+  it, and no code path prints it. `boks ca export` and `boks ca env` hand out the
+  certificate only.
+- The certificate is public. A guest holding it can *verify* certificates Boks minted; it
+  cannot mint any. Exfiltrating it gains an attacker nothing.
+- A guest trusting this CA is trusting the host it already runs on — which already owns its
+  kernel, disk and clock. That is not a new trust relationship. **Do not install it in your
+  host trust store**: in a guest its reach is one sandbox, in your login keychain it is every
+  TLS connection you make, and anyone who reads the key file owns them.
+- Leaves are minted per host from the *policy target*, never from the guest's ClientHello, so
+  a guest cannot choose what gets signed. They are cached in memory and never written to
+  disk.
+- Revocation is regeneration: no guest checks a revocation list, so `boks ca regenerate`
+  replaces the key and everything issued under the old one stops chaining to anything
+  trusted. Anything holding the old certificate must be given the new one.
+
+**Transparency.** Every logged flow records how it was carried, using Docker Sandboxes' own
+vocabulary: `forward` (Boks handled it at the HTTP level and could read it — plaintext HTTP,
+or HTTPS it terminated), `forward-bypass` (tunnelled, ciphertext only), `transparent`
+(judged at the network layer without the proxy; Boks cannot produce this yet). `boks policy
+ls` and `boks proxy` both state, unprompted, which hosts will be decrypted.
+
 #### Known limits, stated up front
 
 - SNI-based filtering can be evaded by clients that omit or lie about SNI; the netstack's
@@ -155,6 +221,13 @@ Three things that verification changed, all of them reflected in the code:
   at the host-side gateway is the hook for that; it does not by itself close the channel.
 - **Every allowed host is an exfiltration destination.** An allowlist bounds *where* data can
   go, not whether it goes. This is why the default preset is short and exact.
+- A flow marked for interception that turns out not to be TLS for the host that was judged —
+  no SNI, a mismatched SNI, or a protocol that is not TLS at all — is carried blind instead
+  and gets no credential. The log records the downgrade rather than leaving a `forward` entry
+  standing for a flow Boks never read.
+- Host patterns come in one wildcard form (`*.example.com`, matching any depth of subdomain
+  but not the apex). Docker Sandboxes' v2 permission grammar distinguishes single-label from
+  multi-label wildcards; Boks cannot express "exactly one label". See the parity matrix.
 
 ### The measured baseline today
 
@@ -223,20 +296,31 @@ destinations while the sandbox runs — it does not let the agent keep, print or
 the secret. That is a meaningful reduction, not an elimination: an agent that can make
 requests through the proxy can still make *authenticated* requests.
 
-The mechanism exists in `internal/secret` and works through `boks proxy`: bearer, basic and
-arbitrary-header schemes, scoped to host patterns you write out, with a catch-all `*`
-rejected. Secrets live in an AES-256-GCM file keyed from a passphrase; names are encrypted
-too. There is **no host API a guest can call** to list or fetch a secret, and adding one
-would end the guarantee — the only consumer of the store is the proxy's own request path.
-Values are wrapped in a type whose printed and JSON forms are redacted, and a test asserts a
-secret cannot reach a log.
+The mechanism exists in `internal/secret` and works through `boks proxy`, over HTTP **and
+HTTPS**. A credential names a service and owns a set of injection rules; each rule names a
+domain, a header and a value format with one `%s` (`bearer` and `basic[:user]` are
+shorthands for the two common shapes). Several hosts can share one stored secret, which is
+why the model has two levels. A catch-all `*` domain is rejected — under this design it
+would not merely send a token anywhere, it would also decide to decrypt everything.
 
-Two limits worth being explicit about:
+Secrets live in an AES-256-GCM file keyed from a passphrase; names are encrypted too. There
+is **no host API a guest can call** to list or fetch a secret, and adding one would end the
+guarantee — the only consumer of the store is the proxy's own request path. Values are
+wrapped in a type whose printed and JSON forms are redacted, and tests assert a secret
+cannot reach a log, including on the intercepted path.
 
-- **HTTPS injection is not possible without terminating TLS, so it is not done.** Injection
-  applies to plaintext HTTP only. Inside a `CONNECT` tunnel the proxy sees ciphertext.
-  Docker Sandboxes injects into HTTPS, which means it terminates TLS somewhere; Boks will
-  not do that silently. Closing the gap means an explicit, per-host opt-in to interception.
+Placeholders are part of the credential, not a constant: a guest is meant to hold something
+*shaped like* a real credential for that service, because clients validate credential format
+locally and a marker like `boks-managed` makes them fail before a request reaches the proxy.
+
+Three limits worth being explicit about:
+
+- **HTTPS injection costs a TLS interception, per configured host.** See
+  [TLS interception and the Boks CA](#tls-interception-and-the-boks-ca). This is the one
+  place Boks deliberately reads a guest's traffic, and it happens only for hosts you named.
+- **An injected credential is still usable by the guest.** A compromised agent can make
+  authenticated requests to the approved destinations for as long as the sandbox runs. It
+  cannot keep, print or exfiltrate the value.
 - **The file store is only as strong as the passphrase.** It is the portable fallback until
   the OS keychains are implemented. A key file stored beside the encrypted file is
   deliberately not offered: it protects nothing while appearing to.
@@ -267,6 +351,10 @@ in the sandbox.)*
    exist, but nothing applies them to a sandbox, and the default runtime configuration still
    reaches host loopback.
 6. **Terminal escape sequences** in guest output.
+7. **The interception CA** — a signing key on your machine. Its blast radius is bounded by
+   what trusts it, which should be sandboxes and nothing else. A key stolen off the host is
+   worth a MITM against anything that was told to trust it; that is why it is owner-only, why
+   Boks refuses to use a key others can read, and why `boks ca regenerate` exists.
 
 ## What Boks does not claim
 
@@ -275,7 +363,10 @@ in the sandbox.)*
 - It provides **no** network isolation in a running sandbox today. A policy engine, a host
   proxy and a host network stack configuration exist and are tested; none is wired into
   `boks run`.
-- It provides **no** credential protection in a running sandbox today.
+- It provides **no** credential protection in a running sandbox today. Injection works
+  through `boks proxy`, which nothing wires into `boks run`.
+- It does **not** claim end-to-end TLS to every destination any more. Hosts you configure a
+  credential for are decrypted by Boks, by design; everything else is not.
 - It has **no** defence against hypervisor vulnerabilities beyond keeping libkrun current.
 
 Boks aims to be honest about this. If a property is not listed as tested, assume it does not

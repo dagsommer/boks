@@ -278,10 +278,14 @@ exists. See [security-model.md](security-model.md#network).
 | Default deny | Deny-by-default with an allowlist | Same | P0 | partial | Default preset `standard` is deny-by-default; asserted explicitly in the netstack config too |
 | Policy presets | Open / Balanced / Locked Down, chosen at first run | `open` / `standard` / `locked` | P1 | done | `standard` is the default; entries justified in `internal/policy/preset.go` |
 | Exact + wildcard hosts | Allowlist includes broad wildcards such as `*.googleapis.com` | Exact and wildcard, plus ports, IPs and CIDR | P0 | done | No multi-tenant wildcards in any preset — they allow every tenant's bucket |
+| Host pattern forms | v2 grammar: exact, host with port, single-label wildcard, multi-label wildcard, port ranges, port wildcard, CIDR | Exact, host with port, one wildcard form, port ranges and wildcard, CIDR | P1 | partial | **Gap:** Boks' `*.example.com` matches any subdomain depth, so "exactly one label" cannot be expressed. Not yet worth a second syntax |
 | Deny precedence | Local deny rules still apply under org governance | Deny always wins over allow | P0 | done | Order- and specificity-independent; tested |
 | Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | Decisions recorded as JSON lines under the state dir; local only |
 | Per-run allow flags | Policy configured per sandbox/host | `-allow`/`-deny` repeatable, `-policy <preset>`, `-net <mode>` | P0 | partial | Parsed and validated on `boks run`, which says plainly that they are not applied |
-| TLS interception | Not used for filtering; HTTPS filtered without MITM | No MITM; filter on CONNECT host + SNI | P0 | done | Verified end to end: the client validates the origin's own chain through the proxy |
+| TLS interception | Used for credential injection, not for filtering: a "Docker Sandboxes Proxy CA" sits in the guest trust store and is also exposed as `PROXY_CA_CERT_B64` | Terminate **only** for hosts with a credential rule; local CA, certificate handed over as a file and as `BOKS_CA_CERT_B64` | P0 | done | Demonstrated end to end: the intercepted host presents a Boks-issued certificate, an unconfigured host presents the origin's own chain |
+| Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | partial | `forward` and `forward-bypass` are produced today; `transparent` needs the netstack datapath, so nothing writes it |
+| Structured decisions | Blocked rows read `no applicable policies for op(action=net:connect:tcp, resource=net:domain:<host>:<port>)` | Same action/resource vocabulary on every decision | P1 | done | Recorded as fields rather than formatted prose, so the display layer can group, filter and aggregate |
+| Aggregated log display | Rows deduplicated per destination with `LAST SEEN` and `COUNT`, split into blocked and allowed | Same | P1 | done | One dependency install produces hundreds of identical allows; `-raw` still prints every decision |
 | SNI cross-check | Not documented | Deny a tunnel whose ClientHello names a forbidden host | P1 | done | Only possible after the `200`, so the client sees a broken handshake; the reason is in the log |
 | Resolved-address recheck | Not documented | Deny rules re-applied to the address a permitted name resolved to | P1 | done | Stops `allowed.test A 127.0.0.1` from becoming a path to host services |
 | Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | planned | Belongs to the netstack, which is not yet in the datapath |
@@ -296,24 +300,29 @@ exists. See [security-model.md](security-model.md#network).
 
 ## 5. Credentials and secrets
 
-**Where Boks stands.** `internal/secret` implements the model and `boks proxy` applies it;
-`boks secret set/ls/rm` manages an encrypted host-side store. It is not wired into
-`boks run`, and injection is limited to plaintext HTTP because Boks will not terminate TLS
-silently.
+**Where Boks stands.** `internal/secret` implements the model and `boks proxy` applies it,
+over HTTP **and HTTPS**; `boks secret set/ls/rm` manages an encrypted host-side store. It is
+still not wired into `boks run`. HTTPS injection is paid for with a TLS termination, for the
+configured hosts and no others — see
+[security-model.md](security-model.md#tls-interception-and-the-boks-ca).
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | partial | Works through `boks proxy`; not wired into `run` |
-| Schemes | Not documented in detail | `bearer`, `basic`, arbitrary `header` | P0 | done | Covers GitHub, Anthropic and registries with no vendor-specific code |
-| HTTPS injection | Supported | **Not possible without terminating TLS, so not done** | P0 | none | Docker must be terminating TLS somewhere. Boks treats interception as an explicit per-host decision, not a default |
+| Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | partial | Works through `boks proxy` for HTTP and HTTPS; not wired into `run` |
+| Credential grammar | v2 `credentials[]`: one service owns many `inject` rules, each with a domain, a header and a `format` or `scheme`, plus `proxyManaged` and an env var name | Same two-level shape | P1 | done | `-inject service@host[,host]=bearer\|basic[:user]\|header[:format]`; several hosts share one stored secret |
+| Schemes | `format` (`Bearer %s`) or `scheme` (`bearer`/`basic` with `username`), mutually exclusive | Same, with the same exclusivity enforced | P0 | done | A format string covers every vendor; basic auth keeps a username field because its value is base64(user:secret) |
+| Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | partial | Modelled, validated and printed; nothing writes a guest's environment yet |
+| OAuth credentials | v2 `oauth`: sentinel access and refresh tokens in a guest credential file, swapped by the proxy for `resourceHosts` | Not implemented | P2 | none | The model leaves room for it: a credential is not assumed to be a single header |
+| HTTPS injection | Supported | Supported, by terminating TLS for the configured hosts only | P0 | done | Demonstrated: origin received the real secret, client had sent only a placeholder. Every other host stays a blind tunnel |
+| Interception CA | Self-signed proxy CA installed in the guest and exposed as an env var | Local CA under the state dir; `boks ca show/export/env/regenerate` | P0 | done | Private key never leaves the host; leaves minted from the policy target, never from the guest's ClientHello |
 | Secret storage | OS keychain; Linux uses desktop keyring or an encrypted file | Encrypted local file first, keychains later | P1 | partial | AES-256-GCM, PBKDF2-HMAC-SHA256 over `BOKS_SECRETS_PASSPHRASE`; names encrypted too |
 | Keychain providers | macOS Keychain, Secret Service, Credential Manager | Same, behind the `Provider` interface | P1 | none | Interface exists; no implementation |
-| Scope | Injection tied to configured destinations | Only for explicitly configured hosts | P0 | done | A catch-all `*` destination is rejected outright |
+| Scope | `serviceDomains` (v1) / `inject[].domain` (v2) are separate from the network allowlist | Only explicitly configured hosts; separate from `-allow` | P0 | done | A catch-all is rejected outright. Reachable and credential-bearing are different sets: the second is also exactly the set that gets decrypted |
 | Placeholder replacement | Guest holds a placeholder | Existing header is overwritten, never appended | P0 | done | A surviving placeholder would be a silent auth failure at best |
 | Guest secret access | Guest never receives raw values | Same; no host API for the guest to query | P0 | done | The store's only consumer is the proxy's request path. Adding a lookup endpoint would end the guarantee |
 | Never logged | Not documented | Values redacted in every printed and serialised form | P1 | done | Enforced by the `Value` type and asserted by tests |
 | `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set` | P1 | done | Reads from stdin by default; `-value` documented as visible in the process list |
-| Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | none | Needs HTTPS injection, hence TLS termination — blocked on that decision |
+| Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | partial | The mechanism exists (basic auth with a username, over an intercepted flow); never exercised against a real Git host |
 | SSH agent forwarding | Supported; SSH key signing works, GPG/S-MIME do not | Host agent socket forwarding | P2 | none | |
 | OAuth device login | Agent login inside sandbox; session tokens stay on host | Out of scope near-term | P2 | none | |
 
@@ -411,7 +420,15 @@ silently.
    symlinked workspace resolves to its target before naming, so two paths to the same
    directory share one sandbox.
 4. **Kit schema.** Deliberately unanswered until real runtime features exist to configure.
-5. ~~**TSI vs external network provider.**~~ **Answered 2026-08-11.** The external provider
+5. **`transparent` flows.** Docker's log has a third proxy mode for flows judged at the
+   network layer without the proxy — SSH on port 22 appeared under it. Boks reserves the
+   value but cannot produce it: nothing terminates the guest's NIC in the datapath yet, so
+   there is no network-layer decision point to record. When there is, hostname rules will
+   not apply to those flows and IP/port rules will be all there is.
+6. **Kit loading.** The credential model now matches the v2 `credentials[]` shape — one
+   service, many injection rules — so a loader can be added without reworking it. Nothing
+   parses YAML today, and `oauth` is modelled only to the extent of not designing it out.
+7. ~~**TSI vs external network provider.**~~ **Answered 2026-08-11.** The external provider
    displaces TSI: with it attached the guest has `eth0` and a host loopback probe that TSI
    answered is refused. Two annotations are needed (`io.containerd.nerdbox.network.N` for
    the VM, `io.containerd.nerdbox.ctr.network.N` keyed by `vmmac` for the container), `addr`

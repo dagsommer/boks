@@ -7,6 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,21 +29,89 @@ const (
 	StageSNI Stage = "sni"
 	// StageDial is the address a permitted hostname resolved to.
 	StageDial Stage = "dial"
+	// StageRequest is a request read inside a flow Boks terminated. It exists only for
+	// inspected flows, because it is the one thing a blind tunnel cannot show.
+	StageRequest Stage = "request"
+)
+
+// Mode records how a flow reached its destination, and therefore how much of it Boks could
+// read. It is a transparency guarantee, not a debugging aid: a user must be able to look at
+// the log and separate what Boks read from what it merely carried.
+//
+// The three values and their names are Docker Sandboxes' own, taken from real `sbx policy
+// log` output. Matching the reference product's vocabulary is worth more than inventing
+// clearer words for the same three things.
+type Mode string
+
+const (
+	// ModeForward is a flow Boks handled at the HTTP level, and therefore could read.
+	// Either plaintext HTTP, where there was never anything to break, or HTTPS that Boks
+	// terminated and re-originated — which happens only for a host with a credential
+	// rule, because reading the request is the only way to add a header to it.
+	ModeForward Mode = "forward"
+	// ModeForwardBypass is a CONNECT tunnel spliced byte-for-byte: the flow used the
+	// proxy, but bypassed inspection. TLS is end-to-end, the client validated the
+	// origin's own certificate chain, and Boks saw ciphertext only. This is the default
+	// for every destination without a credential rule.
+	ModeForwardBypass Mode = "forward-bypass"
+	// ModeTransparent is a flow that never used the proxy and was judged at the network
+	// layer instead — the case a raw socket or a non-HTTP protocol such as SSH produces.
+	// Only address and port rules can apply there, because a raw connection carries no
+	// hostname.
+	//
+	// Boks does not produce this mode yet: nothing terminates the guest's NIC in the
+	// datapath, so there is no network-layer enforcement point to record. The value
+	// exists because the log format has to have room for it before that lands, not
+	// because anything writes it today.
+	ModeTransparent Mode = "transparent"
 )
 
 // Decision is one logged policy outcome. It is the unit `boks policy log` displays and the
 // only record Boks keeps of sandbox network activity. It stays on this machine.
+//
+// The action and resource are recorded as structured strings rather than folded into the
+// prose reason, so that the display layer can group, filter and aggregate them, and so that
+// a later policy over something other than the network — a filesystem path, an MCP server —
+// can be logged in the same shape instead of a second, incompatible one.
 type Decision struct {
-	Time    time.Time `json:"time"`
-	Stage   Stage     `json:"stage"`
-	Host    string    `json:"host"`
-	Port    int       `json:"port"`
-	Allowed bool      `json:"allowed"`
-	Reason  string    `json:"reason"`
-	Rule    string    `json:"rule,omitempty"`
-	Policy  string    `json:"policy"`
+	Time time.Time `json:"time"`
+	// Type is the policy domain. Only "network" exists today.
+	Type    string `json:"type"`
+	Stage   Stage  `json:"stage"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	Allowed bool   `json:"allowed"`
+	// Action is the operation that was judged, as "net:connect:tcp".
+	Action string `json:"action"`
+	// Resource is what it was judged against, as "net:domain:example.com:443" or
+	// "net:ip:203.0.113.7:443".
+	Resource string `json:"resource"`
+	Reason   string `json:"reason"`
+	// Rule is the rule that decided, or an explicit statement that none applied.
+	Rule   string `json:"rule,omitempty"`
+	Policy string `json:"policy"`
+	// Mode says how the flow was carried, and so whether Boks could read it. Empty when
+	// the disposition was not yet known at the point the decision was taken.
+	Mode Mode `json:"mode,omitempty"`
 	// Sandbox is the sandbox the flow came from, when the proxy knows it.
 	Sandbox string `json:"sandbox,omitempty"`
+}
+
+// TypeNetwork is the policy domain every decision Boks takes today belongs to.
+const TypeNetwork = "network"
+
+// ActionConnectTCP is the only operation Boks judges so far: opening a TCP connection to a
+// destination. It is spelled out rather than implied so that the log does not have to be
+// re-interpreted when a second action exists.
+const ActionConnectTCP = "net:connect:tcp"
+
+// ResourceOf renders a target as a typed resource string.
+func ResourceOf(t Target) string {
+	kind := "domain"
+	if t.IsIP() {
+		kind = "ip"
+	}
+	return fmt.Sprintf("net:%s:%s:%d", kind, t.Host, t.Port)
 }
 
 func (d Decision) String() string {
@@ -48,8 +119,12 @@ func (d Decision) String() string {
 	if d.Allowed {
 		verb = "ALLOW"
 	}
-	return fmt.Sprintf("%s %s %-7s %s:%d  %s",
-		d.Time.Format(time.RFC3339), verb, d.Stage, d.Host, d.Port, d.Reason)
+	mode := string(d.Mode)
+	if mode == "" {
+		mode = "-"
+	}
+	return fmt.Sprintf("%s %s %-7s %-14s %s:%d  %s",
+		d.Time.Format(time.RFC3339), verb, d.Stage, mode, d.Host, d.Port, d.Reason)
 }
 
 // Sink receives decisions as they are made. Implementations must be safe for concurrent
@@ -204,6 +279,78 @@ func ReadDecisions(r io.Reader, n int) ([]Decision, error) {
 	return out, nil
 }
 
+// Aggregate is a set of decisions that were, for a reader's purposes, the same decision:
+// one destination, one mode, one outcome, one reason.
+type Aggregate struct {
+	Sandbox  string
+	Type     string
+	Host     string
+	Port     int
+	Mode     Mode
+	Allowed  bool
+	Rule     string
+	Reason   string
+	First    time.Time
+	LastSeen time.Time
+	Count    int
+}
+
+// Aggregated collapses a decision log into one row per destination and mode, newest first.
+//
+// A log with a line per request is a log nobody reads: a single dependency install produces
+// hundreds of identical allows and buries the one denial that explains the failure. The
+// per-decision records are still on disk — this is a display concern, and the raw form
+// stays available.
+//
+// The stage is deliberately not part of the identity. It is Boks' own notion of where in
+// the pipeline a check happened; what a reader wants is "this destination, carried this
+// way, was allowed or refused for this reason, this many times".
+func Aggregated(decisions []Decision) []Aggregate {
+	type key struct {
+		sandbox, typ, host string
+		port               int
+		mode               Mode
+		allowed            bool
+		rule, reason       string
+	}
+	index := map[key]int{}
+	var out []Aggregate
+	for _, d := range decisions {
+		k := key{d.Sandbox, d.Type, d.Host, d.Port, d.Mode, d.Allowed, d.Rule, d.Reason}
+		if i, ok := index[k]; ok {
+			out[i].Count++
+			if d.Time.After(out[i].LastSeen) {
+				out[i].LastSeen = d.Time
+			}
+			if d.Time.Before(out[i].First) {
+				out[i].First = d.Time
+			}
+			continue
+		}
+		index[k] = len(out)
+		out = append(out, Aggregate{
+			Sandbox: d.Sandbox, Type: d.Type, Host: d.Host, Port: d.Port,
+			Mode: d.Mode, Allowed: d.Allowed, Rule: d.Rule, Reason: d.Reason,
+			First: d.Time, LastSeen: d.Time, Count: 1,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].LastSeen.Equal(out[j].LastSeen) {
+			return out[i].LastSeen.After(out[j].LastSeen)
+		}
+		return out[i].Host < out[j].Host
+	})
+	return out
+}
+
+// Destination renders the aggregate's host and port the way a user typed the rule.
+func (a Aggregate) Destination() string {
+	if strings.Contains(a.Host, ":") { // IPv6 literal
+		return "[" + a.Host + "]:" + strconv.Itoa(a.Port)
+	}
+	return a.Host + ":" + strconv.Itoa(a.Port)
+}
+
 // DefaultLogPath is where the decision log lives when no path is given.
 //
 // XDG state on Linux, ~/Library/Application Support on macOS, %LocalAppData% on Windows —
@@ -274,26 +421,57 @@ func (e *Engine) Log() *Log { return e.log }
 
 // Check evaluates a target at a given stage and records the outcome.
 func (e *Engine) Check(stage Stage, t Target) Decision {
-	return e.record(stage, t, e.policy.Evaluate(t))
+	return e.CheckMode(stage, t, NoMode)
+}
+
+// CheckMode is Check with the flow's disposition attached, so the log can say whether Boks
+// read the connection or only carried it.
+func (e *Engine) CheckMode(stage Stage, t Target, m Mode) Decision {
+	return e.record(stage, t, e.policy.Evaluate(t), m)
 }
 
 // CheckResolved evaluates an address a permitted hostname resolved to, against deny rules
 // only. See Policy.EvaluateDeny for why the allow rules are not consulted.
-func (e *Engine) CheckResolved(t Target) Decision {
-	return e.record(StageDial, t, e.policy.EvaluateDeny(t))
+func (e *Engine) CheckResolved(t Target, m Mode) Decision {
+	return e.record(StageDial, t, e.policy.EvaluateDeny(t), m)
 }
 
-func (e *Engine) record(stage Stage, t Target, v Verdict) Decision {
+// NoMode marks a decision taken before the flow's disposition is known.
+const NoMode Mode = ""
+
+// Note records that a permitted flow's disposition turned out differently from what was
+// logged when it was allowed — a flow marked for inspection that ended up carried blind,
+// say. Without it the log could claim Boks read something it did not, or the reverse, and
+// that claim is the whole point of recording the mode at all.
+//
+// The reason is written by Boks, never taken from traffic.
+func (e *Engine) Note(stage Stage, t Target, m Mode, reason string) Decision {
+	return e.record(stage, t, Verdict{Allowed: true, Reason: reason}, m)
+}
+
+func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode) Decision {
+	resource := ResourceOf(t)
+	rule := v.Rule
+	if rule == "" {
+		// Say that nothing matched, in the same structured terms a matching rule would
+		// be reported in, rather than leaving the field empty and making the reader
+		// infer it.
+		rule = fmt.Sprintf("no applicable policies for op(action=%s, resource=%s)", ActionConnectTCP, resource)
+	}
 	d := Decision{
-		Time:    e.now(),
-		Stage:   stage,
-		Host:    t.Host,
-		Port:    t.Port,
-		Allowed: v.Allowed,
-		Reason:  v.Reason,
-		Rule:    v.Rule,
-		Policy:  e.policy.Name,
-		Sandbox: e.sandbox,
+		Time:     e.now(),
+		Type:     TypeNetwork,
+		Stage:    stage,
+		Host:     t.Host,
+		Port:     t.Port,
+		Allowed:  v.Allowed,
+		Action:   ActionConnectTCP,
+		Resource: resource,
+		Reason:   v.Reason,
+		Rule:     rule,
+		Policy:   e.policy.Name,
+		Mode:     m,
+		Sandbox:  e.sandbox,
 	}
 	e.log.Record(d)
 	return d
