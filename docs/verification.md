@@ -28,7 +28,9 @@ for any of it.
 ### Host versus guest
 
 Collected from the same machine, minutes apart. Guest values are from
-`boks run . -- …` with the default `-cpus 2 -memory 2048`.
+`boks run shell . -- …` with `-cpus 2 -memory 2048`. (Those were the defaults at the time;
+the defaults are now all host CPUs and half the host's memory, so a repeat run reports the
+values you pass rather than these.)
 
 | Fact | Host | Guest |
 |---|---|---|
@@ -157,7 +159,7 @@ On a host with hardware virtualisation (bare metal Linux with KVM, or Apple sili
 3. **Collect the same from a sandbox.**
 
    ```
-   boks run . -- sh -c 'uname -r; cat /proc/sys/kernel/random/boot_id; cat /proc/uptime; nproc'
+   boks run shell . -cpus 2 -m 2048m -- sh -c 'uname -r; cat /proc/sys/kernel/random/boot_id; cat /proc/uptime; nproc'
    ```
 
 4. **Compare.** The boot_id must differ, the guest uptime must be far smaller than the
@@ -166,20 +168,20 @@ On a host with hardware virtualisation (bare metal Linux with KVM, or Apple sili
 5. **Check the device topology.**
 
    ```
-   boks run . -- sh -c 'ls /sys/bus/virtio/devices; cat /proc/version'
+   boks run shell . -- sh -c 'ls /sys/bus/virtio/devices; cat /proc/version'
    ```
 
 6. **Confirm the workspace still behaves.** Exact path, contents, and write-back:
 
    ```
-   boks run . -- sh -c 'pwd && ls && touch boks-probe'
+   boks run shell . -- sh -c 'pwd && ls && touch boks-probe'
    ```
 
 7. **Confirm containment of the parent.** The parent directory must contain only the
    workspace:
 
    ```
-   boks run /some/dir/project -- ls /some/dir
+   boks run shell /some/dir/project -- ls /some/dir
    ```
 
 8. **Run the integration suite against the real runtime.**
