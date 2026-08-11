@@ -1,0 +1,50 @@
+#!/bin/sh
+# Install the Boks certificate authority into this guest's trust store.
+#
+# Boks injects credentials by terminating TLS for the hosts a credential rule names, which
+# means the guest is offered a certificate signed by a CA generated on the host. Without
+# this, every intercepted request fails verification. `boks ca env` prints the variable
+# consumed here.
+#
+# Doing nothing when the variable is unset is deliberate: an image that refuses to start
+# without an injected CA would be unusable for the (common) sandbox that intercepts nothing.
+#
+# This lives as its own command, not only inside the entrypoint, because the entrypoint is
+# not on every path into a sandbox: a persistent sandbox runs an idle keeper as its container
+# process and `boks exec` runs the command it was given, so neither passes through it. In
+# those cases run `boks exec <sandbox> boks-install-ca` once — the write persists in the
+# sandbox's snapshot.
+set -eu
+
+if [ -z "${BOKS_CA_CERT_B64:-}" ]; then
+	exit 0
+fi
+
+dest=/usr/local/share/ca-certificates/boks-local-ca.crt
+
+# Write via a temporary file so a truncated decode never leaves a half-certificate that
+# update-ca-certificates would then splice into the bundle.
+tmp="${dest}.tmp.$$"
+umask 022
+if ! printf '%s' "$BOKS_CA_CERT_B64" | base64 -d >"$tmp" 2>/dev/null; then
+	rm -f "$tmp"
+	echo "boks: BOKS_CA_CERT_B64 is not valid base64; the CA was not installed" >&2
+	exit 1
+fi
+if ! grep -q "BEGIN CERTIFICATE" "$tmp"; then
+	rm -f "$tmp"
+	echo "boks: BOKS_CA_CERT_B64 did not decode to a PEM certificate; the CA was not installed" >&2
+	exit 1
+fi
+mv "$tmp" "$dest"
+
+# Everything update-ca-certificates says on the way to success is chatter, and one line of
+# it is a warning it emits on every Debian trixie run ("rehash: warning: skipping
+# ca-certificates.crt") that has nothing to do with us. Printing that at the start of every
+# sandbox would train people to ignore the output. So: silent when it works, and the whole
+# of it when it does not.
+if ! output="$(update-ca-certificates 2>&1)"; then
+	printf '%s\n' "$output" >&2
+	echo "boks: update-ca-certificates failed; the Boks CA is not trusted in this sandbox" >&2
+	exit 1
+fi

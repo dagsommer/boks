@@ -276,16 +276,23 @@ func (f *sandboxFlags) config(inv invocation, agentArgs []string) (sandbox.Confi
 		cpus = autoCPUs()
 	}
 
+	// An agent's Init prefix names paths that exist in the image Boks ships for it —
+	// /usr/bin/tini and the Boks entrypoint. -template points somewhere Boks knows nothing
+	// about, so the prefix has to come off with the image it belongs to; otherwise
+	// `boks run shell -t debian:stable -- uname -a` fails on a missing tini.
+	run := inv.agent
 	image := f.image
 	if image == "" {
-		image = inv.agent.Image
+		image = run.Image
+	} else if image != run.Image {
+		run = run.Bare()
 	}
 
 	// A sandbox that already exists recorded what it runs when it was created, agent
 	// arguments included. An invocation that gives none of its own is asking for that,
 	// not for the agent's bare command line — otherwise `boks create shell . -- npm run
 	// dev` followed by `boks run shell .` would quietly drop the interesting half.
-	command := inv.agent.Argv(agentArgs)
+	command := run.Argv(agentArgs)
 	if inv.exists && len(agentArgs) == 0 {
 		command = nil
 	}
