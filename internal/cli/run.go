@@ -127,6 +127,12 @@ Flags:
 			}
 		}()
 	}
+	if *ephemeral {
+		// Deferred after the stack's teardown, so it runs once the socket directory
+		// is gone: an ephemeral sandbox also takes with it the copy of the CA that
+		// existed only to be shared into it.
+		defer forgetNetworkQuietly(inv.name, env.Stderr)
+	}
 	cfg.Ephemeral = *ephemeral
 	cfg.Stdin = env.Stdin
 	cfg.Stdout = env.Stdout

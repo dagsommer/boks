@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/dagsommer/boks/internal/agent"
+	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
@@ -15,6 +16,13 @@ func createCommand(ctx context.Context, env Env) error {
 
 	agents := agent.Builtin()
 	flags := registerSandboxFlags(fs)
+
+	// A sandbox's network mode is fixed when it is created, because it lives in
+	// annotations the runtime reads at boot — so `create` is exactly where it has to be
+	// decidable. Without these flags here, every sandbox made with `create` would come up
+	// on the runtime's default transport, which is the one that reaches host loopback.
+	var netFlags policyFlags
+	netFlags.register(fs)
 
 	fs.Usage = func() {
 		fmt.Fprintf(env.Stderr, `Usage: boks create [flags] [agent] [workspace...] [-- agent args...]
@@ -64,6 +72,28 @@ Flags:
 		return err
 	}
 	cfg.Stderr = env.Stderr
+
+	// Only the wiring, not the stack: nothing starts here, so there is no VM to serve and
+	// no socket to hold. `run`, `exec` or `start` brings the network up when the sandbox
+	// actually boots.
+	mode, err := network.ParseMode(netFlags.mode)
+	if err != nil {
+		return err
+	}
+	spec, err := netFlags.enforceSpec(ctx, inv.name, *flags.address, mode)
+	if err != nil {
+		return err
+	}
+	if err := describeNetwork(&netFlags, spec, mode, env.Stderr); err != nil {
+		return err
+	}
+	guest, err := spec.Prepare()
+	if err != nil {
+		return err
+	}
+	cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
+	cfg.Env = append(cfg.Env, guest.Env...)
+	cfg.Mounts = guest.Mounts
 
 	info, err := sandbox.Create(ctx, cfg)
 	if err != nil {
