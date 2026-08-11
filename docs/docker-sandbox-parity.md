@@ -123,7 +123,7 @@ website documents.
 | `kit` | (Experimental) Manage kit artifacts | none |
 | `template` | Manage sandbox templates (the image an agent runs in) | none; `-image` flag only |
 | `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
-| `daemon` | `start`, `stop`, `status`, `log-level` for the `sandboxd` daemon | none, and none needed — see below |
+| `daemon` | `start`, `stop`, `status`, `log-level` for the `sandboxd` daemon | no daemon; `boks net ls\|stop` covers the one background process Boks has — see below |
 | `diagnose` | Diagnose installation issues | `doctor` (same job, different name) |
 | `setup` | (Experimental) Detect host configuration and prepare | partly `doctor`'s remedies |
 | `reset` | Reset all sandboxes and clean up state | none |
@@ -135,12 +135,20 @@ Boks additionally has `start` and `inspect`, which sbx does not: sbx starts impl
 `run`/`exec`, and its only `inspect` is `policy inspect`. These are deliberate additions, not
 parity gaps.
 
-**sbx runs a daemon; Boks does not.** `sandboxd` presumably owns VM supervision and state,
-which is the natural consequence of managing hypervisors directly. Boks delegates that to
-containerd and its shims, so there is nothing left for a daemon to own. This is a genuine
-architectural divergence and the better position for a local-first tool — one less privileged
-long-lived process — but it does mean anything sbx does *between* CLI invocations has no
-equivalent here, and that needs watching as features land.
+**sbx runs one daemon; Boks runs one short-lived process per running sandbox.** `sandboxd`
+presumably owns VM supervision and state, which is the natural consequence of managing
+hypervisors directly. Boks delegates VM supervision to containerd and its shims, so a daemon
+has almost nothing left to own — but "almost" turned out to matter: the host-side network
+stack terminates the guest's NIC, so *something* has to hold that socket for as long as the
+VM runs, and no CLI invocation lasts that long.
+
+So Boks now spawns `boks net serve`, one process per **running** sandbox, on demand. It is
+not a daemon in the sense that matters: nothing starts at boot, a host with no running
+sandbox runs no Boks process, it holds one sandbox's credentials rather than every
+sandbox's, it exposes no API, and it exits when the sandbox's task exits. The divergence from
+sbx is therefore narrower than it was — Boks does have a background process now — but the
+blast radius is one sandbox and the lifetime is one VM. `boks net ls` and `boks net stop`
+make it visible and stoppable, and there is still no `boks daemon start`.
 
 **Persistent, scoped policy is a bigger gap than it looked.** `sbx policy allow/deny/rm` write
 rules that survive the invocation, and rules are either global or scoped to a single sandbox.
@@ -263,36 +271,38 @@ and a typed resource, leaving formatting and aggregation to the display layer.
 
 ## 4. Networking
 
-**Where Boks stands (2026-08-11).** The policy engine, the host forward proxy and the
-host-side network configuration are built and tested; **none of it is applied to a running
-sandbox**, so Boks enforces nothing today. What changed this week is that the transport
-enforcement needs was verified: attaching a virtio-net link to a host-side userspace stack
-does displace libkrun's TSI, so a point at which Boks can drop a flow now demonstrably
-exists. See [security-model.md](security-model.md#network).
+**Where Boks stands (2026-08-11).** The policy engine, the host forward proxy, the credential
+injection and the host-side stack are now **applied to every sandbox `boks run` creates**: the
+container is wired to a virtual NIC whose far end is a userspace stack in a per-sandbox Boks
+process, with the proxy listening inside that virtual network. The transport underneath was
+verified on real hardware. The enforcement built on it has been exercised **only against a
+simulated guest** on the real link socket — no VM has ever been refused a destination by
+Boks, because the machine this was built on has no hypervisor. See
+[security-model.md](security-model.md#network).
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor-tap-vsock, embedded as a library) | P0 | partial | Transport verified; nothing wired into `run`. `internal/network` builds the annotations and supervises the stack |
-| No-network mode | Not offered as such | `-net none`: NIC on the VM, container not wired to it | P0 | partial | Costs nothing, turns TSI off, refuses host loopback. Strongest containment available |
-| Egress via proxy | All outbound HTTP/HTTPS routed through a host proxy | Same | P0 | partial | `boks proxy` works standalone (`internal/proxy`); not wired into `run` |
-| Default deny | Deny-by-default with an allowlist | Same | P0 | partial | Default preset `standard` is deny-by-default; asserted explicitly in the netstack config too |
+| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor-tap-vsock, embedded as a library) | P0 | partial | Wired into `run`, `exec`, `create` and `start`. Transport verified on hardware; the enforcement on top of it only against a simulated guest |
+| No-network mode | Not offered as such | `-net none`: NIC on the VM, container not wired to it | P0 | done | End to end: VM NIC annotation only, no stack, no proxy, no listener, no proxy environment. Strongest containment available |
+| Egress via proxy | All outbound HTTP/HTTPS routed through a host proxy | Same | P0 | partial | The proxy listens *inside* the sandbox's virtual network — nothing is bound on the host — and the guest is pointed at it. `boks proxy` still runs standalone |
+| Default deny | Deny-by-default with an allowlist | Same | P0 | partial | Default preset `standard` is deny-by-default, applied to every run; asserted explicitly in the netstack config too |
 | Policy presets | Open / Balanced / Locked Down, chosen at first run | `open` / `standard` / `locked` | P1 | done | `standard` is the default; entries justified in `internal/policy/preset.go` |
 | Exact + wildcard hosts | Allowlist includes broad wildcards such as `*.googleapis.com` | Exact and wildcard, plus ports, IPs and CIDR | P0 | done | No multi-tenant wildcards in any preset — they allow every tenant's bucket |
 | Host pattern forms | v2 grammar: exact, host with port, single-label wildcard, multi-label wildcard, port ranges, port wildcard, CIDR | Exact, host with port, one wildcard form, port ranges and wildcard, CIDR | P1 | partial | **Gap:** Boks' `*.example.com` matches any subdomain depth, so "exactly one label" cannot be expressed. Not yet worth a second syntax |
 | Deny precedence | Local deny rules still apply under org governance | Deny always wins over allow | P0 | done | Order- and specificity-independent; tested |
 | Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | Decisions recorded as JSON lines under the state dir; local only |
-| Per-run allow flags | Policy configured per sandbox/host | `-allow`/`-deny` repeatable, `-policy <preset>`, `-net <mode>` | P0 | partial | Parsed and validated on `boks run`, which says plainly that they are not applied |
+| Per-run allow flags | Policy configured per sandbox/host | `-allow`/`-deny` repeatable, `-policy <preset>`, `-net <mode>` | P0 | partial | Applied to the sandbox. **Not persisted**: the rules belong to the process serving that sandbox's network, so `boks start` and `boks exec` on a stopped sandbox use the default preset and say so |
 | TLS interception | Used for credential injection, not for filtering: a "Docker Sandboxes Proxy CA" sits in the guest trust store and is also exposed as `PROXY_CA_CERT_B64` | Terminate **only** for hosts with a credential rule; local CA, certificate handed over as a file and as `BOKS_CA_CERT_B64` | P0 | done | Demonstrated end to end: the intercepted host presents a Boks-issued certificate, an unconfigured host presents the origin's own chain |
-| Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | partial | `forward` and `forward-bypass` are produced today; `transparent` needs the netstack datapath, so nothing writes it |
+| Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | partial | `forward` and `forward-bypass` are produced, now attributed to the sandbox they came from; `transparent` needs judgements taken in the netstack itself, which is not built |
 | Structured decisions | Blocked rows read `no applicable policies for op(action=net:connect:tcp, resource=net:domain:<host>:<port>)` | Same action/resource vocabulary on every decision | P1 | done | Recorded as fields rather than formatted prose, so the display layer can group, filter and aggregate |
 | Aggregated log display | Rows deduplicated per destination with `LAST SEEN` and `COUNT`, split into blocked and allowed | Same | P1 | done | One dependency install produces hundreds of identical allows; `-raw` still prints every decision |
 | SNI cross-check | Not documented | Deny a tunnel whose ClientHello names a forbidden host | P1 | done | Only possible after the `200`, so the client sees a broken handshake; the reason is in the log |
 | Resolved-address recheck | Not documented | Deny rules re-applied to the address a permitted name resolved to | P1 | done | Stops `allowed.test A 127.0.0.1` from becoming a path to host services |
-| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | planned | Belongs to the netstack, which is not yet in the datapath |
+| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | partial | The netstack is in the datapath and NATs nothing by default, so nothing routes out except through the proxy. Never observed against a real guest, and no policy decision is *recorded* for a dropped raw flow |
 | Hostname rules for non-HTTP | Don't work; IP addresses required | Same limitation, documented | P1 | done | Address and CIDR rules exist for exactly this |
 | IPv6 | Not documented | Covered by the rule language from the start | P1 | partial | TSI had no v6; a real NIC does. No routable v6 is handed to the guest |
 | DNS mediation | Not documented | Guest resolver pointed at the host-side gateway | P1 | partial | `io.containerd.nerdbox.ctr.dns`; the hook for name policy, not yet a closed channel |
-| Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | partial | **Live regression vs Docker until the netstack is wired into `run`**: the default path is still TSI, where the guest's `127.0.0.1` is the host's. `-net none` and the presets close it; nothing applies them yet |
+| Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | partial | Every sandbox `run` creates is wired to the stack instead of TSI, and every preset denies the host's loopback outright. Sandboxes created *before* this wiring existed are still on TSI, and Boks warns when it meets one |
 | Upstream proxy | Honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`; `DOCKER_SANDBOXES_PROXY` supports http/https/socks5/socks5h | Support an upstream proxy env var | P2 | none | socks5h delegates DNS to the proxy |
 | Port publishing | `--publish` at creation; `sbx ports SANDBOX --publish/--unpublish/--json` later; ignored when re-attaching | `boks ports` equivalent | P1 | none | The netstack can forward, and Boks explicitly asserts it does not. Spec `[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]`; omitting HOST_PORT allocates an ephemeral one |
 | Port binding defaults | Binds **loopback** by default, expanded per address family: `tcp`/`udp` bind both `127.0.0.1` and `::1`, or v4 only for a v4-only sandbox; `tcp4`/`udp4` v4 only; `tcp6`/`udp6` v6 only. Protocols: tcp, tcp4, tcp6, udp, udp4, udp6 | Same | P1 | none | Defaulting to loopback rather than all interfaces is the safe choice and should be copied exactly |
@@ -300,18 +310,20 @@ exists. See [security-model.md](security-model.md#network).
 
 ## 5. Credentials and secrets
 
-**Where Boks stands.** `internal/secret` implements the model and `boks proxy` applies it,
-over HTTP **and HTTPS**; `boks secret set/ls/rm` manages an encrypted host-side store. It is
-still not wired into `boks run`. HTTPS injection is paid for with a TLS termination, for the
-configured hosts and no others — see
+**Where Boks stands.** `internal/secret` implements the model and it is now applied by
+`boks run`, over HTTP **and HTTPS**; `boks secret set/ls/rm` manages an encrypted host-side
+store. The values are resolved by the foreground command and handed to the sandbox's network
+process on a pipe, so no long-lived process ever holds the passphrase and no secret appears
+in a command line. HTTPS injection is paid for with a TLS termination, for the configured
+hosts and no others — see
 [security-model.md](security-model.md#tls-interception-and-the-boks-ca).
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | partial | Works through `boks proxy` for HTTP and HTTPS; not wired into `run` |
+| Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | partial | Applied by `boks run` for HTTP and HTTPS. Never exercised against a real guest |
 | Credential grammar | v2 `credentials[]`: one service owns many `inject` rules, each with a domain, a header and a `format` or `scheme`, plus `proxyManaged` and an env var name | Same two-level shape | P1 | done | `-inject service@host[,host]=bearer\|basic[:user]\|header[:format]`; several hosts share one stored secret |
 | Schemes | `format` (`Bearer %s`) or `scheme` (`bearer`/`basic` with `username`), mutually exclusive | Same, with the same exclusivity enforced | P0 | done | A format string covers every vendor; basic auth keeps a username field because its value is base64(user:secret) |
-| Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | partial | Modelled, validated and printed; nothing writes a guest's environment yet |
+| Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | done | `-guest-credential service=ENV=placeholder` sets it in the sandbox's environment; a test drives a canary secret through and asserts only the placeholder arrives |
 | OAuth credentials | v2 `oauth`: sentinel access and refresh tokens in a guest credential file, swapped by the proxy for `resourceHosts` | Not implemented | P2 | none | The model leaves room for it: a credential is not assumed to be a single header |
 | HTTPS injection | Supported | Supported, by terminating TLS for the configured hosts only | P0 | done | Demonstrated: origin received the real secret, client had sent only a placeholder. Every other host stays a blind tunnel |
 | Interception CA | Self-signed proxy CA installed in the guest and exposed as an env var | Local CA under the state dir; `boks ca show/export/env/regenerate` | P0 | done | Private key never leaves the host; leaves minted from the policy target, never from the guest's ClientHello |
