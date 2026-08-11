@@ -301,8 +301,16 @@ func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 		return State{}, errors.New("enforce: the network supervisor reported ready but left no state")
 	}
 	if progress != nil {
-		fmt.Fprintf(progress, "network: %s stack for %s, proxy at %s (pid %d)\n",
-			st.Mode, st.Sandbox, orNone(st.ProxyURL), st.PID)
+		if st.ProxyURL == "" {
+			// -net none still runs a process: the VM's NIC has to have somewhere to
+			// write or it does not come up. Saying what it writes to is more useful
+			// than announcing a stack that is not there.
+			fmt.Fprintf(progress, "network: none for %s — the VM's NIC ends in a discard socket (pid %d)\n",
+				st.Sandbox, st.PID)
+		} else {
+			fmt.Fprintf(progress, "network: %s stack for %s, proxy at %s (pid %d)\n",
+				st.Mode, st.Sandbox, st.ProxyURL, st.PID)
+		}
 	}
 	return st, nil
 }
@@ -413,11 +421,4 @@ func ReadSpec(r io.Reader) (Spec, error) {
 		return Spec{}, fmt.Errorf("boks net serve: decoding the spec: %w", err)
 	}
 	return spec, nil
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "none"
-	}
-	return s
 }

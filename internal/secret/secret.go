@@ -530,16 +530,22 @@ func CredentialHosts(credentials []Credential) []string {
 // Placeholders returns the stand-in values a guest should be given, keyed by the
 // environment variable name where one was configured and by the service otherwise.
 //
-// Nothing consumes this yet: no part of Boks writes into a guest's environment. It is here
-// because the placeholder is a property of the credential, and because a guest with no
-// placeholder at all fails differently — and less obviously — than one holding a
-// well-shaped fake.
+// This is the guest-facing half of the guarantee: the tool inside the sandbox reads a value
+// *shaped* like a credential, and the proxy replaces it on the way out. A guest with no
+// placeholder at all fails differently and less obviously than one holding a well-shaped
+// fake — its client believes it is unauthenticated and never makes the request.
 func (i *Injector) Placeholders() map[string]string {
 	if i == nil {
 		return nil
 	}
+	return Placeholders(i.credentials)
+}
+
+// Placeholders is the Injector method for credentials that have not been bound to a
+// provider, which is the shape the code assembling a guest's environment has.
+func Placeholders(credentials []Credential) map[string]string {
 	out := map[string]string{}
-	for _, c := range i.credentials {
+	for _, c := range credentials {
 		if c.Placeholder == "" {
 			continue
 		}

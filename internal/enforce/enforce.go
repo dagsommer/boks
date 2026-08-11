@@ -40,6 +40,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -207,8 +208,35 @@ func (s Spec) Prepare() (Guest, error) {
 		g.Mounts = append(g.Mounts, mount)
 	}
 
-	g.Env = env
+	placeholders, err := s.placeholderEnv()
+	if err != nil {
+		return Guest{}, err
+	}
+	g.Env = append(env, placeholders...)
 	return g, nil
+}
+
+// placeholderEnv gives the guest a stand-in for each credential the proxy supplies.
+//
+// This is the guest-facing half of "the real secret never enters the guest": the tool
+// inside the sandbox reads ANTHROPIC_API_KEY, or GITHUB_TOKEN, and finds something
+// *shaped* like a credential, which the proxy replaces on the way out. Without it the
+// injection is invisible to the tool, which then believes it is unauthenticated and never
+// makes the request the proxy was waiting to sign.
+//
+// The value is the placeholder from the credential, never the secret. Nothing in this
+// package can put a real value in a guest's environment, and a test asserts it.
+func (s Spec) placeholderEnv() ([]string, error) {
+	credentials, err := s.Credentials()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for name, value := range secret.Placeholders(credentials) {
+		out = append(out, name+"="+value)
+	}
+	sort.Strings(out) // a stable environment, so a container spec does not churn
+	return out, nil
 }
 
 // noProxy keeps a guest's own loopback out of the proxy. Everything else goes through it,
