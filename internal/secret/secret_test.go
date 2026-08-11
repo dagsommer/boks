@@ -54,66 +54,126 @@ func TestValueNeverRendersItself(t *testing.T) {
 	}
 }
 
-func TestParseRule(t *testing.T) {
+func mustCredential(t *testing.T, service string, specs ...string) Credential {
+	t.Helper()
+	c := Credential{Service: service}
+	for _, spec := range specs {
+		got, rules, err := ParseInject(spec)
+		if err != nil {
+			t.Fatalf("ParseInject(%q): %v", spec, err)
+		}
+		if got != service {
+			t.Fatalf("ParseInject(%q) is for service %q, want %q", spec, got, service)
+		}
+		c.Inject = append(c.Inject, rules...)
+	}
+	return c
+}
+
+func TestParseInject(t *testing.T) {
 	tests := []struct {
-		spec       string
-		wantSecret string
-		wantScheme Scheme
-		wantExtra  string
+		spec        string
+		wantService string
+		wantDomains []string
+		wantHeader  string
+		wantFormat  string
 	}{
-		{"api.anthropic.com=anthropic:header:x-api-key", "anthropic", SchemeHeader, "x-api-key"},
-		{"github.com,api.github.com=gh:basic:x-access-token", "gh", SchemeBasic, "x-access-token"},
-		{"registry.example.com=reg:bearer", "reg", SchemeBearer, ""},
-		{"*.internal.example.com=tok:bearer", "tok", SchemeBearer, ""},
+		{"anthropic@api.anthropic.com=x-api-key", "anthropic", []string{"api.anthropic.com"}, "x-api-key", "%s"},
+		{"gh@github.com,api.github.com=bearer", "gh", []string{"github.com", "api.github.com"}, "Authorization", "Bearer %s"},
+		{"ado@pkgs.dev.azure.com=basic:x-access-token", "ado", []string{"pkgs.dev.azure.com"}, "Authorization", "Basic %s"},
+		{"odd@api.example.com=Authorization:token %s", "odd", []string{"api.example.com"}, "Authorization", "token %s"},
+		{"wild@*.internal.example.com=bearer", "wild", []string{"*.internal.example.com"}, "Authorization", "Bearer %s"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.spec, func(t *testing.T) {
-			r, err := ParseRule(tc.spec)
+			service, rules, err := ParseInject(tc.spec)
 			if err != nil {
-				t.Fatalf("ParseRule: %v", err)
+				t.Fatalf("ParseInject: %v", err)
 			}
-			if r.Secret != tc.wantSecret || r.Scheme != tc.wantScheme {
-				t.Errorf("got %s:%s, want %s:%s", r.Secret, r.Scheme, tc.wantSecret, tc.wantScheme)
+			if service != tc.wantService {
+				t.Errorf("service = %q, want %q", service, tc.wantService)
 			}
-			extra := r.Header
-			if r.Scheme == SchemeBasic {
-				extra = r.Username
+			if len(rules) != len(tc.wantDomains) {
+				t.Fatalf("got %d rules, want %d", len(rules), len(tc.wantDomains))
 			}
-			if extra != tc.wantExtra {
-				t.Errorf("extra = %q, want %q", extra, tc.wantExtra)
-			}
-			// The rendered form must round-trip, so `boks policy ls` output can be
-			// pasted back into a flag.
-			back, err := ParseRule(r.String())
-			if err != nil {
-				t.Fatalf("re-parsing %q: %v", r.String(), err)
-			}
-			if back.String() != r.String() {
-				t.Errorf("round trip: %q -> %q", r.String(), back.String())
+			for i, want := range tc.wantDomains {
+				if rules[i].Domain.String() != want {
+					t.Errorf("domain %d = %q, want %q", i, rules[i].Domain, want)
+				}
+				if rules[i].header() != tc.wantHeader {
+					t.Errorf("header = %q, want %q", rules[i].header(), tc.wantHeader)
+				}
+				if rules[i].effectiveFormat() != tc.wantFormat {
+					t.Errorf("format = %q, want %q", rules[i].effectiveFormat(), tc.wantFormat)
+				}
 			}
 		})
 	}
 }
 
-// TestParseRuleRejectsCatchAll is a security property, not a parsing detail: a credential
-// destination of "*" would send the token wherever the guest chose.
-func TestParseRuleRejectsCatchAll(t *testing.T) {
+// TestParseInjectRejectsDangerousRules covers security properties, not parsing details: a
+// catch-all domain would send the token wherever the guest chose *and* decrypt everything,
+// and a format that can carry a newline turns one header into two.
+func TestParseInjectRejectsDangerousRules(t *testing.T) {
 	bad := []string{
-		"*=tok:bearer",
-		"github.com,*=tok:bearer",
-		"github.com=tok:header",       // header scheme with no header name
-		"github.com=tok:oauth",        // unknown scheme
-		"github.com=tok:bearer:extra", // bearer takes no third field
-		"github.com=:bearer",          // no secret name
-		"github.com",                  // no '=' at all
-		"=tok:bearer",
+		"tok@*=bearer",
+		"tok@github.com,*=bearer",
+		"tok@github.com=bearer:extra",          // bearer takes no further field
+		"tok@github.com=Authorization:no-verb", // no %s at all
+		"tok@github.com=Authorization:%s %s",   // two of them
+		"tok@github.com=Authorization:%d",      // wrong verb
+		"tok@github.com=",                      // no attachment
+		"@github.com=bearer",                   // no service
+		"tok@=bearer",                          // no host
+		"github.com=bearer",                    // no service@
+		"tok@github.com",                       // no attachment at all
 	}
 	for _, spec := range bad {
 		t.Run(spec, func(t *testing.T) {
-			if r, err := ParseRule(spec); err == nil {
-				t.Errorf("ParseRule(%q) = %v, want an error", spec, r)
+			if service, rules, err := ParseInject(spec); err == nil {
+				t.Errorf("ParseInject(%q) = %s %v, want an error", spec, service, rules)
 			}
 		})
+	}
+	// A newline inside a value format would let a credential forge a second header.
+	r := Inject{Domain: policy.MustPattern("api.example.com"), Header: "Authorization", Format: "Bearer %s\r\nX-Evil: 1"}
+	if err := r.Validate(); err == nil {
+		t.Error("a value format containing CRLF was accepted")
+	}
+	// So would one in a header name.
+	if err := (Inject{Domain: policy.MustPattern("api.example.com"), Header: "X\r\nEvil", Format: "%s"}).Validate(); err == nil {
+		t.Error("a header name containing CRLF was accepted")
+	}
+	// Format and scheme are alternatives, never both.
+	both := Inject{Domain: policy.MustPattern("api.example.com"), Scheme: SchemeBearer, Format: "Bearer %s"}
+	if err := both.Validate(); err == nil {
+		t.Error("a rule setting both a scheme and a format was accepted")
+	}
+	// The zero pattern matches everything; it must not be usable as a domain.
+	if err := (Inject{Scheme: SchemeBearer}).Validate(); err == nil {
+		t.Error("a rule with no domain was accepted")
+	}
+}
+
+func TestParseGuestCredential(t *testing.T) {
+	service, env, placeholder, err := ParseGuestCredential("gh=GH_TOKEN=gho_sbxproxymanaged000000000000000000000")
+	if err != nil {
+		t.Fatalf("ParseGuestCredential: %v", err)
+	}
+	if service != "gh" || env != "GH_TOKEN" || placeholder != "gho_sbxproxymanaged000000000000000000000" {
+		t.Errorf("got %q %q %q", service, env, placeholder)
+	}
+	service, env, placeholder, err = ParseGuestCredential("gh=gho_something")
+	if err != nil {
+		t.Fatalf("ParseGuestCredential: %v", err)
+	}
+	if service != "gh" || env != "" || placeholder != "gho_something" {
+		t.Errorf("got %q %q %q", service, env, placeholder)
+	}
+	// A placeholder that is empty is worse than none: the guest's own client then fails
+	// in a way that looks like a boks bug.
+	if _, _, _, err := ParseGuestCredential("gh="); err == nil {
+		t.Error("an empty placeholder was accepted")
 	}
 }
 
@@ -126,7 +186,7 @@ func mustTarget(t *testing.T, hostport string) policy.Target {
 	return tgt
 }
 
-func TestInjectorSchemes(t *testing.T) {
+func TestInjectorAttachmentForms(t *testing.T) {
 	provider := MapProvider{"tok": canary}
 
 	tests := []struct {
@@ -134,18 +194,15 @@ func TestInjectorSchemes(t *testing.T) {
 		wantHeader string
 		wantValue  string
 	}{
-		{"api.example.com=tok:bearer", "Authorization", "Bearer " + canary},
-		{"api.example.com=tok:header:x-api-key", "X-Api-Key", canary},
-		{"api.example.com=tok:basic:x-access-token", "Authorization",
+		{"tok@api.example.com=bearer", "Authorization", "Bearer " + canary},
+		{"tok@api.example.com=x-api-key", "X-Api-Key", canary},
+		{"tok@api.example.com=Authorization:token %s", "Authorization", "token " + canary},
+		{"tok@api.example.com=basic:x-access-token", "Authorization",
 			"Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+canary))},
 	}
 	for _, tc := range tests {
 		t.Run(tc.spec, func(t *testing.T) {
-			rule, err := ParseRule(tc.spec)
-			if err != nil {
-				t.Fatalf("ParseRule: %v", err)
-			}
-			inj, err := NewInjector(provider, rule)
+			inj, err := NewInjector(provider, mustCredential(t, "tok", tc.spec))
 			if err != nil {
 				t.Fatalf("NewInjector: %v", err)
 			}
@@ -164,12 +221,39 @@ func TestInjectorSchemes(t *testing.T) {
 	}
 }
 
-func TestInjectorScoping(t *testing.T) {
-	rule, err := ParseRule("api.example.com,*.svc.example.com=tok:bearer")
+// TestOneSecretManyHosts is the reason the model has two levels: several destinations share
+// one stored secret, and the attachment is written once per destination group rather than
+// the secret being repeated.
+func TestOneSecretManyHosts(t *testing.T) {
+	cred := mustCredential(t, "ghe",
+		"ghe@ghe.example.com,api.ghe.example.com=bearer",
+		"ghe@pkgs.example.com=basic:x-access-token")
+	inj, err := NewInjector(MapProvider{"ghe": canary}, cred)
 	if err != nil {
-		t.Fatalf("ParseRule: %v", err)
+		t.Fatalf("NewInjector: %v", err)
 	}
-	inj, err := NewInjector(MapProvider{"tok": canary}, rule)
+	for _, host := range []string{"ghe.example.com:443", "api.ghe.example.com:443"} {
+		h := http.Header{}
+		if _, err := inj.Apply(context.Background(), mustTarget(t, host), h); err != nil {
+			t.Fatalf("Apply(%s): %v", host, err)
+		}
+		if h.Get("Authorization") != "Bearer "+canary {
+			t.Errorf("%s got %q", host, h.Get("Authorization"))
+		}
+	}
+	h := http.Header{}
+	if _, err := inj.Apply(context.Background(), mustTarget(t, "pkgs.example.com:443"), h); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+canary))
+	if h.Get("Authorization") != want {
+		t.Errorf("the same secret attached the other way = %q, want %q", h.Get("Authorization"), want)
+	}
+}
+
+func TestInjectorScoping(t *testing.T) {
+	inj, err := NewInjector(MapProvider{"tok": canary},
+		mustCredential(t, "tok", "tok@api.example.com,*.svc.example.com=bearer"))
 	if err != nil {
 		t.Fatalf("NewInjector: %v", err)
 	}
@@ -200,16 +284,18 @@ func TestInjectorScoping(t *testing.T) {
 			if got != (len(used) > 0) {
 				t.Errorf("used = %v but header injected = %v", used, got)
 			}
+			// Whatever decides injection also decides interception, or a host gets
+			// decrypted for nothing.
+			if inj.Handles(mustTarget(t, tc.target)) != tc.want {
+				t.Errorf("Handles disagrees with injection for %s", tc.target)
+			}
 		})
 	}
 }
 
 func TestInjectorReportsMissingSecretWithoutLeaking(t *testing.T) {
-	rule, err := ParseRule("api.example.com=absent:bearer")
-	if err != nil {
-		t.Fatalf("ParseRule: %v", err)
-	}
-	inj, err := NewInjector(MapProvider{"other": canary}, rule)
+	inj, err := NewInjector(MapProvider{"other": canary},
+		mustCredential(t, "absent", "absent@api.example.com=bearer"))
 	if err != nil {
 		t.Fatalf("NewInjector: %v", err)
 	}
@@ -229,6 +315,65 @@ func TestInjectorReportsMissingSecretWithoutLeaking(t *testing.T) {
 	}
 }
 
+// TestCredentialWithNoRulesIsRejected: a credential nothing can use is a configuration
+// mistake, and accepting it silently means a secret that never arrives anywhere.
+func TestCredentialWithNoRulesIsRejected(t *testing.T) {
+	if _, err := NewInjector(MapProvider{"tok": canary}, Credential{Service: "tok"}); err == nil {
+		t.Error("a credential with no injection rules was accepted")
+	}
+	dup := mustCredential(t, "tok", "tok@api.example.com=bearer")
+	if _, err := NewInjector(MapProvider{"tok": canary}, dup, dup); err == nil {
+		t.Error("the same service was accepted twice")
+	}
+}
+
+func TestPlaceholdersAreKeyedByEnvironmentVariable(t *testing.T) {
+	cred := mustCredential(t, "gh", "gh@github.com=bearer")
+	cred.EnvName, cred.Placeholder, cred.ProxyManaged = "GH_TOKEN", "gho_sbxproxymanaged000000000000000000000", true
+	other := mustCredential(t, "anthropic", "anthropic@api.anthropic.com=x-api-key")
+	other.Placeholder = "sk-ant-api03-placeholder"
+
+	inj, err := NewInjector(MapProvider{"gh": canary, "anthropic": canary}, cred, other)
+	if err != nil {
+		t.Fatalf("NewInjector: %v", err)
+	}
+	got := inj.Placeholders()
+	if got["GH_TOKEN"] != cred.Placeholder {
+		t.Errorf("placeholders = %v, want it keyed by the environment variable", got)
+	}
+	if got["anthropic"] != other.Placeholder {
+		t.Errorf("a credential with no environment variable should be keyed by service: %v", got)
+	}
+	// A placeholder is not a secret, and must not be redacted into uselessness: the guest
+	// has to be given the literal value.
+	if strings.Contains(fmt.Sprint(got), Redacted) {
+		t.Errorf("placeholders were redacted: %v", got)
+	}
+}
+
+func TestHostsListsWhatWillBeDecrypted(t *testing.T) {
+	first := mustCredential(t, "tok", "tok@b.test,a.test=bearer")
+	second := mustCredential(t, "other", "other@a.test=x-key")
+	inj, err := NewInjector(MapProvider{"tok": canary, "other": canary}, first, second)
+	if err != nil {
+		t.Fatalf("NewInjector: %v", err)
+	}
+	want := []string{"a.test", "b.test"}
+	got := inj.Hosts()
+	if len(got) != len(want) {
+		t.Fatalf("Hosts = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Hosts = %v, want %v (sorted and deduplicated)", got, want)
+		}
+	}
+	var nilInjector *Injector
+	if nilInjector.Hosts() != nil || nilInjector.Handles(mustTarget(t, "a.test:443")) {
+		t.Error("a nil injector claims to handle something")
+	}
+}
+
 func TestNilInjectorIsANoop(t *testing.T) {
 	var inj *Injector
 	h := http.Header{}
@@ -236,8 +381,8 @@ func TestNilInjectorIsANoop(t *testing.T) {
 	if err != nil || len(used) != 0 || len(h) != 0 {
 		t.Errorf("nil injector did something: used=%v err=%v h=%v", used, err, h)
 	}
-	if inj.Rules() != nil {
-		t.Error("nil injector reported rules")
+	if inj.Credentials() != nil {
+		t.Error("nil injector reported credentials")
 	}
 }
 
