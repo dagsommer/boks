@@ -117,6 +117,20 @@ const (
 	unixPathMaxDarwin = 104 // sun_path on macOS/BSD; Linux allows 108
 )
 
+// ModeFromAnnotations reads back the mode a container was created with.
+//
+// A sandbox's mode is fixed when it is created, because it is expressed in annotations the
+// runtime reads at boot. A later command that has to bring the sandbox up — `boks exec` on a
+// stopped sandbox, `boks start` — must serve the network the container was wired for rather
+// than the one its own flags default to, or it would attach a stack to a container that is
+// not connected to it, or none to a container that is.
+func ModeFromAnnotations(annotations map[string]string) Mode {
+	if _, ok := annotations[annotationCtrNet+".0"]; ok {
+		return ModeNAT
+	}
+	return ModeNone
+}
+
 // Config describes the network a sandbox should get.
 type Config struct {
 	Mode Mode

@@ -37,6 +37,11 @@ type Info struct {
 	Workspaces  []WorkspaceRef `json:"workspaces"`
 	Command     []string       `json:"command,omitempty"`
 	Env         []string       `json:"env,omitempty"`
+	// Annotations are the OCI annotations the sandbox was created with. They are how the
+	// runtime is configured — resources and networking — so they are the record of what a
+	// sandbox is wired to, and a later command that has to bring it back up reads its
+	// network mode from here rather than guessing.
+	Annotations map[string]string `json:"annotations,omitempty"`
 	Cwd         string         `json:"cwd,omitempty"`
 	PID         uint32         `json:"pid,omitempty"`
 	ExitCode    *uint32        `json:"exit_code,omitempty"`
@@ -222,6 +227,84 @@ func stopContainer(ctx context.Context, container client.Container) error {
 	return nil
 }
 
+// WaitUntilStopped blocks until the sandbox's task is gone — exited, deleted, or the whole
+// container removed — and returns nil when it is.
+//
+// It exists for the network supervisor, whose life is exactly the life of the VM it serves.
+// Two things make it more than a status poll. It tolerates the task not existing *yet*,
+// because the caller starts before the task does: the VM connects to the link socket while
+// it boots, so the network cannot be brought up afterwards. And it gives up if no task
+// appears within appear, so that a run which failed between "start the network" and "start
+// the sandbox" does not leave a stack holding a socket for nobody.
+//
+// Polling rather than watching containerd's event stream: the interval is a local gRPC call
+// and the cost of missing an event is a stack that lingers for one interval, while the cost
+// of a dropped stream is a stack that lingers forever.
+func WaitUntilStopped(ctx context.Context, address, name string, appear, interval time.Duration) error {
+	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
+	c, err := connect(ctx, address)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if interval <= 0 {
+		interval = time.Second
+	}
+	appearBy := time.Now().Add(appear)
+	seen := false
+
+	for {
+		running, err := taskRunning(ctx, c, name)
+		if err != nil {
+			return err
+		}
+		switch {
+		case running:
+			seen = true
+		case seen:
+			return nil // it ran, and now it does not
+		case time.Now().After(appearBy):
+			return fmt.Errorf("sandbox %q never started within %s", name, appear)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// taskRunning reports whether the sandbox currently has a live task. A missing container or
+// a missing task both mean "not running" rather than an error: the caller is watching for
+// exactly that transition, and a sandbox removed out from under it is one way it happens.
+func taskRunning(ctx context.Context, c *client.Client, name string) (bool, error) {
+	container, err := c.LoadContainer(ctx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("looking up sandbox %q: %w", name, err)
+	}
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading sandbox %q: %w", name, err)
+	}
+	status, err := task.Status(ctx)
+	if err != nil {
+		return false, nil
+	}
+	switch status.Status {
+	case client.Running, client.Paused, client.Created:
+		return true, nil
+	}
+	return false, nil
+}
+
 // Remove deletes a sandbox and its snapshot. A running sandbox is refused unless force is
 // set, so that `boks rm` cannot silently kill work in progress.
 func Remove(ctx context.Context, address, name string, force bool) error {
@@ -347,9 +430,12 @@ func describe(ctx context.Context, container client.Container) (Info, error) {
 		Command:     decodeCommand(info.Labels),
 	}
 
-	if spec, err := container.Spec(ctx); err == nil && spec.Process != nil {
-		out.Env = spec.Process.Env
-		out.Cwd = spec.Process.Cwd
+	if spec, err := container.Spec(ctx); err == nil {
+		out.Annotations = spec.Annotations
+		if spec.Process != nil {
+			out.Env = spec.Process.Env
+			out.Cwd = spec.Process.Cwd
+		}
 	}
 
 	task, err := container.Task(ctx, nil)
