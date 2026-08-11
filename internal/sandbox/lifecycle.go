@@ -27,6 +27,7 @@ const (
 // Info is everything Boks knows about one sandbox, all of it read back from containerd.
 type Info struct {
 	Name        string         `json:"name"`
+	Agent       string         `json:"agent,omitempty"`
 	Status      string         `json:"status"`
 	Image       string         `json:"image"`
 	Runtime     string         `json:"runtime"`
@@ -103,6 +104,47 @@ func List(ctx context.Context, address string) ([]Info, error) {
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Created.Before(infos[j].Created) })
 	return infos, nil
+}
+
+// Find returns one sandbox by name, reporting absence as a false rather than an error, for
+// callers deciding whether to create it.
+func Find(ctx context.Context, address, name string) (Info, bool, error) {
+	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
+	c, err := connect(ctx, address)
+	if err != nil {
+		return Info{}, false, err
+	}
+	defer c.Close()
+
+	container, err := c.LoadContainer(ctx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return Info{}, false, nil
+		}
+		return Info{}, false, fmt.Errorf("looking up sandbox %q: %w", name, err)
+	}
+	info, err := describe(ctx, container)
+	if err != nil {
+		return Info{}, false, err
+	}
+	return info, true, nil
+}
+
+// Choose decides which sandbox an agent and workspace map to, against the sandboxes that
+// exist on this host. It is ChooseName with containerd as the lookup.
+func Choose(ctx context.Context, address, agent, hostPath string) (Choice, error) {
+	infos, err := List(ctx, address)
+	if err != nil {
+		return Choice{}, err
+	}
+	byName := make(map[string]Info, len(infos))
+	for _, info := range infos {
+		byName[info.Name] = info
+	}
+	return ChooseName(agent, hostPath, func(name string) (Info, bool) {
+		info, ok := byName[name]
+		return info, ok
+	})
 }
 
 // Inspect returns the full detail of one sandbox.
@@ -294,6 +336,7 @@ func describe(ctx context.Context, container client.Container) (Info, error) {
 
 	out := Info{
 		Name:        container.ID(),
+		Agent:       info.Labels[LabelAgent],
 		Status:      StatusStopped,
 		Image:       info.Image,
 		Runtime:     info.Runtime.Name,
