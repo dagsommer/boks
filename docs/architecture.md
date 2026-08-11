@@ -14,7 +14,10 @@ implementation built from open-source components; it is not derived from Docker'
 ## Layering
 
 ```
-boks CLI  (cmd/boks)
+boks CLI  (cmd/boks, internal/cli)
+    |
+    v
+agent registry (internal/agent)        -- name -> image, startup command, args mode
     |
     v
 orchestration  (internal/sandbox)      -- resolves workspace, image, spec; owns lifecycle
@@ -52,12 +55,13 @@ open-source software. Boks does not implement a VMM, a kernel or a shim.
 | Guest root filesystem format | EROFS | required on macOS, optional on Linux |
 | Workspace resolution, exact-path mounting | **Boks** | OCI spec construction |
 | Host prerequisite diagnosis (`doctor`) | **Boks** | |
-| Sandbox naming, state, lifecycle | **Boks** | |
+| Sandbox naming, state, lifecycle | **Boks** | the derived name is the identity; see *Persistence and sandbox state* |
+| Agent definitions | **Boks** — `internal/agent` | data, not code: name, image, command, args mode. `Registry.Add` is where user-defined agents will arrive |
 | Network policy engine | **Boks** — `internal/policy` *(built, not enforcing)* | see *Networking* |
 | Host network stack config + supervision | **Boks** — `internal/network` *(built, not wired)* | gvisor-tap-vsock, embedded |
 | Host proxy + credential injection | **Boks** — `internal/proxy`, `internal/secret` *(built, cooperating-client only)* | |
 | Port forwarding | **Boks** *(unverified)* | |
-| Kits / declarative config | **Boks** *(not started)* | |
+| Kits / declarative config | **Boks** *(not started)* | the loader that will feed `Registry.Add`; no schema yet, by choice |
 | Nested Docker daemon | guest image + **Boks** *(not started)* | |
 
 ## Why nerdbox
@@ -80,6 +84,9 @@ without touching the CLI or the workspace logic.
 
 ## VM lifecycle
 
+0. `boks run [agent] [workspace...]` resolves the agent — a name, an image, a startup
+   command and an args mode, from `internal/agent` — and derives the sandbox name from that
+   agent and the primary workspace.
 1. `boks run` connects to containerd and selects a namespace (`boks`).
 2. Image is pulled if absent, and unpacked with the snapshotter the runtime needs
    (`erofs` for nerdbox).
@@ -116,7 +123,7 @@ contents are never shared.
 One caveat inherited from nerdbox: bind-mounting a *single file* shares its **parent
 directory** with the VM. Boks therefore only mounts directories for workspaces.
 
-*(verified 2026-08-11: `boks run /private/tmp/boksprobe/deep/a/b/c/project -- pwd` printed
+*(verified 2026-08-11: `boks run shell /private/tmp/boksprobe/deep/a/b/c/project -- pwd` printed
 that exact path inside the guest; the intermediate directories were created automatically
 and each contained only the next component of the path, nothing from the host.)*
 
@@ -260,25 +267,31 @@ writable snapshot; `stop` kills and deletes the *task*, leaving both, and `start
 new task over the same snapshot. Only `rm` deletes the container and the snapshot.
 
 So that a sandbox outlives whatever command created it, the container's own process is an
-idle keeper (`sh` trapping SIGTERM and sleeping), and user commands are containerd *execs*
-inside it. `boks run` therefore means: create if absent, start if stopped, then exec. This is
-also what makes `boks exec` possible at all — containerd can only exec into a running task.
+idle keeper — a shell that sleeps, and on SIGTERM sends SIGTERM to every process in the
+guest before exiting, so an exec'd build or server is asked to stop rather than killed. User
+commands are containerd *execs* inside it. `boks run` therefore means: create if absent,
+start if stopped, then exec, and `boks exec` starts a stopped sandbox for the same reason —
+containerd can only exec into a running task, so there is nothing to ask the user.
 
 **There is no host-side state store, deliberately.** containerd's container record already
 holds the name, image, runtime, snapshotter, creation time and full OCI spec; container
-labels carry the two things it cannot express — the workspaces the sandbox was created for
-(`dev.boks.workspaces`) and the default command (`dev.boks.command`) — plus a marker
-(`dev.boks.managed`) so Boks ignores containers it did not create. `ls` and `inspect` are
+labels carry the three things it cannot express — the workspaces the sandbox was created
+for (`dev.boks.workspaces`), the default command (`dev.boks.command`) and the agent it runs
+(`dev.boks.agent`) — plus a marker (`dev.boks.managed`) so Boks ignores containers it did
+not create. `ls` and `inspect` are
 derived views over containerd, which means there is no file to fall out of sync with
 reality, nothing orphaned when a sandbox is removed by other means, and no per-user state
 directory to place correctly on each platform. If something ever genuinely cannot live in
 containerd, it belongs under the platform's state directory (`~/.local/state/boks` on Linux,
 `~/Library/Application Support/boks` on macOS) — not a hardcoded Linux path.
 
-Identity: the sandbox name is derived from the workspace's absolute host path
-(`boks-<12 hex of sha256>`) unless `-name` says otherwise, which is what makes a second
-`boks run` in the same directory re-attach instead of duplicating. See open question 3 in
-[docker-sandbox-parity.md](docker-sandbox-parity.md) for the reasoning and its consequences.
+Identity: the sandbox name is derived from the agent and the workspace's directory name
+(`<agent>-<dir>`, as sbx does) unless `-name` says otherwise, which is what makes a second
+`boks run` with the same agent in the same directory re-attach instead of duplicating. The
+name *is* the identity — there is no separate key — so the derivation has to answer for
+characters containerd rejects, two directories sharing a basename, filesystem roots and
+containerd's length limit. Each of those decisions, and their consequences, is in section 2a
+of [docker-sandbox-parity.md](docker-sandbox-parity.md).
 
 `boks run -rm` keeps the original ephemeral behaviour: the command is the container process
 and the container, task and snapshot are gone when it exits.
