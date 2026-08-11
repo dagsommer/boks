@@ -16,28 +16,68 @@ func TestBuiltinNames(t *testing.T) {
 	}
 }
 
-// Only the shell agent can run today. The rest are known names without an environment,
-// which is a different answer from "no such agent" and has to read as one.
-func TestOnlyShellIsRunnable(t *testing.T) {
+// Every agent Boks ships an image for runs without being told one, and every one of those
+// images is a Boks image at the published tag.
+func TestRunnableAgentsPointAtBoksImages(t *testing.T) {
 	r := Builtin()
 	shell, ok := r.Lookup("shell")
 	if !ok {
 		t.Fatal("the default agent is not registered")
 	}
-	if !shell.Runnable() {
-		t.Error("the shell agent has no image")
+	// The shell agent is the base image itself, not an image of its own.
+	if shell.Image != Image("base") {
+		t.Errorf("shell image = %q, want the base image %q", shell.Image, Image("base"))
 	}
 	if err := RequireRunnable(shell); err != nil {
 		t.Errorf("RequireRunnable(shell) = %v, want nil", err)
 	}
 
-	claude, _ := r.Lookup("claude")
-	err := RequireRunnable(claude)
+	for _, a := range r.All() {
+		if !a.Runnable() {
+			continue
+		}
+		if !strings.HasPrefix(a.Image, ImageRepo+"/") {
+			t.Errorf("agent %q runs %q, which is not a Boks image", a.Name, a.Image)
+		}
+		if !strings.HasSuffix(a.Image, ":"+ImageTag) {
+			t.Errorf("agent %q runs %q, which is not at the published tag %q", a.Name, a.Image, ImageTag)
+		}
+		// An image Boks builds carries tini and the CA entrypoint, and a sandbox
+		// bypasses the image's own ENTRYPOINT, so the definition has to name them.
+		if len(a.Init) == 0 {
+			t.Errorf("agent %q has an image but no init prefix", a.Name)
+		}
+	}
+}
+
+// Kiro is registered without an image. That has to read as "the name is right, the
+// environment is missing", which is a different answer from "no such agent".
+func TestAnAgentWithoutAnImageExplainsItself(t *testing.T) {
+	kiro, ok := Builtin().Lookup("kiro")
+	if !ok {
+		t.Fatal("kiro is not registered")
+	}
+	if kiro.Runnable() {
+		t.Fatal("kiro was reported as runnable; update this test if an image now exists")
+	}
+	err := RequireRunnable(kiro)
 	if err == nil {
 		t.Fatal("an agent with no image was reported as runnable")
 	}
 	if !strings.Contains(err.Error(), "-template") {
 		t.Errorf("error = %q, want it to say how to supply an image", err)
+	}
+}
+
+// -template puts the agent in an image Boks knows nothing about, where the paths in Init do
+// not exist. Bare is what keeps the command runnable there.
+func TestBareDropsTheInitPrefix(t *testing.T) {
+	claude, _ := Builtin().Lookup("claude")
+	if got := claude.Argv(nil); !slices.Equal(got, append(slices.Clone(initArgv), "claude")) {
+		t.Errorf("Argv = %v, want the init prefix in front of the command", got)
+	}
+	if got := claude.Bare().Argv(nil); !slices.Equal(got, []string{"claude"}) {
+		t.Errorf("Bare().Argv = %v, want just the command", got)
 	}
 }
 
@@ -69,6 +109,14 @@ func TestArgv(t *testing.T) {
 			[]string{"uname", "-a"}, []string{"uname", "-a"}},
 		{"no command of its own", Agent{Args: ArgsAppend}, []string{"ls"}, []string{"ls"}},
 		{"image default", Agent{}, nil, nil},
+		{"init comes first", Agent{Init: []string{"tini", "--"}, Command: []string{"claude"}}, nil,
+			[]string{"tini", "--", "claude"}},
+		{"init survives appended arguments",
+			Agent{Init: []string{"tini", "--"}, Command: []string{"claude"}, Args: ArgsAppend},
+			[]string{"--continue"}, []string{"tini", "--", "claude", "--continue"}},
+		{"init survives a replaced command",
+			Agent{Init: []string{"tini", "--"}, Command: []string{"/bin/bash"}, Args: ArgsCommand},
+			[]string{"uname", "-a"}, []string{"tini", "--", "uname", "-a"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
