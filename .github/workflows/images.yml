@@ -1,0 +1,188 @@
+# Build and publish the Boks agent images to ghcr.io/dagsommer/boks/*.
+#
+# The shape of this workflow is a security decision, not an accident of convenience. Read
+# the comment on the `push` job before simplifying it into a single `docker buildx
+# --push`, which is what it will look like it wants to be.
+name: images
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push to GHCR (otherwise build only)"
+        type: boolean
+        default: false
+
+env:
+  IMAGE_REPO: ghcr.io/dagsommer/boks
+
+# Nothing at the top level gets more than read. Each job asks for what it needs.
+permissions:
+  contents: read
+
+jobs:
+  # Resolve the tag once, from internal/agent, so the images and the registry that resolves
+  # an agent to an image can never disagree about what version means.
+  tag:
+    runs-on: ubuntu-24.04
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      images: ${{ steps.resolve.outputs.images }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: resolve
+        run: |
+          set -euo pipefail
+          image_tag="$(sed -n 's/^const ImageTag = "\(.*\)"$/\1/p' internal/agent/agent.go)"
+          if [ -z "$image_tag" ]; then
+            echo "could not read ImageTag from internal/agent/agent.go" >&2
+            exit 1
+          fi
+          # A release tag that disagrees with the constant would publish images the built
+          # binary does not point at. Fail here rather than ship that.
+          if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$image_tag" ]; then
+            echo "git tag ${GITHUB_REF_NAME} does not match agent.ImageTag ${image_tag}" >&2
+            exit 1
+          fi
+          echo "image_tag=$image_tag" >>"$GITHUB_OUTPUT"
+          # The agent images are every directory under images/ except the base.
+          images="$(ls images | grep -v '^base$' | jq -R . | jq -sc .)"
+          echo "images=$images" >>"$GITHUB_OUTPUT"
+
+  # The job that executes third-party code. Every image here runs an installer, a vendor
+  # binary, or an unpacked archive we did not write, so this job is assumed to be the one
+  # an attacker gets to. It therefore holds no registry credential: `permissions` is
+  # read-only and there is no login step. The worst a poisoned build can do is produce a bad
+  # artifact, which is still bad — but it cannot publish it, and it cannot steal a token
+  # that would let it publish anything else.
+  #
+  # One runner per architecture rather than QEMU: the arm64 build is native, so it is
+  # minutes instead of an hour, and an emulated apt/npm run is its own source of flakiness.
+  build:
+    needs: tag
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    # A throwaway registry on the runner. The agent images are `FROM` the base, and buildx's
+    # container driver resolves references through a registry rather than through the local
+    # docker image store — so the base has to be somewhere fetchable before anything can
+    # build on it, and it must not be GHCR, because this job holds no GHCR credential.
+    # Nothing published here outlives the job.
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."localhost:5000"]
+              http = true
+
+      - name: Build every image to an OCI archive
+        env:
+          IMAGE_TAG: ${{ needs.tag.outputs.image_tag }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          AGENT_IMAGES: ${{ join(fromJSON(needs.tag.outputs.images), ' ') }}
+        run: |
+          set -euo pipefail
+          mkdir -p oci
+          staged="localhost:5000/base:${IMAGE_TAG}"
+
+          # The base first, into the local registry, so the agent builds can pull it.
+          docker buildx build --platform "$PLATFORM" --tag "$staged" --push images/base
+
+          # Then everything, base included, exported as archives. The base build repeats
+          # here but is served from cache; it is exported rather than re-run.
+          #
+          # Provenance and an SBOM on every image: if we ask people to run our images, they
+          # are entitled to know what went into them and which workflow put it there.
+          for name in base $AGENT_IMAGES; do
+            args=()
+            if [ "$name" != base ]; then
+              args+=(--build-arg "BASE_IMAGE=${staged}")
+            fi
+            docker buildx build \
+              --platform "$PLATFORM" \
+              --provenance=mode=max \
+              --sbom=true \
+              "${args[@]}" \
+              --tag "${IMAGE_REPO}/${name}:${IMAGE_TAG}" \
+              --output "type=oci,dest=oci/${name}-${ARCH}.tar" \
+              "images/${name}"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oci-${{ matrix.arch }}
+          path: oci/*.tar
+          retention-days: 3
+          compression-level: 0 # already compressed layers
+
+  # The job that holds the credential. It runs no third-party code: it downloads the
+  # archives the build produced and copies bytes into the registry. Splitting it out is the
+  # whole point — `packages: write` never coexists with someone else's install script in the
+  # same runner. Do not merge this back into `build` for tidiness.
+  push:
+    needs: [tag, build]
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: oci-*
+          path: oci
+          merge-multiple: true
+
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push each architecture, then join them into one multi-arch tag
+        env:
+          IMAGE_TAG: ${{ needs.tag.outputs.image_tag }}
+          AGENT_IMAGES: ${{ join(fromJSON(needs.tag.outputs.images), ' ') }}
+        run: |
+          set -euo pipefail
+          for name in base $AGENT_IMAGES; do
+            for arch in amd64 arm64; do
+              # --all carries the attestation manifests alongside the image manifest.
+              skopeo copy --all \
+                "oci-archive:oci/${name}-${arch}.tar" \
+                "docker://${IMAGE_REPO}/${name}:${IMAGE_TAG}-${arch}"
+            done
+            # The per-arch tags stay published: they are what the index points at, and
+            # deleting them would break the multi-arch tag that references them.
+            docker buildx imagetools create \
+              --tag "${IMAGE_REPO}/${name}:${IMAGE_TAG}" \
+              "${IMAGE_REPO}/${name}:${IMAGE_TAG}-amd64" \
+              "${IMAGE_REPO}/${name}:${IMAGE_TAG}-arm64"
+          done

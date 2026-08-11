@@ -1,0 +1,14 @@
+#!/bin/sh
+# Prepare the guest, then become the command it was asked to run.
+#
+# `exec` matters: the entrypoint must not stay in the process tree, or it — not tini and not
+# the agent — is what signals reach and what exit code the sandbox reports.
+set -eu
+
+boks-install-ca
+
+if [ "$#" -eq 0 ]; then
+	set -- /bin/bash
+fi
+
+exec "$@"
