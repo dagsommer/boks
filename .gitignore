@@ -24,3 +24,6 @@ secrets/
 *.swp
 .idea/
 .vscode/
+
+# Agent worktrees and local Claude state
+.claude/
