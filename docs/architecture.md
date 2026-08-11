@@ -166,7 +166,10 @@ guest --virtio-net--> unix socket --> gvisor netstack (host) --> policy engine -
 
 Raw TCP/UDP to unapproved destinations is dropped by the netstack; HTTP and HTTPS are
 steered to a host-side forward proxy that filters on hostname. For HTTPS the proxy reads the
-`CONNECT` target and the TLS SNI — no interception, no custom CA.
+`CONNECT` target and the TLS SNI without decrypting anything — **except** for hosts that
+have a credential injection rule, which are terminated and re-originated so a header can be
+attached. That is the only interception Boks performs, and every logged flow says which it
+was: `forward` (read by Boks) or `forward-bypass` (tunnelled, ciphertext only).
 
 **Configuration (`internal/network`).** Two annotations are required, and each does half the
 job. Both were confirmed against nerdbox's source (`internal/shim/task/networking.go` and
@@ -229,26 +232,38 @@ Design constraints Boks adopts:
 A local encrypted file provider comes first; OS keychains (Keychain, Secret Service,
 Credential Manager) later.
 
-**Implemented in `internal/secret`.** Three schemes cover every vendor seen so far without
-naming one: `bearer` (`Authorization: Bearer …`), `basic` (`Authorization: Basic …`, which is
-how Git over HTTPS and most registries take a token) and `header` (an arbitrary header, for
-API-key styles such as `x-api-key`). A rule is written
-`host[,host…]=name:scheme[:extra]`, its host patterns come from the same matcher the policy
-uses, and a catch-all `*` is rejected — sending a token "wherever this request is going" is
-the failure this exists to prevent. Values are wrapped in a type whose `String`, `GoString`
-and JSON forms are redacted, and a test asserts a secret cannot be printed.
+**Implemented in `internal/secret`.** The model has two levels, following the credential
+grammar Docker Sandboxes' kits use: a credential names a service and owns a set of injection
+rules, each naming a domain, a header and a value format with one `%s` (`bearer` and
+`basic[:user]` are shorthands for the two common shapes). Several hosts can therefore share
+one stored secret — an enterprise Git host and its API endpoint, a feed and its mirror —
+without repeating the scheme, which is how a rotation ends up applied to three places out of
+four. On the command line that is
+`-inject service@host[,host…]=bearer|basic[:user]|header[:format]`, with host patterns from
+the same matcher the policy uses, and a catch-all is rejected: sending a token "wherever this
+request is going" is the failure this exists to prevent, and under the interception design it
+would also decide to decrypt everything.
+
+The placeholder a guest holds belongs to the credential
+(`-guest-credential service=[ENV=]placeholder`) rather than being a constant, because clients
+validate credential format locally: a marker like `boks-managed` makes `gh` and friends fail
+before a request ever reaches the proxy. Values are wrapped in a type whose `String`,
+`GoString` and JSON forms are redacted, and a test asserts a secret cannot be printed.
 
 Storage is an AES-256-GCM file keyed by PBKDF2-HMAC-SHA256 over a passphrase from
 `BOKS_SECRETS_PASSPHRASE`. Secret *names* are inside the ciphertext too. A key file next to
 the encrypted file is deliberately not offered: it encrypts nothing against anyone who can
 read the directory, while looking like it does.
 
-**Known limit — HTTPS.** Injection needs to see the request, and Boks does not intercept
-TLS. So injection applies only to plaintext HTTP today: inside a `CONNECT` tunnel the proxy
-sees ciphertext and cannot add a header without becoming a man in the middle. Docker
-Sandboxes does inject into HTTPS, which means it terminates TLS somewhere. Closing this gap
-means choosing to terminate TLS for specific configured hosts — a deliberate MITM, and a
-decision for the user to make explicitly rather than a convenience Boks helps itself to.
+**HTTPS costs an interception (`internal/ca`).** Injection needs to see the request, and an
+HTTPS request is visible only to something that terminates the session. Boks terminates TLS
+for hosts an injection rule names, and for no others: it mints a leaf from a locally
+generated CA whose private key never leaves the host, verifies the origin's real certificate
+itself, and streams bodies through without retaining anything. `Injector.Handles` is the
+single predicate deciding both injection and interception, so the two sets cannot drift
+apart. `boks ca show|export|env|regenerate` inspects, distributes and retires the authority;
+the certificate goes to a guest as a file and as `BOKS_CA_CERT_B64`, because Node and Python
+carry their own trust stores and ignore the system one.
 
 *(implemented and unit-tested; not wired into `boks run`.)*
 
@@ -359,10 +374,12 @@ Honest statement of what has actually been observed, as of this commit:
   provider attached the guest gains `eth0` and the same host-loopback probe is refused. What
   has **not** been observed is any policy being enforced against a guest — the transport is
   verified, the enforcement built on it is not.
-- policy engine, host proxy (HTTP + CONNECT + SNI filtering, no TLS interception),
-  credential injection, network annotation generation and host-stack supervision:
-  **unit-tested on the host**, and the proxy exercised end to end against real TLS origins.
-  None of it is connected to a sandbox.
+- policy engine, host proxy (HTTP + CONNECT + SNI filtering, and TLS termination for
+  credential-bearing hosts only), credential injection, network annotation generation and
+  host-stack supervision: **unit-tested on the host**, and the proxy exercised end to end
+  against real TLS origins — including a demonstration that an intercepted host presents a
+  Boks certificate while an unconfigured one keeps the origin's own chain. None of it is
+  connected to a sandbox.
 
 See [docs/verification.md](verification.md) for the procedure that will confirm the VM
 boundary on capable hardware, and for what evidence counts.

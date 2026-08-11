@@ -225,15 +225,14 @@ Feature-by-feature detail with priorities:
 Ordered by what unblocks the most. The VM boundary is done — networking is now the gap
 that matters, because today a sandbox can reach your host's own services.
 
-1. Network isolation: replace TSI with a virtio-net link into a host-side userspace
-   netstack, giving deny-by-default and an allowlist that the guest cannot opt out of
-2. Host forward proxy with hostname filtering (no TLS interception)
-3. Credential injection — real secrets stay on the host
-4. Confirm the lifecycle against a real hypervisor — it has so far only been exercised
+1. **Wire the netstack, proxy and credential injection into `boks run`** — all three are
+   built and tested, and none of them applies to a running sandbox yet
+2. Confirm the lifecycle against a real hypervisor — it has so far only been exercised
    without one, so stop/start over a live microVM is unverified
-5. Clone mode, so guest writes do not land on the host by default
-6. Docker daemon inside the guest
-7. Port publishing, and the dashboard-style listing that needs it
+3. The interactive dashboard that bare `boks` should open
+4. Clone mode, so guest writes do not land on the host by default
+5. Docker daemon inside the guest
+6. Port publishing, and the `PORTS` column that has nothing to show without it
 8. Kits / declarative configuration
 9. Windows, once the runtime supports it
 

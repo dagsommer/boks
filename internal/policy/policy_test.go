@@ -485,3 +485,69 @@ func mustPolicy(t *testing.T, name string) Policy {
 	}
 	return p
 }
+
+func TestDecisionCarriesModeAndStructuredResource(t *testing.T) {
+	e := NewEngine(mustPolicy(t, PresetLocked), NewLog(8))
+	e.CheckMode(StageConnect, mustTarget(t, "api.example.com:443"), ModeForward)
+	e.CheckMode(StageConnect, mustTarget(t, "203.0.113.7:443"), ModeForwardBypass)
+
+	got := e.Log().Recent(0)
+	if len(got) != 2 {
+		t.Fatalf("recorded %d decisions, want 2", len(got))
+	}
+	if got[0].Mode != ModeForward {
+		t.Errorf("mode = %q, want %q", got[0].Mode, ModeForward)
+	}
+	if got[0].Type != TypeNetwork || got[0].Action != ActionConnectTCP {
+		t.Errorf("decision = %+v, want type %q and action %q", got[0], TypeNetwork, ActionConnectTCP)
+	}
+	if got[0].Resource != "net:domain:api.example.com:443" {
+		t.Errorf("resource = %q", got[0].Resource)
+	}
+	if got[1].Resource != "net:ip:203.0.113.7:443" {
+		t.Errorf("resource for an address literal = %q", got[1].Resource)
+	}
+	// A decision no rule matched must say so structurally, not by leaving a field empty.
+	if !strings.Contains(got[0].Rule, "no applicable policies for op(action=net:connect:tcp") {
+		t.Errorf("rule = %q", got[0].Rule)
+	}
+	// The printed form must show the mode: it is the transparency guarantee.
+	if !strings.Contains(got[0].String(), string(ModeForward)) {
+		t.Errorf("printed decision hides the mode: %s", got[0].String())
+	}
+}
+
+func TestAggregatedCollapsesRepeats(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	decisions := []Decision{
+		{Time: base, Type: TypeNetwork, Host: "a.test", Port: 443, Mode: ModeForwardBypass, Allowed: true, Reason: "allowed by rule"},
+		{Time: base.Add(time.Second), Type: TypeNetwork, Host: "a.test", Port: 443, Mode: ModeForwardBypass, Allowed: true, Reason: "allowed by rule"},
+		{Time: base.Add(2 * time.Second), Type: TypeNetwork, Host: "a.test", Port: 443, Mode: ModeForward, Allowed: true, Reason: "allowed by rule"},
+		{Time: base.Add(3 * time.Second), Type: TypeNetwork, Host: "b.test", Port: 443, Allowed: false, Reason: "denied by default"},
+	}
+	got := Aggregated(decisions)
+	if len(got) != 3 {
+		t.Fatalf("aggregated to %d rows, want 3: %+v", len(got), got)
+	}
+	// Newest first.
+	if got[0].Host != "b.test" || got[0].Allowed {
+		t.Errorf("first row = %+v, want the newest denial", got[0])
+	}
+	var bypass Aggregate
+	for _, a := range got {
+		if a.Mode == ModeForwardBypass {
+			bypass = a
+		}
+	}
+	if bypass.Count != 2 {
+		t.Errorf("repeat count = %d, want 2", bypass.Count)
+	}
+	if !bypass.LastSeen.Equal(base.Add(time.Second)) {
+		t.Errorf("last seen = %s, want the newer of the two", bypass.LastSeen)
+	}
+	// The same destination carried two different ways stays two rows: collapsing them
+	// would hide which flows boks could read.
+	if bypass.Destination() != "a.test:443" {
+		t.Errorf("destination = %q", bypass.Destination())
+	}
+}
