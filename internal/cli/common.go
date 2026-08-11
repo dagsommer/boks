@@ -280,11 +280,20 @@ func (f *sandboxFlags) config(inv invocation, agentArgs []string) (sandbox.Confi
 	if image == "" {
 		image = inv.agent.Image
 	}
+
+	// A sandbox that already exists recorded what it runs when it was created, agent
+	// arguments included. An invocation that gives none of its own is asking for that,
+	// not for the agent's bare command line — otherwise `boks create shell . -- npm run
+	// dev` followed by `boks run shell .` would quietly drop the interesting half.
+	command := inv.agent.Argv(agentArgs)
+	if inv.exists && len(agentArgs) == 0 {
+		command = nil
+	}
 	return sandbox.Config{
 		Name:        inv.name,
 		Agent:       inv.agent.Name,
 		Image:       image,
-		Command:     inv.agent.Argv(agentArgs),
+		Command:     command,
 		Workspaces:  inv.workspaces,
 		Env:         append(slices.Clone(inv.agent.Env), f.env...),
 		CPUs:        cpus,

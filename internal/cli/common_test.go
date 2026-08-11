@@ -224,6 +224,35 @@ func TestConfigTakesImageAndCommandFromTheAgent(t *testing.T) {
 	}
 }
 
+// `boks create shell . -- npm run dev` records that command; a later `boks run shell .`
+// must run it rather than the agent's bare command line.
+func TestConfigKeepsAnExistingSandboxesRecordedCommand(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	flags := registerSandboxFlags(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	shell, _ := agent.Builtin().Lookup("shell")
+
+	cfg, err := flags.config(invocation{agent: shell, name: "shell-foo", exists: true}, nil)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if len(cfg.Command) != 0 {
+		t.Errorf("command = %v, want none so the sandbox's own is used", cfg.Command)
+	}
+
+	// Arguments given now still win over the recorded ones.
+	cfg, err = flags.config(invocation{agent: shell, name: "shell-foo", exists: true}, []string{"ls"})
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if !slices.Equal(cfg.Command, []string{"ls"}) {
+		t.Errorf("command = %v, want the arguments after --", cfg.Command)
+	}
+}
+
 func TestWriteTable(t *testing.T) {
 	var out bytes.Buffer
 	writeTable(&out, []sandbox.Info{{
