@@ -163,6 +163,38 @@ func TestPrepareShipsTheCAWhenSomethingWillBeDecrypted(t *testing.T) {
 	}
 }
 
+// TestGuestGetsThePlaceholderAndNeverTheSecret is the guest-facing half of the credential
+// guarantee. The tool inside the sandbox has to find something shaped like a credential, or
+// it will not make the request the proxy was waiting to sign — and what it finds must never
+// be the credential.
+func TestGuestGetsThePlaceholderAndNeverTheSecret(t *testing.T) {
+	spec := testSpec(t, network.ModeNAT)
+	spec.Inject = []string{"anthropic@api.anthropic.com=x-api-key"}
+	spec.GuestCredentials = []string{"anthropic=ANTHROPIC_API_KEY=sk-ant-placeholder"}
+	spec.Secrets = map[string]string{"anthropic": "sk-the-real-canary"}
+	spec.Intercept = true
+
+	guest, err := spec.Prepare()
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	env := envMap(guest.Env)
+	if env["ANTHROPIC_API_KEY"] != "sk-ant-placeholder" {
+		t.Errorf("ANTHROPIC_API_KEY = %q, want the placeholder", env["ANTHROPIC_API_KEY"])
+	}
+	for _, kv := range guest.Env {
+		if strings.Contains(kv, "sk-the-real-canary") {
+			t.Fatalf("the real credential reached the guest's environment: %s", kv)
+		}
+	}
+	// Nor anywhere else the sandbox can read: the annotations are on the container too.
+	for k, v := range guest.Annotations {
+		if strings.Contains(v, "sk-the-real-canary") {
+			t.Fatalf("the real credential reached annotation %s", k)
+		}
+	}
+}
+
 // TestPrepareForNoNetwork: -net none must not advertise a proxy that does not exist, and
 // must still attach the NIC to the VM — that annotation is what turns the runtime's own
 // transport off, and with it the guest's access to host loopback.
