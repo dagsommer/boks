@@ -1,0 +1,358 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"maps"
+	"text/tabwriter"
+	"time"
+
+	"github.com/dagsommer/boks/internal/enforce"
+	"github.com/dagsommer/boks/internal/network"
+	"github.com/dagsommer/boks/internal/policy"
+	"github.com/dagsommer/boks/internal/sandbox"
+)
+
+// netCommand inspects and controls the per-sandbox network stacks.
+//
+// A sandbox's network lives in a process of its own, because the stack terminates the
+// guest's NIC and has to last exactly as long as the VM does — see internal/enforce. That
+// process is spawned on demand by `run`, `exec` and `start`, and it ends when the sandbox
+// stops. This command is how a person sees it and ends it by hand: a background process
+// nobody can list or stop is a thing users are right to distrust.
+func netCommand(ctx context.Context, env Env) error {
+	if len(env.Args) == 0 {
+		netUsage(env.Stderr)
+		return errors.New("a subcommand is required")
+	}
+	sub := Env{Args: env.Args[1:], Stdin: env.Stdin, Stdout: env.Stdout, Stderr: env.Stderr}
+	switch env.Args[0] {
+	case "-h", "--help", "help":
+		netUsage(env.Stdout)
+		return nil
+	case "ls", "list":
+		return netLs(ctx, sub)
+	case "stop":
+		return netStop(ctx, sub)
+	case "serve":
+		return netServe(ctx, sub)
+	}
+	netUsage(env.Stderr)
+	return fmt.Errorf("unknown net subcommand %q", env.Args[0])
+}
+
+func netUsage(w io.Writer) {
+	fmt.Fprint(w, `Usage: boks net <ls|stop|serve> [flags]
+
+  ls      list the running sandbox network stacks
+  stop    end a sandbox's network stack
+  serve   run one stack in the foreground, reading its configuration from stdin
+
+A sandbox's network is a host-side stack that terminates the guest's virtual NIC, with a
+filtering proxy listening inside the sandbox's own virtual network. It runs in a process of
+its own so that it lasts as long as the sandbox's VM does rather than as long as the command
+that started it: a build running in a sandbox does not lose the network because you pressed
+Ctrl-C in another terminal.
+
+One process per running sandbox, started on demand and never at boot. It exits when the
+sandbox's task exits, so 'boks stop' takes it with the sandbox.
+
+'boks net serve' is what the others spawn. It is a normal command rather than a hidden one
+so that the background process can be reproduced, watched and debugged.
+`)
+}
+
+func netLs(_ context.Context, env Env) error {
+	fset := flag.NewFlagSet("boks net ls", flag.ContinueOnError)
+	fset.SetOutput(env.Stderr)
+	if err := fset.Parse(env.Args); err != nil {
+		if err == flag.ErrHelp {
+			return flagErrHelp
+		}
+		return err
+	}
+
+	states := enforce.List(policy.StateDir())
+	if len(states) == 0 {
+		fmt.Fprintln(env.Stderr, "no sandbox network stacks are running")
+		return nil
+	}
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "SANDBOX\tMODE\tPROXY\tINTERCEPT\tPID\tUPTIME")
+	for _, st := range states {
+		proxy := st.ProxyURL
+		if proxy == "" {
+			proxy = "-"
+		}
+		intercept := "no"
+		if st.Intercept {
+			intercept = "yes"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
+			st.Sandbox, st.Mode, proxy, intercept, st.PID, time.Since(st.Started).Round(time.Second))
+	}
+	return w.Flush()
+}
+
+func netStop(_ context.Context, env Env) error {
+	fset := flag.NewFlagSet("boks net stop", flag.ContinueOnError)
+	fset.SetOutput(env.Stderr)
+	if err := fset.Parse(env.Args); err != nil {
+		if err == flag.ErrHelp {
+			return flagErrHelp
+		}
+		return err
+	}
+	if fset.NArg() == 0 {
+		return errors.New("a sandbox name is required; run 'boks net ls' to see what is running")
+	}
+	for _, name := range fset.Args() {
+		if err := enforce.Stop(policy.StateDir(), name); err != nil {
+			return err
+		}
+		fmt.Fprintf(env.Stderr, "stopped the network stack for %s\n", name)
+	}
+	return nil
+}
+
+// netServe is the supervisor process. It reads its specification from stdin rather than
+// from flags so that the secret values it needs never appear in a command line, where every
+// other process on the host could read them.
+func netServe(ctx context.Context, env Env) error {
+	fset := flag.NewFlagSet("boks net serve", flag.ContinueOnError)
+	fset.SetOutput(env.Stderr)
+	fset.Usage = func() {
+		fmt.Fprint(env.Stderr, `Usage: boks net serve < spec.json
+
+Runs one sandbox's network stack in the foreground: the host-side stack that terminates the
+guest's NIC, and the filtering proxy inside the sandbox's virtual network. It exits when the
+sandbox's task exits, or on SIGTERM.
+
+The specification arrives on stdin as JSON, because it carries the credential values the
+proxy attaches to requests and those must not be visible in the process table.
+`)
+	}
+	if err := fset.Parse(env.Args); err != nil {
+		if err == flag.ErrHelp {
+			return flagErrHelp
+		}
+		return err
+	}
+
+	spec, err := enforce.ReadSpec(env.Stdin)
+	if err != nil {
+		return err
+	}
+	return enforce.Serve(ctx, spec, env.Stdout, func(ctx context.Context) error {
+		// The stack's life is the VM's life. Watching the task is what makes that true
+		// without a second supervision mechanism: containerd already knows.
+		return sandbox.WaitUntilStopped(ctx, spec.Address, spec.Sandbox, enforce.TaskAppearTimeout, enforce.TaskPollInterval)
+	})
+}
+
+// networkFor decides which network a sandbox gets, honouring what an existing sandbox was
+// already wired for, and tells the user when the two differ.
+//
+// The mode is fixed when a sandbox is created, because it lives in annotations the runtime
+// reads at boot. Silently applying `-net none` to a sandbox created with a network would be
+// the worst kind of wrong: the flag would appear to be obeyed while the container stayed
+// connected.
+func networkFor(inv invocation, requested network.Mode, explicit bool, stderr io.Writer) (mode network.Mode, wired bool) {
+	if !inv.exists {
+		return requested, true
+	}
+	existing, wired := network.ModeFromAnnotations(inv.info.Annotations)
+	if !wired {
+		fmt.Fprintf(stderr, "%s", unwiredSandboxWarning(inv.name))
+		return existing, false
+	}
+	if explicit && existing != requested {
+		fmt.Fprintf(stderr,
+			"note: sandbox %q is wired for -net %s, which is fixed when a sandbox is created.\n"+
+				"      Remove it and run again to change it: boks rm %s\n",
+			inv.name, existing, inv.name)
+	}
+	return existing, true
+}
+
+// unwiredSandboxWarning covers a sandbox created before Boks wired networking, or by
+// something else. It is worth a warning rather than a note: such a sandbox is not merely
+// unenforced, it is on the runtime's default transport, where the guest reaches host
+// loopback services.
+func unwiredSandboxWarning(name string) string {
+	return fmt.Sprintf(
+		"WARNING: sandbox %q was created without Boks network annotations, so it runs on the\n"+
+			"         runtime's default transport (libkrun's TSI). There, the guest's 127.0.0.1 is\n"+
+			"         the host's, and no policy can be applied to it at all.\n"+
+			"         Recreate it to get an enforced network: boks rm %s\n\n", name, name)
+}
+
+// attachSandboxNetwork decides, describes and starts the network for a sandbox that is
+// about to run, and fills in what the sandbox has to be created with.
+//
+// The order is forced by the runtime: the annotations must be on the container when it is
+// created, and the host-side stack must already hold the link socket when the VM boots,
+// because the VM connects to it during boot. It returns whether this invocation started the
+// stack, which is what tells the caller whether it owns cleaning it up.
+func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocation, cfg *sandbox.Config,
+	requested network.Mode, env Env) (bool, error) {
+
+	mode, wired := networkFor(inv, requested, flags.mode != "", env.Stderr)
+	if !wired {
+		// A sandbox Boks did not wire has no link socket to hold and no stack that
+		// could reach it. networkFor has already said so, loudly.
+		return false, nil
+	}
+
+	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode)
+	if err != nil {
+		return false, err
+	}
+	if err := describeNetwork(flags, spec, mode, env.Stderr); err != nil {
+		return false, err
+	}
+	guest, err := spec.Prepare()
+	if err != nil {
+		return false, err
+	}
+	cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
+	cfg.Env = append(cfg.Env, guest.Env...)
+	cfg.Mounts = guest.Mounts
+
+	running := inv.exists && inv.info.Status == sandbox.StatusRunning
+	_, started, err := attachNetwork(ctx, spec, running, env.Stderr)
+	return started, err
+}
+
+// withNetworkAnnotations merges the network's annotations into whatever the user asked for.
+//
+// An explicit -annotation wins, the same way it wins over the computed resource
+// annotations: the flag exists to try a runtime capability Boks has no first-class flag
+// for, and that is worth nothing if Boks overrides it.
+func withNetworkAnnotations(fromNetwork, user map[string]string) map[string]string {
+	merged := make(map[string]string, len(fromNetwork)+len(user))
+	maps.Copy(merged, fromNetwork)
+	maps.Copy(merged, user)
+	return merged
+}
+
+// attachNetwork brings up a sandbox's network stack, and reports whether this invocation is
+// the one that started it.
+//
+// It must be called before the sandbox's task starts: the VM connects to the link socket
+// while it boots, so a socket that appears afterwards is a boot failure rather than a retry.
+func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr io.Writer) (enforce.State, bool, error) {
+	if _, alive := enforce.Lookup(spec.StateDir, spec.Sandbox); alive {
+		return reuseNetwork(spec, stderr)
+	}
+	if running {
+		// The sandbox is up but its stack is not: the process that served it is gone.
+		// Binding a fresh socket at the same path is the only thing that could restore
+		// it, and whether a running VM re-attaches to one has never been tested — so
+		// try, and say exactly that rather than implying it worked.
+		fmt.Fprintf(stderr,
+			"note: sandbox %q is running but had no network stack; starting one now.\n"+
+				"      Whether a running guest re-attaches to a new link socket is unverified.\n"+
+				"      If the sandbox has no network, restart it: boks stop %s\n",
+			spec.Sandbox, spec.Sandbox)
+	}
+	state, err := enforce.Ensure(ctx, spec, stderr)
+	if err != nil {
+		return enforce.State{}, false, err
+	}
+	return state, true, nil
+}
+
+func reuseNetwork(spec enforce.Spec, stderr io.Writer) (enforce.State, bool, error) {
+	state, _ := enforce.Lookup(spec.StateDir, spec.Sandbox)
+	return state, false, nil
+}
+
+// enforceSpec turns the policy flags into the specification the network stack runs from.
+//
+// Credential *values* are resolved here, in the foreground process that has the passphrase,
+// and handed to the stack on a pipe. The stack therefore never learns the passphrase and
+// can attach only the credentials this sandbox was configured with.
+func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mode network.Mode) (enforce.Spec, error) {
+	plan, err := f.planFor(name, mode)
+	if err != nil {
+		return enforce.Spec{}, err
+	}
+	credentials, err := f.credentialRules()
+	if err != nil {
+		return enforce.Spec{}, err
+	}
+
+	secrets := map[string]string{}
+	if len(credentials) > 0 {
+		store, err := openSecretStore("")
+		if err != nil {
+			return enforce.Spec{}, err
+		}
+		for _, c := range credentials {
+			value, err := store.Lookup(ctx, c.Service)
+			if err != nil {
+				return enforce.Spec{}, fmt.Errorf("credential %q: %w\nStore it first: boks secret set %s", c.Service, err, c.Service)
+			}
+			secrets[c.Service] = value.Reveal()
+		}
+	}
+
+	return enforce.Spec{
+		Sandbox:          name,
+		Plan:             plan,
+		Preset:           f.preset,
+		Allow:            f.allow,
+		Deny:             f.deny,
+		Inject:           f.inject,
+		GuestCredentials: f.guest,
+		Secrets:          secrets,
+		Intercept:        true,
+		CADir:            caDir(""),
+		StateDir:         policy.StateDir(),
+		LogPath:          policy.DefaultLogPath(),
+		Address:          address,
+	}, nil
+}
+
+// describeNetwork prints what the sandbox's network will do, before anything runs in it.
+//
+// A user is entitled to know which destinations are permitted and which of their flows will
+// be decrypted *at the moment they ask for it*, not from a certificate error later.
+func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stderr io.Writer) error {
+	if mode == network.ModeNone {
+		fmt.Fprint(stderr, noNetworkNotice)
+		if len(f.allow) > 0 || len(f.deny) > 0 || len(f.inject) > 0 || f.preset != "" {
+			fmt.Fprint(stderr, "         The policy flags are not applied: nothing leaves this sandbox to judge.\n")
+		}
+		fmt.Fprintln(stderr)
+		return nil
+	}
+
+	pol, err := spec.Policy()
+	if err != nil {
+		return err
+	}
+	credentials, err := spec.Credentials()
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(stderr, pol.Describe())
+	if notice := interceptionNotice(credentials); notice != "" {
+		fmt.Fprintf(stderr, "\n%s", notice)
+	}
+	fmt.Fprintf(stderr, "\n%s\n", enforcementNote)
+	return nil
+}
+
+// stopNetworkQuietly is the cleanup path. Failures are reported rather than returned: it
+// runs while a command is already failing or exiting, and the original outcome is the more
+// useful one.
+func stopNetworkQuietly(name string, stderr io.Writer) {
+	if err := enforce.Stop(policy.StateDir(), name); err != nil {
+		fmt.Fprintf(stderr, "warning: %v\n", err)
+	}
+}

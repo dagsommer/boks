@@ -119,7 +119,7 @@ Presets:
 		}
 		fmt.Fprintf(env.Stdout, "\n%s", interceptionNotice(rules))
 	}
-	fmt.Fprintf(env.Stdout, "\n%s", notEnforcedWarning)
+	fmt.Fprintf(env.Stdout, "\n%s\n", enforcementNote)
 	return nil
 }
 

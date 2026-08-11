@@ -78,17 +78,17 @@ const (
 	// image pull, no network.
 	readyTimeout = 20 * time.Second
 
-	// taskAppearTimeout bounds how long a supervisor waits for the sandbox's task to
+	// TaskAppearTimeout bounds how long a supervisor waits for the sandbox's task to
 	// exist before concluding that the command that spawned it failed. It has to cover an
 	// image pull on a slow link, because the CLI starts the network before it creates the
 	// container — the VM connects to the socket while it boots, so the socket cannot
 	// appear afterwards.
-	taskAppearTimeout = 15 * time.Minute
+	TaskAppearTimeout = 15 * time.Minute
 
-	// taskPollInterval is how often the supervisor asks containerd whether the sandbox is
+	// TaskPollInterval is how often the supervisor asks containerd whether the sandbox is
 	// still running. It is a local call; the interval trades a little latency in teardown
 	// for not holding a streaming watch open for the life of a sandbox.
-	taskPollInterval = 2 * time.Second
+	TaskPollInterval = 2 * time.Second
 
 	readyMarker = "ready"
 )
@@ -209,6 +209,20 @@ func Stop(stateDir, sandbox string) error {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("enforce: removing %s: %w", dir, err)
+	}
+	return nil
+}
+
+// Forget removes what a sandbox leaves on the host beyond its stack: the directory holding
+// the copy of the CA certificate that was shared into it.
+//
+// It is separate from Stop because the two have different lifetimes. The stack goes away
+// whenever the sandbox stops; the certificate directory is the source of a mount and has to
+// survive a stop, so that the sandbox can be started again. Only removal takes it.
+func Forget(stateDir, sandbox string) error {
+	dir := filepath.Join(stateDir, "certs", sanitize(sandbox))
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("enforce: removing %s: %w", dir, err)
 	}
