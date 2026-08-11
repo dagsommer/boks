@@ -1,0 +1,26 @@
+# Build artifacts
+/bin/
+*.exe
+
+# Test and coverage output
+*.test
+*.out
+coverage.*
+
+# Local sandbox and runtime state
+/state/
+*.img
+*.qcow2
+*.erofs
+
+# Local configuration and secrets
+.env
+*.local.yaml
+*.local.yml
+secrets/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
