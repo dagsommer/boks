@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"text/tabwriter"
-	"time"
 
 	"github.com/dagsommer/boks/internal/sandbox"
 )
@@ -16,7 +15,8 @@ func lsCommand(ctx context.Context, env Env) error {
 	fs := flag.NewFlagSet("boks ls", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
 
-	quiet := fs.Bool("q", false, "print only sandbox names")
+	quiet := fs.Bool("quiet", false, "print only sandbox names")
+	fs.BoolVar(quiet, "q", false, "alias for -quiet")
 	asJSON := fs.Bool("json", false, "print the full listing as JSON")
 	address := addressFlag(fs)
 
@@ -58,7 +58,7 @@ Flags:
 		}
 		return nil
 	default:
-		writeTable(env.Stdout, infos, time.Now())
+		writeTable(env.Stdout, infos)
 		return nil
 	}
 }
@@ -69,37 +69,30 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-func writeTable(w io.Writer, infos []sandbox.Info, now time.Time) {
+// writeTable renders the listing with sbx's columns.
+//
+// PORTS is empty because nothing publishes ports yet. The column is still there: a listing
+// whose shape changes when a feature lands is a listing nobody can write a script against,
+// and an empty column says "none" where a missing one says nothing at all. Image, creation
+// time and the rest are in -json and 'boks inspect', which is where detail belongs.
+func writeTable(w io.Writer, infos []sandbox.Info) {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tSTATUS\tIMAGE\tWORKSPACE\tAGE")
+	fmt.Fprintln(tw, "SANDBOX\tAGENT\tSTATUS\tPORTS\tWORKSPACE")
 	for _, info := range infos {
 		status := info.Status
 		if info.Ephemeral {
 			status += " (ephemeral)"
 		}
-		workspace := info.Workspace()
-		if workspace == "" {
-			workspace = "-"
-		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			info.Name, status, info.Image, workspace, humanAge(now.Sub(info.Created)))
+			info.Name, dash(info.Agent), status, "", dash(info.Workspace()))
 	}
 	_ = tw.Flush()
 }
 
-// humanAge renders a duration the way a listing wants it: one unit, no decimals, so the
-// column stays narrow and scannable.
-func humanAge(d time.Duration) string {
-	switch {
-	case d < 0:
-		return "0s"
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
+// dash marks a value a sandbox does not have, as opposed to one that does not exist yet.
+func dash(v string) string {
+	if v == "" {
+		return "-"
 	}
+	return v
 }

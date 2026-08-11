@@ -5,9 +5,10 @@
 // This package owns the lifecycle around that — image, spec, task, IO and cleanup — and
 // deliberately contains no VM-specific logic of its own.
 //
-// A sandbox outlives a single command. `boks run` creates one if the workspace does not
-// have it yet, then executes the command as an additional process inside it; the sandbox
-// stays until `boks rm`. The container's own process is an idle keeper (see keeperCommand),
+// A sandbox outlives a single command. `boks run` creates one if the agent and workspace do
+// not have one yet, then executes the command as an additional process inside it; the
+// sandbox stays until `boks rm`. Which sandbox that is comes from its name, derived in
+// identity.go — the name is the identity, not a label on top of one. The container's own process is an idle keeper (see keeperCommand),
 // so the sandbox's lifetime does not depend on whatever the user happened to run first.
 // Ephemeral sandboxes, which are created and destroyed around one command, remain available
 // through Config.Ephemeral.
@@ -56,14 +57,31 @@ const stopTimeout = 10 * time.Second
 // every usable image has, and making it — rather than the user's first command — the
 // container process means the sandbox does not disappear when that command exits.
 //
-// The trap makes `boks stop` a clean SIGTERM exit instead of a ten-second wait for SIGKILL;
-// sleeping in the background with `wait` is what lets the shell see the signal at all.
-var keeperCommand = []string{"/bin/sh", "-c", `trap 'exit 0' TERM INT; while :; do sleep 86400 & wait $!; done`}
+// The trap is what makes `boks stop` graceful. `kill -TERM -- -1` signals every process in
+// the guest, so a build or a server started with `boks exec` is asked to stop before the
+// sandbox goes away; without it those processes learn nothing until containerd's SIGKILL
+// arrives. The blast radius is the guest's PID namespace and nothing else, which is the
+// only place this command ever runs. Exiting from the trap keeps the stop prompt rather
+// than waiting out the ten-second SIGKILL timer.
+//
+// Sleeping in the background with `wait` is what lets the shell see a signal at all — a
+// foreground `sleep` would swallow it. The loop rather than `sleep infinity` is for the
+// implementations that do not accept it; busybox does, GNU coreutils does, some do not, and
+// an image whose sleep refuses would leave a sandbox that dies the moment it starts.
+//
+// Docker Sandboxes wraps the same shape in `tini`, so that PID 1 reaps orphans and forwards
+// signals. That is worth having in a long-lived sandbox, but it cannot go here: an arbitrary
+// image has no init to wrap it with. It belongs to a Boks agent image, whenever there is one.
+var keeperCommand = []string{"/bin/sh", "-c",
+	`trap 'kill -TERM -- -1 2>/dev/null; wait; exit 0' TERM INT; while :; do sleep 86400 & wait $!; done`}
 
 // Config describes a sandbox to create, and the command to run in it.
 type Config struct {
 	// Name identifies the sandbox. Must be unique within the namespace.
 	Name string
+	// Agent is the name of the agent the sandbox runs, recorded so that `boks ls` can
+	// show it and `boks run -name x` can find out what it is without being told.
+	Agent string
 	// Image is the OCI reference providing the guest root filesystem.
 	Image string
 	// Command is the argv to execute inside the guest. Empty uses the sandbox's
@@ -118,18 +136,10 @@ func Run(ctx context.Context, cfg Config) (int, error) {
 	}
 	defer c.Close()
 
-	container, err := c.LoadContainer(ctx, cfg.Name)
+	container, err := ensureContainer(ctx, c, cfg)
 	if err != nil {
-		if !errdefs.IsNotFound(err) {
-			return 1, fmt.Errorf("looking up sandbox %q: %w", cfg.Name, err)
-		}
-		if container, err = create(ctx, c, cfg); err != nil {
-			return 1, err
-		}
-	} else if err := warnWorkspaceMismatch(ctx, container, cfg); err != nil {
 		return 1, err
 	}
-
 	if _, err := ensureRunning(ctx, container); err != nil {
 		return 1, err
 	}
@@ -157,6 +167,43 @@ func Run(ctx context.Context, cfg Config) (int, error) {
 		Stderr:  cfg.Stderr,
 		client:  c,
 	})
+}
+
+// Up creates the sandbox if it does not exist and makes sure it is running, without
+// attaching to anything. It is what `boks run -d` does, and what `boks exec` needs before it
+// can run a command.
+func Up(ctx context.Context, cfg Config) (Info, error) {
+	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
+	c, err := connect(ctx, cfg.Address)
+	if err != nil {
+		return Info{}, err
+	}
+	defer c.Close()
+
+	container, err := ensureContainer(ctx, c, cfg)
+	if err != nil {
+		return Info{}, err
+	}
+	if _, err := ensureRunning(ctx, container); err != nil {
+		return Info{}, err
+	}
+	return describe(ctx, container)
+}
+
+// ensureContainer returns the sandbox's container record, creating it if this is the first
+// time the sandbox has been asked for.
+func ensureContainer(ctx context.Context, c *client.Client, cfg Config) (client.Container, error) {
+	container, err := c.LoadContainer(ctx, cfg.Name)
+	if err != nil {
+		if !errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("looking up sandbox %q: %w", cfg.Name, err)
+		}
+		return create(ctx, c, cfg)
+	}
+	if err := warnWorkspaceMismatch(ctx, container, cfg); err != nil {
+		return nil, err
+	}
+	return container, nil
 }
 
 // runEphemeral is the create-run-destroy path: the command is the container process and
@@ -319,6 +366,9 @@ func containerLabels(ctx context.Context, image client.Image, cfg Config) (map[s
 		LabelManaged:    "1",
 		LabelWorkspaces: workspacesJSON,
 		LabelCommand:    commandJSON,
+	}
+	if cfg.Agent != "" {
+		labels[LabelAgent] = cfg.Agent
 	}
 	if cfg.Ephemeral {
 		labels[LabelEphemeral] = "1"
@@ -526,7 +576,7 @@ func describeTaskError(cfg Config, err error) error {
 	}
 	if len(cfg.Command) > 0 && mentionsCommand(msg, cfg.Command[0]) {
 		return fmt.Errorf("the command %q was not found inside the guest image %s.\n"+
-			"Check the command exists in that image, or pass a different -image.\n\n"+
+			"Check the command exists in that image, or pass a different -template.\n\n"+
 			"underlying error: %w", cfg.Command[0], cfg.Image, err)
 	}
 	if shim != "" {
