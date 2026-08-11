@@ -67,6 +67,12 @@ Flags:
 	if err := flags.requireIsolation(env.Stderr); err != nil {
 		return err
 	}
+	if *detached && *ephemeral {
+		// -rm destroys the sandbox when the command exits, and -d means nobody is
+		// waiting for it to. Together they would leave a sandbox nothing removes.
+		return fmt.Errorf("-d and -rm cannot be combined: an ephemeral sandbox is removed when " +
+			"its command exits, and a detached run has no command to wait for")
+	}
 
 	// Fail on a malformed rule now, before anything is created, so a policy that will one
 	// day be enforced is known to be well-formed today; then say plainly that nothing
