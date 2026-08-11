@@ -169,7 +169,7 @@ Ordered by what unblocks the most:
 
 1. Confirm the VM boundary on hardware with virtualisation, and record the evidence
 2. Network isolation: host-side userspace netstack, deny-by-default, allowlist
-3. Host forward proxy with hostname filtering (no TLS interception)
+3. Host forward proxy with hostname filtering; TLS terminated only for hosts you give a credential
 4. Credential injection — real secrets stay on the host
 5. Persistent sandboxes and the `ls`/`stop`/`rm`/`exec` lifecycle
 6. Clone mode, so guest writes do not land on the host by default
