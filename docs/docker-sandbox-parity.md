@@ -84,35 +84,57 @@ agent name combined with it (a live sandbox for the `boks` directory running Cla
 
 ## 4. Networking
 
+**Where Boks stands (2026-08-11).** The policy engine, the host forward proxy and the
+host-side network configuration are built and tested; **none of it is applied to a running
+sandbox**, so Boks enforces nothing today. What changed this week is that the transport
+enforcement needs was verified: attaching a virtio-net link to a host-side userspace stack
+does displace libkrun's TSI, so a point at which Boks can drop a flow now demonstrably
+exists. See [security-model.md](security-model.md#network).
+
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor-tap-vsock) | P0 | planned | **Today there is no enforcement at all**, and TSI makes it worse than absent — see below |
-| Egress via proxy | All outbound HTTP/HTTPS routed through a host proxy | Same | P0 | planned | |
-| Default deny | Deny-by-default with an allowlist | Same | P0 | planned | |
-| Policy presets | Open / Balanced / Locked Down, chosen at first run | Equivalent presets, names TBD | P1 | none | Balanced is Docker's recommended start |
-| Exact + wildcard hosts | Allowlist includes broad wildcards such as `*.googleapis.com` | Exact and wildcard, plus ports | P0 | planned | Docker's own docs flag broad defaults as a risk |
-| Deny precedence | Local deny rules still apply under org governance | Deny always wins over allow | P0 | planned | |
-| Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `log` | P1 | none | Observability is what makes policy usable |
-| Per-run allow flags | Policy configured per sandbox/host | `--allow host` repeatable | P0 | planned | |
-| TLS interception | Not used for filtering; HTTPS filtered without MITM | No MITM; filter on CONNECT host + SNI | P0 | planned | Avoids a custom CA in the guest |
-| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | partial | ICMP already fails under TSI (`Network unreachable`); raw TCP connects freely |
-| Hostname rules for non-HTTP | Don't work; IP addresses required | Same limitation, documented | P1 | planned | Inherent: no hostname on a raw socket |
-| Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | none | **Regression vs Docker**: under TSI the guest's `127.0.0.1` is the host's, verified against a live host service |
+| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor-tap-vsock, embedded as a library) | P0 | partial | Transport verified; nothing wired into `run`. `internal/network` builds the annotations and supervises the stack |
+| No-network mode | Not offered as such | `-net none`: NIC on the VM, container not wired to it | P0 | partial | Costs nothing, turns TSI off, refuses host loopback. Strongest containment available |
+| Egress via proxy | All outbound HTTP/HTTPS routed through a host proxy | Same | P0 | partial | `boks proxy` works standalone (`internal/proxy`); not wired into `run` |
+| Default deny | Deny-by-default with an allowlist | Same | P0 | partial | Default preset `standard` is deny-by-default; asserted explicitly in the netstack config too |
+| Policy presets | Open / Balanced / Locked Down, chosen at first run | `open` / `standard` / `locked` | P1 | done | `standard` is the default; entries justified in `internal/policy/preset.go` |
+| Exact + wildcard hosts | Allowlist includes broad wildcards such as `*.googleapis.com` | Exact and wildcard, plus ports, IPs and CIDR | P0 | done | No multi-tenant wildcards in any preset — they allow every tenant's bucket |
+| Deny precedence | Local deny rules still apply under org governance | Deny always wins over allow | P0 | done | Order- and specificity-independent; tested |
+| Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | Decisions recorded as JSON lines under the state dir; local only |
+| Per-run allow flags | Policy configured per sandbox/host | `-allow`/`-deny` repeatable, `-policy <preset>`, `-net <mode>` | P0 | partial | Parsed and validated on `boks run`, which says plainly that they are not applied |
+| TLS interception | Not used for filtering; HTTPS filtered without MITM | No MITM; filter on CONNECT host + SNI | P0 | done | Verified end to end: the client validates the origin's own chain through the proxy |
+| SNI cross-check | Not documented | Deny a tunnel whose ClientHello names a forbidden host | P1 | done | Only possible after the `200`, so the client sees a broken handshake; the reason is in the log |
+| Resolved-address recheck | Not documented | Deny rules re-applied to the address a permitted name resolved to | P1 | done | Stops `allowed.test A 127.0.0.1` from becoming a path to host services |
+| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | planned | Belongs to the netstack, which is not yet in the datapath |
+| Hostname rules for non-HTTP | Don't work; IP addresses required | Same limitation, documented | P1 | done | Address and CIDR rules exist for exactly this |
+| IPv6 | Not documented | Covered by the rule language from the start | P1 | partial | TSI had no v6; a real NIC does. No routable v6 is handed to the guest |
+| DNS mediation | Not documented | Guest resolver pointed at the host-side gateway | P1 | partial | `io.containerd.nerdbox.ctr.dns`; the hook for name policy, not yet a closed channel |
+| Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | partial | **Live regression vs Docker until the netstack is wired into `run`**: the default path is still TSI, where the guest's `127.0.0.1` is the host's. `-net none` and the presets close it; nothing applies them yet |
 | Upstream proxy | Honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`; `DOCKER_SANDBOXES_PROXY` supports http/https/socks5/socks5h | Support an upstream proxy env var | P2 | none | socks5h delegates DNS to the proxy |
-| Port publishing | `--publish` at creation; `sbx ports` add/remove later; ignored when re-attaching | `boks ports` equivalent | P1 | none | |
+| Port publishing | `--publish` at creation; `sbx ports` add/remove later; ignored when re-attaching | `boks ports` equivalent | P1 | none | The netstack can forward, and Boks explicitly asserts it does not |
 | Guest binding requirement | Service must listen on the VM's external interface, not just loopback | Same constraint | P1 | none | |
 
 ## 5. Credentials and secrets
 
+**Where Boks stands.** `internal/secret` implements the model and `boks proxy` applies it;
+`boks secret set/ls/rm` manages an encrypted host-side store. It is not wired into
+`boks run`, and injection is limited to plaintext HTTP because Boks will not terminate TLS
+silently.
+
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | planned | Guest holds a placeholder only |
-| Secret storage | OS keychain; Linux uses desktop keyring or an encrypted file | Encrypted local file first, keychains later | P1 | planned | No account, no cloud |
-| Scope | Injection tied to configured destinations | Only for explicitly configured hosts | P0 | planned | |
-| Guest secret access | Guest never receives raw values | Same; no host API for the guest to query | P0 | planned | |
-| `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set` | P1 | none | |
-| Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | planned | Observed behaviour, documented by Docker |
-| SSH agent forwarding | Supported; SSH key signing works, GPG/S-MIME do not | P2 | none | | Host agent socket forwarding |
+| Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | partial | Works through `boks proxy`; not wired into `run` |
+| Schemes | Not documented in detail | `bearer`, `basic`, arbitrary `header` | P0 | done | Covers GitHub, Anthropic and registries with no vendor-specific code |
+| HTTPS injection | Supported | **Not possible without terminating TLS, so not done** | P0 | none | Docker must be terminating TLS somewhere. Boks treats interception as an explicit per-host decision, not a default |
+| Secret storage | OS keychain; Linux uses desktop keyring or an encrypted file | Encrypted local file first, keychains later | P1 | partial | AES-256-GCM, PBKDF2-HMAC-SHA256 over `BOKS_SECRETS_PASSPHRASE`; names encrypted too |
+| Keychain providers | macOS Keychain, Secret Service, Credential Manager | Same, behind the `Provider` interface | P1 | none | Interface exists; no implementation |
+| Scope | Injection tied to configured destinations | Only for explicitly configured hosts | P0 | done | A catch-all `*` destination is rejected outright |
+| Placeholder replacement | Guest holds a placeholder | Existing header is overwritten, never appended | P0 | done | A surviving placeholder would be a silent auth failure at best |
+| Guest secret access | Guest never receives raw values | Same; no host API for the guest to query | P0 | done | The store's only consumer is the proxy's request path. Adding a lookup endpoint would end the guarantee |
+| Never logged | Not documented | Values redacted in every printed and serialised form | P1 | done | Enforced by the `Value` type and asserted by tests |
+| `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set` | P1 | done | Reads from stdin by default; `-value` documented as visible in the process list |
+| Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | none | Needs HTTPS injection, hence TLS termination — blocked on that decision |
+| SSH agent forwarding | Supported; SSH key signing works, GPG/S-MIME do not | Host agent socket forwarding | P2 | none | |
 | OAuth device login | Agent login inside sandbox; session tokens stay on host | Out of scope near-term | P2 | none | |
 
 ## 6. Docker inside the sandbox
@@ -205,6 +227,9 @@ agent name combined with it (a live sandbox for the `boks` directory running Cla
    symlinked workspace resolves to its target before hashing, so two paths to the same
    directory share one sandbox.
 4. **Kit schema.** Deliberately unanswered until real runtime features exist to configure.
-5. **TSI vs external network provider.** TSI is the nerdbox default and simpler, but places
-   the policy decision inside libkrun. Confirm gvisor-tap-vsock is workable before
-   committing.
+5. ~~**TSI vs external network provider.**~~ **Answered 2026-08-11.** The external provider
+   displaces TSI: with it attached the guest has `eth0` and a host loopback probe that TSI
+   answered is refused. Two annotations are needed (`io.containerd.nerdbox.network.N` for
+   the VM, `io.containerd.nerdbox.ctr.network.N` keyed by `vmmac` for the container), `addr`
+   must be CIDR whatever nerdbox's docs show, and one stack serves exactly one VM. What
+   remains open is the enforcement built on top: no policy has been applied to a real guest.
