@@ -65,9 +65,9 @@ func newTestProxy(t *testing.T, p policy.Policy, inj *secret.Injector, opts ...f
 	return &testProxy{Server: srv, url: u, logBuf: logBuf}
 }
 
-// client returns an HTTP client that sends everything through the proxy. rootCA, when
-// non-nil, is the origin server's certificate authority: the client validates the real
-// origin certificate, which is the property "no TLS interception" is about.
+// client returns an HTTP client that sends everything through the proxy. rootCA is what the
+// client trusts: pass the origin's own authority to assert that a flow was tunnelled
+// untouched, or the Boks CA to accept an intercepted one.
 func (p *testProxy) client(rootCA *x509.CertPool) *http.Client {
 	return &http.Client{
 		Timeout: 10 * time.Second,

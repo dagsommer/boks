@@ -80,6 +80,33 @@ rewrites guest `AF_INET` sockets and performs the connection on the host, so gue
 succeed, raw TCP connects, ICMP fails (`Network unreachable`), and a host service on
 `127.0.0.1:11434` answered the guest. See [security-model.md](security-model.md).
 
+## TLS interception, verified on the host
+
+*(verified 2026-08-11, Linux host, no hypervisor involved — this is a host-side path and
+needs no guest.)* Two real HTTPS origins, certificates issued by a throwaway "Demo Web CA"
+standing in for the public trust store; a real `curl` through `boks proxy`; one host with a
+credential injection rule and one without.
+
+| Claim | Evidence |
+|---|---|
+| the origin receives the real secret | `x_api_key_received: "sk-ant-REAL-SECRET-VALUE-…"` |
+| the client only ever sent a placeholder | request carried `x-api-key: sk-ant-api03-placeholder…` |
+| a host with no rule gets nothing | the same placeholder arrived unchanged at `plain.localtest.me`, and no `Authorization` |
+| the intercepted host presents a Boks certificate | `subject=O=Boks intercepted, CN=api.localtest.me` / `issuer=O=Boks, CN=Boks local CA (…)` |
+| the unconfigured host keeps its own chain | `subject=CN=plain.localtest.me` / `issuer=O=Demo Web CA, CN=Demo Web CA` |
+| the log separates the two | `PROXY` column: `forward` for `api.localtest.me:9443`, `forward-bypass` for `plain.localtest.me:9444` |
+| no secret reaches any log | `grep` for the credential in the decision log and the proxy's stderr: 0 hits, while the stderr does say `injected credential anthropic for api.localtest.me:9443` |
+| the origin's certificate is verified by the proxy | the proxy ran with the demo CA in its trust store; a unit test drives the failure path and asserts the request never reaches the origin |
+
+The certificate comparison is the load-bearing part: both hosts were reached through the
+same proxy, by the same client, trusting both authorities, so the only thing distinguishing
+them is whether Boks substituted a certificate — and it did so for exactly the host with a
+credential rule.
+
+**Not verified:** none of this has run against a guest. `boks run` does not start the proxy,
+does not set `HTTP_PROXY`, and does not install the CA anywhere. What is demonstrated is the
+host-side mechanism, driven by a real client over real TLS.
+
 ## What counts as evidence
 
 Weak evidence, do not rely on it:
