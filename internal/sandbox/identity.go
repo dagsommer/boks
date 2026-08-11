@@ -1,11 +1,14 @@
 package sandbox
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/dagsommer/boks/internal/workspace"
 )
@@ -32,38 +35,226 @@ const (
 	// LabelEphemeral marks a sandbox that is removed when its command exits, so `ls`
 	// can say so rather than showing it as an ordinary sandbox about to vanish.
 	LabelEphemeral = "dev.boks.ephemeral"
+	// LabelAgent is the agent the sandbox was created for. It is the half of the
+	// sandbox's identity the container record cannot express, and `ls` has a column for
+	// it; it is also what lets `boks run -name x` work without naming an agent.
+	LabelAgent = "dev.boks.agent"
 )
 
-// NamePrefix begins every derived sandbox name, so that a name's origin is obvious wherever
-// it shows up — including in containerd's own tooling.
-const NamePrefix = "boks-"
-
-// nameDigestBytes is how much of the workspace path digest ends up in a derived name.
-// Twelve hex characters is far more than enough to keep the directories on one machine
-// apart, and short enough to read and type.
-const nameDigestBytes = 6
-
-// containerdName is containerd's own identifier grammar. Rejecting a bad name here gives a
-// better message than containerd's, which surfaces late and mentions its regexp.
+// containerdName is containerd's own identifier grammar: alphanumeric runs joined by single
+// '.', '_' or '-' separators. Rejecting a bad name here gives a better message than
+// containerd's, which surfaces late and mentions its regexp.
 var containerdName = regexp.MustCompile(`^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$`)
 
 // maxNameLength matches containerd's identifier limit.
 const maxNameLength = 76
 
-// DeriveName returns the sandbox name for a workspace path.
+// digestChars is how much of a workspace path digest ends up in a name that needs one. Six
+// hex characters distinguish the directories on one machine and stay short enough to type.
+const digestChars = 6
+
+// DeriveName returns the readable sandbox name for an agent and a workspace:
+// `<agent>-<workspace directory name>`, which is the name sbx uses.
 //
-// Identity is by workspace path, hashed. `boks run ~/src/foo` twice must reach the same
-// sandbox — that is the behaviour Docker Sandboxes has and the reason a sandbox is worth
-// keeping — and the workspace path is the only thing both invocations share. The path
-// cannot be the containerd identifier directly (slashes and spaces are not allowed, and
-// the identifier is capped at 76 characters), so its digest is.
+// Naming and re-attach are the same mechanism. `boks run claude ~/src/foo` twice must reach
+// one sandbox, and it does so by deriving one name from the two things both invocations
+// share — the agent and the workspace. There is no separate identity: the name *is* the
+// identity, which is why it must be derived rather than generated.
 //
-// An explicit -name overrides this, which is what lets one workspace hold several sandboxes
-// and lets a sandbox be reached from any directory. The human-readable path is kept in a
-// label so `boks ls` can show it.
-func DeriveName(hostPath string) string {
+// Case, dots and existing hyphens are kept, so ~/git_repos/finndato.no gives
+// claude-finndato.no. Anything containerd would reject is folded away by sanitiseSegment.
+// An explicit -name overrides the whole scheme; that is what lets one workspace hold several
+// sandboxes and lets a sandbox be reached from any directory.
+func DeriveName(agent, hostPath string) (string, error) {
+	return composeName(agent, hostPath, "")
+}
+
+// QualifiedName is DeriveName with a short digest of the workspace path appended. It is the
+// name used when the readable one is already taken by a *different* directory — see
+// ChooseName, which is where that decision is made.
+func QualifiedName(agent, hostPath string) (string, error) {
+	return composeName(agent, hostPath, pathDigest(hostPath))
+}
+
+// EphemeralName is a unique name for a sandbox that has no lasting identity.
+//
+// A `-rm` run must not take the name of the workspace's persistent sandbox, nor of another
+// run happening at the same time, so the suffix is random rather than derived. It is longer
+// than a path digest so the two cannot be mistaken for one another.
+func EphemeralName(agent, hostPath string) (string, error) {
+	buf := make([]byte, 5)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generating sandbox name: %w", err)
+	}
+	return composeName(agent, hostPath, hex.EncodeToString(buf))
+}
+
+// composeName joins the parts, keeping the result inside containerd's length limit.
+//
+// The workspace half is what gets truncated: the agent half is short, chosen by the user in
+// this invocation, and the part that says what the sandbox is. A truncated name could
+// collide with another long path that shares a prefix, so truncation always brings a digest
+// with it — a name too long to be readable in full is still a name that has to be unique.
+func composeName(agent, hostPath, digest string) (string, error) {
+	if err := validateSegment(agent); err != nil {
+		return "", fmt.Errorf("agent name %q cannot start a sandbox name: %w", agent, err)
+	}
+
+	segment := workspaceSegment(hostPath)
+	if segment == "" {
+		return "", fmt.Errorf("workspace %q has no name to derive a sandbox name from; pass -name", hostPath)
+	}
+
+	budget := maxNameLength - len(agent) - 1
+	if digest != "" {
+		budget -= len(digest) + 1
+	}
+	if budget < 1 {
+		return "", fmt.Errorf("agent name %q leaves no room for a workspace name; pass -name", agent)
+	}
+	if len(segment) > budget {
+		if digest == "" {
+			// Truncating without a digest would let two long paths that share a
+			// prefix share a name, so switch to the qualified form instead.
+			return composeName(agent, hostPath, pathDigest(hostPath))
+		}
+		segment = trimSeparators(segment[:budget])
+		if segment == "" {
+			segment, digest = digest, ""
+		}
+	}
+
+	name := agent + "-" + segment
+	if digest != "" {
+		name += "-" + digest
+	}
+	if err := ValidateName(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// workspaceSegment turns a workspace path into the readable half of a sandbox name.
+//
+// Two cases the rule leaves open are decided here. A workspace at a filesystem root has no
+// basename worth using, so it is called "root": there is only one of them per machine, so
+// the name stays unique. A basename with nothing usable left after sanitising — "…", or a
+// directory named entirely in non-ASCII script — falls back to a digest of the path, which
+// is unreadable but correct, and still re-attaches.
+func workspaceSegment(hostPath string) string {
+	if hostPath == "" {
+		return ""
+	}
+	if filepath.Dir(hostPath) == hostPath {
+		return "root"
+	}
+	if segment := sanitiseSegment(filepath.Base(hostPath)); segment != "" {
+		return segment
+	}
+	return pathDigest(hostPath)
+}
+
+// sanitiseSegment folds a directory name into containerd's identifier grammar.
+//
+// containerd permits ASCII alphanumerics joined by single '.', '_' or '-' separators, and
+// nothing else — no spaces, no slashes, no repeated separators, none at either end. Those
+// are exactly the characters sbx's naming rule preserves, so ordinary project directories
+// pass through unchanged; anything else becomes a single '-', and runs of separators
+// collapse so that "my  project" and "my--project" both give "my-project".
+func sanitiseSegment(s string) string {
+	var b strings.Builder
+	pendingSeparator := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			if pendingSeparator != 0 && b.Len() > 0 {
+				b.WriteByte(pendingSeparator)
+			}
+			pendingSeparator = 0
+			b.WriteByte(c)
+		case c == '.' || c == '_' || c == '-':
+			if pendingSeparator == 0 {
+				pendingSeparator = c
+			}
+		default:
+			// A byte containerd will not take, including every byte of a
+			// multi-byte rune. One separator stands in for a run of them.
+			if pendingSeparator == 0 {
+				pendingSeparator = '-'
+			}
+		}
+	}
+	return b.String()
+}
+
+// trimSeparators removes separators from both ends, which containerd's grammar forbids.
+func trimSeparators(s string) string { return strings.Trim(s, "._-") }
+
+// pathDigest is a short, stable hash of a workspace path, used wherever a name needs to
+// distinguish two directories that would otherwise produce the same one.
+func pathDigest(hostPath string) string {
 	sum := sha256.Sum256([]byte(hostPath))
-	return NamePrefix + hex.EncodeToString(sum[:nameDigestBytes])
+	return hex.EncodeToString(sum[:])[:digestChars]
+}
+
+// validateSegment checks one half of a composed name.
+func validateSegment(s string) error {
+	if s == "" {
+		return fmt.Errorf("it is empty")
+	}
+	if !containerdName.MatchString(s) {
+		return fmt.Errorf("use letters and digits, separated by '.', '_' or '-'")
+	}
+	return nil
+}
+
+// Choice is the sandbox an invocation is about: which name it uses, whether that sandbox
+// already exists, and — when the readable name was already taken by another directory —
+// what it was taken by.
+type Choice struct {
+	Name   string
+	Exists bool
+	Info   Info
+	// CollidedWith is the workspace holding the readable name, set only when this
+	// invocation had to fall back to the qualified one.
+	CollidedWith string
+}
+
+// ChooseName decides which sandbox name an agent and workspace map to, given what already
+// exists. lookup reports the sandbox with a given name, if any.
+//
+// The readable name is not unique: two directories can share a basename, which the old
+// path-digest scheme made impossible. Of the three ways out — reuse the sandbox, refuse, or
+// pick another name — only the third is both safe and usable. Reuse would silently attach
+// the second project to the first project's sandbox, which has the wrong workspace mounted
+// and possibly its files; refusing would leave the user stuck at a name they never chose.
+// So the second directory gets `<agent>-<dir>-<digest>`, deterministically, and is told why.
+//
+// The qualified name is checked first, so a sandbox that was once bumped keeps its name even
+// after the sandbox that bumped it is removed.
+func ChooseName(agent, hostPath string, lookup func(name string) (Info, bool)) (Choice, error) {
+	preferred, err := DeriveName(agent, hostPath)
+	if err != nil {
+		return Choice{}, err
+	}
+	qualified, err := QualifiedName(agent, hostPath)
+	if err != nil {
+		return Choice{}, err
+	}
+
+	if info, ok := lookup(qualified); ok {
+		return Choice{Name: qualified, Exists: true, Info: info}, nil
+	}
+	info, ok := lookup(preferred)
+	switch {
+	case !ok:
+		return Choice{Name: preferred}, nil
+	case info.Workspace() == "" || info.Workspace() == hostPath:
+		return Choice{Name: preferred, Exists: true, Info: info}, nil
+	default:
+		return Choice{Name: qualified, CollidedWith: info.Workspace()}, nil
+	}
 }
 
 // ValidateName reports whether a user-supplied sandbox name is usable as a containerd
