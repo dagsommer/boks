@@ -53,8 +53,9 @@ open-source software. Boks does not implement a VMM, a kernel or a shim.
 | Workspace resolution, exact-path mounting | **Boks** | OCI spec construction |
 | Host prerequisite diagnosis (`doctor`) | **Boks** | |
 | Sandbox naming, state, lifecycle | **Boks** | |
-| Network policy engine | **Boks** *(unverified)* | see *Networking* |
-| Host proxy + credential injection | **Boks** *(unverified)* | |
+| Network policy engine | **Boks** — `internal/policy` *(built, not enforcing)* | see *Networking* |
+| Host network stack config + supervision | **Boks** — `internal/network` *(built, not wired)* | gvisor-tap-vsock, embedded |
+| Host proxy + credential injection | **Boks** — `internal/proxy`, `internal/secret` *(built, cooperating-client only)* | |
 | Port forwarding | **Boks** *(unverified)* | |
 | Kits / declarative config | **Boks** *(not started)* | |
 | Nested Docker daemon | guest image + **Boks** *(not started)* | |
@@ -136,6 +137,15 @@ backed by a host UNIX socket, via `io.containerd.nerdbox.network.*` annotations.
 that at [gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock) gives a userspace
 TCP/IP stack **on the host**, which sees every packet the guest emits.
 
+*(verified 2026-08-11, macOS host with a working hypervisor: the provider **does** displace
+TSI. Same binary, same image, only annotations differ. With the defaults the guest has `lo`
+only and a host service on `127.0.0.1:9999` answers it; with the provider attached the guest
+has `eth0` and the same probe returns **connection refused** — the call is now handled by
+the guest's own loopback stack instead of being impersonated on the host. Corroborated three
+ways: a ninth virtio device (`VIRTIO_ID_NET`) appears, the host stack logs frames carrying
+the VM's MAC, and the guest's `resolv.conf` changes from a copy of the host's file to the
+gateway address Boks configures.)*
+
 That is the property we need: enforcement does not depend on the guest honouring
 `HTTP_PROXY`. A guest that opens a raw socket still has its packets terminated by a host
 stack that can drop them. The intended shape:
@@ -148,9 +158,53 @@ guest --virtio-net--> unix socket --> gvisor netstack (host) --> policy engine -
 
 Raw TCP/UDP to unapproved destinations is dropped by the netstack; HTTP and HTTPS are
 steered to a host-side forward proxy that filters on hostname. For HTTPS the proxy reads the
-`CONNECT` target and, later, the TLS SNI — no interception, no custom CA.
+`CONNECT` target and the TLS SNI — no interception, no custom CA.
 
-*(unverified: not implemented.)*
+**Configuration (`internal/network`).** Two annotations are required, and each does half the
+job. Both were confirmed against nerdbox's source (`internal/shim/task/networking.go` and
+`ctrnetworking.go`), not only its documentation, because the documentation is wrong in at
+least one place: it shows `addr=192.168.127.2`, while the parser calls `netip.ParsePrefix`
+and rejects anything that is not CIDR.
+
+| Annotation | Effect | Required fields |
+|---|---|---|
+| `io.containerd.nerdbox.network.N` | attaches a NIC to the **VM** | `socket`, `mode` (`unixgram` for gvisor-tap-vsock), `mac` (unicast) |
+| `io.containerd.nerdbox.ctr.network.N` | wires the **container** to that NIC | `vmmac`; plus `addr` (CIDR), `gw`, `ifname` |
+| `io.containerd.nerdbox.ctr.dns` | writes the container's `/etc/resolv.conf` | `key=value` pairs, one line each |
+
+No OCI spec change is needed, the network namespace is kept, and `CAP_NET_ADMIN` is **not**
+required despite what nerdbox's README example implies. The shim deletes these annotations
+after parsing, so they never reach the guest.
+
+Consequences Boks' design has to carry:
+
+- **One stack per sandbox.** A second VM on the same socket gets a duplicate address; a
+  third fails to attach. `internal/network` therefore creates a unique socket directory per
+  sandbox and ties the stack's lifetime to the sandbox's.
+- **The stack is embedded, not spawned.** gvisor-tap-vsock is used as a Go library rather
+  than by exec'ing `gvproxy`: a goroutine cannot outlive a crashed parent, there is no PID
+  to track or orphan to reap, and the closed posture becomes a typed configuration a test
+  can assert rather than the absence of command-line flags. The cost is gvisor's netstack in
+  the binary; it cross-compiles for darwin/arm64 and windows/amd64.
+- **Deny-by-default is asserted, not assumed.** The observed unreachability of the host was a
+  property of one configuration, not a guarantee: gvisor-tap-vsock can be told to translate
+  an address onto the host's loopback, forward host ports inward, answer on extra gateway
+  addresses, or proxy the EC2 metadata service. Boks sets all four explicitly closed.
+- **DNS is mediated.** The container's resolver is set to the gateway rather than inherited
+  from a copy of the host's `resolv.conf`, so name resolution is answered by a stack Boks
+  controls. That is the hook a policy on names attaches to; it does not by itself close DNS
+  as an exfiltration channel.
+- **IPv6 is live surface now.** TSI had none; a guest with a real NIC brings up link-local
+  v6 by itself (the spike saw MLD reports). Boks assigns no routable v6 address and no v6
+  gateway, and the policy language covers v6 from the start.
+- **A network-less mode exists today, for free.** Emitting only the VM-level annotation
+  attaches the NIC — which is what turns TSI off — while never wiring the container to it.
+  The container then has `lo` and nothing else, and host loopback is refused. That is
+  `-net none`, and it is the strongest containment Boks can currently offer.
+
+*(implemented in `internal/network`, unit-tested, **not yet wired into `boks run`'s
+datapath**. The transport change is verified; no policy has yet been enforced against a real
+guest.)*
 
 ## Credential injection
 
@@ -167,7 +221,28 @@ Design constraints Boks adopts:
 A local encrypted file provider comes first; OS keychains (Keychain, Secret Service,
 Credential Manager) later.
 
-*(unverified: not implemented.)*
+**Implemented in `internal/secret`.** Three schemes cover every vendor seen so far without
+naming one: `bearer` (`Authorization: Bearer …`), `basic` (`Authorization: Basic …`, which is
+how Git over HTTPS and most registries take a token) and `header` (an arbitrary header, for
+API-key styles such as `x-api-key`). A rule is written
+`host[,host…]=name:scheme[:extra]`, its host patterns come from the same matcher the policy
+uses, and a catch-all `*` is rejected — sending a token "wherever this request is going" is
+the failure this exists to prevent. Values are wrapped in a type whose `String`, `GoString`
+and JSON forms are redacted, and a test asserts a secret cannot be printed.
+
+Storage is an AES-256-GCM file keyed by PBKDF2-HMAC-SHA256 over a passphrase from
+`BOKS_SECRETS_PASSPHRASE`. Secret *names* are inside the ciphertext too. A key file next to
+the encrypted file is deliberately not offered: it encrypts nothing against anyone who can
+read the directory, while looking like it does.
+
+**Known limit — HTTPS.** Injection needs to see the request, and Boks does not intercept
+TLS. So injection applies only to plaintext HTTP today: inside a `CONNECT` tunnel the proxy
+sees ciphertext and cannot add a header without becoming a man in the middle. Docker
+Sandboxes does inject into HTTPS, which means it terminates TLS somewhere. Closing this gap
+means choosing to terminate TLS for specific configured hosts — a deliberate MITM, and a
+decision for the user to make explicitly rather than a convenience Boks helps itself to.
+
+*(implemented and unit-tested; not wired into `boks run`.)*
 
 ## Nested Docker
 
@@ -207,8 +282,17 @@ Honest statement of what has actually been observed, as of this commit:
 - resource annotations (`io.containerd.nerdbox.resources.*`) reaching the VMM: **observed**
   — guest `nproc` and `MemTotal` track `-cpus`/`-memory`.
 - the Linux/KVM path: **not observed**. Verification so far is macOS-only.
-- network isolation: **observed absent**. The guest reaches the host's loopback services
-  via TSI; see [security-model.md](security-model.md).
+- network isolation: **observed absent in the default configuration**. With nerdbox's
+  defaults the guest reaches the host's loopback services via TSI; see
+  [security-model.md](security-model.md).
+- the external network provider displacing TSI: **observed** (2026-08-11, macOS). With the
+  provider attached the guest gains `eth0` and the same host-loopback probe is refused. What
+  has **not** been observed is any policy being enforced against a guest — the transport is
+  verified, the enforcement built on it is not.
+- policy engine, host proxy (HTTP + CONNECT + SNI filtering, no TLS interception),
+  credential injection, network annotation generation and host-stack supervision:
+  **unit-tested on the host**, and the proxy exercised end to end against real TLS origins.
+  None of it is connected to a sandbox.
 
 See [docs/verification.md](verification.md) for the procedure that will confirm the VM
 boundary on capable hardware, and for what evidence counts.

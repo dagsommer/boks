@@ -8,9 +8,9 @@ account, no cloud service, no telemetry.
 
 > [!WARNING]
 > **Boks is experimental and incomplete.** The VM boundary is real and has been measured
-> (see [Status](#status)), but there is **no network policy**: a sandbox reaches the
-> internet *and* your host's own loopback services. Do not rely on Boks to contain hostile
-> code today.
+> (see [Status](#status)), but **no network policy is enforced on a running sandbox**: it
+> reaches the internet *and* your host's own loopback services. Do not rely on Boks to
+> contain hostile code today.
 
 ## Status
 
@@ -38,11 +38,15 @@ What works, tested locally:
 
 What is **not** done:
 
-- **No network policy — and the default is more open than you may expect.** The guest has
-  no virtual NIC, but libkrun's TSI performs its connections on the host, so the sandbox
-  reaches the internet *and* anything listening on your host's `127.0.0.1`. There is no
-  allowlist, no proxy, no enforcement. This is the biggest gap.
-- **No credential injection.** Any secret you put in a sandbox is in the sandbox.
+- **No network policy in the datapath — and the default is more open than you may expect.**
+  The guest has no virtual NIC, but libkrun's TSI performs its connections on the host, so
+  the sandbox reaches the internet *and* anything listening on your host's `127.0.0.1`.
+  A policy engine, a host forward proxy (`boks proxy`, `boks policy ls|log`) and the
+  host-side network configuration now exist and are tested, but **nothing is applied to a
+  running sandbox yet**. This is still the biggest gap.
+- **No credential injection in a sandbox.** The mechanism exists and works through
+  `boks proxy`; `boks run` does not use it. Any secret you put in a sandbox is in the
+  sandbox.
 - **No nested Docker**, no persistent sandboxes, no `ls`/`stop`/`rm`/`exec`, no kits.
 - **Linux is untested in practice.** The boundary was verified on macOS/Apple silicon;
   the Linux/KVM path is designed for but has not been exercised end to end.
@@ -91,8 +95,18 @@ Useful flags:
 | `-cpus`, `-memory` | guest vCPUs and MiB |
 | `-env KEY=VALUE` | set an environment variable (repeatable) |
 | `-t` | allocate a pseudo-terminal |
+| `-policy`, `-allow`, `-deny`, `-net`, `-secret` | network policy — **validated and printed, not yet applied** |
 
 A workspace argument may carry a `:ro` suffix for a read-only share.
+
+Network policy has its own commands while it is not part of a run:
+
+```bash
+./bin/boks policy ls -policy standard        # what a preset resolves to, and why
+./bin/boks proxy -policy locked -allow api.example.com:443 -v
+./bin/boks policy log                        # what was allowed or denied, and why
+./bin/boks secret set github                 # a credential the guest never receives
+```
 
 ## Architecture
 
@@ -119,7 +133,9 @@ Two things to understand before using Boks:
 - **Workspace writes are live on your host.** A sandbox can modify `Makefile`,
   `package.json` scripts, Git hooks or CI config, which then run on *your* machine. Review
   diffs before running anything from a workspace a sandbox touched.
-- **There is no network policy yet.** A guest can reach whatever the runtime permits.
+- **No network policy is enforced yet.** A guest can reach whatever the runtime permits.
+  `boks policy ls` shows what a policy would resolve to and `boks proxy` filters traffic
+  sent through it, but nothing constrains a running sandbox.
 
 Boks will never mount the host's Docker or containerd socket into a guest.
 
@@ -135,8 +151,8 @@ public documentation using open-source components; it is not derived from Docker
 |---|---|---|
 | microVM per sandbox | yes | designed, unverified |
 | exact-path workspace | yes | yes (unverified in a VM) |
-| network policy enforced outside the guest | yes | planned |
-| credential injection by host proxy | yes | planned |
+| network policy enforced outside the guest | yes | engine + proxy built, not wired into `run` |
+| credential injection by host proxy | yes | built, not wired into `run` |
 | Docker daemon inside the sandbox | yes | planned |
 | persistent sandboxes, `ls`/`stop`/`rm`/`exec` | yes | planned |
 | kits / declarative config | yes | planned |
