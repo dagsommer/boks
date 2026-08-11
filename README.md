@@ -7,11 +7,19 @@ Boks is a local-first, open-source alternative to Docker Sandboxes (`docker sbx`
 account, no cloud service, no telemetry.
 
 > [!WARNING]
-> **Boks is experimental and incomplete.** The VM boundary it is built around has not yet
-> been demonstrated by this project on hardware with virtualisation available — see
-> [Status](#status). Do not rely on it to contain hostile code today.
+> **Boks is experimental and incomplete.** The VM boundary is real and has been measured
+> (see [Status](#status)), but there is **no network policy**: a sandbox reaches the
+> internet *and* your host's own loopback services. Do not rely on Boks to contain hostile
+> code today.
 
 ## Status
+
+The VM boundary is **verified**. On 2026-08-11, on an Apple M5 Pro running macOS 26.5.2,
+`boks run` booted a real microVM: the guest reported **Linux 6.12.44 aarch64** while the
+host ran **Darwin 25.5.0**, with its own `boot_id`, an uptime of 0.03 s against the host's
+28 days, and vCPU and memory counts matching `-cpus`/`-memory` rather than the host's 18
+cores and 48 GiB. A shared-kernel container cannot produce any of that. Full evidence and
+procedure: [docs/verification.md](docs/verification.md).
 
 What works, tested locally:
 
@@ -25,24 +33,29 @@ What works, tested locally:
 - Cleanup leaves no containers, tasks, shim processes or mounts behind, including after
   Ctrl-C.
 
+- **Symlinks do not escape.** A symlink inside the workspace pointing at `/etc` or `~/.ssh`
+  resolves inside the guest, not on the host.
+
 What is **not** done:
 
-- **The VM boundary is unverified.** The development machine is itself a VM without nested
-  virtualisation, so no hypervisor was available to boot a guest. The orchestration was
-  validated against containerd's `runc` runtime, which shares the host kernel and is *not*
-  isolation. `boks run` refuses non-VM runtimes unless you explicitly opt out.
-- **No network policy.** A sandbox has whatever network access the runtime gives it. There
-  is no allowlist, no proxy, no enforcement.
+- **No network policy — and the default is more open than you may expect.** The guest has
+  no virtual NIC, but libkrun's TSI performs its connections on the host, so the sandbox
+  reaches the internet *and* anything listening on your host's `127.0.0.1`. There is no
+  allowlist, no proxy, no enforcement. This is the biggest gap.
 - **No credential injection.** Any secret you put in a sandbox is in the sandbox.
 - **No nested Docker**, no persistent sandboxes, no `ls`/`stop`/`rm`/`exec`, no kits.
-- Linux only in practice. macOS is designed for, not tested. Windows is unsupported.
+- **Linux is untested in practice.** The boundary was verified on macOS/Apple silicon;
+  the Linux/KVM path is designed for but has not been exercised end to end.
 
 See [docs/verification.md](docs/verification.md) for exactly what has been observed and the
 procedure to confirm the VM boundary on capable hardware.
 
 ## Requirements
 
-- Linux with hardware virtualisation (`/dev/kvm`, and membership of the `kvm` group)
+- Hardware virtualisation: Linux with `/dev/kvm` (and membership of the `kvm` group), or
+  macOS on Apple silicon (Hypervisor.framework). macOS additionally needs the nerdbox shim
+  codesigned with the `com.apple.security.hypervisor` entitlement and a user-writable
+  `/var/run/containerd` — see [docs/verification.md](docs/verification.md#macos-setup-notes).
 - [containerd](https://containerd.io/) 2.2 or later, running
 - [nerdbox](https://github.com/containerd/nerdbox) — the VM runtime shim
   (`containerd-shim-nerdbox-v1`) on containerd's `PATH`

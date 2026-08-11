@@ -114,8 +114,9 @@ contents are never shared.
 One caveat inherited from nerdbox: bind-mounting a *single file* shares its **parent
 directory** with the VM. Boks therefore only mounts directories for workspaces.
 
-*(unverified: exact-path mounting is implemented and unit-tested, but has not been observed
-inside a booted VM — see "Verification status".)*
+*(verified 2026-08-11: `boks run /private/tmp/boksprobe/deep/a/b/c/project -- pwd` printed
+that exact path inside the guest; the intermediate directories were created automatically
+and each contained only the next component of the path, nothing from the host.)*
 
 ## Networking
 
@@ -125,6 +126,10 @@ Two options exist below us, and the choice matters for security.
 `AF_INET` socket syscalls to `AF_TSI`, and the VMM performs the connection on the host.
 Convenient, but: no IPv6, no ICMP, and the policy decision point lives inside libkrun where
 Boks cannot express rules.
+
+*(verified 2026-08-11: confirmed in a running guest — `/sys/class/net` contains only `lo`,
+yet outbound TCP works and the host's own `127.0.0.1` services answered the guest, because
+the host performs the connect. This is why TSI cannot be the long-term answer.)*
 
 **External network provider (chosen direction).** nerdbox can attach a virtio-net interface
 backed by a host UNIX socket, via `io.containerd.nerdbox.network.*` annotations. Pointing
@@ -194,11 +199,16 @@ Honest statement of what has actually been observed, as of this commit:
 
 - containerd connection, image pull/unpack, container+task lifecycle, stdio streaming,
   exit-code propagation, cleanup: **tested locally**.
-- exact-path workspace mount construction: **unit-tested**; end-to-end behaviour inside a
-  VM: **not observed**.
-- VM boot, guest kernel identity, virtiofs sharing under nerdbox: **not observed**. The
-  development machine used so far is itself a VM without nested virtualisation
-  (`/dev/kvm` absent), so no hypervisor is available to it.
+- exact-path workspace mount construction: **unit-tested**, and **observed inside a booted
+  microVM** — including auto-creation of the intermediate guest directories.
+- VM boot, guest kernel identity, virtiofs sharing under nerdbox: **observed**
+  (2026-08-11, macOS/Apple silicon). Guest ran Linux 6.12.44 on a Darwin host, with its own
+  boot_id, uptime and vCPU/memory topology.
+- resource annotations (`io.containerd.nerdbox.resources.*`) reaching the VMM: **observed**
+  — guest `nproc` and `MemTotal` track `-cpus`/`-memory`.
+- the Linux/KVM path: **not observed**. Verification so far is macOS-only.
+- network isolation: **observed absent**. The guest reaches the host's loopback services
+  via TSI; see [security-model.md](security-model.md).
 
 See [docs/verification.md](verification.md) for the procedure that will confirm the VM
 boundary on capable hardware, and for what evidence counts.
