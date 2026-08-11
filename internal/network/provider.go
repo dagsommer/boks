@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 )
 
@@ -34,8 +35,17 @@ type provider interface {
 	// start binds the link socket and begins serving. It must return only once the
 	// socket exists, because the VM will connect to it as soon as the task starts.
 	start(ctx context.Context, plan Plan, logger io.Writer) error
+	// listen returns a listener *inside* the virtual network, at addr. See
+	// (*Network).Listen for why that is the only place Boks' proxy should listen.
+	listen(addr string) (net.Listener, error)
+	// dial opens a connection into the virtual network from the host side.
+	dial(ctx context.Context, addr string) (net.Conn, error)
 	stop() error
 }
+
+// ErrNoNetwork is returned by Listen and Dial when the sandbox has no virtual network to
+// listen in — ModeNone, or a stack that was never started.
+var ErrNoNetwork = errors.New("network: this sandbox has no virtual network")
 
 // New builds a Network from a Config. Nothing is started and no socket exists yet.
 func New(cfg Config) (*Network, error) {
@@ -43,6 +53,17 @@ func New(cfg Config) (*Network, error) {
 	if err != nil {
 		return nil, err
 	}
+	return NewFromPlan(plan)
+}
+
+// NewFromPlan builds a Network for an already-computed Plan.
+//
+// It exists because the process that computes a sandbox's annotations and the process that
+// serves the other end of its link are not always the same one. Passing the plan across,
+// rather than recomputing it, is what makes it impossible for the two to disagree about the
+// socket path or the addressing — a disagreement that would show up as a VM that boots with
+// a NIC connected to nothing.
+func NewFromPlan(plan Plan) (*Network, error) {
 	var p provider
 	switch plan.Mode {
 	case ModeNone:
@@ -57,6 +78,47 @@ func New(cfg Config) (*Network, error) {
 
 // Plan returns the computed plan.
 func (n *Network) Plan() Plan { return n.plan }
+
+// Listen returns a TCP listener **inside** the sandbox's virtual network, on the gateway
+// address at port.
+//
+// This is where Boks' filtering proxy listens, and the reason is worth stating: a listener
+// obtained this way exists only in one sandbox's virtual network. Nothing is bound on the
+// host, so no other process, no other sandbox and nothing on the LAN can reach it, and two
+// sandboxes cannot collide on a port. Binding a host port and telling the guest to use it
+// would have all three problems.
+//
+// ModeNone has no virtual network to listen in and returns ErrNoNetwork: a sandbox with no
+// network must not acquire one through the back door of a proxy.
+func (n *Network) Listen(port int) (net.Listener, error) {
+	if err := n.running(); err != nil {
+		return nil, err
+	}
+	return n.provider.listen(net.JoinHostPort(n.plan.Gateway.String(), strconv.Itoa(port)))
+}
+
+// Dial opens a connection from the host side into the sandbox's virtual network.
+//
+// It is the inverse of Listen, and it exists for two reasons: it is how a test drives the
+// datapath without a hypervisor — dial the gateway, speak to whatever Boks put there — and
+// it is what a future `boks ports` would forward an inbound connection through. It is
+// host→guest only. Nothing here lets the guest reach the host; that direction is decided by
+// the policy engine in front of the proxy.
+func (n *Network) Dial(ctx context.Context, port int) (net.Conn, error) {
+	if err := n.running(); err != nil {
+		return nil, err
+	}
+	return n.provider.dial(ctx, net.JoinHostPort(n.plan.Gateway.String(), strconv.Itoa(port)))
+}
+
+func (n *Network) running() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !n.started || n.stopped {
+		return fmt.Errorf("%w: it has not been started", ErrNoNetwork)
+	}
+	return nil
+}
 
 // Annotations returns the OCI annotations the sandbox must be created with.
 func (n *Network) Annotations() map[string]string { return n.plan.Annotations() }
@@ -160,6 +222,17 @@ func (b *blackhole) start(ctx context.Context, plan Plan, logger io.Writer) erro
 		_ = conn.Close()
 	}()
 	return nil
+}
+
+// listen and dial refuse: ModeNone has a link socket, so the VM's NIC has somewhere to
+// write, but there is no network stack behind it and no address to reach. A proxy in a
+// sandbox with no network would be a network.
+func (b *blackhole) listen(string) (net.Listener, error) {
+	return nil, fmt.Errorf("%w: -net none attaches no stack, so there is nothing to listen in", ErrNoNetwork)
+}
+
+func (b *blackhole) dial(context.Context, string) (net.Conn, error) {
+	return nil, fmt.Errorf("%w: -net none attaches no stack, so there is nothing to dial", ErrNoNetwork)
 }
 
 func (b *blackhole) stop() error {

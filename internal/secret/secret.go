@@ -376,6 +376,49 @@ func parseAttachment(attach string) (Inject, error) {
 	return r, nil
 }
 
+// ParseCredentials assembles a set of credentials from the two CLI spellings: the
+// injection rules and the placeholders the guest holds instead of a secret.
+//
+// It lives here rather than in the command layer because two different processes build the
+// same credentials from the same strings — the CLI, to validate them and to tell the user
+// which hosts will be decrypted, and the process that runs the proxy, which receives the
+// specs verbatim. Parsing them in one place is what keeps those two from disagreeing about
+// what the user asked for.
+//
+// Rules for one service accumulate onto one credential, which is the point of the two-level
+// model: four hosts sharing one enterprise token are four rules and one secret.
+func ParseCredentials(inject, guest []string) ([]Credential, error) {
+	var order []string
+	byService := map[string]*Credential{}
+	for _, spec := range inject {
+		service, rules, err := ParseInject(spec)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := byService[service]; !ok {
+			byService[service] = &Credential{Service: service}
+			order = append(order, service)
+		}
+		byService[service].Inject = append(byService[service].Inject, rules...)
+	}
+	for _, spec := range guest {
+		service, env, placeholder, err := ParseGuestCredential(spec)
+		if err != nil {
+			return nil, err
+		}
+		c, ok := byService[service]
+		if !ok {
+			return nil, fmt.Errorf("-guest-credential %s: no -inject rule mentions service %q, so nothing would ever replace that placeholder", spec, service)
+		}
+		c.EnvName, c.Placeholder, c.ProxyManaged = env, placeholder, true
+	}
+	out := make([]Credential, 0, len(order))
+	for _, name := range order {
+		out = append(out, *byService[name])
+	}
+	return out, nil
+}
+
 // ParseGuestCredential fills in the guest-side half of a credential:
 //
 //	service=placeholder
