@@ -29,9 +29,13 @@ What works, tested locally:
   through containerd or re-attaches to the one that agent and directory already have, runs
   the agent (or a command after `--`), streams its output, and returns its exit code.
   `-rm` makes it ephemeral instead.
-- **Agents** — `shell` is the one Boks ships an image for; the other names `sbx` uses
-  (`claude`, `codex`, `copilot`, `cursor`, `docker-agent`, `droid`, `gemini`, `kiro`,
-  `opencode`) are registered and run with an explicit `-template`.
+- **Agents with prepared images** — `claude`, `codex`, `copilot`, `cursor`, `docker-agent`,
+  `droid`, `gemini`, `opencode` and `shell` each resolve to an image at
+  `ghcr.io/dagsommer/boks/`, built from [`images/`](images/): a shared Debian base with the
+  toolchain preinstalled, plus one thin layer per agent. `kiro` is registered without an
+  image and needs an explicit `-template`. Every CLI has been run; none has yet been run
+  inside a microVM. See [images/README.md](images/README.md), including why nothing in them
+  is installed by a package manager.
 - **The sandbox lifecycle** — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`, `cp`.
   Sandboxes persist until removed, and files written inside one survive stop/start. *Tested
   end to end against containerd on the non-VM dev runtime only* — see below.
@@ -58,8 +62,12 @@ What is **not** done:
 - **Credentials cannot be injected into HTTPS at all** without terminating TLS, which Boks
   deliberately does not do. Only plaintext HTTP injection works today.
 - **No nested Docker**, no kits, no port publishing.
-- **No prepared agent images.** The agent registry is real, but only `shell` has an image
-  behind it, and there is no way yet to define an agent in a file rather than in code.
+- **The agent images have never run in a microVM.** They were built and exercised with
+  `docker run`, which proves each CLI is installed and starts — and nothing at all about
+  isolation. `kiro` has no image (see [images/README.md](images/README.md) for why), and
+  there is still no way to define an agent in a file rather than in code.
+- **The images are not published until a release tag is pushed.** Until then the references
+  in the agent registry resolve to nothing; build them locally with `make images`.
 - **No terminal dashboard** for bare `boks`, no `--clone`, `--kit`, `--profile` or
   `--publish`. See the CLI surface section of the parity matrix.
 - **The lifecycle commands have not been exercised behind a VM.** They were built and tested
@@ -207,7 +215,7 @@ public documentation using open-source components; it is not derived from Docker
 | workspace `:ro`, no parent exposure | yes | **yes**, verified |
 | sandbox lifecycle (`ls`/`exec`/`stop`/`rm`/`cp`) | yes | **yes**, not yet exercised behind a VM |
 | agent-first CLI, readable sandbox names | yes | **yes** — same grammar, same naming rule |
-| prepared agent images | yes, ten of them | only `shell`; the other names need `-template` |
+| prepared agent images | yes, ten of them | **nine of ten**, multi-arch on a shared base; `kiro` needs `-template` |
 | terminal dashboard for bare `sbx` | yes | no — see the parity matrix |
 | network policy enforced outside the guest | yes | engine + proxy built, not wired into `run` |
 | credential injection by host proxy | yes | HTTP only, and not wired into `run` |
@@ -243,7 +251,13 @@ make build     # build ./bin/boks
 make test      # unit tests
 make check     # vet + unit tests
 make integration   # requires a running containerd; see below
+
+make images       # build the agent images for this architecture; needs docker
+make images-test  # each CLI runs, uid 1000, tini as PID 1, an injected CA lands
 ```
+
+`make images` builds for the host architecture only. Multi-arch images are published from
+`.github/workflows/images.yml` on a release tag, using a native runner per architecture.
 
 Integration tests drive a real containerd and are skipped unless `BOKS_INTEGRATION=1`. By
 default they run against the isolating runtime, so a pass means the assertions held behind a
