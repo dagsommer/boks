@@ -321,7 +321,11 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 // describeNetwork prints what the sandbox's network will do, before anything runs in it.
 //
 // A user is entitled to know which destinations are permitted and which of their flows will
-// be decrypted *at the moment they ask for it*, not from a certificate error later.
+// be decrypted *at the moment they ask for it*, not from a certificate error later. How much
+// is said depends on whether they asked: a run that names no policy flags gets one line and a
+// pointer, because a wall of text before every `boks run` is text nobody reads. A run that
+// configures anything gets the whole resolved policy, and a run that will have traffic
+// decrypted gets that spelled out whether it asked or not.
 func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stderr io.Writer) error {
 	if mode == network.ModeNone {
 		fmt.Fprint(stderr, noNetworkNotice)
@@ -340,8 +344,16 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stder
 	if err != nil {
 		return err
 	}
+	notice := interceptionNotice(credentials)
+
+	if !f.specified() && notice == "" {
+		fmt.Fprintf(stderr, "network: %s, policy %s — 'boks policy ls' for the rules, "+
+			"'boks policy log' for what they decided.\n", mode, pol.Name)
+		return nil
+	}
+
 	fmt.Fprint(stderr, pol.Describe())
-	if notice := interceptionNotice(credentials); notice != "" {
+	if notice != "" {
 		fmt.Fprintf(stderr, "\n%s", notice)
 	}
 	fmt.Fprintf(stderr, "\n%s\n", enforcementNote)
