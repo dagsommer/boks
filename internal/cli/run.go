@@ -18,6 +18,12 @@ func runCommand(ctx context.Context, env Env) error {
 	tty := fs.Bool("t", false, "allocate a pseudo-terminal")
 	ephemeral := fs.Bool("rm", false, "destroy the sandbox when the command exits")
 
+	// Network policy flags are accepted and validated here, but not applied: see
+	// netflags.go and the warning below. Their definitions live in netflags.go so that
+	// `run`, `proxy` and `policy ls` cannot drift apart.
+	var netFlags policyFlags
+	netFlags.register(fs)
+
 	fs.Usage = func() {
 		fmt.Fprint(env.Stderr, `Usage: boks run [flags] <workspace> [-- command [args...]]
 
@@ -67,6 +73,21 @@ Flags:
 	name, err := flags.sandboxName(workspaces[0])
 	if err != nil {
 		return err
+	}
+
+	// Fail on a malformed rule now, so a policy that will one day be enforced is known to
+	// be well-formed today; then say plainly that nothing applies it yet.
+	if _, err := netFlags.resolve(); err != nil {
+		return err
+	}
+	if _, err := netFlags.credentialRules(); err != nil {
+		return err
+	}
+	if _, err := netFlags.networkPlan(name); err != nil {
+		return err
+	}
+	if netFlags.specified() {
+		fmt.Fprintf(env.Stderr, "%s\n", notEnforcedWarning)
 	}
 	if *ephemeral && *flags.name == "" {
 		// An ephemeral sandbox must not collide with the persistent one for the same
