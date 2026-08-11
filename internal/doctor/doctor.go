@@ -112,7 +112,7 @@ func Run(ctx context.Context, env Env) Report {
 
 // Checks returns the checks applicable to the current platform, in display order.
 func Checks() []Check {
-	return []Check{
+	checks := []Check{
 		platformCheck(),
 		virtualizationCheck(),
 		containerdCheck(),
@@ -121,6 +121,9 @@ func Checks() []Check {
 		runtimeShimCheck(),
 		hypervisorLibraryCheck(),
 	}
+	// Platforms contribute their own requirements rather than every check having to
+	// declare itself irrelevant elsewhere.
+	return append(checks, extraChecks()...)
 }
 
 // Write renders a report as an aligned table followed by remediation text.
@@ -175,10 +178,7 @@ func platformCheck() Check {
 						Remedy: "Boks on macOS targets Apple silicon. Intel Macs have no supported VM backend.",
 					}
 				}
-				return Result{
-					Status: StatusWarn, Detail: detail,
-					Remedy: "macOS support is designed for but not yet exercised. Expect breakage.",
-				}
+				return Result{Status: StatusOK, Detail: detail}
 			default:
 				return Result{
 					Status: StatusFail, Detail: detail,
