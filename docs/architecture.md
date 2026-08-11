@@ -87,9 +87,10 @@ without touching the CLI or the workspace logic.
    annotations (`io.containerd.nerdbox.resources.cpu`, `.memory`).
 5. Starting the task causes containerd to launch the shim, which boots a microVM, mounts
    virtiofs shares, and starts the process under the guest init.
-6. Boks waits on the task, streams stdio, and propagates the guest exit code.
-7. On exit — or on signal — Boks kills the task, deletes it, deletes the container and
-   removes the snapshot. Ephemeral sandboxes leave nothing behind.
+6. Boks waits on the process, streams stdio, and propagates the guest exit code.
+7. A persistent sandbox stays up: only the exec'd process is reaped. `boks stop` kills and
+   deletes the task, and `boks rm` deletes the container and its snapshot. With `-rm` all of
+   that happens when the command exits — on signal too, so nothing is left behind.
 
 ## Workspace sharing
 
@@ -176,12 +177,36 @@ to the host daemon. The host Docker socket is never forwarded — that would def
 isolation boundary entirely. This requires a guest image carrying dockerd plus a writable
 data volume; it is not part of the first milestone.
 
-## Persistence
+## Persistence and sandbox state
 
-Docker Sandboxes keeps a sandbox alive until explicitly removed: packages, images and
-shell history survive stop/start. Boks starts ephemeral (`run` creates and destroys) and
-will grow named, persistent sandboxes backed by a writable snapshot plus a small host-side
-state store. State belongs under XDG paths on Linux (`~/.local/state/boks`).
+Docker Sandboxes keeps a sandbox alive until explicitly removed: packages, images and shell
+history survive stop/start. Boks does the same. A sandbox is a containerd container plus its
+writable snapshot; `stop` kills and deletes the *task*, leaving both, and `start` creates a
+new task over the same snapshot. Only `rm` deletes the container and the snapshot.
+
+So that a sandbox outlives whatever command created it, the container's own process is an
+idle keeper (`sh` trapping SIGTERM and sleeping), and user commands are containerd *execs*
+inside it. `boks run` therefore means: create if absent, start if stopped, then exec. This is
+also what makes `boks exec` possible at all — containerd can only exec into a running task.
+
+**There is no host-side state store, deliberately.** containerd's container record already
+holds the name, image, runtime, snapshotter, creation time and full OCI spec; container
+labels carry the two things it cannot express — the workspaces the sandbox was created for
+(`dev.boks.workspaces`) and the default command (`dev.boks.command`) — plus a marker
+(`dev.boks.managed`) so Boks ignores containers it did not create. `ls` and `inspect` are
+derived views over containerd, which means there is no file to fall out of sync with
+reality, nothing orphaned when a sandbox is removed by other means, and no per-user state
+directory to place correctly on each platform. If something ever genuinely cannot live in
+containerd, it belongs under the platform's state directory (`~/.local/state/boks` on Linux,
+`~/Library/Application Support/boks` on macOS) — not a hardcoded Linux path.
+
+Identity: the sandbox name is derived from the workspace's absolute host path
+(`boks-<12 hex of sha256>`) unless `-name` says otherwise, which is what makes a second
+`boks run` in the same directory re-attach instead of duplicating. See open question 3 in
+[docker-sandbox-parity.md](docker-sandbox-parity.md) for the reasoning and its consequences.
+
+`boks run -rm` keeps the original ephemeral behaviour: the command is the container process
+and the container, task and snapshot are gone when it exits.
 
 ## Platform direction
 
@@ -199,6 +224,11 @@ Honest statement of what has actually been observed, as of this commit:
 
 - containerd connection, image pull/unpack, container+task lifecycle, stdio streaming,
   exit-code propagation, cleanup: **tested locally**.
+- the persistent lifecycle — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`, `cp`,
+  re-attach by workspace, and files surviving stop/start: **tested against a real containerd
+  on the runc runtime only**, on a host with no hypervisor. That exercises the orchestration
+  and containerd's snapshot semantics; it says nothing about whether these hold across a VM
+  boundary.
 - exact-path workspace mount construction: **unit-tested**, and **observed inside a booted
   microVM** — including auto-creation of the intermediate guest directories.
 - VM boot, guest kernel identity, virtiofs sharing under nerdbox: **observed**
