@@ -1,19 +1,19 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
+	"slices"
 	"strings"
 
+	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/runtimecfg"
 	"github.com/dagsommer/boks/internal/sandbox"
 	"github.com/dagsommer/boks/internal/workspace"
 )
-
-// defaultImage is a small, widely mirrored base image. It is a starting point for proving
-// the runtime works, not a curated agent environment.
-const defaultImage = "docker.io/library/alpine:latest"
 
 type stringList []string
 
@@ -22,11 +22,16 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 // sandboxFlags are the flags that describe a sandbox to create. `run` and `create` build the
 // same thing and must accept the same options, so they register them from one place.
+//
+// Flag names follow sbx where sbx has one, including its short aliases: someone with the
+// habit should not have to learn a second spelling. That is why the image flag is
+// `-t/-template` — sbx's word for "the image an agent runs in" — even though `-t` means a
+// terminal in almost every other container tool.
 type sandboxFlags struct {
-	image       *string
+	image       string
+	memory      string
 	name        *string
 	cpus        *int
-	memory      *int
 	runtimeID   *string
 	snapshotter *string
 	address     *string
@@ -38,16 +43,18 @@ type sandboxFlags struct {
 
 func registerSandboxFlags(fs *flag.FlagSet) *sandboxFlags {
 	f := &sandboxFlags{
-		image:       fs.String("image", defaultImage, "OCI image providing the guest root filesystem"),
-		name:        fs.String("name", "", "sandbox name (default: derived from the workspace path)"),
-		cpus:        fs.Int("cpus", 2, "vCPUs for the guest"),
-		memory:      fs.Int("memory", 2048, "guest memory in MiB"),
+		name:        fs.String("name", "", "sandbox name (default: <agent>-<workspace directory>)"),
+		cpus:        fs.Int("cpus", 0, "vCPUs for the guest (0: all host CPUs)"),
 		runtimeID:   fs.String("runtime", runtimecfg.Runtime, "containerd runtime handler"),
 		snapshotter: fs.String("snapshotter", runtimecfg.Snapshotter, "containerd snapshotter"),
 		address:     addressFlag(fs),
 		insecure: fs.Bool("i-know-this-is-not-isolated", false,
 			"permit a non-VM runtime; for developing Boks itself, never for running untrusted code"),
 	}
+	fs.StringVar(&f.image, "template", "", "OCI image for the guest root filesystem (default: the agent's image)")
+	fs.StringVar(&f.image, "t", "", "alias for -template")
+	fs.StringVar(&f.memory, "memory", "", "guest memory, binary units (1024m, 8g) (default: half the host's, max 32g)")
+	fs.StringVar(&f.memory, "m", "", "alias for -memory")
 	fs.Var(&f.env, "env", "extra environment variable KEY=VALUE (repeatable)")
 	fs.Var(&f.mounts, "mount", "extra host directory to share, PATH or PATH:ro (repeatable)")
 	fs.Var(&f.annotations, "annotation", "extra OCI annotation KEY=VALUE passed to the runtime (repeatable)")
@@ -78,13 +85,28 @@ func addressFlag(fs *flag.FlagSet) *string {
 	return fs.String("containerd-address", runtimecfg.DefaultAddress(), "containerd socket")
 }
 
-// workspaces resolves the primary workspace argument plus any -mount into guest shares.
-func (f *sandboxFlags) workspaces(primaryArg string) ([]workspace.Workspace, error) {
-	primary, err := workspace.Parse(primaryArg)
-	if err != nil {
-		return nil, err
+// defaultWorkspace is the workspace used when none is given. sbx defaults to the current
+// directory, which is where a user standing in a project already is.
+const defaultWorkspace = "."
+
+// workspaces resolves the workspace arguments plus any -mount into guest shares. The first
+// argument is the primary workspace: it is the process's working directory, and the one the
+// sandbox is named after.
+func (f *sandboxFlags) workspaces(args []string, agents *agent.Registry) ([]workspace.Workspace, error) {
+	if len(args) == 0 {
+		args = []string{defaultWorkspace}
 	}
-	workspaces := []workspace.Workspace{primary}
+	var workspaces []workspace.Workspace
+	for i, arg := range args {
+		ws, err := workspace.Parse(arg)
+		if err != nil {
+			if i == 0 {
+				return nil, describeWorkspaceError(arg, agents, err)
+			}
+			return nil, err
+		}
+		workspaces = append(workspaces, ws)
+	}
 	for _, m := range f.mounts {
 		ws, err := workspace.Parse(m)
 		if err != nil {
@@ -95,17 +117,123 @@ func (f *sandboxFlags) workspaces(primaryArg string) ([]workspace.Workspace, err
 	return workspaces, nil
 }
 
-// sandboxName decides which sandbox this invocation is about: the name given, or the one
-// derived from the workspace path so that a second invocation from the same directory finds
-// the same sandbox.
-func (f *sandboxFlags) sandboxName(primary workspace.Workspace) (string, error) {
-	if *f.name == "" {
-		return sandbox.DeriveName(primary.HostPath), nil
+// describeWorkspaceError adds the one piece of context a first positional argument can be
+// wrong about now that the agent comes first: a mistyped agent name is read as a directory,
+// and "no such directory" alone would not say why.
+func describeWorkspaceError(arg string, agents *agent.Registry, err error) error {
+	if strings.ContainsAny(arg, `/\.`) {
+		return err
 	}
-	if err := sandbox.ValidateName(*f.name); err != nil {
-		return "", err
+	return fmt.Errorf("%w\nIf %q was meant as an agent, the agents are: %s",
+		err, arg, strings.Join(agents.Names(), ", "))
+}
+
+// invocation is what `run` and `create` work out from their arguments: which agent, which
+// sandbox, and which host directories go into it.
+type invocation struct {
+	agent      agent.Agent
+	name       string
+	exists     bool
+	info       sandbox.Info
+	workspaces []workspace.Workspace
+}
+
+// splitAgent separates the agent positional from the workspace positionals.
+//
+// The first positional is the agent exactly when it names one. Anything else is a workspace
+// and the agent is decided elsewhere — from the named sandbox, or the default. This keeps
+// `boks run`, `boks run .`, `boks run shell`, `boks run shell . ~/lib` and
+// `boks run -name existing` all unambiguous without a lookahead into containerd.
+func splitAgent(agents *agent.Registry, positional []string) (name string, workspaceArgs []string) {
+	if len(positional) > 0 && agents.Known(positional[0]) {
+		return positional[0], positional[1:]
 	}
-	return *f.name, nil
+	return "", positional
+}
+
+// resolve works out the sandbox an invocation is about.
+//
+// Naming and re-attach are one mechanism: the name is derived from the agent and the
+// workspace, so running again in the same directory with the same agent finds the same
+// sandbox. Everything this function adds to sandbox.ChooseName is the part that needs to
+// know what already exists — reading the agent back from a named sandbox, and stepping
+// around a readable name another directory got to first.
+func (f *sandboxFlags) resolve(ctx context.Context, agents *agent.Registry, positional []string, env Env) (invocation, error) {
+	agentName, workspaceArgs := splitAgent(agents, positional)
+	if agentName != "" {
+		// Fail on an unknown agent before touching containerd, so a typo does not
+		// look like a daemon problem.
+		if _, err := agents.Resolve(agentName); err != nil {
+			return invocation{}, err
+		}
+	}
+
+	var inv invocation
+	if *f.name != "" {
+		if err := sandbox.ValidateName(*f.name); err != nil {
+			return invocation{}, err
+		}
+		inv.name = *f.name
+		info, exists, err := sandbox.Find(ctx, *f.address, inv.name)
+		if err != nil {
+			return invocation{}, err
+		}
+		inv.exists, inv.info = exists, info
+
+		switch {
+		case agentName == "" && exists:
+			// The agent positional is optional for a sandbox that exists: it
+			// already knows what it runs.
+			agentName = info.Agent
+		case agentName != "" && exists && info.Agent != "" && info.Agent != agentName:
+			return invocation{}, fmt.Errorf(
+				"sandbox %q runs the %q agent, not %q.\n"+
+					"An agent is fixed when a sandbox is created; remove it with 'boks rm %s'\n"+
+					"or choose another -name.", inv.name, info.Agent, agentName, inv.name)
+		}
+	}
+	if agentName == "" {
+		agentName = agent.Default
+	}
+
+	// A sandbox that already exists has its workspaces fixed, so an invocation that
+	// named none is not asking for the current directory — it is asking for that
+	// sandbox, from wherever the user happens to be standing.
+	if !(inv.exists && len(workspaceArgs) == 0) {
+		workspaces, err := f.workspaces(workspaceArgs, agents)
+		if err != nil {
+			return invocation{}, err
+		}
+		inv.workspaces = workspaces
+	}
+
+	resolved, err := agents.Resolve(agentName)
+	if err != nil {
+		return invocation{}, err
+	}
+	inv.agent = resolved
+
+	if inv.name == "" {
+		choice, err := sandbox.Choose(ctx, *f.address, agentName, inv.workspaces[0].HostPath)
+		if err != nil {
+			return invocation{}, err
+		}
+		if choice.CollidedWith != "" {
+			fmt.Fprintf(env.Stderr,
+				"note: the name %s-%s belongs to a sandbox for %s, so this one is %s.\n",
+				agentName, filepath.Base(inv.workspaces[0].HostPath), choice.CollidedWith, choice.Name)
+		}
+		inv.name, inv.exists, inv.info = choice.Name, choice.Exists, choice.Info
+	}
+
+	// The image is only needed to create a sandbox. An agent Boks has no image for can
+	// still be re-attached to, and can be created with an image the user supplies.
+	if !inv.exists && f.image == "" {
+		if err := agent.RequireRunnable(inv.agent); err != nil {
+			return invocation{}, err
+		}
+	}
+	return inv, nil
 }
 
 // requireIsolation refuses to present a container-only runtime as a sandbox, unless the
@@ -129,18 +257,38 @@ func (f *sandboxFlags) requireIsolation(stderr io.Writer) error {
 	return nil
 }
 
-func (f *sandboxFlags) config(name string, workspaces []workspace.Workspace) (sandbox.Config, error) {
+// config turns the flags and the resolved invocation into a sandbox definition. The agent
+// supplies what the user did not: the image, the command, and the environment it needs.
+func (f *sandboxFlags) config(inv invocation, agentArgs []string) (sandbox.Config, error) {
 	annotations, err := parseKeyValues(f.annotations)
 	if err != nil {
 		return sandbox.Config{}, err
 	}
+
+	memoryMiB := autoMemoryMiB()
+	if f.memory != "" {
+		if memoryMiB, err = parseMemory(f.memory); err != nil {
+			return sandbox.Config{}, err
+		}
+	}
+	cpus := *f.cpus
+	if cpus == 0 {
+		cpus = autoCPUs()
+	}
+
+	image := f.image
+	if image == "" {
+		image = inv.agent.Image
+	}
 	return sandbox.Config{
-		Name:        name,
-		Image:       *f.image,
-		Workspaces:  workspaces,
-		Env:         f.env,
-		CPUs:        *f.cpus,
-		MemoryMiB:   *f.memory,
+		Name:        inv.name,
+		Agent:       inv.agent.Name,
+		Image:       image,
+		Command:     inv.agent.Argv(agentArgs),
+		Workspaces:  inv.workspaces,
+		Env:         append(slices.Clone(inv.agent.Env), f.env...),
+		CPUs:        cpus,
+		MemoryMiB:   memoryMiB,
 		Runtime:     *f.runtimeID,
 		Snapshotter: *f.snapshotter,
 		Address:     *f.address,
