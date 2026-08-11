@@ -37,11 +37,13 @@ func runCommand(ctx context.Context, env Env) error {
 		snapshot  = fs.String("snapshotter", runtimecfg.Snapshotter, "containerd snapshotter")
 		insecure  = fs.Bool("i-know-this-is-not-isolated", false,
 			"permit a non-VM runtime; for developing Boks itself, never for running untrusted code")
-		envVars stringList
-		mounts  stringList
+		envVars     stringList
+		mounts      stringList
+		annotations stringList
 	)
 	fs.Var(&envVars, "env", "extra environment variable KEY=VALUE (repeatable)")
 	fs.Var(&mounts, "mount", "extra host directory to share, PATH or PATH:ro (repeatable)")
+	fs.Var(&annotations, "annotation", "extra OCI annotation KEY=VALUE passed to the runtime (repeatable)")
 
 	fs.Usage = func() {
 		fmt.Fprint(env.Stderr, `Usage: boks run [flags] <workspace> [-- command [args...]]
@@ -106,6 +108,11 @@ Flags:
 			*runtimeID)
 	}
 
+	parsedAnnotations, err := parseKeyValues(annotations)
+	if err != nil {
+		return err
+	}
+
 	sandboxName := *name
 	if sandboxName == "" {
 		sandboxName, err = generateName()
@@ -125,6 +132,7 @@ Flags:
 		Runtime:     *runtimeID,
 		Snapshotter: *snapshot,
 		Address:     *address,
+		Annotations: parsedAnnotations,
 		TTY:         *tty,
 		Stdin:       env.Stdin,
 		Stdout:      env.Stdout,
@@ -137,6 +145,25 @@ Flags:
 		return &ExitError{Code: code}
 	}
 	return nil
+}
+
+// parseKeyValues turns repeated KEY=VALUE flags into a map.
+//
+// An empty key is rejected rather than silently dropped, since a typo would otherwise
+// produce a sandbox that quietly lacks the setting the user asked for.
+func parseKeyValues(entries []string) (map[string]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		key, value, found := strings.Cut(entry, "=")
+		if !found || key == "" {
+			return nil, fmt.Errorf("invalid KEY=VALUE %q", entry)
+		}
+		out[key] = value
+	}
+	return out, nil
 }
 
 // parseInterspersed parses flags that may appear before or after positional arguments.

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -64,6 +65,10 @@ type Config struct {
 	Snapshotter string
 	// Address is the containerd socket.
 	Address string
+	// Annotations are extra OCI annotations passed to the runtime. The VM runtime is
+	// configured this way — networking, for instance — so exposing them lets a
+	// capability be tried before Boks grows a first-class flag for it.
+	Annotations map[string]string
 	// TTY allocates a pseudo-terminal for the guest process.
 	TTY bool
 
@@ -202,6 +207,10 @@ func workspaceMounts(workspaces []workspace.Workspace) []specs.Mount {
 	return mounts
 }
 
+// resourceAnnotations builds the annotations handed to the runtime: the resource requests
+// derived from flags, plus anything the caller passed through explicitly.
+//
+// Caller-supplied entries win, so an explicit -annotation can override a computed one.
 func resourceAnnotations(cfg Config) map[string]string {
 	annotations := map[string]string{}
 	if cfg.CPUs > 0 {
@@ -210,6 +219,7 @@ func resourceAnnotations(cfg Config) map[string]string {
 	if cfg.MemoryMiB > 0 {
 		annotations[annotationMemory] = strconv.Itoa(cfg.MemoryMiB)
 	}
+	maps.Copy(annotations, cfg.Annotations)
 	return annotations
 }
 
