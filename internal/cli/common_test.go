@@ -194,15 +194,16 @@ func TestConfigTakesImageAndCommandFromTheAgent(t *testing.T) {
 	if cfg.Agent != "shell" {
 		t.Errorf("agent = %q, want %q", cfg.Agent, "shell")
 	}
-	if !slices.Equal(cfg.Command, shell.Command) {
-		t.Errorf("command = %v, want the agent's %v", cfg.Command, shell.Command)
+	if !slices.Equal(cfg.Command, shell.Argv(nil)) {
+		t.Errorf("command = %v, want the agent's %v", cfg.Command, shell.Argv(nil))
 	}
 	if cfg.CPUs < 1 || cfg.MemoryMiB < 64 {
 		t.Errorf("auto sizing gave %d vCPUs and %d MiB", cfg.CPUs, cfg.MemoryMiB)
 	}
 
 	// -template overrides the agent's image; arguments after -- become the command,
-	// because that is what arguments to a shell are.
+	// because that is what arguments to a shell are. The agent's init prefix goes with the
+	// image it belongs to — a Debian image has no /usr/bin/tini and no Boks entrypoint.
 	override := flag.NewFlagSet("test", flag.ContinueOnError)
 	override.SetOutput(io.Discard)
 	overrideFlags := registerSandboxFlags(override)
@@ -248,7 +249,7 @@ func TestConfigKeepsAnExistingSandboxesRecordedCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
-	if !slices.Equal(cfg.Command, []string{"ls"}) {
+	if !slices.Equal(cfg.Command, shell.Argv([]string{"ls"})) {
 		t.Errorf("command = %v, want the arguments after --", cfg.Command)
 	}
 }
