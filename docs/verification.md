@@ -97,14 +97,48 @@ Run the suite unmodified — it defaults to the isolating runtime:
 BOKS_INTEGRATION=1 go test ./internal/sandbox/ -run Integration -v
 ```
 
-### What is *not* contained
+### What was *not* contained, in that configuration
 
-Network. The guest has no virtio-net device — only `lo` — yet it reaches the internet, and
-it reaches **the host's own loopback services**. nerdbox's default is libkrun's TSI, which
+Network. The guest had no virtio-net device — only `lo` — yet it reached the internet, and it
+reached **the host's own loopback services**. nerdbox's default is libkrun's TSI, which
 rewrites guest `AF_INET` sockets and performs the connection on the host, so guest
 `127.0.0.1` is the *host's* `127.0.0.1`. Observed: DNS resolves, outbound HTTP and HTTPS
 succeed, raw TCP connects, ICMP fails (`Network unreachable`), and a host service on
 `127.0.0.1:11434` answered the guest. See [security-model.md](security-model.md).
+
+`boks run` now wires every sandbox it creates to a host-side stack instead, which is what the
+next section is for: that wiring has never been watched from inside a real guest.
+
+## Confirming the network enforcement, on a host with a hypervisor
+
+Everything below is **unverified**. The datapath was built and tested on a machine with no
+hypervisor, against a simulated guest attached to the real link socket
+(`internal/network/vnettest`): real Ethernet frames, ARP, a TCP handshake and HTTP through
+the proxy, with an allowed host fetched and a denied one refused. That exercises the host
+side and says nothing about libkrun's virtio-net device, nerdbox's annotations, or how a real
+guest behaves.
+
+These are the checks that would settle it, in the order they build on each other. Run them
+with the isolating runtime — the runc dev runtime ignores the nerdbox annotations entirely,
+so a pass there means only that the *spec* is right.
+
+| # | Question | How to answer it | What a pass looks like |
+|---|---|---|---|
+| 1 | Does the guest get the NIC Boks asked for? | `boks run shell . -- sh -c 'ls /sys/class/net; ip -4 addr show eth0'` | `eth0` exists with `192.168.127.2/24` — the address from the container annotation, not DHCP |
+| 2 | Is the host's loopback gone? | run a host service on `127.0.0.1:9999`, then probe it from the guest | connection refused, where TSI answered |
+| 3 | Does the guest reach the proxy? | `boks run shell . -- sh -c 'echo > /dev/tcp/192.168.127.1/3128'` | connects; the stack's log shows the flow |
+| 4 | Is an allowed host allowed? | `boks run -allow example.com:443 shell . -- curl -sSI https://example.com` | `200`, and an `allow` line in `boks policy log` for that sandbox |
+| 5 | Is a denied host denied? | the same `curl` for a host no rule permits | `403` from the proxy with the reason, and a `deny` line in the log |
+| 6 | **Is a guest that ignores `HTTP_PROXY` still contained?** | in the guest, `env -u HTTP_PROXY -u http_proxy curl -sS https://example.com`, and a raw TCP connect to a public address | it fails: the stack NATs nothing, so there is no route out except through the proxy. **This is the single most important check** — it is the difference between an enforcement boundary and a suggestion |
+| 7 | Is DNS mediated? | `cat /etc/resolv.conf` in the guest | `nameserver 192.168.127.1`, not a copy of the host's file |
+| 8 | Does `-net none` mean none? | `boks run -net none shell . -- sh -c 'ls /sys/class/net; curl -sS https://example.com'` | `lo` only, and nothing reachable |
+| 9 | Is the CA usable inside the guest? | with an `-inject` rule: `curl` the intercepted host from the guest | the certificate is Boks-issued, and the origin receives the real credential while the guest held only the placeholder |
+| 10 | Does the network survive the command that started it? | `boks run -d`, then `boks exec <name> curl …` from a fresh shell | it still works; `boks net ls` shows the same PID |
+| 11 | **Does a running VM re-attach to a restarted stack?** | `boks net stop <name>`, then `boks exec <name> true` to start a fresh one, then probe from the guest | unknown, and it decides how gracefully a crashed supervisor recovers. If the guest cannot get its network back, the honest fix is a restart, and Boks should say so rather than appear to have repaired it |
+| 12 | Does teardown reach the VM? | `boks stop <name>`; then `boks ls`, `ps` for `boks net serve`, and the state directory | no supervisor, no socket, no directory |
+
+Check 6 is the one that decides whether any of this is a boundary. Checks 11 and 12 decide
+whether the per-sandbox supervisor is the right shape or whether it needs a repair path.
 
 ## TLS interception, verified on the host
 
@@ -129,9 +163,10 @@ same proxy, by the same client, trusting both authorities, so the only thing dis
 them is whether Boks substituted a certificate — and it did so for exactly the host with a
 credential rule.
 
-**Not verified:** none of this has run against a guest. `boks run` does not start the proxy,
-does not set `HTTP_PROXY`, and does not install the CA anywhere. What is demonstrated is the
-host-side mechanism, driven by a real client over real TLS.
+**Not verified:** none of this has run against a guest. `boks run` now does start the proxy,
+set `HTTP_PROXY` and share the CA into the sandbox — see the checks above — but no VM has
+exercised any of it. What is demonstrated here is the host-side mechanism, driven by a real
+client over real TLS.
 
 ## What counts as evidence
 
