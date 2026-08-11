@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"flag"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
@@ -60,57 +62,87 @@ func TestParseLeadingFlags(t *testing.T) {
 	}
 }
 
-func TestSandboxNameFromWorkspace(t *testing.T) {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	flags := registerSandboxFlags(fs)
-	if err := fs.Parse(nil); err != nil {
-		t.Fatal(err)
+// The rule that makes `boks run [agent] [workspace...]` parseable without asking containerd
+// anything: the first positional is the agent exactly when it names one.
+func TestSplitAgent(t *testing.T) {
+	agents := agent.Builtin()
+	tests := []struct {
+		name           string
+		positional     []string
+		wantAgent      string
+		wantWorkspaces []string
+	}{
+		{"nothing", nil, "", nil},
+		{"agent only", []string{"shell"}, "shell", []string{}},
+		{"agent and workspace", []string{"shell", "."}, "shell", []string{"."}},
+		{"agent and several workspaces", []string{"claude", ".", "~/lib:ro"}, "claude", []string{".", "~/lib:ro"}},
+		{"workspace only", []string{"."}, "", []string{"."}},
+		{"an agent name is not read as a workspace", []string{"./shell"}, "", []string{"./shell"}},
+		{"unknown first positional is a workspace", []string{"cladue"}, "", []string{"cladue"}},
 	}
-
-	ws, err := (&sandboxFlags{}).workspaces(t.TempDir())
-	if err != nil {
-		t.Fatalf("workspaces: %v", err)
-	}
-	got, err := flags.sandboxName(ws[0])
-	if err != nil {
-		t.Fatalf("sandboxName: %v", err)
-	}
-	if want := sandbox.DeriveName(ws[0].HostPath); got != want {
-		t.Errorf("sandboxName = %q, want the derived name %q", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAgent, gotWorkspaces := splitAgent(agents, tt.positional)
+			if gotAgent != tt.wantAgent {
+				t.Errorf("agent = %q, want %q", gotAgent, tt.wantAgent)
+			}
+			if !slices.Equal(gotWorkspaces, tt.wantWorkspaces) {
+				t.Errorf("workspaces = %v, want %v", gotWorkspaces, tt.wantWorkspaces)
+			}
+		})
 	}
 }
 
-// An explicit name is what lets one workspace hold several sandboxes, so it must win over
-// the derived one — and be rejected early if containerd would not accept it.
-func TestSandboxNameExplicit(t *testing.T) {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	flags := registerSandboxFlags(fs)
-	if err := fs.Parse([]string{"-name", "web"}); err != nil {
-		t.Fatal(err)
-	}
+// With no workspace argument the sandbox is for the current directory, which is where the
+// user already is.
+func TestWorkspacesDefaultToTheCurrentDirectory(t *testing.T) {
+	dir := t.TempDir()
+	restore := chdir(t, dir)
+	defer restore()
 
-	ws, err := (&sandboxFlags{}).workspaces(t.TempDir())
+	workspaces, err := (&sandboxFlags{}).workspaces(nil, agent.Builtin())
+	if err != nil {
+		t.Fatalf("workspaces: %v", err)
+	}
+	if len(workspaces) != 1 {
+		t.Fatalf("got %d workspaces, want 1", len(workspaces))
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := flags.sandboxName(ws[0])
-	if err != nil {
-		t.Fatalf("sandboxName: %v", err)
+	if workspaces[0].HostPath != resolved {
+		t.Errorf("workspace = %q, want the current directory %q", workspaces[0].HostPath, resolved)
 	}
-	if got != "web" {
-		t.Errorf("sandboxName = %q, want %q", got, "web")
-	}
+}
 
-	bad := flag.NewFlagSet("test", flag.ContinueOnError)
-	bad.SetOutput(io.Discard)
-	badFlags := registerSandboxFlags(bad)
-	if err := bad.Parse([]string{"-name", "not a name"}); err != nil {
-		t.Fatal(err)
+// Extra workspaces mount alongside the first, and the :ro suffix keeps working.
+func TestWorkspacesTakeSeveralPathsAndModes(t *testing.T) {
+	first, second := t.TempDir(), t.TempDir()
+	flags := &sandboxFlags{}
+	workspaces, err := flags.workspaces([]string{first, second + ":ro"}, agent.Builtin())
+	if err != nil {
+		t.Fatalf("workspaces: %v", err)
 	}
-	if _, err := badFlags.sandboxName(ws[0]); err == nil {
-		t.Error("sandboxName accepted a name containerd would reject")
+	if len(workspaces) != 2 {
+		t.Fatalf("got %d workspaces, want 2", len(workspaces))
+	}
+	if !workspaces[1].ReadOnly() {
+		t.Error("the :ro suffix was not honoured")
+	}
+	if workspaces[0].ReadOnly() {
+		t.Error("the primary workspace became read-only")
+	}
+}
+
+// A mistyped agent is read as a directory, so the error has to say what the agents are.
+func TestWorkspaceErrorMentionsAgents(t *testing.T) {
+	_, err := (&sandboxFlags{}).workspaces([]string{"cladue"}, agent.Builtin())
+	if err == nil {
+		t.Fatal("a non-existent workspace was accepted")
+	}
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error = %q, want it to list the agents", err)
 	}
 }
 
@@ -142,48 +174,101 @@ func TestRequireIsolation(t *testing.T) {
 	}
 }
 
-func TestHumanAge(t *testing.T) {
-	tests := []struct {
-		d    time.Duration
-		want string
-	}{
-		{-time.Second, "0s"},
-		{500 * time.Millisecond, "0s"},
-		{90 * time.Second, "1m"},
-		{3 * time.Hour, "3h"},
-		{50 * time.Hour, "2d"},
+// The agent decides what a sandbox contains; the flags only override it.
+func TestConfigTakesImageAndCommandFromTheAgent(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	flags := registerSandboxFlags(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		if got := humanAge(tt.d); got != tt.want {
-			t.Errorf("humanAge(%v) = %q, want %q", tt.d, got, tt.want)
-		}
+
+	shell, _ := agent.Builtin().Lookup("shell")
+	cfg, err := flags.config(invocation{agent: shell, name: "shell-foo"}, nil)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.Image != shell.Image {
+		t.Errorf("image = %q, want the agent's %q", cfg.Image, shell.Image)
+	}
+	if cfg.Agent != "shell" {
+		t.Errorf("agent = %q, want %q", cfg.Agent, "shell")
+	}
+	if !slices.Equal(cfg.Command, shell.Command) {
+		t.Errorf("command = %v, want the agent's %v", cfg.Command, shell.Command)
+	}
+	if cfg.CPUs < 1 || cfg.MemoryMiB < 64 {
+		t.Errorf("auto sizing gave %d vCPUs and %d MiB", cfg.CPUs, cfg.MemoryMiB)
+	}
+
+	// -template overrides the agent's image; arguments after -- become the command,
+	// because that is what arguments to a shell are.
+	override := flag.NewFlagSet("test", flag.ContinueOnError)
+	override.SetOutput(io.Discard)
+	overrideFlags := registerSandboxFlags(override)
+	if err := override.Parse([]string{"-t", "debian:stable", "-cpus", "3", "-m", "512m"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = overrideFlags.config(invocation{agent: shell, name: "shell-foo"}, []string{"uname", "-a"})
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if cfg.Image != "debian:stable" {
+		t.Errorf("image = %q, want the -template value", cfg.Image)
+	}
+	if !slices.Equal(cfg.Command, []string{"uname", "-a"}) {
+		t.Errorf("command = %v, want the arguments after --", cfg.Command)
+	}
+	if cfg.CPUs != 3 || cfg.MemoryMiB != 512 {
+		t.Errorf("sizing = %d vCPUs, %d MiB; want 3 and 512", cfg.CPUs, cfg.MemoryMiB)
 	}
 }
 
 func TestWriteTable(t *testing.T) {
-	now := time.Now()
 	var out bytes.Buffer
 	writeTable(&out, []sandbox.Info{{
-		Name:       "web",
+		Name:       "claude-boks",
+		Agent:      "claude",
 		Status:     sandbox.StatusRunning,
 		Image:      "docker.io/library/alpine:latest",
-		Created:    now.Add(-2 * time.Hour),
 		Workspaces: []sandbox.WorkspaceRef{{HostPath: "/home/alice/src/foo"}},
-	}}, now)
+	}})
 
 	got := out.String()
-	for _, want := range []string{"NAME", "web", "running", "alpine", "/home/alice/src/foo", "2h"} {
+	header := strings.SplitN(got, "\n", 2)[0]
+	for _, want := range []string{"SANDBOX", "AGENT", "STATUS", "PORTS", "WORKSPACE"} {
+		if !strings.Contains(header, want) {
+			t.Errorf("header = %q, want a %s column", header, want)
+		}
+	}
+	if strings.Contains(header, "IMAGE") {
+		t.Errorf("header = %q, want sbx's columns only", header)
+	}
+	for _, want := range []string{"claude-boks", "claude", "running", "/home/alice/src/foo"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("table = %q, want it to contain %q", got, want)
 		}
 	}
 }
 
-// A sandbox with no workspace still has to render a row.
-func TestWriteTableWithoutWorkspace(t *testing.T) {
+// A sandbox from an older Boks has no agent recorded, and one may have no workspace. Both
+// still have to render a row.
+func TestWriteTableWithoutAgentOrWorkspace(t *testing.T) {
 	var out bytes.Buffer
-	writeTable(&out, []sandbox.Info{{Name: "bare", Status: sandbox.StatusStopped}}, time.Now())
+	writeTable(&out, []sandbox.Info{{Name: "bare", Status: sandbox.StatusStopped}})
 	if !strings.Contains(out.String(), "bare") {
 		t.Errorf("table = %q, want a row for the sandbox", out.String())
 	}
+}
+
+func chdir(t *testing.T, dir string) func() {
+	t.Helper()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	return func() { _ = os.Chdir(previous) }
 }
