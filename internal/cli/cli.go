@@ -37,7 +37,15 @@ type command struct {
 
 func commands() []command {
 	return []command{
-		{"run", "Run a command inside a sandbox", runCommand},
+		{"run", "Run a command inside a sandbox, creating or re-attaching to it", runCommand},
+		{"exec", "Run an additional command inside a running sandbox", execCommand},
+		{"create", "Create a sandbox without starting it", createCommand},
+		{"ls", "List sandboxes", lsCommand},
+		{"inspect", "Print sandbox details as JSON", inspectCommand},
+		{"start", "Start a stopped sandbox", startCommand},
+		{"stop", "Stop a sandbox without deleting it", stopCommand},
+		{"rm", "Delete a sandbox and its filesystem", rmCommand},
+		{"cp", "Copy files between the host and a sandbox", cpCommand},
 		{"doctor", "Check host prerequisites for running sandboxes", doctorCommand},
 		{"version", "Print the boks version", versionCommand},
 	}
