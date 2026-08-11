@@ -348,11 +348,17 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stder
 	return nil
 }
 
-// stopNetworkQuietly is the cleanup path. Failures are reported rather than returned: it
-// runs while a command is already failing or exiting, and the original outcome is the more
-// useful one.
+// stopNetworkQuietly and forgetNetworkQuietly are the cleanup paths. Failures are reported
+// rather than returned: they run while a command is already failing or exiting, and the
+// original outcome is the more useful one to end up as the error.
 func stopNetworkQuietly(name string, stderr io.Writer) {
 	if err := enforce.Stop(policy.StateDir(), name); err != nil {
+		fmt.Fprintf(stderr, "warning: %v\n", err)
+	}
+}
+
+func forgetNetworkQuietly(name string, stderr io.Writer) {
+	if err := enforce.Forget(policy.StateDir(), name); err != nil {
 		fmt.Fprintf(stderr, "warning: %v\n", err)
 	}
 }
