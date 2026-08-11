@@ -42,9 +42,9 @@ type Info struct {
 	// sandbox is wired to, and a later command that has to bring it back up reads its
 	// network mode from here rather than guessing.
 	Annotations map[string]string `json:"annotations,omitempty"`
-	Cwd         string         `json:"cwd,omitempty"`
-	PID         uint32         `json:"pid,omitempty"`
-	ExitCode    *uint32        `json:"exit_code,omitempty"`
+	Cwd         string            `json:"cwd,omitempty"`
+	PID         uint32            `json:"pid,omitempty"`
+	ExitCode    *uint32           `json:"exit_code,omitempty"`
 }
 
 // Workspace returns the sandbox's primary workspace host path, or "" if it has none.
