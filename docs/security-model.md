@@ -101,13 +101,60 @@ regardless of guest cooperation. HTTP/HTTPS is steered to a host forward proxy t
 on the `CONNECT` target and TLS SNI, without interception — no custom CA in the guest, so
 end-to-end TLS is preserved and the proxy cannot read request bodies.
 
-Known limits of that approach, stated up front:
-- SNI-based filtering can be evaded by clients that omit or lie about SNI; the netstack's
-  destination-IP rules are the backstop.
-- Hostname rules are meaningless for raw sockets — only IP/port rules apply there.
-- DNS is a covert channel unless resolution is also mediated.
+#### What exists today
 
-*(none of this is implemented. Boks currently applies **no** network policy.)*
+| Piece | State |
+|---|---|
+| Policy engine — exact/wildcard hosts, IP and CIDR rules, ports, deny precedence, presets, decision log (`internal/policy`) | built, unit-tested |
+| Host forward proxy — HTTP, `CONNECT`, SNI cross-check, no TLS interception (`internal/proxy`) | built, exercised end to end against real TLS origins |
+| Credential injection, encrypted host-side store (`internal/secret`) | built, unit-tested |
+| Network annotations and host-stack supervision (`internal/network`) | built, unit-tested |
+| Any of it applied to a running sandbox | **not done** |
+
+**The proxy is not an enforcement boundary.** It filters only traffic a client chooses to
+send it. Nothing is wired into `boks run`, and even when it is, a proxy alone would remain a
+cooperating-client mechanism. `boks run -allow …` today validates the rules, prints them,
+and says plainly that they are not applied.
+
+#### What the enforcement path now rests on
+
+*(verified 2026-08-11, macOS host with a hypervisor.)* An external network provider **does**
+displace TSI. With nerdbox's defaults the guest has `lo` only and a host service on
+`127.0.0.1` answers it; with a virtio-net link to a host-side stack, the guest has `eth0`
+and the same probe is **refused** — the connection is handled by the guest's own loopback
+stack instead of being impersonated on the host. So there is now a point at which Boks can
+see and drop a flow. **No policy has yet been enforced against a real guest**; the transport
+is verified, the enforcement built on it is not.
+
+Three things that verification changed, all of them reflected in the code:
+
+- **Deny-by-default must be asserted, not inherited.** The host being unreachable was a
+  property of one configuration. The same stack can be told to map an address onto the
+  host's loopback, forward host ports inward, answer on extra gateway addresses, or proxy
+  the EC2 metadata service. Boks sets all four explicitly closed, and a test reads them back.
+- **IPv6 became live surface.** TSI had none. A guest with a real NIC brings up link-local
+  v6 by itself. Boks hands out no routable v6 address and no v6 gateway, and the policy
+  language covers v6 from the start rather than as an addition.
+- **A genuinely network-less mode exists now.** Attaching the NIC to the VM without wiring
+  the container to it turns TSI off and leaves the container with loopback only. That is
+  `-net none`, and it is the strongest containment Boks can currently offer — the only
+  posture that does not depend on unfinished enforcement code.
+
+#### Known limits, stated up front
+
+- SNI-based filtering can be evaded by clients that omit or lie about SNI; the netstack's
+  destination-IP rules are the backstop. The proxy checks the SNI against policy and drops
+  the tunnel on a mismatch, but it can only do so *after* answering `200`, so the client
+  sees a broken handshake and the reason lives in the decision log.
+- Encrypted Client Hello removes the SNI signal entirely.
+- Hostname rules are meaningless for raw sockets — only IP/port rules apply there.
+- A hostname allow says nothing about the address it resolves to. The proxy re-checks the
+  resolved address against the deny rules before dialling, which stops `evil.test A
+  127.0.0.1`; it cannot stop a name whose address changes between check and connect.
+- DNS is a covert channel unless resolution is also mediated. Pointing the guest's resolver
+  at the host-side gateway is the hook for that; it does not by itself close the channel.
+- **Every allowed host is an exfiltration destination.** An allowlist bounds *where* data can
+  go, not whether it goes. This is why the default preset is short and exact.
 
 ### The measured baseline today
 
@@ -132,6 +179,21 @@ reach, and no `HTTP_PROXY` setting changes that because the guest never has to c
 This is the single largest gap between Boks today and its stated goals, and it is the
 argument for the external-network-provider direction above: with TSI there is no point at
 which Boks can see or drop a flow.
+
+The same probes with an external network provider attached *(verified 2026-08-11, same
+host)*:
+
+| Probe | TSI (default) | provider attached |
+|---|---|---|
+| interfaces in the guest | `lo` only | `lo` + `eth0` |
+| host service on `127.0.0.1` | **answers the guest** | **connection refused** |
+| guest `/etc/resolv.conf` | a copy of the host's | the host-side gateway |
+| IPv6 | absent entirely | guest emits link-local traffic |
+
+The refusal is the discriminator: the call is being handled by the guest's own loopback
+stack, where nothing listens, rather than performed on the host. That is the whole reason
+the provider is worth its complexity — and it is *all* that has been shown. Boks still
+applies no policy to a running sandbox.
 
 ### Host services
 
@@ -161,8 +223,26 @@ destinations while the sandbox runs — it does not let the agent keep, print or
 the secret. That is a meaningful reduction, not an elimination: an agent that can make
 requests through the proxy can still make *authenticated* requests.
 
-*(unverified: not implemented. Any credential you put in a sandbox today is simply in the
-sandbox.)*
+The mechanism exists in `internal/secret` and works through `boks proxy`: bearer, basic and
+arbitrary-header schemes, scoped to host patterns you write out, with a catch-all `*`
+rejected. Secrets live in an AES-256-GCM file keyed from a passphrase; names are encrypted
+too. There is **no host API a guest can call** to list or fetch a secret, and adding one
+would end the guarantee — the only consumer of the store is the proxy's own request path.
+Values are wrapped in a type whose printed and JSON forms are redacted, and a test asserts a
+secret cannot reach a log.
+
+Two limits worth being explicit about:
+
+- **HTTPS injection is not possible without terminating TLS, so it is not done.** Injection
+  applies to plaintext HTTP only. Inside a `CONNECT` tunnel the proxy sees ciphertext.
+  Docker Sandboxes injects into HTTPS, which means it terminates TLS somewhere; Boks will
+  not do that silently. Closing the gap means an explicit, per-host opt-in to interception.
+- **The file store is only as strong as the passphrase.** It is the portable fallback until
+  the OS keychains are implemented. A key file stored beside the encrypted file is
+  deliberately not offered: it protects nothing while appearing to.
+
+*(none of it is wired into `boks run`. Any credential you put in a sandbox today is simply
+in the sandbox.)*
 
 ### Privileged execution
 
@@ -183,15 +263,19 @@ sandbox.)*
    just a malicious `Makefile` you later run. Mitigated by review, and eventually clone mode.
 4. **containerd configuration** — a misconfigured or over-privileged containerd undermines
    everything above it.
-5. **Network policy gaps** — currently total, since no policy exists.
+5. **Network policy gaps** — currently total in the datapath: a policy engine and proxy
+   exist, but nothing applies them to a sandbox, and the default runtime configuration still
+   reaches host loopback.
 6. **Terminal escape sequences** in guest output.
 
 ## What Boks does not claim
 
 - It has **not** been security-reviewed or audited.
 - It has **not** demonstrated the VM boundary in this project's own testing.
-- It provides **no** network isolation today.
-- It provides **no** credential protection today.
+- It provides **no** network isolation in a running sandbox today. A policy engine, a host
+  proxy and a host network stack configuration exist and are tested; none is wired into
+  `boks run`.
+- It provides **no** credential protection in a running sandbox today.
 - It has **no** defence against hypervisor vulnerabilities beyond keeping libkrun current.
 
 Boks aims to be honest about this. If a property is not listed as tested, assume it does not

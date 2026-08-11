@@ -1,0 +1,205 @@
+// Package policy decides whether a sandbox may reach a network destination.
+//
+// It is pure logic: no sockets, no files, no clock beyond timestamping decisions. That is
+// deliberate. The decision function is the part of Boks whose behaviour has to be
+// predictable under adversarial input, so it is kept small enough to test exhaustively and
+// separate from the machinery that acts on its answers.
+//
+// # What this package is not
+//
+// A policy engine is not an enforcement boundary on its own. Today the only thing that
+// consults it is the host forward proxy (internal/proxy), and a guest reaches that proxy
+// only if it chooses to — Boks' current VM runtime uses libkrun's TSI, which performs the
+// guest's connections on the host with no point at which Boks can drop a flow. **An
+// environment variable is not a security boundary.** Until the guest's traffic is
+// terminated by a host-side network stack, treat every decision here as advisory: it
+// describes what a cooperating client is permitted to do.
+//
+// # Evaluation order
+//
+//  1. every deny rule is tested; the first match denies, and nothing can override it;
+//  2. every allow rule is tested; the first match allows;
+//  3. otherwise the policy's default action applies.
+//
+// Deny always beats allow, regardless of specificity or order in the file. This makes a
+// deny rule something you can reason about without reading the rest of the policy, at the
+// cost of not being able to carve an allow exception out of a deny. That trade is the
+// right way round for a security control: the failure mode is "too little access", which
+// is visible and fixable, rather than "more access than you thought".
+package policy
+
+import (
+	"fmt"
+	"strings"
+)
+
+// Action is the outcome of a rule or the default disposition of a policy.
+type Action int
+
+const (
+	Deny Action = iota
+	Allow
+)
+
+func (a Action) String() string {
+	if a == Allow {
+		return "allow"
+	}
+	return "deny"
+}
+
+// ParseAction parses "allow" or "deny".
+func ParseAction(s string) (Action, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "allow":
+		return Allow, nil
+	case "deny":
+		return Deny, nil
+	}
+	return Deny, fmt.Errorf("unknown action %q; use \"allow\" or \"deny\"", s)
+}
+
+// Rule permits or forbids a set of destinations.
+type Rule struct {
+	Action Action
+	Host   Pattern
+	Ports  PortSet
+	// Why explains the rule to a human reading `boks policy ls`. Presets fill it in;
+	// rules from the command line leave it empty.
+	Why string
+}
+
+// ParseRule builds a rule from an action and a "host[:ports]" specification.
+//
+// Examples: "github.com", "github.com:443", "*.githubusercontent.com:443",
+// "10.0.0.0/8", "[::1]:8080", "*:22". An IPv6 literal needs brackets before a port,
+// exactly as in a URL.
+func ParseRule(action Action, spec string) (Rule, error) {
+	host, ports, err := splitHostPort(spec)
+	if err != nil {
+		return Rule{}, err
+	}
+	pattern, err := ParsePattern(host)
+	if err != nil {
+		return Rule{}, err
+	}
+	set, err := ParsePorts(ports)
+	if err != nil {
+		return Rule{}, fmt.Errorf("rule %q: %w", spec, err)
+	}
+	return Rule{Action: action, Host: pattern, Ports: set}, nil
+}
+
+// MustRule is ParseRule for preset definitions.
+func MustRule(action Action, spec, why string) Rule {
+	r, err := ParseRule(action, spec)
+	if err != nil {
+		panic(err)
+	}
+	r.Why = why
+	return r
+}
+
+// Match reports whether the rule covers the target.
+func (r Rule) Match(t Target) bool {
+	return r.Host.Match(t) && r.Ports.Match(t.Port)
+}
+
+// Spec renders the rule's destination in the syntax ParseRule accepts.
+func (r Rule) Spec() string {
+	if r.Ports.Any() {
+		return r.Host.String()
+	}
+	host := r.Host.String()
+	if strings.Contains(host, ":") { // IPv6 literal or prefix
+		host = "[" + host + "]"
+	}
+	return host + ":" + r.Ports.String()
+}
+
+func (r Rule) String() string { return r.Action.String() + " " + r.Spec() }
+
+// Policy is a named set of rules plus the disposition for destinations no rule mentions.
+type Policy struct {
+	// Name identifies the policy in decisions and in `boks policy ls`.
+	Name string
+	// Default applies when no rule matches. Deny-by-default is the intended posture;
+	// Allow exists so that an "open" preset can still carry deny rules.
+	Default Action
+	Rules   []Rule
+}
+
+// Evaluate decides a target, applying deny precedence.
+func (p Policy) Evaluate(t Target) Verdict {
+	for i := range p.Rules {
+		r := p.Rules[i]
+		if r.Action == Deny && r.Match(t) {
+			return Verdict{
+				Allowed: false,
+				Rule:    r.Spec(),
+				Reason:  fmt.Sprintf("denied by rule %q", r.Spec()),
+			}
+		}
+	}
+	for i := range p.Rules {
+		r := p.Rules[i]
+		if r.Action == Allow && r.Match(t) {
+			return Verdict{
+				Allowed: true,
+				Rule:    r.Spec(),
+				Reason:  fmt.Sprintf("allowed by rule %q", r.Spec()),
+			}
+		}
+	}
+	if p.Default == Allow {
+		return Verdict{
+			Allowed: true,
+			Reason:  fmt.Sprintf("allowed by default (policy %q allows anything not denied)", p.Name),
+		}
+	}
+	return Verdict{
+		Allowed: false,
+		Reason:  fmt.Sprintf("denied by default (policy %q allows only listed destinations)", p.Name),
+	}
+}
+
+// EvaluateDeny applies only the deny rules.
+//
+// It exists for the second check the proxy makes: a hostname is allowed by name, then
+// resolved, and the address it resolved to is tested against the deny rules before any
+// packet is sent. Without that step `evil.test A 127.0.0.1` turns a hostname allowlist
+// into a path to the host's own services. The allow rules are deliberately not consulted,
+// because an allow written for a name says nothing about the address behind it.
+func (p Policy) EvaluateDeny(t Target) Verdict {
+	for i := range p.Rules {
+		r := p.Rules[i]
+		if r.Action == Deny && r.Match(t) {
+			return Verdict{
+				Allowed: false,
+				Rule:    r.Spec(),
+				Reason:  fmt.Sprintf("denied by rule %q", r.Spec()),
+			}
+		}
+	}
+	return Verdict{Allowed: true, Reason: "no deny rule matched the resolved address"}
+}
+
+// With returns a copy of the policy with extra rules appended. Presets are values, so
+// command-line rules never mutate a shared definition.
+func (p Policy) With(rules ...Rule) Policy {
+	out := p
+	out.Rules = make([]Rule, 0, len(p.Rules)+len(rules))
+	out.Rules = append(out.Rules, p.Rules...)
+	out.Rules = append(out.Rules, rules...)
+	return out
+}
+
+// Verdict is the outcome of evaluating a target, with the reasoning attached. The reason
+// travels into the decision log and into the proxy's error body, so a user who is blocked
+// learns why without turning on a debug flag.
+type Verdict struct {
+	Allowed bool
+	// Rule is the matched rule's specification, empty when the default applied.
+	Rule   string
+	Reason string
+}
