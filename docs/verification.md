@@ -71,6 +71,30 @@ A full boot, command and teardown takes **~0.23 s**.
 | cleanup after SIGINT | pass |
 | `BOKS_INTEGRATION=1` suite against `io.containerd.nerdbox.v1` | 7/7 pass |
 
+### Not yet verified behind that boundary
+
+The persistent sandbox lifecycle — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`,
+`cp`, and re-attaching to a workspace's sandbox — was built and tested against a real
+containerd on a host with **no hypervisor**, using the runc dev runtime
+(`-runtime io.containerd.runc.v2 -snapshotter native -i-know-this-is-not-isolated`). That
+proves the containerd orchestration and that files written in a sandbox survive stop/start
+over the same snapshot. It proves nothing about the VM boundary.
+
+What still needs a capable host to confirm:
+
+- that `stop` tears the microVM down and `start` boots a *new* VM over the same writable
+  snapshot, with in-guest state intact (check `boot_id` and uptime differ across the stop);
+- that an `exec`'d process runs inside the *same* VM as the sandbox's own process (compare
+  `boot_id`, and check the exec'd process sees the sandbox's PID namespace);
+- that `rm` leaves no VM, shim, snapshot or mount behind;
+- that `cp` works when the guest is reached through vsock rather than a local FIFO.
+
+Run the suite unmodified — it defaults to the isolating runtime:
+
+```bash
+BOKS_INTEGRATION=1 go test ./internal/sandbox/ -run Integration -v
+```
+
 ### What is *not* contained
 
 Network. The guest has no virtio-net device — only `lo` — yet it reaches the internet, and

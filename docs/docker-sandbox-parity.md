@@ -32,16 +32,16 @@ Last reviewed against Docker's docs: 2026-08-11.
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| `run` | Creates or re-attaches, then attaches to the agent | `boks run <ws> -- <cmd>`; ephemeral first | P0 | done | Re-attach semantics deferred |
-| Re-attach by workspace | Running again from the same workspace path reconnects instead of duplicating | Planned once sandboxes are named/persistent | P1 | none | Requires host state store |
-| `create` | Builds in background without attaching | `boks create` | P1 | none | |
-| `start` / `stop` | Stop pauses; state survives | Same | P1 | none | Needs persistent snapshot |
-| `rm` | Deletes sandbox and everything in it; `--force` for active | `boks rm` | P1 | none | |
-| `ls` | Lists sandboxes with status and port mappings | `boks ls` | P1 | none | |
-| `inspect` | Sandbox details | `boks inspect`, JSON output | P2 | none | |
-| `exec` | `sbx exec -it <name> bash` into a running sandbox | `boks exec` | P1 | none | Needs long-lived sandboxes first |
-| Persistence across stop/start | Packages, Docker images, config, shell history persist until `rm` | Same, via writable snapshot | P1 | none | Boks is ephemeral-only today |
-| Naming | `--name`; reconnect from any directory | Same | P1 | none | |
+| `run` | Creates or re-attaches, then attaches to the agent | `boks run <ws> -- <cmd>`, persistent by default | P0 | partial | Re-attach implemented; verified on the non-VM runtime only |
+| Re-attach by workspace | Running again from the same workspace path reconnects instead of duplicating | Sandbox name derived from the workspace path digest | P1 | partial | No host state store: containerd's container record is the state |
+| `create` | Builds in background without attaching | `boks create` | P1 | partial | Creates without starting; verified on the non-VM runtime |
+| `start` / `stop` | Stop pauses; state survives | Same | P1 | partial | Stop kills the task, keeps container + snapshot; verified on the non-VM runtime |
+| `rm` | Deletes sandbox and everything in it; `--force` for active | `boks rm`, `-f` | P1 | partial | Deletes the snapshot too; verified on the non-VM runtime |
+| `ls` | Lists sandboxes with status and port mappings | `boks ls`, `-q`, `-json` | P1 | partial | No port mappings yet — none exist |
+| `inspect` | Sandbox details | `boks inspect`, JSON output | P2 | partial | Verified on the non-VM runtime |
+| `exec` | `sbx exec -it <name> bash` into a running sandbox | `boks exec [-i] [-t] [-it]` | P1 | partial | Streams IO, propagates the exit code; raw mode and resize unverified in a VM |
+| Persistence across stop/start | Packages, Docker images, config, shell history persist until `rm` | Same, via the container's writable snapshot | P1 | partial | Confirmed across stop/start on the non-VM runtime |
+| Naming | `--name`; reconnect from any directory | Same, `-name` | P1 | partial | An explicit name overrides the derived one |
 | Dashboard TUI | Interactive dashboard with live CPU/memory, shells, attach | Not planned near-term | P2 | none | Nice UX, not a correctness feature |
 | `reset` | Stops VMs, deletes data, can preserve secrets | `boks reset` | P2 | none | |
 
@@ -57,7 +57,7 @@ Last reviewed against Docker's docs: 2026-08-11.
 | Clone mode | `--clone` makes an in-VM Git clone; host repo read-only at `/run/sandbox/source`; fixed at creation | Equivalent planned; keep the read-only host mount idea | P1 | none | Good default for hostile code |
 | Live host writes | Direct mode changes are immediately live on the host | Same, and documented as a real risk | P0 | done | See security-model.md |
 | Large-repo slowness | `git status` etc. can be slow over passthrough | Expected; measure before optimizing | P2 | none | |
-| `cp` to/from sandbox | `sbx cp` with `SANDBOX:PATH` on one side; no sandbox-to-sandbox | `boks cp`, same restriction | P2 | none | |
+| `cp` to/from sandbox | `sbx cp` with `SANDBOX:PATH` on one side; no sandbox-to-sandbox | `boks cp`, same restriction | P2 | partial | Tar stream through `exec`; needs a running sandbox and `tar` in the image |
 | Root disk size | 20 GB default | Configurable | P2 | none | |
 
 ## 4. Networking
@@ -151,8 +151,19 @@ Last reviewed against Docker's docs: 2026-08-11.
 2. **Exact-path mounting for non-existent guest parents.** Whether the guest runtime creates
    `/home/alice/src` implicitly for the mount point, or whether Boks must pre-create it, is
    unverified pending a working VM.
-3. **Re-attach identity.** Docker keys sandbox reuse on workspace path. Boks needs to decide
-   between path-hash identity and explicit names before building persistence.
+3. ~~**Re-attach identity.**~~ **Answered.** Both, with the path as the default. A sandbox's
+   containerd identifier is `boks-<first 12 hex of sha256(workspace host path)>` unless
+   `-name` is given, in which case that name is used verbatim. The path digest is what makes
+   `boks run .` twice from one directory reach one sandbox — the path is the only thing two
+   invocations share, and it cannot be the identifier itself because containerd identifiers
+   allow neither slashes nor 76+ characters. An explicit name is what lets one workspace hold
+   several sandboxes and lets a sandbox be reached from any directory, matching `sbx --name`.
+   The readable path is kept in a container label, so `boks ls` shows it.
+
+   Consequences worth knowing: renaming or moving a workspace directory orphans its sandbox
+   (it is still listed, still removable, but a new one is created for the new path), and a
+   symlinked workspace resolves to its target before hashing, so two paths to the same
+   directory share one sandbox.
 4. **Kit schema.** Deliberately unanswered until real runtime features exist to configure.
 5. **TSI vs external network provider.** TSI is the nerdbox default and simpler, but places
    the policy decision inside libkrun. Confirm gvisor-tap-vsock is workable before
