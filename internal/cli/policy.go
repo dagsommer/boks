@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"sort"
+	"text/tabwriter"
+	"time"
 
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
@@ -102,10 +104,20 @@ Presets:
 		return err
 	}
 	if len(rules) > 0 {
-		fmt.Fprint(env.Stdout, "\ncredential injection (host-side only; the guest never receives a value):\n")
-		for _, r := range rules {
-			fmt.Fprintf(env.Stdout, "  %s\n", r)
+		fmt.Fprint(env.Stdout, "\ncredentials (host-side only; the guest never receives a value):\n")
+		for _, c := range rules {
+			fmt.Fprintf(env.Stdout, "  %s\n", c)
+			if c.Placeholder != "" {
+				name := c.EnvName
+				if name == "" {
+					name = "(no environment variable configured)"
+				}
+				// The placeholder is not a secret — that is the whole point of it — so
+				// printing it is safe and useful: it is what you set in the guest.
+				fmt.Fprintf(env.Stdout, "    guest holds %s=%s\n", name, c.Placeholder)
+			}
 		}
+		fmt.Fprintf(env.Stdout, "\n%s", interceptionNotice(rules))
 	}
 	fmt.Fprintf(env.Stdout, "\n%s", notEnforcedWarning)
 	return nil
@@ -115,15 +127,27 @@ func policyLog(_ context.Context, env Env) error {
 	fset := flag.NewFlagSet("boks policy log", flag.ContinueOnError)
 	fset.SetOutput(env.Stderr)
 	var (
-		limit = fset.Int("n", 50, "show at most this many decisions (0 for all)")
+		limit = fset.Int("n", 500, "read at most this many decisions (0 for all)")
 		path  = fset.String("file", policy.DefaultLogPath(), "decision log file")
+		raw   = fset.Bool("raw", false, "one line per decision instead of one per destination")
 	)
 	fset.Usage = func() {
 		fmt.Fprint(env.Stderr, `Usage: boks policy log [flags]
 
-Shows recent network policy decisions: what was allowed or denied, and why. Decisions are
-written by the host proxy ('boks proxy'). The log stays on this machine and is never
-uploaded anywhere.
+Shows recent network policy decisions: what was allowed or denied, how the flow was
+carried, and why. Decisions are written by the host proxy ('boks proxy'). The log stays on
+this machine and is never uploaded anywhere.
+
+Identical decisions are collapsed into one row with a count, because a single dependency
+install produces hundreds of them and the one denial that explains a failure should not be
+buried. Use -raw for the unaggregated form.
+
+The PROXY column is the part to read when you care about confidentiality:
+
+  forward          boks handled this at the HTTP level and could read it — plaintext
+                   HTTP, or HTTPS terminated because the host has a credential rule
+  forward-bypass   tunnelled untouched; end-to-end TLS, boks saw ciphertext only
+  transparent      judged at the network layer, without the proxy (not produced yet)
 
 Flags:
 `)
@@ -155,8 +179,71 @@ Flags:
 		fmt.Fprintf(env.Stdout, "no decisions recorded in %s\n", *path)
 		return nil
 	}
-	for _, d := range decisions {
-		fmt.Fprintln(env.Stdout, d)
+	if *raw {
+		for _, d := range decisions {
+			fmt.Fprintln(env.Stdout, d)
+		}
+		return nil
 	}
+	writeDecisionTable(env.Stdout, policy.Aggregated(decisions), time.Now())
 	return nil
+}
+
+// writeDecisionTable prints aggregated decisions, blocked first.
+//
+// Blocked requests come first because they are the ones someone is looking for: a run that
+// failed did so for a reason that is in that section. The columns follow Docker Sandboxes'
+// own layout, so that a person who knows one log can read the other.
+func writeDecisionTable(w io.Writer, rows []policy.Aggregate, now time.Time) {
+	var blocked, allowed []policy.Aggregate
+	for _, r := range rows {
+		if r.Allowed {
+			allowed = append(allowed, r)
+			continue
+		}
+		blocked = append(blocked, r)
+	}
+
+	section := func(title string, rows []policy.Aggregate) {
+		fmt.Fprintf(w, "%s\n", title)
+		if len(rows) == 0 {
+			fmt.Fprint(w, "  (none)\n\n")
+			return
+		}
+		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+		fmt.Fprint(tw, "  SANDBOX\tTYPE\tHOST\tPROXY\tRULE\tREASON\tLAST SEEN\tCOUNT\n")
+		for _, r := range rows {
+			sandbox := r.Sandbox
+			if sandbox == "" {
+				sandbox = "-"
+			}
+			mode := string(r.Mode)
+			if mode == "" {
+				mode = "-"
+			}
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+				sandbox, r.Type, r.Destination(), mode, r.Rule, r.Reason, since(now, r.LastSeen), r.Count)
+		}
+		tw.Flush()
+		fmt.Fprintln(w)
+	}
+	section("Blocked requests:", blocked)
+	section("Allowed requests:", allowed)
+	fmt.Fprint(w, "PROXY: forward = boks read this flow · forward-bypass = tunnelled, ciphertext only\n")
+}
+
+// since renders an age the way a person reads one.
+func since(now, then time.Time) string {
+	d := now.Sub(then)
+	switch {
+	case d < 0:
+		return "just now"
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return then.Format(time.RFC3339)
 }
