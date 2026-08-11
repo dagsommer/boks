@@ -25,9 +25,13 @@ What works, tested locally:
 
 - `boks doctor` — inspects containerd, the VM runtime, virtualisation, snapshotter and its
   host tooling, and explains how to fix what is missing.
-- `boks run <workspace> -- <command>` — creates a sandbox through containerd or re-attaches
-  to the one that workspace already has, runs a command in it, streams its output, and
-  returns its exit code. `-rm` makes it ephemeral instead.
+- `boks run [agent] [workspace...]` — agent-first, like `sbx run`. Creates a sandbox
+  through containerd or re-attaches to the one that agent and directory already have, runs
+  the agent (or a command after `--`), streams its output, and returns its exit code.
+  `-rm` makes it ephemeral instead.
+- **Agents** — `shell` is the one Boks ships an image for; the other names `sbx` uses
+  (`claude`, `codex`, `copilot`, `cursor`, `docker-agent`, `droid`, `gemini`, `kiro`,
+  `opencode`) are registered and run with an explicit `-template`.
 - **The sandbox lifecycle** — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`, `cp`.
   Sandboxes persist until removed, and files written inside one survive stop/start. *Tested
   end to end against containerd on the non-VM dev runtime only* — see below.
@@ -54,8 +58,10 @@ What is **not** done:
 - **Credentials cannot be injected into HTTPS at all** without terminating TLS, which Boks
   deliberately does not do. Only plaintext HTTP injection works today.
 - **No nested Docker**, no kits, no port publishing.
-- **The CLI is command-first, not agent-first**, so it does not yet match `sbx run <agent>`.
-  See the CLI surface section of the parity matrix.
+- **No prepared agent images.** The agent registry is real, but only `shell` has an image
+  behind it, and there is no way yet to define an agent in a file rather than in code.
+- **No terminal dashboard** for bare `boks`, no `--clone`, `--kit`, `--profile` or
+  `--publish`. See the CLI surface section of the parity matrix.
 - **The lifecycle commands have not been exercised behind a VM.** They were built and tested
   against a real containerd on a host with no hypervisor, using the runc dev runtime. The
   containerd orchestration is verified; the VM-specific behaviour of `stop`/`start` (a
@@ -90,44 +96,58 @@ make build
 
 ./bin/boks doctor
 
-./bin/boks run . -- uname -a
-./bin/boks run . -- sh -lc 'pwd && ls'
-./bin/boks run -rm /home/alice/src/foo -- go test ./...
+./bin/boks run                              # a shell in the current directory
+./bin/boks run shell . -- uname -a
+./bin/boks run shell . -- sh -lc 'pwd && ls'
+./bin/boks run -rm shell /home/alice/src/foo -- go test ./...
 ```
 
-The workspace is shared into the guest at the same absolute path it has on the host, and is
-the process's working directory. Nothing above it is exposed.
+The agent comes first and decides what the sandbox contains; the workspaces follow and
+default to the current directory. Each workspace is shared into the guest at the same
+absolute path it has on the host, and the first is the process's working directory. Nothing
+above them is exposed. Anything after `--` goes to the agent — for `shell`, that is the
+command to run.
 
 ### Sandboxes persist
 
-A sandbox lives until you remove it. Running again from the same workspace re-attaches to
-it, so installed packages, caches and shell state are still there:
+A sandbox lives until you remove it. Running the same agent in the same directory
+re-attaches to it, so installed packages, caches and shell state are still there:
 
 ```bash
-./bin/boks run .                 # create, or re-attach to this workspace's sandbox
-./bin/boks ls                    # NAME  STATUS  IMAGE  WORKSPACE  AGE
+./bin/boks run shell             # create, or re-attach to this directory's shell sandbox
+./bin/boks ls                    # SANDBOX  AGENT  STATUS  PORTS  WORKSPACE
 ./bin/boks exec -it $(./bin/boks ls -q) sh
 ./bin/boks stop <name>           # keeps everything inside
-./bin/boks start <name>
 ./bin/boks cp ./file.txt <name>:/root/file.txt
 ./bin/boks rm <name>             # deletes the sandbox and its filesystem
 ```
 
-Identity is the workspace path: the sandbox is named after a digest of it, so `boks run .`
-from one directory always means one sandbox. `-name` overrides that, which is how one
-workspace gets several sandboxes, and how a sandbox is reached from anywhere.
+**The name is the identity.** A sandbox is called `<agent>-<workspace directory>` —
+`shell-boks` for the `shell` agent in `~/git_repos/boks` — and that derived name is what a
+second run looks up, so naming and re-attach are the same mechanism. Two different
+directories with the same name are not merged: the second one gets
+`<agent>-<dir>-<digest>` and is told why. `-name` overrides the derivation, which is how one
+workspace gets several sandboxes, and how a sandbox is reached from anywhere:
 
-Useful flags:
+```bash
+./bin/boks run -name shell-boks  # re-attach by name, from any directory
+```
+
+Useful flags, named after sbx's:
 
 | Flag | Meaning |
 |---|---|
-| `-image` | guest root filesystem (default `alpine:latest`) |
-| `-name` | name the sandbox instead of deriving it from the workspace |
+| `-t`, `-template` | guest root filesystem (default: the agent's image) |
+| `-name` | name the sandbox instead of deriving it from agent and workspace |
+| `-d`, `-detached` | print the sandbox name and exit instead of attaching |
 | `-rm` | destroy the sandbox when the command exits |
 | `-mount PATH[:ro]` | share an extra directory (repeatable) |
-| `-cpus`, `-memory` | guest vCPUs and MiB |
+| `-cpus` | guest vCPUs (0: all host CPUs) |
+| `-m`, `-memory` | guest memory, binary units (`1024m`, `8g`; default half the host's, max 32g) |
 | `-env KEY=VALUE` | set an environment variable (repeatable) |
-| `-t` | allocate a pseudo-terminal |
+
+A pseudo-terminal is allocated when stdin and stdout are both terminals, and never when
+either is a pipe, so there is no flag for it.
 | `-policy`, `-allow`, `-deny`, `-net`, `-secret` | network policy — **validated and printed, not yet applied** |
 
 A workspace argument may carry a `:ro` suffix for a read-only share.
@@ -186,11 +206,12 @@ public documentation using open-source components; it is not derived from Docker
 | exact-path workspace | yes | **yes**, verified |
 | workspace `:ro`, no parent exposure | yes | **yes**, verified |
 | sandbox lifecycle (`ls`/`exec`/`stop`/`rm`/`cp`) | yes | **yes**, not yet exercised behind a VM |
-| agent-first CLI, dashboard, readable names | yes | no — see the parity matrix |
+| agent-first CLI, readable sandbox names | yes | **yes** — same grammar, same naming rule |
+| prepared agent images | yes, ten of them | only `shell`; the other names need `-template` |
+| terminal dashboard for bare `sbx` | yes | no — see the parity matrix |
 | network policy enforced outside the guest | yes | engine + proxy built, not wired into `run` |
 | credential injection by host proxy | yes | HTTP only, and not wired into `run` |
 | Docker daemon inside the sandbox | yes | planned |
-| persistent sandboxes, `ls`/`stop`/`rm`/`exec` | yes | yes (unverified in a VM) |
 | kits / declarative config | yes | planned |
 | account required | yes | **never** |
 | telemetry | yes, opt-out | **none** |
