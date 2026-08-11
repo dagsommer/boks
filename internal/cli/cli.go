@@ -41,6 +41,7 @@ func commands() []command {
 		{"policy", "Show network policy rules and recent decisions", policyCommand},
 		{"proxy", "Run the host forward proxy (experimental, not wired into run)", proxyCommand},
 		{"secret", "Manage host-side credentials the guest never receives", secretCommand},
+		{"ca", "Inspect or replace the local CA used for TLS interception", caCommand},
 		{"doctor", "Check host prerequisites for running sandboxes", doctorCommand},
 		{"version", "Print the boks version", versionCommand},
 	}
