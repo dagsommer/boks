@@ -6,6 +6,7 @@ require (
 	github.com/containerd/containerd/v2 v2.2.6
 	github.com/containerd/errdefs v1.0.0
 	github.com/opencontainers/runtime-spec v1.3.0
+	golang.org/x/sys v0.46.0
 )
 
 require (
@@ -49,7 +50,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
 	google.golang.org/grpc v1.78.0 // indirect

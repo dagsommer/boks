@@ -25,8 +25,12 @@ What works, tested locally:
 
 - `boks doctor` — inspects containerd, the VM runtime, virtualisation, snapshotter and its
   host tooling, and explains how to fix what is missing.
-- `boks run <workspace> -- <command>` — creates an ephemeral sandbox through containerd,
-  runs a command, streams its output, returns its exit code, and cleans up.
+- `boks run <workspace> -- <command>` — creates a sandbox through containerd or re-attaches
+  to the one that workspace already has, runs a command in it, streams its output, and
+  returns its exit code. `-rm` makes it ephemeral instead.
+- **The sandbox lifecycle** — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`, `cp`.
+  Sandboxes persist until removed, and files written inside one survive stop/start. *Tested
+  end to end against containerd on the non-VM dev runtime only* — see below.
 - **Exact-path workspace sharing** — the workspace appears inside the guest at its absolute
   host path, writes reach the host, `:ro` is honoured, and directories above the workspace
   are not exposed.
@@ -43,7 +47,11 @@ What is **not** done:
   reaches the internet *and* anything listening on your host's `127.0.0.1`. There is no
   allowlist, no proxy, no enforcement. This is the biggest gap.
 - **No credential injection.** Any secret you put in a sandbox is in the sandbox.
-- **No nested Docker**, no persistent sandboxes, no `ls`/`stop`/`rm`/`exec`, no kits.
+- **No nested Docker**, no kits, no port publishing.
+- **The lifecycle commands have not been exercised behind a VM.** They were built and tested
+  against a real containerd on a host with no hypervisor, using the runc dev runtime. The
+  containerd orchestration is verified; the VM-specific behaviour of `stop`/`start` (a
+  microVM being torn down and rebooted over the same snapshot) is not.
 - **Linux is untested in practice.** The boundary was verified on macOS/Apple silicon;
   the Linux/KVM path is designed for but has not been exercised end to end.
 
@@ -76,17 +84,38 @@ make build
 
 ./bin/boks run . -- uname -a
 ./bin/boks run . -- sh -lc 'pwd && ls'
-./bin/boks run /home/alice/src/foo -- sh
+./bin/boks run -rm /home/alice/src/foo -- go test ./...
 ```
 
 The workspace is shared into the guest at the same absolute path it has on the host, and is
 the process's working directory. Nothing above it is exposed.
+
+### Sandboxes persist
+
+A sandbox lives until you remove it. Running again from the same workspace re-attaches to
+it, so installed packages, caches and shell state are still there:
+
+```bash
+./bin/boks run .                 # create, or re-attach to this workspace's sandbox
+./bin/boks ls                    # NAME  STATUS  IMAGE  WORKSPACE  AGE
+./bin/boks exec -it $(./bin/boks ls -q) sh
+./bin/boks stop <name>           # keeps everything inside
+./bin/boks start <name>
+./bin/boks cp ./file.txt <name>:/root/file.txt
+./bin/boks rm <name>             # deletes the sandbox and its filesystem
+```
+
+Identity is the workspace path: the sandbox is named after a digest of it, so `boks run .`
+from one directory always means one sandbox. `-name` overrides that, which is how one
+workspace gets several sandboxes, and how a sandbox is reached from anywhere.
 
 Useful flags:
 
 | Flag | Meaning |
 |---|---|
 | `-image` | guest root filesystem (default `alpine:latest`) |
+| `-name` | name the sandbox instead of deriving it from the workspace |
+| `-rm` | destroy the sandbox when the command exits |
 | `-mount PATH[:ro]` | share an extra directory (repeatable) |
 | `-cpus`, `-memory` | guest vCPUs and MiB |
 | `-env KEY=VALUE` | set an environment variable (repeatable) |
@@ -139,7 +168,7 @@ public documentation using open-source components; it is not derived from Docker
 | network policy enforced outside the guest | yes | no — guest reaches host loopback |
 | credential injection by host proxy | yes | planned |
 | Docker daemon inside the sandbox | yes | planned |
-| persistent sandboxes, `ls`/`stop`/`rm`/`exec` | yes | planned |
+| persistent sandboxes, `ls`/`stop`/`rm`/`exec` | yes | yes (unverified in a VM) |
 | kits / declarative config | yes | planned |
 | account required | yes | **never** |
 | telemetry | yes, opt-out | **none** |
@@ -157,10 +186,11 @@ that matters, because today a sandbox can reach your host's own services.
    netstack, giving deny-by-default and an allowlist that the guest cannot opt out of
 2. Host forward proxy with hostname filtering (no TLS interception)
 3. Credential injection — real secrets stay on the host
-4. Verify the Linux/KVM path end to end, as macOS has been
-5. Persistent sandboxes and the `ls`/`stop`/`rm`/`exec` lifecycle
-6. Clone mode, so guest writes do not land on the host by default
-7. Docker daemon inside the guest
+4. Confirm the lifecycle against a real hypervisor — it has so far only been exercised
+   without one, so stop/start over a live microVM is unverified
+5. Clone mode, so guest writes do not land on the host by default
+6. Docker daemon inside the guest
+7. Port publishing, and the dashboard-style listing that needs it
 8. Kits / declarative configuration
 9. Windows, once the runtime supports it
 
