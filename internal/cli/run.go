@@ -8,10 +8,11 @@ import (
 	"strings"
 
 	"github.com/dagsommer/boks/internal/agent"
+	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
-func runCommand(ctx context.Context, env Env) error {
+func runCommand(ctx context.Context, env Env) (err error) {
 	fs := flag.NewFlagSet("boks run", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
 
@@ -21,9 +22,9 @@ func runCommand(ctx context.Context, env Env) error {
 	fs.BoolVar(detached, "d", false, "alias for -detached")
 	ephemeral := fs.Bool("rm", false, "destroy the sandbox when the command exits")
 
-	// Network policy flags are accepted and validated here, but not applied: see
-	// netflags.go and the warning below. Their definitions live in netflags.go so that
-	// `run`, `proxy` and `policy ls` cannot drift apart.
+	// The network policy flags decide what the sandbox's network is and what may cross
+	// it. Their definitions live in netflags.go so that `run`, `proxy` and `policy ls`
+	// cannot drift apart.
 	var netFlags policyFlags
 	netFlags.register(fs)
 
@@ -74,9 +75,12 @@ Flags:
 			"its command exits, and a detached run has no command to wait for")
 	}
 
-	// Fail on a malformed rule now, before anything is created, so a policy that will one
-	// day be enforced is known to be well-formed today; then say plainly that nothing
-	// applies it yet.
+	// Fail on a malformed rule before anything is created or pulled, so that a mistyped
+	// pattern costs a message rather than a sandbox.
+	requestedMode, err := network.ParseMode(netFlags.mode)
+	if err != nil {
+		return err
+	}
 	if _, err := netFlags.resolve(); err != nil {
 		return err
 	}
@@ -85,9 +89,6 @@ Flags:
 	}
 	if _, err := netFlags.networkPlan(sandboxNameFor(*flags.name)); err != nil {
 		return err
-	}
-	if netFlags.specified() {
-		fmt.Fprintf(env.Stderr, "%s\n", notEnforcedWarning)
 	}
 
 	inv, err := flags.resolve(ctx, agents, positional, env)
@@ -107,6 +108,25 @@ Flags:
 	if err != nil {
 		return err
 	}
+
+	// The network is decided, described and started before the sandbox: its annotations
+	// have to be on the container when it is created, and the host-side stack has to be
+	// holding the link socket before the VM boots and connects to it.
+	started, err := attachSandboxNetwork(ctx, &netFlags, inv, &cfg, requestedMode, env)
+	if err != nil {
+		return err
+	}
+	if started {
+		defer func() {
+			// An ephemeral sandbox leaves nothing behind, its network included. A
+			// run that failed must not leave a stack holding a socket for a VM that
+			// will never connect. A persistent sandbox that started successfully
+			// keeps its stack — that it outlives this process is the whole point.
+			if *ephemeral || err != nil {
+				stopNetworkQuietly(inv.name, env.Stderr)
+			}
+		}()
+	}
 	cfg.Ephemeral = *ephemeral
 	cfg.Stdin = env.Stdin
 	cfg.Stdout = env.Stdout
@@ -118,9 +138,12 @@ Flags:
 	cfg.TTY = !*detached && isTerminal(env.Stdin) && isTerminal(env.Stdout)
 
 	if *detached {
-		info, err := sandbox.Up(ctx, cfg)
-		if err != nil {
-			return err
+		// Assign rather than declare: the deferred network cleanup above reads this
+		// function's error, and a shadowed one would make a failed run look successful
+		// to it and leave a stack behind.
+		info, upErr := sandbox.Up(ctx, cfg)
+		if upErr != nil {
+			return upErr
 		}
 		fmt.Fprintln(env.Stdout, info.Name)
 		return nil
