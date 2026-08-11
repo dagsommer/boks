@@ -1,0 +1,111 @@
+# The shared foundation every Boks agent image is built on.
+#
+# Debian 13 (trixie) rather than Ubuntu: it is the smaller of the two slim images, its
+# glibc is 2.41 (newer than Ubuntu 24.04's 2.39, which matters because some vendor CLIs
+# ship glibc-linked binaries with a floor as high as 2.39 on arm64), and — unlike
+# ubuntu:24.04 — it does not already occupy uid 1000 with a distro user, so `agent` can
+# have the uid the kit convention expects without deleting someone first.
+FROM debian:trixie-slim
+
+# ARG, not ENV: noninteractive is a property of this build, not of a sandbox someone later
+# runs an editor in.
+ARG DEBIAN_FRONTEND=noninteractive
+
+# One layer for the whole distro payload. It is the expensive step and the one that changes
+# least, so it goes first and stays cacheable; splitting it would only add layers that are
+# always invalidated together anyway.
+#
+# tini is here because a long-lived sandbox needs an init: a real Docker Sandboxes guest was
+# observed running tini as PID 1, and without one an agent that spawns and abandons children
+# accumulates zombies for the life of the sandbox.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      gnupg \
+      jq \
+      less \
+      libatomic1 \
+      openssh-client \
+      procps \
+      python3 \
+      python3-pip \
+      python3-venv \
+      ripgrep \
+      tini \
+      unzip \
+      xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+# Node from nodejs.org rather than the distro, because the agent CLIs are published to npm
+# and track Node LTS, while Debian's node is pinned to whatever was current at freeze. The
+# version is an ARG so a release can move it without editing the recipe.
+ARG NODE_VERSION=24.19.0
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) node_arch=x64 ;; \
+      arm64) node_arch=arm64 ;; \
+      *) echo "boks: unsupported architecture $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    tarball="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/${tarball}"; \
+    curl -fsSL -o /tmp/SHASUMS256.txt "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"; \
+    sum="$(awk -v f="$tarball" '$2 == f { print $1 }' /tmp/SHASUMS256.txt)"; \
+    test -n "$sum"; \
+    echo "$sum  /tmp/node.tar.xz" | sha256sum -c -; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner; \
+    rm -f /tmp/node.tar.xz /tmp/SHASUMS256.txt; \
+    # 65 MB of C++ headers for building native addons. node-gyp fetches its own copy for
+    # whatever version it is targeting, so keeping these only makes the image bigger.
+    rm -rf /usr/local/include/node /usr/local/share/doc /usr/local/share/man; \
+    node --version; \
+    npm --version
+
+# uid/gid 1000 with home /home/agent. This is the kit convention (`setup.startup` defaults
+# to user "1000") and what a real sbx guest runs as, so a workspace written inside a sandbox
+# ends up owned by the same uid as on a typical single-user Linux host.
+RUN set -eux; \
+    groupadd --gid 1000 agent; \
+    useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash agent; \
+    mkdir -p /home/agent/.local/bin /home/agent/.npm-global; \
+    chown -R agent:agent /home/agent
+
+# The CA entrypoint has to write to the trust store, and the container process is uid 1000.
+# Rather than grant the agent user root (or run the whole sandbox as root), hand it exactly
+# the three paths update-ca-certificates writes: the drop-in directory, the generated bundle
+# directory, and the index it rewrites. Nothing else in / changes owner.
+#
+# In the threat model this costs nothing — the guest is a disposable VM whose entire
+# filesystem is already the agent's to ruin — and it keeps the process uid honest.
+RUN set -eux; \
+    mkdir -p /usr/local/share/ca-certificates; \
+    chown agent:agent /usr/local/share/ca-certificates /etc/ssl/certs /etc/ca-certificates.conf; \
+    chown agent:agent /etc/ssl/certs/ca-certificates.crt
+
+COPY --chmod=0755 boks-install-ca boks-entrypoint /usr/local/bin/
+
+# Node and Python carry their own trust stores and ignore the system one, so they need to be
+# pointed at a bundle explicitly. All three name the *system* bundle rather than the injected
+# certificate: that file always exists, so nothing breaks when no CA is injected, and
+# update-ca-certificates appends the Boks CA to it in place when one is.
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    NPM_CONFIG_PREFIX=/home/agent/.npm-global \
+    PATH=/home/agent/.npm-global/bin:/home/agent/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
+    LANG=C.UTF-8 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
+
+USER agent
+WORKDIR /home/agent
+
+# tini first so it is PID 1 and reaps; the entrypoint installs the CA and then execs, so it
+# does not linger as a process of its own.
+#
+# Note that `boks run` replaces the whole argv (containerd's WithProcessArgs discards the
+# image entrypoint), which is why internal/agent carries this same prefix in Agent.Init.
+# The ENTRYPOINT here is what makes `docker run` and any other OCI runtime behave the same.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/boks-entrypoint"]
+CMD ["/bin/bash"]
