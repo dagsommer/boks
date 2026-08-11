@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -138,9 +139,21 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 	return image, nil
 }
 
+// guestPlatform is the platform the OCI spec describes.
+//
+// The guest is always Linux, even when the host is not: the spec describes the microVM's
+// contents, not the machine running Boks. Without this, spec generation on macOS produces a
+// Darwin spec with no Linux section, and the image config cannot be applied at all.
+func guestPlatform() string {
+	return "linux/" + runtime.GOARCH
+}
+
 // createContainer builds the OCI spec and registers the container with containerd.
 func createContainer(ctx context.Context, c *client.Client, image client.Image, cfg Config) (client.Container, error) {
 	specOpts := []oci.SpecOpts{
+		// Must come first: it resets the spec to the platform default, discarding
+		// anything applied before it.
+		oci.WithDefaultSpecForPlatform(guestPlatform()),
 		oci.WithImageConfig(image),
 		oci.WithAnnotations(resourceAnnotations(cfg)),
 	}
