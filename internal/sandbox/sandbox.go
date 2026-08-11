@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -234,12 +235,19 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 		return 1, fmt.Errorf("starting sandbox process: %w", err)
 	}
 
-	forwardSignals(ctx, task)
+	interrupted := forwardSignals(ctx, task)
 
 	status := <-statusC
 	code, _, statusErr := status.Result()
 
 	cleanupTask(ctx, task)
+
+	// An interrupted run is not a failure. Report it the way a shell does — 128 plus the
+	// signal number — and say nothing, rather than surfacing the transport-level
+	// cancellation that tearing the task down produces.
+	if sig := interrupted.Load(); sig != 0 {
+		return 128 + int(sig), nil
+	}
 
 	if statusErr != nil {
 		return 1, fmt.Errorf("sandbox process failed: %w", statusErr)
@@ -257,7 +265,12 @@ func ioCreator(cfg Config) cio.Creator {
 
 // forwardSignals relays interrupt and termination to the guest process so that Ctrl-C
 // behaves as it would for a local command, and so cleanup still runs.
-func forwardSignals(ctx context.Context, task client.Task) {
+//
+// The returned value holds the signal number that was delivered, or zero if the run was
+// never interrupted, so the caller can report the conventional 128+signal exit status.
+func forwardSignals(ctx context.Context, task client.Task) *atomic.Int32 {
+	var received atomic.Int32
+
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -265,11 +278,19 @@ func forwardSignals(ctx context.Context, task client.Task) {
 		select {
 		case sig := <-sigC:
 			if s, ok := sig.(syscall.Signal); ok {
-				_ = task.Kill(ctx, s)
+				received.Store(int32(s))
+				// Kill on a detached context: the process-wide signal handler has
+				// very likely cancelled ctx already, which would make this a no-op
+				// and leave the guest running until cleanup forces it.
+				killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
+				defer cancel()
+				_ = task.Kill(killCtx, s)
 			}
 		case <-ctx.Done():
 		}
 	}()
+
+	return &received
 }
 
 // cleanupTask removes the task, killing it first if it is still running. Errors are

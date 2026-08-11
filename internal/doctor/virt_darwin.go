@@ -4,8 +4,13 @@ package doctor
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
+
+	"github.com/dagsommer/boks/internal/runtimecfg"
 )
 
 // virtualizationCheck reports whether the machine can host a libkrun VM.
@@ -31,6 +36,73 @@ func virtualizationCheck() Check {
 					"This check reports architecture support only; it has not been\n" +
 					"confirmed that a VM will start.",
 			}
+		},
+	}
+}
+
+// hypervisorEntitlement is the code-signing entitlement libkrun needs in order to use
+// Hypervisor.framework.
+const hypervisorEntitlement = "com.apple.security.hypervisor"
+
+// extraChecks adds the macOS-only requirements.
+func extraChecks() []Check {
+	return []Check{runtimeEntitlementCheck()}
+}
+
+// runtimeEntitlementCheck verifies the shim binary carries the hypervisor entitlement.
+//
+// This is worth a dedicated check because the failure is both silent and opaque: an
+// unsigned shim starts normally and dies inside libkrun with `krun_start_enter failed: -22`,
+// which names neither code signing nor the entitlement. Build systems that produce the shim
+// without a codesign step hit this every time.
+//
+// The probe never hard-fails on an inconclusive result: if codesign cannot be run, or its
+// output cannot be interpreted, that is reported as a warning rather than blocking a host
+// that may well be fine.
+func runtimeEntitlementCheck() Check {
+	return Check{
+		Name: "runtime entitlement",
+		Run: func(ctx context.Context, env Env) Result {
+			binary := runtimecfg.ShimBinary(env.Runtime)
+			if binary == "" {
+				return Result{Status: StatusSkip, Detail: "unrecognised runtime " + env.Runtime}
+			}
+			path, err := exec.LookPath(binary)
+			if err != nil {
+				// The shim check already reports this; do not repeat the failure.
+				return Result{Status: StatusSkip, Detail: "shim not found (see vm runtime)"}
+			}
+
+			ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+			defer cancel()
+
+			// codesign writes the entitlement plist to stdout and its commentary to
+			// stderr, so both are captured.
+			out, err := exec.CommandContext(ctx, "codesign", "-d", "--entitlements", "-", path).CombinedOutput()
+			if err != nil {
+				return Result{
+					Status: StatusWarn,
+					Detail: "could not inspect the shim's signature",
+					Remedy: fmt.Sprintf("Running codesign against %s failed: %v\n"+
+						"Boks could not confirm the shim carries the %s entitlement,\n"+
+						"which libkrun needs to use Hypervisor.framework. If sandboxes fail to\n"+
+						"boot with 'krun_start_enter failed: -22', this is the likely cause.",
+						path, err, hypervisorEntitlement),
+				}
+			}
+			if !strings.Contains(string(out), hypervisorEntitlement) {
+				return Result{
+					Status: StatusFail,
+					Detail: "shim lacks " + hypervisorEntitlement,
+					Remedy: fmt.Sprintf("%s is not signed with the %s entitlement.\n"+
+						"libkrun needs it to use Hypervisor.framework; without it a sandbox dies\n"+
+						"inside libkrun with 'krun_start_enter failed: -22', which names nothing.\n"+
+						"Sign it with an entitlements plist granting %s — nerdbox's own\n"+
+						"build:shim task does this, while a plain image build does not.",
+						path, hypervisorEntitlement, hypervisorEntitlement),
+				}
+			}
+			return Result{Status: StatusOK, Detail: hypervisorEntitlement}
 		},
 	}
 }

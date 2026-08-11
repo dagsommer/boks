@@ -88,6 +88,10 @@ func kvmOpenFailure(err error) Result {
 	}
 }
 
+// extraChecks adds Linux-only requirements. There are none beyond the shared set: KVM
+// access is covered by virtualizationCheck.
+func extraChecks() []Check { return nil }
+
 // hypervisorLibrary reports where libkrun is expected on this platform.
 func hypervisorLibraryNames() []string {
 	return []string{"libkrun.so.1", "libkrun.so"}

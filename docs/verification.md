@@ -194,6 +194,13 @@ errors that do not name their own cause.
 
    Check with `codesign -d --entitlements - _output/containerd-shim-nerdbox-v1`.
 
+   `boks doctor` now performs this check itself, as `runtime entitlement`. **That check has
+   not yet been run against a real macOS host** — it was added on Linux, where it does not
+   apply, so its parsing of `codesign` output is unconfirmed. Verifying it is the first thing
+   to do on the next macOS run: it should report `ok` on a signed shim, and `fail` with the
+   remedy above on an unsigned one. It reports a warning, never a hard failure, if `codesign`
+   itself cannot be run.
+
 2. **`/var/run/containerd` must exist and be writable by you.** containerd derives the
    shim's socket path from a compile-time constant
    (`pkg/shim/util_unix.go`: `const socketRoot = defaults.DefaultStateDir`), so no config
@@ -220,3 +227,14 @@ errors that do not name their own cause.
 
 When this procedure is run again on different hardware, update the "Current status" section
 above with the observed values — the boot_ids, the kernel versions, the vCPU count.
+
+### Confirm on the next macOS run
+
+Two changes were made after the verification above, on a Linux machine with no hypervisor.
+Both are unconfirmed against a booted VM:
+
+- the `runtime entitlement` check in `boks doctor` (see the codesign note above);
+- Ctrl-C now exits `128+signal` — 130 for SIGINT, 143 for SIGTERM — and prints nothing,
+  instead of exiting 1 with a raw `context canceled` gRPC error. Verified against
+  containerd's `runc` runtime, including that no container, task or shim survives; not yet
+  observed tearing down a real VM.

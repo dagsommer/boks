@@ -104,6 +104,29 @@ func TestContainerdCheckHandlesMissingSocket(t *testing.T) {
 	}
 }
 
+// Checks are assembled from a shared set plus per-platform additions; a malformed entry
+// would panic at run time rather than fail visibly.
+func TestChecksAreWellFormed(t *testing.T) {
+	seen := map[string]bool{}
+	for _, c := range Checks() {
+		if c.Name == "" {
+			t.Error("a check has an empty name")
+		}
+		if c.Run == nil {
+			t.Errorf("check %q has no Run function", c.Name)
+		}
+		if seen[c.Name] {
+			t.Errorf("duplicate check name %q; names are the display key", c.Name)
+		}
+		seen[c.Name] = true
+	}
+	for _, required := range []string{"platform", "virtualization", "containerd", "vm runtime"} {
+		if !seen[required] {
+			t.Errorf("check %q is missing", required)
+		}
+	}
+}
+
 func TestStatusString(t *testing.T) {
 	for status, want := range map[Status]string{
 		StatusOK: "ok", StatusWarn: "warn", StatusFail: "fail", StatusSkip: "skip",
