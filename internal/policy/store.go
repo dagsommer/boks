@@ -136,6 +136,13 @@ func (r RuleSpec) canonical() string {
 	return rule.Spec()
 }
 
+// SameDestination reports whether the rule names the destination in spec, comparing them as
+// the engine would rather than as text: "GitHub.com" and "github.com:*" are one destination.
+func (r RuleSpec) SameDestination(spec string) bool {
+	other := RuleSpec{Action: r.Action, Spec: spec}
+	return r.canonical() == other.canonical()
+}
+
 // Profile is a named policy a run can select: a base preset plus rules.
 //
 // A profile is not a new concept — it is a policy with a name — and it is kept that way
