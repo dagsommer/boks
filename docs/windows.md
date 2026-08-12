@@ -21,15 +21,20 @@ Split the question in two, because the answer differs:
 
 | Half | Status |
 |---|---|
-| Booting a Linux microVM per sandbox, from an arbitrary OCI image, with a writable snapshot, driven through containerd | **Available.** containerd and hcsshim already do this. Boks would need real work but no new mechanism. |
-| Terminating the guest's network in a host userspace process, so every flow can be judged | **Not available, by any supported mechanism.** |
+| Booting a Linux microVM per sandbox, from an arbitrary OCI image, with a writable snapshot, driven through containerd | **The mechanism exists**; containerd and hcsshim already do this, and Boks needs no new one. But the Linux utility VM it boots has **no public 2026 source** for its kernel and rootfs, and no public CI in either project ever boots one. Call it *plausible and unproven*, not *available*. |
+| Terminating the guest's network in a host userspace process, so every flow can be judged | **Not available, by any supported mechanism.** Not unproven — precluded by the HCS device schema. |
+
+The asymmetry matters. The first row is a research risk: someone could sit down with a Windows
+machine and find out. The second is not a risk, it is a finding — there is no experiment that
+would make Hyper-V hand a userspace process the guest's Ethernet frames, because it exposes no
+device that does that.
 
 A Windows port built today would produce a sandbox with a real VM boundary and a network Boks
 could not police. Boks already has a name for the honest version of that — `-net none` — and
 it is the only mode that could ship truthfully.
 
-The recommendation is therefore: **do not build a Windows backend yet.** Not because the work
-is large, but because the result would either be a sandbox with no network at all, or a
+The recommendation is therefore: **do not build a native Windows backend.** Not because the
+work is large, but because the result would either be a sandbox with no network at all, or a
 sandbox whose network policy is decorative. The second is the failure mode this project exists
 to avoid, and it is the easiest one to ship by accident.
 
