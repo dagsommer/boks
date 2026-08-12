@@ -481,6 +481,37 @@ shipping one is not a direction this project should take.
 the packets*. The result still funnels into `addNIC(endpoint)` with an HCN `EndpointId`. The
 data plane is unchanged.
 
+### The near-miss: an internal HNS network
+
+One arrangement gets closer than any other and is worth writing down, because it is the first
+thing a reviewer will propose and it *almost* works.
+
+HNS can create an **`Internal`** network: the guest gets an endpoint, and the **host** gets a
+vNIC on the same layer-2 segment. Point the guest's default route at that host vNIC, leave
+Windows IP forwarding disabled and configure no NAT, and the guest can reach exactly one thing
+— the host. Run the Boks proxy on the host vNIC and the guest's HTTP and HTTPS go through it.
+
+That is containment, and it is real. It is **not** what Boks does, and the difference is
+precisely the property the project spent its netstack work on:
+
+| | Boks today | Internal HNS network |
+|---|---|---|
+| Who terminates the guest's frames | a Boks netstack | the Windows kernel |
+| Raw TCP to an arbitrary address | judged per flow against policy, allowed or `RST` with a logged reason | fails, because nothing routes it — no decision, no log entry |
+| Allowing a specific IP or port | a policy rule | impossible without host firewall/route surgery Boks does not own |
+| `transparent`-mode flows in `boks policy log` | recorded | do not exist |
+| What enforcement rests on | a stack Boks assembled and can test | Windows routing and firewall state, which anything with admin can change |
+
+So an internal HNS network would give Boks a **proxy-only** posture: cooperating clients get
+hostname rules and credential injection, and everything else gets silence instead of a
+judgement. Boks explicitly rejected that model on Linux and macOS — `docs/architecture.md` calls
+the guest environment "a convenience, not the control", and the whole point of putting policy
+in the stack's own TCP forwarder was that a guest ignoring `HTTP_PROXY` must still be judged.
+
+It is worth knowing this exists, because it is the best available Windows posture and it is
+better than nothing. It should not be described as network policy enforcement, because a policy
+that cannot say "allow this address" and cannot log a denial is not the same object.
+
 ### Why hvsock does not close the gap
 
 The original hypothesis was that gvisor-tap-vsock's hvsock transport could stand in for the
