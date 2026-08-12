@@ -8,7 +8,7 @@ package policy
 //	2. profile    the selected profile's own rules
 //	3. global     stored rules that apply to every sandbox on this machine
 //	4. sandbox    stored rules for this sandbox only
-//	5. flags      -allow / -deny on this invocation (a Boks addition, not sbx parity)
+//	5. flags      --allow / --deny on this invocation (a Boks addition, not sbx parity)
 //
 // # Precedence, and why it is this way
 //
@@ -21,14 +21,14 @@ package policy
 // So:
 //
 //   - **A deny in any layer beats an allow in any layer.** A sandbox-scoped allow cannot
-//     unsay a global deny; nor can a per-run `-allow`. This is the property that makes
+//     unsay a global deny; nor can a per-run `--allow`. This is the property that makes
 //     scoping safe to hand to a user: adding a rule to one sandbox can never widen access
 //     past what the machine's policy forbids, so the blast radius of a scoped rule is
 //     bounded by construction rather than by care.
 //   - **Narrower scopes only add.** They cannot remove a rule from a wider one, and they
 //     cannot change the default action. Removing a global rule is done where it was written,
 //     with `boks policy rm`, which is visible and deliberate.
-//   - **The base is replaceable, the rules are not.** `-policy locked` or a profile replaces
+//   - **The base is replaceable, the rules are not.** `--policy locked` or a profile replaces
 //     the preset the default action comes from. That is the one thing a run can override,
 //     and it can only ever be observed as a *different set of preset rules*, never as the
 //     disappearance of a stored deny.
@@ -45,8 +45,8 @@ import (
 // Scope labels used in verdicts and in `boks policy ls`. They are the words a user would
 // have to act on, so they name the place a rule is written rather than an internal concept.
 const (
-	scopeFlagAllow = "flag -allow"
-	scopeFlagDeny  = "flag -deny"
+	scopeFlagAllow = "flag --allow"
+	scopeFlagDeny  = "flag --deny"
 	scopeGlobal    = "global"
 )
 
@@ -110,9 +110,9 @@ type Request struct {
 	Sandbox string
 	// Profile selects a stored profile as the base.
 	Profile string
-	// Preset overrides the base preset (`-policy`). It wins over Profile's preset.
+	// Preset overrides the base preset (`--policy`). It wins over Profile's preset.
 	Preset string
-	// Allow and Deny are this run's own rules (`-allow`, `-deny`).
+	// Allow and Deny are this run's own rules (`--allow`, `--deny`).
 	Allow []string
 	Deny  []string
 }
@@ -155,7 +155,7 @@ func (req Request) Resolve() (Resolution, error) {
 			res.Rules = appendScoped(res.Rules, profile.Rules, "profile "+req.Profile)
 			res.Layers = append(res.Layers, Layer{
 				Source: "profile " + req.Profile,
-				Detail: "-policy " + req.Preset + " replaced this profile's preset",
+				Detail: "--policy " + req.Preset + " replaced this profile's preset",
 				Count:  len(profile.Rules),
 			})
 			names = append(names, "profile:"+req.Profile)
@@ -195,7 +195,7 @@ func (req Request) Resolve() (Resolution, error) {
 	res.Rules = append(res.Rules, flagRules...)
 	res.Layers = append(res.Layers, Layer{
 		Source: "flags",
-		Detail: "-allow/-deny on this run; a Boks addition, not carried by the sandbox",
+		Detail: "--allow/--deny on this run; a Boks addition, not carried by the sandbox",
 		Count:  len(flagRules),
 	})
 	if len(flagRules) > 0 {
@@ -275,14 +275,14 @@ func parseFlagRules(allow, deny []string) ([]RuleSpec, error) {
 	for _, spec := range deny {
 		r := RuleSpec{Action: Deny, Spec: spec, Scope: scopeFlagDeny}
 		if _, err := r.Rule(); err != nil {
-			return nil, fmt.Errorf("-deny %s: %w", spec, err)
+			return nil, fmt.Errorf("--deny %s: %w", spec, err)
 		}
 		out = append(out, r)
 	}
 	for _, spec := range allow {
 		r := RuleSpec{Action: Allow, Spec: spec, Scope: scopeFlagAllow}
 		if _, err := r.Rule(); err != nil {
-			return nil, fmt.Errorf("-allow %s: %w", spec, err)
+			return nil, fmt.Errorf("--allow %s: %w", spec, err)
 		}
 		out = append(out, r)
 	}
@@ -390,16 +390,16 @@ func (p *SandboxPolicy) String() string {
 	}
 	var parts []string
 	if p.Profile != "" {
-		parts = append(parts, "-profile "+p.Profile)
+		parts = append(parts, "--profile "+p.Profile)
 	}
 	if p.Preset != "" {
-		parts = append(parts, "-policy "+p.Preset)
+		parts = append(parts, "--policy "+p.Preset)
 	}
 	for _, a := range p.Allow {
-		parts = append(parts, "-allow "+a)
+		parts = append(parts, "--allow "+a)
 	}
 	for _, d := range p.Deny {
-		parts = append(parts, "-deny "+d)
+		parts = append(parts, "--deny "+d)
 	}
 	return strings.Join(parts, " ")
 }
