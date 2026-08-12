@@ -1,8 +1,11 @@
 # Upstream: virtio-net on Windows (libkrun)
 
-Boks enforces network policy at the virtio-net boundary. On Windows that boundary does not
-exist yet, which is the single reason `boks run` cannot work there — see
+Boks enforces network policy at the virtio-net boundary. Upstream libkrun cannot provide
+that boundary on Windows, which is why `boks run` cannot work there — see
 `internal/network/gateway_windows.go`, which says so and fails early.
+
+Not because it is impossible: a shipping product drives a virtio NIC on Windows through
+libkrun's own ABI today (below). Because upstream has no virtio-net backend for it.
 
 This document records the upstream change that closes the libkrun half of that gap, and
 what Boks would have to do once it lands.
@@ -19,6 +22,27 @@ libkrun's Windows Hypervisor Platform backend was merged upstream in May–June 
 #660, #665, #691, #692). virtio-fs, blk, console, balloon and rng were ported with it.
 virtio-net was not, and virtio-net is the device Boks needs: TSI has no policy decision
 point we control, so the NIC is the boundary.
+
+## Evidence that the target is reachable
+
+A Windows 11 machine running Docker Sandboxes was inspected read-only on 2026-08-12. What
+it shows is that every layer below us already works on Windows:
+
+- **virtio-net is running in production.** The guest's `/sys/bus/virtio/devices/*/modalias`
+  entries decode to virtio device-id `1` (net), plus block ×4, virtio-fs ×4, balloon,
+  console and vsock. A userspace VMM on Windows is emulating a virtio NIC today.
+- **Through libkrun's ABI, with the shim we consume.** The install ships `sailor.dll` (a VMM
+  exposing libkrun's ABI), **`containerd-shim-nerdbox-v1.exe`**, `mkfs.erofs.exe` and
+  `mkfs.ext4.exe`. A working Windows build of the nerdbox shim exists and loads a VMM
+  through the `krun.dll` ABI.
+- **No kernel driver, no elevation.** No `.sys` file, no registered driver or service, and
+  `sbx diagnose` passes eight user-level checks without admin rights.
+- **No Hyper-V worker process** — no `vmwp.exe`, no `vmmem`; the shim process holds the VM.
+  Consistent with WHP rather than Hyper-V managing the machine. *Inferred* — confirming the
+  API calls would need ETW or a debugger, which was not done.
+
+This is about feasibility, not about our code. It says the platform, the ABI and the shim
+all support this shape of VM; it says nothing about whether the branch below works.
 
 ## The change
 
@@ -72,14 +96,25 @@ libkrun's virtio-net is necessary, not sufficient. Still outstanding for Windows
 - **The rest of libkrun's devices crate does not compile for Windows.** `vsock`,
   `file_traits`, `linux_errno` and `legacy/x86_64/serial` are Unix-only, and
   `fs/windows/passthrough.rs` references `windows-sys` `Wdk_*` features that its
-  `Cargo.toml` never declares. The WHP port is visibly a work in progress with no Windows
-  CI behind it.
-- **nerdbox has no Windows support**, and Boks reaches libkrun only through the shim.
-- **containerd on Windows** does not run Linux guests the way the Boks stack assumes.
+  `Cargo.toml` never declares. There is no Windows job in libkrun's CI and `main` does not
+  compile for Windows at all — the WHP port is visibly a work in progress.
+- **nerdbox on Windows from the tree we build from.** A Windows build of the shim exists in
+  production (`containerd-shim-nerdbox-v1.exe` in the Docker Sandboxes install), so this is
+  a question of availability rather than feasibility — but whether the upstream nerdbox we
+  consume builds and runs on Windows has not been checked. That is the next thing to find
+  out, and it is cheap to.
+- **containerd on Windows** running Linux guests the way the Boks stack assumes.
+- **Our own Windows path**: `gateway_windows.go`, a Windows counterpart to `stack_unix.go`,
+  and the stream transport described above.
 
-So the realistic reading is: this removes one blocker of several, and its main value right
-now is that it puts the question in front of libkrun's maintainers rather than leaving it
-unasked.
+So the realistic reading is: this removes one blocker of several. Its value is that the
+blocker is now a patch in front of libkrun's maintainers rather than an unasked question,
+and that we know the layers underneath it are not the obstacle.
+
+The comment in `gateway_windows.go` and `gateway_unix.go` saying "nerdbox does not support
+Windows either" should be softened when someone next touches it — a shipping Windows shim
+binary exists, so the accurate statement is that *we* have no Windows path, not that none
+is possible.
 
 ## Verification, honestly
 
@@ -94,3 +129,7 @@ The branch compiles. That is all.
   proposed change.
 - Nobody has run a frame through it on Windows. The upstream PR asks explicitly for someone
   with Windows hardware to verify it.
+
+The Docker Sandboxes findings above do not count as verification of this branch, and the PR
+says so in as many words. They establish that a virtio NIC can be driven on Windows through
+libkrun's ABI; our implementation of one remains unexecuted code.
