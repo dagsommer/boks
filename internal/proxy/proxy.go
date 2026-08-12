@@ -548,7 +548,7 @@ func denialText(d policy.Decision) string {
 
 To permit it, add the destination when starting the sandbox:
 
-  boks run -allow %s:%d ...
+  boks run --allow %s:%d ...
 
 Recent decisions: boks policy log
 `, d.Host, d.Port, d.Stage, d.Policy, d.Reason, d.Host, d.Port)

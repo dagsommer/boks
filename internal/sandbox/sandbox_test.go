@@ -159,3 +159,33 @@ func TestInterruptedExit(t *testing.T) {
 		}
 	}
 }
+
+// A workspace is a live mount of a host directory, so inside the guest it is owned by the
+// host user's uid and the process is not that user. Git refuses to touch such a repository,
+// which is the first thing a coding agent does — and `git diff` fails as "Not a git
+// repository", which an agent may act on.
+func TestGitSafeDirectoryEnv(t *testing.T) {
+	env := gitSafeDirectoryEnv([]workspace.Workspace{
+		{GuestPath: "/private/tmp/one"},
+		{GuestPath: "/home/alice/two"},
+	})
+
+	want := []string{
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=safe.directory",
+		"GIT_CONFIG_VALUE_0=/private/tmp/one",
+		"GIT_CONFIG_KEY_1=safe.directory",
+		"GIT_CONFIG_VALUE_1=/home/alice/two",
+	}
+	if !slices.Equal(env, want) {
+		t.Errorf("env = %v, want %v", env, want)
+	}
+
+	// The count must match the entries, or git reads past the end and ignores the lot.
+	if got := len(env); got != 1+2*2 {
+		t.Errorf("%d entries for 2 workspaces, want 5", got)
+	}
+	if len(gitSafeDirectoryEnv(nil)) != 0 {
+		t.Error("no workspaces should produce no configuration, not an empty count")
+	}
+}

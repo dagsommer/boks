@@ -159,7 +159,7 @@ func TestHTTPDenied(t *testing.T) {
 		t.Fatalf("status = %d, want 403; body = %q", resp.StatusCode, body)
 	}
 	// A denial must be self-explanatory: what, why, and what to do.
-	for _, want := range []string{"blocked by network policy", "denied.test", "denied by default", "boks run -allow"} {
+	for _, want := range []string{"blocked by network policy", "denied.test", "denied by default", "boks run --allow"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("denial body does not mention %q:\n%s", want, body)
 		}
