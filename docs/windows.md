@@ -119,7 +119,8 @@ who wants Boks can plausibly have it today, and that is worth more than a roadma
 
 ### Why it should work
 
-Boks needs four things from a Linux host. All four are present in a stock WSL2:
+Boks needs four things from a Linux host. All four are **available** in a stock WSL2 — which is
+not the same as active, as the next section explains:
 
 | Boks needs | In WSL2 |
 |---|---|
