@@ -860,26 +860,31 @@ Two measurements support that last row, and both were taken during this spike:
 
 ## What was built, and what was not
 
-**Built** — accuracy only, no new capability:
+**Built** — message accuracy only, no new capability:
 
 - `internal/doctor/virt_windows.go`: a Windows-specific `virtualization` check whose failure
-  names the real blocker instead of "no VM backend for windows". It deliberately probes for
-  nothing: offering a checklist of Hyper-V, the shim and the boot files would imply that
-  completing it leads somewhere.
+  says the platform is not the obstacle and names the missing VMM. It deliberately probes for
+  nothing — offering a prerequisite checklist would imply that completing it leads somewhere,
+  and today there is no Boks Windows backend to enable.
 - `internal/doctor/doctor.go`: the platform check's Windows remedy no longer says "blocked on
-  runtime support", which was wrong.
-- `internal/network/gateway_windows.go` and `internal/enforce/lock_windows.go`: the errors and
-  comments now state the HCS device-schema reason, the hvsock/guest-agent distinction, and the
-  `LockFileEx` design for whoever implements it.
+  runtime support".
+- `internal/network/gateway_windows.go`, `internal/enforce/lock_windows.go`: the errors and
+  comments now name WHP and the missing VMM, record the HCS and AF_UNIX findings as *true but
+  not load-bearing* so they are not rediscovered as blockers, and carry the `LockFileEx` design
+  for whoever implements it.
+
+Each of these was written once against the LCOW conclusion and rewritten when section 7
+overturned it. That is worth noting because the first version would have been a confidently
+worded, well-sourced, wrong error message — the exact failure mode this project's documentation
+standard exists to prevent.
 
 **Not built, on purpose:**
 
-- **No Windows link transport.** There is nothing to connect it to.
+- **No Windows link transport.** Its shape depends on which VMM, and there is no VMM.
 - **No `LockFileEx` supervisor liveness.** A correct primitive with no caller (section 6).
-- **No runtime-handler switch to `io.containerd.runhcs.v1`.** It would make `IsolatedRuntime`
-  assert a VM boundary on a platform where nothing has run (section 2).
-- **No new dependencies.** `hcsshim` and `linuxkit/virtsock` remain indirect. Nothing in this
-  spike needed to import either; the findings came from reading them.
+- **No VMM.** Section 8 is an assessment, not a plan of record.
+- **No new dependencies.** `hcsshim` and `linuxkit/virtsock` remain indirect. Nothing here
+  needed to import either; the findings came from reading them.
 
 Linux and macOS behaviour is untouched. `gofmt`, `go vet`, `go test ./... -count=1` are clean,
 and `linux/amd64`, `darwin/arm64` and `windows/amd64` all build.
@@ -890,21 +895,24 @@ and `linux/amd64`, `darwin/arm64` and `windows/amd64` all build.
 
 Ranked by how much it would change the conclusion.
 
-1. **Where a 2026 user obtains supported LCOW boot files.** Everything else is downstream. If
-   there is no distributable kernel and initrd, the runtime half is blocked too and the answer
-   becomes a flat no.
-2. **Whether the LCOW guest kernel has TUN support.** Decides whether the guest-agent
-   construction in section 5 is even theoretically available.
-3. Whether LCOW works at all at current `hcsshim`/`containerd` versions, given neither project
-   exercises it in CI.
-4. Whether the LCOW v2 shim's stated **Windows Server 2025** requirement extends to the
-   **Windows 11** client SKU that shares its build number.
-5. The maximum number of concurrent 9p shares per UVM.
+1. **Whether an open-source WHP-capable VMM exists that can do virtio-net with a backend Boks
+   can own.** This is now the entire question; section 8 assesses it.
+2. **Whether the nerdbox shim's Windows support is upstream or Docker's own.** Docker ships
+   `containerd-shim-nerdbox-v1.exe`; whether that comes from `containerd/nerdbox` or a private
+   fork decides whether Boks can use it or would have to port it.
+3. **What form a WHP VMM's virtio-net backend would take** — a host socket, a callback, a
+   named pipe — and therefore what the Windows gateway looks like.
+4. Whether the VMM would need to be a separate process or could be linked in, which decides
+   whether the supervisor's lifetime argument still holds unchanged.
 
-Two questions that were open when this document was first written have since been answered and
-moved into the sections above: what path a workspace appears at inside a Windows-hosted `sbx`
-sandbox (section 4 — `/c/...`, verified), and how Docker Sandboxes enforces policy on Windows
-(section 7).
+The LCOW-specific unknowns are retired rather than answered: where to obtain UVM boot files,
+whether the LCOW kernel has TUN, whether LCOW works at current versions, whether its Windows
+Server 2025 requirement covers Windows 11, and the 9p share limit. None of them matters unless
+someone deliberately chooses the LCOW path, and section 7 is the argument for not doing that.
+
+Two questions open when this document was first written have been answered and moved into the
+sections above: the workspace path inside a Windows-hosted `sbx` sandbox (section 4 — `/c/...`),
+and how Docker Sandboxes enforces policy on Windows (section 7).
 
 ---
 
