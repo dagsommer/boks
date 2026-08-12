@@ -124,8 +124,34 @@ func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (
 	if len(f.allow) > 0 {
 		req.Allow = f.allow
 	}
-	req.Deny = append(append([]string(nil), req.Deny...), f.deny...)
+	req.Deny = unionDenies(req.Deny, f.deny)
 	return req.Resolve()
+}
+
+// unionDenies merges a sandbox's recorded denies with this run's, keeping each destination
+// once.
+//
+// It is a union rather than a replacement because a prohibition must not disappear because
+// this invocation typed a different one. It is deduplicated because a `boks create -deny x`
+// supplies the same rule twice — once as the flag and once as the record built from it — and
+// a policy that lists the same deny twice is a policy a user cannot check against what they
+// wrote.
+func unionDenies(recorded, flags []string) []string {
+	out := append([]string(nil), recorded...)
+	for _, spec := range flags {
+		probe := policy.RuleSpec{Action: policy.Deny, Spec: spec}
+		duplicate := false
+		for _, existing := range out {
+			if probe.SameDestination(existing) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			out = append(out, spec)
+		}
+	}
+	return out
 }
 
 // sandboxRecord is what this invocation's flags say a new sandbox should remember. It holds
