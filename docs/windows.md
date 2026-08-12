@@ -922,41 +922,99 @@ For someone with a Windows 11 machine and hardware virtualisation. Written in th
 [verification.md](verification.md): each step says what would count as evidence, and none of it
 has been run.
 
-**Nothing below is expected to produce a working Boks sandbox.** Steps 1–7 establish whether
-the runtime half is real; step 8 is the one that decides the project's question, and it is
-expected to fail.
+**Nothing below produces a working Boks sandbox** — Boks has no Windows backend. What these
+steps do is (A) corroborate section 7, which was reached by static analysis and deserves a
+runtime check, and (B) establish whether a candidate VMM can actually give Boks what it needs.
+Part C is the LCOW path, kept only for anyone who wants to confirm the cul-de-sac is one.
 
-### Prerequisites
+Part A is the highest-value work here. Section 7 reverses this document's original verdict on
+the strength of an import table; one afternoon on a Windows machine would turn that into an
+observation.
 
-1. **Enable the hypervisor.**
+### Part A — corroborate what the reference product does
+
+1. **Confirm the platform requirement is WHP, not Hyper-V.** On a clean Windows 11 with the
+   Hyper-V *role* disabled and only the Hypervisor Platform feature enabled:
+
+   ```powershell
+   Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform, Microsoft-Hyper-V-All |
+       Select FeatureName, State
+   Get-Service vmms -ErrorAction SilentlyContinue
+   ```
+
+   Evidence: `sbx` runs a sandbox with `HypervisorPlatform` enabled and
+   `Microsoft-Hyper-V-All` disabled, and with the `vmms` service absent or stopped. **That is
+   the single cleanest confirmation** that the Hyper-V management stack — and therefore HCS,
+   HNS and the virtual switch — is not in the path.
+
+2. **Confirm no kernel driver and no privileged service.**
+
+   ```powershell
+   Get-ChildItem -Recurse "$env:LOCALAPPDATA\DockerSandboxes" -Include *.sys
+   Get-Service | Where-Object { $_.DisplayName -match 'Docker|Sandbox' }
+   fltmc filters
+   ```
+
+   Evidence: no `.sys`, no service, no filter driver attributable to the product.
+
+3. **Watch a sandbox's traffic actually being judged.** Run a workload under a restrictive
+   policy and inspect the decision log for a `transparent` flow — a raw TCP connection judged
+   without the proxy.
+
+   Evidence: a denial recorded for a direct-to-IP connection. That proves userspace termination
+   end to end, since nothing in the kernel is positioned to do it.
+
+4. **Confirm the workspace path convention.**
+
+   ```
+   sbx run --workspace C:\Users\<you>\src\foo <agent> -- sh -c "pwd; mount; ls /sys/bus"
+   ```
+
+   Evidence: `pwd` prints `/c/Users/<you>/src/foo`; `mount` shows **virtiofs**, not 9p; and
+   `/sys/bus` contains `virtio`. A 9p mount or a `vmbus` topology would contradict section 7
+   and should be reported.
+
+### Part B — can a candidate VMM give Boks what it needs?
+
+For whichever VMM section 8 identifies, the questions are the same three, in order. Stop at the
+first failure; each is a hard requirement.
+
+5. **Does it run on Windows via WHP, and boot an arbitrary Linux kernel and rootfs?**
+   Evidence: a Linux guest reaching userspace on a machine with the Hyper-V role disabled.
+
+6. **Does it expose virtio-net with a backend Boks can own?** This is the load-bearing
+   question and the reason for the whole exercise. A NAT'd or host-bridged NIC is **not**
+   sufficient — Boks needs the guest's Ethernet frames delivered to a Boks process, as a
+   socket, a pipe or an in-process callback.
+   Evidence: frames from the guest arriving in a userspace program that is not the VMM, or a
+   documented API that would allow it.
+
+7. **Can it be driven by a containerd shim, one VM per container?**
+   Evidence: either an existing shim, or an embeddable API rather than a CLI-only VMM.
+
+If step 6 fails for every candidate, the honest conclusion is that Boks' Windows story depends
+on writing a VMM or on an upstream project adding a backend — and that should be stated as
+plainly as the rest of this document.
+
+### Part C — the LCOW path (for completeness only)
+
+Sections 1–5 argue this is the wrong target. These steps confirm that rather than pursue it,
+and the most likely outcome is stopping at step 9.
+
+8. **Enable Hyper-V and install containerd, then confirm the LCOW plugins initialised.**
 
    ```powershell
    Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All
-   Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
-   systeminfo | Select-String "Hyper-V"
-   ```
-
-   Evidence: a reboot, then `Get-Service vmms` running.
-
-2. **Install containerd for Windows and confirm the LCOW plugins initialised.**
-
-   ```powershell
    ctr plugins ls | Select-String "lcow"
-   ```
-
-   Evidence: `io.containerd.snapshotter.v1  windows-lcow` with an empty error column. A plugin
-   listed with an init error is the interesting failure and should be recorded verbatim.
-
-3. **Confirm the shim is present.**
-
-   ```powershell
    Get-Command containerd-shim-runhcs-v1.exe
    ```
 
-   Evidence: a path. Note that containerd's PATH is the service's, not the shell's — the same
-   trap `doctor` already warns about on Unix.
+   Evidence: `io.containerd.snapshotter.v1  windows-lcow` with an empty error column, and a
+   path for the shim. A plugin listed with an init error is the interesting failure and should
+   be recorded verbatim. Note that containerd's PATH is the service's, not the shell's — the
+   same trap `doctor` already warns about on Unix.
 
-4. **Find the boot files.** This is the step most likely to stop everything.
+9. **Find the boot files.** This is the step most likely to stop everything.
 
    ```powershell
    Get-ChildItem "$env:ProgramFiles\Linux Containers"
