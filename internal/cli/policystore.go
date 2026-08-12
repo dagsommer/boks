@@ -452,7 +452,9 @@ func writeCheck(w io.Writer, pol policy.Policy, res policy.Resolution, target po
 	fmt.Fprintf(w, "  policy: %s (default %s)\n", res.Name, res.Default)
 	rule := verdict.Rule
 	if rule == "" {
-		rule = "(none matched)"
+		// The same sentence the decision log writes for a flow nothing matched, so that
+		// what check says and what the log says are one string rather than two.
+		rule = policy.NoRuleFor(target)
 	}
 	fmt.Fprintf(w, "  rule:   %s\n", rule)
 	fmt.Fprintf(w, "  scope:  %s\n", scopeOrDefault(verdict.Scope))
@@ -626,25 +628,23 @@ func inspectRule(env Env, store *policy.Store, sandbox string, specs []string) e
 		}
 		fmt.Fprintf(env.Stdout, "destination: %s\n", spec)
 
-		var matches []policy.RuleSpec
-		for _, r := range res.Rules {
-			if r.SameDestination(spec) {
-				matches = append(matches, r)
-			}
+		target, probe := policy.ProbeTarget(spec)
+		matches, err := rulesFor(res, spec, target, probe)
+		if err != nil {
+			return err
 		}
 		if len(matches) == 0 {
-			fmt.Fprint(env.Stdout, "  no rule is written for exactly this destination\n")
+			fmt.Fprint(env.Stdout, "  no rule applies to this destination\n")
 		}
 		for _, m := range matches {
-			line := fmt.Sprintf("  %s in %s", m.Action, m.Scope)
+			line := fmt.Sprintf("  %s %s in %s", m.Action, m.Spec, m.Scope)
 			if m.Note != "" {
 				line += "  — " + m.Note
 			}
 			fmt.Fprintln(env.Stdout, line)
 		}
 
-		target, ok := policy.ProbeTarget(spec)
-		if !ok {
+		if !probe {
 			fmt.Fprint(env.Stdout, "  (a pattern names a set of destinations, so there is no single verdict to report;\n"+
 				"   use 'boks policy check <host>' for a specific one)\n")
 			continue
@@ -657,6 +657,32 @@ func inspectRule(env Env, store *policy.Store, sandbox string, specs []string) e
 		fmt.Fprintf(env.Stdout, "  effect: %s is %s — %s (%s)\n", target, outcome, v.Reason, scopeOrDefault(v.Scope))
 	}
 	return nil
+}
+
+// rulesFor lists the rules bearing on a destination, from every scope.
+//
+// For a destination that names one place, that means every rule whose pattern *covers* it —
+// a `deny github.com` is what a reader asking about `github.com:443` needs to see, and an
+// exact-text comparison would hide it. For a pattern, which names a set, it falls back to
+// the rules written with that same text, because there is no target to match against.
+func rulesFor(res policy.Resolution, spec string, target policy.Target, probe bool) ([]policy.RuleSpec, error) {
+	var out []policy.RuleSpec
+	for _, r := range res.Rules {
+		if !probe {
+			if r.SameDestination(spec) {
+				out = append(out, r)
+			}
+			continue
+		}
+		rule, err := r.Rule()
+		if err != nil {
+			return nil, err
+		}
+		if rule.Match(target) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 // writeStoredRules prints a scope's rules as they are written down, denies first.
