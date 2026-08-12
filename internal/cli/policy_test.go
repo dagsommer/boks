@@ -11,30 +11,119 @@ import (
 	"github.com/dagsommer/boks/internal/secret"
 )
 
+// runCLI drives the whole command tree the way the binary does, so a test exercises the
+// real dispatch, the real flags and the real argument validation rather than one function
+// out of context.
 func runCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	env := Env{
-		Args:   args[1:],
+	root := newRootCommand(Env{
+		Args:   args,
 		Stdin:  strings.NewReader(stdin),
 		Stdout: &out,
 		Stderr: &errOut,
-	}
-	switch args[0] {
-	case "policy":
-		err = policyCommand(context.Background(), env)
-	case "secret":
-		err = secretCommand(context.Background(), env)
-	case "ca":
-		err = caCommand(context.Background(), env)
-	default:
-		t.Fatalf("unknown command %q", args[0])
-	}
+	})
+	root.SetArgs(args)
+	root.SetContext(context.Background())
+	_, err = root.ExecuteC()
 	return out.String(), errOut.String(), err
 }
 
+// mainExitCode runs the CLI exactly as cmd/boks does, for the assertions that are about the
+// process's exit status rather than its output.
+func mainExitCode(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	code = Main(context.Background(), Env{
+		Args:   args,
+		Stdin:  strings.NewReader(""),
+		Stdout: &out,
+		Stderr: &errOut,
+	})
+	return out.String(), errOut.String(), code
+}
+
+// The exit codes a script can rely on: 0 for help, 2 for anything the user got wrong about
+// how they invoked boks, and 1 for a command that ran and failed.
+func TestExitCodes(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"bare boks", nil, 2},
+		{"help", []string{"--help"}, 0},
+		{"version", []string{"--version"}, 0},
+		{"unknown command", []string{"nosuchthing"}, 2},
+		{"unknown flag", []string{"ls", "--nope"}, 2},
+		{"missing argument", []string{"stop"}, 2},
+		{"contradictory flags", []string{"ls", "-q", "--json"}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, code := mainExitCode(t, tt.args...); code != tt.want {
+				t.Errorf("boks %v exited %d, want %d", tt.args, code, tt.want)
+			}
+		})
+	}
+}
+
+// Help goes to stdout and reads like sbx's, because a habit formed there should work here.
+func TestHelpFormatMatchesTheReference(t *testing.T) {
+	out, _, code := mainExitCode(t, "--help")
+	if code != 0 {
+		t.Fatalf("boks --help exited %d", code)
+	}
+	for _, want := range []string{"Usage:", "Available Commands:", "Flags:", "completion", "run", "-h, --help"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("boks --help does not contain %q:\n%s", want, out)
+		}
+	}
+
+	runHelp, _, code := mainExitCode(t, "run", "--help")
+	if code != 0 {
+		t.Fatalf("boks run --help exited %d", code)
+	}
+	// The symptom that started this: the template flag has to render with both spellings.
+	for _, want := range []string{"-t, --template", "-m, --memory", "-d, --detached"} {
+		if !strings.Contains(runHelp, want) {
+			t.Errorf("boks run --help does not render %q:\n%s", want, runHelp)
+		}
+	}
+	// The developer flags are hidden from the command that would otherwise list them
+	// beside the ones a user is meant to choose between.
+	for _, hidden := range []string{"--runtime", "--snapshotter", "--i-know-this-is-not-isolated"} {
+		if strings.Contains(runHelp, hidden) {
+			t.Errorf("boks run --help lists the developer flag %q:\n%s", hidden, runHelp)
+		}
+	}
+	// Hidden is not gone: they still parse.
+	if _, _, code := mainExitCode(t, "ls", "--containerd-address", "/nonexistent.sock", "--help"); code != 0 {
+		t.Errorf("a hidden developer flag was rejected, exit %d", code)
+	}
+}
+
+// `boks list` is `boks ls`, because sbx accepts both.
+func TestLsHasTheListAlias(t *testing.T) {
+	if _, _, code := mainExitCode(t, "list", "--help"); code != 0 {
+		t.Errorf("boks list --help exited %d, want the ls command", code)
+	}
+}
+
+// Cobra generates the completion scripts; the point of this test is that the command is
+// wired in at all, since sbx has one and Boks did not.
+func TestCompletionCommandExists(t *testing.T) {
+	out, _, code := mainExitCode(t, "completion", "bash")
+	if code != 0 {
+		t.Fatalf("boks completion bash exited %d", code)
+	}
+	if !strings.Contains(out, "boks") {
+		t.Errorf("the completion script does not mention boks:\n%s", out)
+	}
+}
+
 func TestPolicyLsShowsResolvedRules(t *testing.T) {
-	out, _, err := runCLI(t, "", "policy", "ls", "-policy", "locked", "-allow", "api.example.com:443")
+	out, _, err := runCLI(t, "", "policy", "ls", "--policy", "locked", "--allow", "api.example.com:443")
 	if err != nil {
 		t.Fatalf("policy ls: %v", err)
 	}
@@ -63,23 +152,23 @@ func TestPolicyLsDefaultsToStandard(t *testing.T) {
 }
 
 func TestPolicyLsRejectsBadRules(t *testing.T) {
-	if _, _, err := runCLI(t, "", "policy", "ls", "-allow", "*.*.example.com"); err == nil {
+	if _, _, err := runCLI(t, "", "policy", "ls", "--allow", "*.*.example.com"); err == nil {
 		t.Error("an invalid -allow rule was accepted")
 	}
-	if _, _, err := runCLI(t, "", "policy", "ls", "-policy", "balanced"); err == nil {
+	if _, _, err := runCLI(t, "", "policy", "ls", "--policy", "balanced"); err == nil {
 		t.Error("an unknown preset was accepted")
 	}
-	if _, _, err := runCLI(t, "", "policy", "ls", "-inject", "tok@*=bearer"); err == nil {
+	if _, _, err := runCLI(t, "", "policy", "ls", "--inject", "tok@*=bearer"); err == nil {
 		t.Error("a catch-all injection rule was accepted")
 	}
-	if _, _, err := runCLI(t, "", "policy", "ls", "-guest-credential", "unknown=placeholder"); err == nil {
+	if _, _, err := runCLI(t, "", "policy", "ls", "--guest-credential", "unknown=placeholder"); err == nil {
 		t.Error("a placeholder for a service with no injection rule was accepted")
 	}
 }
 
 func TestPolicyLogWithoutAFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent.jsonl")
-	out, _, err := runCLI(t, "", "policy", "log", "-file", missing)
+	out, _, err := runCLI(t, "", "policy", "log", "--file", missing)
 	if err != nil {
 		t.Fatalf("policy log: %v", err)
 	}
@@ -105,7 +194,7 @@ func TestPolicyLogReadsDecisions(t *testing.T) {
 	engine.CheckMode(policy.StageConnect, target, policy.ModeForwardBypass)
 	sink.Close()
 
-	out, _, err := runCLI(t, "", "policy", "log", "-file", path)
+	out, _, err := runCLI(t, "", "policy", "log", "--file", path)
 	if err != nil {
 		t.Fatalf("policy log: %v", err)
 	}
@@ -120,7 +209,7 @@ func TestPolicyLogReadsDecisions(t *testing.T) {
 		t.Errorf("two identical decisions were not collapsed into a count of 2:\n%s", out)
 	}
 
-	raw, _, err := runCLI(t, "", "policy", "log", "-file", path, "-raw")
+	raw, _, err := runCLI(t, "", "policy", "log", "--file", path, "--raw")
 	if err != nil {
 		t.Fatalf("policy log -raw: %v", err)
 	}
