@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"flag"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,53 +9,85 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
 	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
-func TestParseLeadingFlags(t *testing.T) {
+// TestExecGrammar is what parseLeadingFlags used to be tested for, asserted through the real
+// command now that pflag does the parsing: boks' flags come before the sandbox name, and
+// everything after it — flags included — belongs to the guest. `-it` is no longer a
+// special-cased flag of its own; pflag splits the combined shorthand.
+func TestExecGrammar(t *testing.T) {
 	tests := []struct {
-		name        string
-		args        []string
-		wantFirst   string
-		wantRest    []string
-		wantTTY     bool
-		wantCombine bool
+		name            string
+		args            []string
+		wantName        string
+		wantCommand     []string
+		wantTTY         bool
+		wantInteractive bool
+		wantErr         bool
 	}{
-		{"name and command", []string{"web", "ls"}, "web", []string{"ls"}, false, false},
+		{name: "name and command", args: []string{"web", "ls"}, wantName: "web", wantCommand: []string{"ls"}},
 		{
 			// Guest flags must reach the guest, not our flag set.
-			"guest flags", []string{"-t", "web", "ls", "-l", "-t"},
-			"web", []string{"ls", "-l", "-t"}, true, false,
+			name: "guest flags", args: []string{"-t", "web", "ls", "-l", "-t"},
+			wantName: "web", wantCommand: []string{"ls", "-l", "-t"}, wantTTY: true,
 		},
-		{"combined shorthand", []string{"-it", "web", "sh"}, "web", []string{"sh"}, false, true},
-		{"explicit separator", []string{"web", "--", "git", "status"}, "web", []string{"git", "status"}, false, false},
-		{"name only", []string{"web"}, "web", nil, false, false},
-		{"nothing", nil, "", nil, false, false},
+		{
+			name: "combined shorthand", args: []string{"-it", "web", "sh"},
+			wantName: "web", wantCommand: []string{"sh"}, wantTTY: true, wantInteractive: true,
+		},
+		{
+			name: "explicit separator", args: []string{"web", "--", "git", "status"},
+			wantName: "web", wantCommand: []string{"git", "status"},
+		},
+		{
+			name: "flag with a value", args: []string{"-w", "/tmp", "-e", "A=1", "web", "sh"},
+			wantName: "web", wantCommand: []string{"sh"},
+		},
+		{name: "name only", args: []string{"web"}, wantErr: true},
+		{name: "nothing", args: []string{}, wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fs := flag.NewFlagSet("test", flag.ContinueOnError)
-			fs.SetOutput(io.Discard)
-			tty := fs.Bool("t", false, "")
-			both := fs.Bool("it", false, "")
+			cmd := newExecCommand(Env{Stdout: io.Discard, Stderr: io.Discard}, &devFlags{})
+			var gotName string
+			var gotCommand []string
+			cmd.RunE = func(cmd *cobra.Command, args []string) error {
+				gotName, gotCommand = args[0], commandFor(args)
+				return nil
+			}
+			cmd.SetArgs(tt.args)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
 
-			first, rest, err := parseLeadingFlags(fs, tt.args)
+			err := cmd.Execute()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("boks exec %v was accepted", tt.args)
+				}
+				return
+			}
 			if err != nil {
-				t.Fatalf("parseLeadingFlags(%v): %v", tt.args, err)
+				t.Fatalf("boks exec %v: %v", tt.args, err)
 			}
-			if first != tt.wantFirst {
-				t.Errorf("first = %q, want %q", first, tt.wantFirst)
+			if gotName != tt.wantName {
+				t.Errorf("sandbox = %q, want %q", gotName, tt.wantName)
 			}
-			if !slices.Equal(rest, tt.wantRest) {
-				t.Errorf("rest = %v, want %v", rest, tt.wantRest)
+			if !slices.Equal(gotCommand, tt.wantCommand) {
+				t.Errorf("command = %v, want %v", gotCommand, tt.wantCommand)
 			}
-			if *tty != tt.wantTTY {
-				t.Errorf("-t = %v, want %v", *tty, tt.wantTTY)
+			tty, _ := cmd.Flags().GetBool("tty")
+			interactive, _ := cmd.Flags().GetBool("interactive")
+			if tty != tt.wantTTY {
+				t.Errorf("--tty = %v, want %v", tty, tt.wantTTY)
 			}
-			if *both != tt.wantCombine {
-				t.Errorf("-it = %v, want %v", *both, tt.wantCombine)
+			if interactive != tt.wantInteractive {
+				t.Errorf("--interactive = %v, want %v", interactive, tt.wantInteractive)
 			}
 		})
 	}
@@ -148,25 +179,15 @@ func TestWorkspaceErrorMentionsAgents(t *testing.T) {
 
 // A non-VM runtime must never be presented as a sandbox by accident.
 func TestRequireIsolation(t *testing.T) {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	flags := registerSandboxFlags(fs)
-	if err := fs.Parse([]string{"-runtime", "io.containerd.runc.v2"}); err != nil {
-		t.Fatal(err)
-	}
+	dev := parseDevFlags(t, "--runtime", "io.containerd.runc.v2")
 	var stderr bytes.Buffer
-	if err := flags.requireIsolation(&stderr); err == nil {
+	if err := dev.requireIsolation(&stderr); err == nil {
 		t.Fatal("requireIsolation allowed a container runtime without the opt-out")
 	}
 
-	optOut := flag.NewFlagSet("test", flag.ContinueOnError)
-	optOut.SetOutput(io.Discard)
-	optOutFlags := registerSandboxFlags(optOut)
-	if err := optOut.Parse([]string{"-runtime", "io.containerd.runc.v2", "-i-know-this-is-not-isolated"}); err != nil {
-		t.Fatal(err)
-	}
+	optOut := parseDevFlags(t, "--runtime", "io.containerd.runc.v2", "--i-know-this-is-not-isolated")
 	stderr.Reset()
-	if err := optOutFlags.requireIsolation(&stderr); err != nil {
+	if err := optOut.requireIsolation(&stderr); err != nil {
 		t.Fatalf("requireIsolation with the opt-out: %v", err)
 	}
 	if !strings.Contains(stderr.String(), "NOT an isolation boundary") {
@@ -174,14 +195,51 @@ func TestRequireIsolation(t *testing.T) {
 	}
 }
 
-// The agent decides what a sandbox contains; the flags only override it.
-func TestConfigTakesImageAndCommandFromTheAgent(t *testing.T) {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+// The opt-out is hidden from help, which must not make it harder to find: the refusal names
+// it, and that is where someone reads it.
+func TestIsolationRefusalNamesItsOptOut(t *testing.T) {
+	dev := parseDevFlags(t, "--runtime", "io.containerd.runc.v2")
+	err := dev.requireIsolation(io.Discard)
+	if err == nil {
+		t.Fatal("requireIsolation allowed a container runtime without the opt-out")
+	}
+	if !strings.Contains(err.Error(), "--i-know-this-is-not-isolated") {
+		t.Errorf("the refusal does not name the flag that overrides it: %v", err)
+	}
+}
+
+// parseDevFlags registers the hidden developer flags on their own set and parses arguments
+// into them, the way the root command does for the whole tree.
+func parseDevFlags(t *testing.T, args ...string) *devFlags {
+	t.Helper()
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	flags := registerSandboxFlags(fs)
-	if err := fs.Parse(nil); err != nil {
+	dev := &devFlags{}
+	dev.register(fs)
+	if err := fs.Parse(args); err != nil {
 		t.Fatal(err)
 	}
+	return dev
+}
+
+// parseSandboxFlags registers the sandbox flags on their own set and parses arguments into
+// them, so a test can exercise config() without running a command.
+func parseSandboxFlags(t *testing.T, args ...string) *sandboxFlags {
+	t.Helper()
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dev := &devFlags{}
+	dev.register(fs)
+	flags := registerSandboxFlags(fs, dev)
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	return flags
+}
+
+// The agent decides what a sandbox contains; the flags only override it.
+func TestConfigTakesImageAndCommandFromTheAgent(t *testing.T) {
+	flags := parseSandboxFlags(t)
 
 	shell, _ := agent.Builtin().Lookup("shell")
 	cfg, err := flags.config(invocation{agent: shell, name: "shell-foo"}, nil)
@@ -201,15 +259,10 @@ func TestConfigTakesImageAndCommandFromTheAgent(t *testing.T) {
 		t.Errorf("auto sizing gave %d vCPUs and %d MiB", cfg.CPUs, cfg.MemoryMiB)
 	}
 
-	// -template overrides the agent's image; arguments after -- become the command,
+	// --template overrides the agent's image; arguments after -- become the command,
 	// because that is what arguments to a shell are. The agent's init prefix goes with the
 	// image it belongs to — a Debian image has no /usr/bin/tini and no Boks entrypoint.
-	override := flag.NewFlagSet("test", flag.ContinueOnError)
-	override.SetOutput(io.Discard)
-	overrideFlags := registerSandboxFlags(override)
-	if err := override.Parse([]string{"-t", "debian:stable", "-cpus", "3", "-m", "512m"}); err != nil {
-		t.Fatal(err)
-	}
+	overrideFlags := parseSandboxFlags(t, "-t", "debian:stable", "--cpus", "3", "-m", "512m")
 	cfg, err = overrideFlags.config(invocation{agent: shell, name: "shell-foo"}, []string{"uname", "-a"})
 	if err != nil {
 		t.Fatalf("config: %v", err)
@@ -228,12 +281,7 @@ func TestConfigTakesImageAndCommandFromTheAgent(t *testing.T) {
 // `boks create shell . -- npm run dev` records that command; a later `boks run shell .`
 // must run it rather than the agent's bare command line.
 func TestConfigKeepsAnExistingSandboxesRecordedCommand(t *testing.T) {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	flags := registerSandboxFlags(fs)
-	if err := fs.Parse(nil); err != nil {
-		t.Fatal(err)
-	}
+	flags := parseSandboxFlags(t)
 	shell, _ := agent.Builtin().Lookup("shell")
 
 	cfg, err := flags.config(invocation{agent: shell, name: "shell-foo", exists: true}, nil)
