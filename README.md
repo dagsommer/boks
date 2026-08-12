@@ -7,17 +7,10 @@ Boks is a local-first, open-source alternative to Docker Sandboxes (`docker sbx`
 account, no cloud service, no telemetry.
 
 > [!WARNING]
-> **Boks is experimental and incomplete.** The VM boundary is real and has been measured
-> (see [Status](#status)). **The network policy has been measured broken, fixed, and not yet
-> re-measured.** On 2026-08-12, against a real guest, a sandbox that unset
-> `http_proxy`/`https_proxy` reached any destination it liked: a denied host returned HTTP
-> 200 and a raw TLS handshake to a denied address completed against the origin's own
-> certificate. The cause was a host-side stack that forwarded whatever it was handed; it now
-> judges every TCP connection against the policy before dialling it, and drops UDP and ICMP.
-> That fix is proven against a **simulated** guest on the real link socket and against no VM
-> at all. `-net none` is a real boundary, verified. Do not rely on `-net nat` to contain
-> hostile code until check 6 in
-> [docs/verification.md](docs/verification.md#re-run-check-6) has been re-run.
+> **Boks is experimental.** The VM boundary and the network policy have both been measured
+> against a real guest (see [Status](#status)), and both hold — but this is a young project
+> with one verified platform, one verified hypervisor, and plenty still unbuilt. Judge it on
+> what the verification document says was observed, not on what the feature list implies.
 
 ## Status
 
@@ -64,9 +57,11 @@ What works, tested locally:
   own loopback services — which the old TSI transport exposed — are now unreachable.
   The stack itself judges every TCP connection the guest opens, by address and port, before
   it dials anything, so a guest that ignores the proxy is judged rather than unfiltered; UDP
-  and ICMP are dropped. **That part is proven only against a simulated guest** — see the
-  warning above. `-net none` gives a sandbox no network at all, and is the one posture whose
-  containment has been confirmed against a real guest. The stack lives in a small
+  and ICMP are dropped. **Verified against a real guest on 2026-08-13**: with every proxy
+  variable unset, a denied address is refused before anything is dialled, while an address
+  the policy permits connects end to end — so the stack judges each flow rather than simply
+  dropping what does not use the proxy. `-net none` gives a sandbox no network at all. The
+  stack lives in a small
   per-sandbox process so that it lasts as long as the sandbox's VM rather than as long as
   your command — a build running in a sandbox does not lose the network when you press
   Ctrl-C. `boks net ls` shows them, `boks stop` takes them down.
@@ -77,12 +72,14 @@ What works, tested locally:
 
 What is **not** done:
 
-- **Datapath enforcement has never met a real guest.** The host-side stack now judges every
-  TCP connection before dialling it, which is the fix for the failure measured on
-  2026-08-12 — but that fix has only ever been exercised by a simulated guest on the real
-  link socket. Nobody has watched a real VM be refused. Re-running the probe is the top
-  outstanding task: see
-  [docs/verification.md](docs/verification.md#re-run-check-6).
+- **A hostname-only policy denies raw connections, including to the allowed host.** A raw
+  socket carries no name, so it is judged on the address; `-allow example.com` therefore does
+  not permit a direct connection to example.com's address. That fails closed, which is the
+  safe direction, but "allowed through the proxy" and "allowed on a raw socket" are different
+  questions and the CLI does not say so at the point you write the rule.
+- **UDP and ICMP drops are silent.** TCP denials are logged with a reason; a guest probing
+  UDP or ICMP leaves nothing in `boks policy log`. An observability gap, not a containment
+  one.
 - **No policy over names, and no UDP.** DNS is mediated by the sandbox's own resolver and
   cannot be sent anywhere else, but the names themselves are not filtered. UDP and ICMP are
   dropped with no way to ask for them, which costs QUIC and `ping`.
@@ -232,11 +229,11 @@ Two things to understand before using Boks:
 - **Workspace writes are live on your host.** A sandbox can modify `Makefile`,
   `package.json` scripts, Git hooks or CI config, which then run on *your* machine. Review
   diffs before running anything from a workspace a sandbox touched.
-- **A guest that ignores the proxy used to escape the policy, and the fix is unwitnessed.**
-  Measured against a real VM on 2026-08-12: with `http_proxy`/`https_proxy` unset, a denied
-  host answered normally and a raw TLS handshake to a denied address reached the real origin.
-  The host-side stack now judges each connection by address before dialling it, which a
-  simulated guest confirms and no VM has. `-net none` is the posture that has been confirmed.
+- **A guest that ignores the proxy is still judged.** This was measured broken on
+  2026-08-12 — a denied host answered normally and a raw TLS handshake reached the real
+  origin — and measured fixed against a real VM on 2026-08-13: the same handshake is now
+  refused before anything is dialled, and every decision is logged. Enforcement is on the
+  address in the packet, so hostname rules do not authorise raw connections.
 - **Hosts you configure a credential for are decrypted by Boks**, by design, and `boks run`
   tells you which. Everything else is tunnelled with the origin's own certificate chain.
 
@@ -259,7 +256,7 @@ public documentation using open-source components; it is not derived from Docker
 | agent-first CLI, readable sandbox names | yes | **yes** — same grammar, same naming rule |
 | prepared agent images | yes, ten of them | **nine of ten**, multi-arch on a shared base; `kiro` needs `-template` |
 | terminal dashboard for bare `sbx` | yes | no — see the parity matrix |
-| network policy enforced outside the guest | yes | **built, unwitnessed** — the host stack judges every TCP connection by address before dialling; proven against a simulated guest only |
+| network policy enforced outside the guest | yes | **yes** — the host stack judges every TCP connection by address before dialling; verified against a real guest |
 | UDP and ICMP blocked at the network layer | yes | **yes**, except DNS to the sandbox's own resolver |
 | credential injection by host proxy | yes | **yes**, HTTP and HTTPS, verified inside a real guest |
 | Docker daemon inside the sandbox | yes | planned |
@@ -276,12 +273,10 @@ Feature-by-feature detail with priorities:
 Ordered by what unblocks the most. The VM boundary is done and the network datapath now
 enforces — what matters most is watching it work against a real guest.
 
-1. **Re-run check 6 on a machine with a hypervisor.** The host-side stack now judges every
-   TCP connection, which closes the gap that a guest with the proxy variables unset walked
-   straight through. Until that probe is repeated against a real VM, the claim rests on a
-   simulated guest — see [docs/verification.md](docs/verification.md#re-run-check-6)
-2. A repair path for a crashed network supervisor: the VM does not re-attach to a restarted
+1. A repair path for a crashed network supervisor: the VM does not re-attach to a restarted
    stack, so today the sandbox loses its network until it is restarted
+2. Policy over names for raw flows, so that `-allow example.com` can authorise a direct
+   connection to the address it resolves to rather than denying it
 3. The interactive dashboard that bare `boks` should open
 4. Clone mode, so guest writes do not land on the host by default
 5. Docker daemon inside the guest
