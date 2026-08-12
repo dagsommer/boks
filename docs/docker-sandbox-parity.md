@@ -394,7 +394,7 @@ hosts and no others — see
 |---|---|---|---|---|---|
 | macOS | Sonoma 14+, Apple silicon only | Supported; **the verified platform** | P1 | done | Needs the shim codesigned with `com.apple.security.hypervisor` and a user-owned `/var/run/containerd` |
 | Linux | Ubuntu 24.04+, x86_64/aarch64, KVM required, user in `kvm` group, nested virt if in a VM | Supported, same requirements | P0 | partial | `doctor` checks these, but no VM has been booted on Linux yet |
-| Windows | Windows 11 x86_64, Hypervisor Platform enabled | Blocked on nerdbox | P2 | none | nerdbox lists Windows as future work |
+| Windows | Windows 11 x86_64, Hypervisor Platform enabled | No native backend, and two upstream projects away | P2 | none | Blocked twice over: libkrun targets KVM and Hypervisor.framework with no Windows port, and the nerdbox shim does not build for Windows. Docker supports it because it built its own stack on Windows Hypervisor Platform. **WSL2 with nested virtualisation is the plausible route** — Boks then runs as the Linux program it is, against `/dev/kvm` — and is untested |
 | Docker Desktop | Not required | Not required | — | done | |
 
 ---
