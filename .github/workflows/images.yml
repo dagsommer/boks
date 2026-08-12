@@ -49,7 +49,10 @@ jobs:
           fi
           echo "image_tag=$image_tag" >>"$GITHUB_OUTPUT"
           # The agent images are every directory under images/ except the base.
-          images="$(ls images | grep -v '^base$' | jq -R . | jq -sc .)"
+          # Directories only: images/ also holds a README, and feeding that to buildx
+          # asks it for the tag ghcr.io/dagsommer/boks/README.md, which it rejects for
+          # not being lowercase — a confusing way to learn that a doc is not an image.
+          images="$(find images -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -v '^base$' | sort | jq -R . | jq -sc .)"
           echo "images=$images" >>"$GITHUB_OUTPUT"
 
   # The job that executes third-party code. Every image here runs an installer, a vendor
