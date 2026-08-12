@@ -185,9 +185,10 @@ func platformCheck() Check {
 				// ships on it. See virt_windows.go and docs/windows.md.
 				return Result{
 					Status: StatusFail, Detail: detail,
-					Remedy: "Boks does not run sandboxes on Windows yet. The platform can host them —\n" +
-						"the Windows Hypervisor Platform is a user-mode hypervisor API that supports\n" +
-						"this design — but Boks has no VMM that speaks it. See docs/windows.md.",
+					Remedy: "Boks does not run sandboxes on Windows yet. The platform can host them, and\n" +
+						"libkrun's Windows Hypervisor Platform backend is in progress upstream — but\n" +
+						"virtio-net, the one device Boks' enforcement needs, is not ported yet.\n" +
+						"Run Boks inside WSL2 in the meantime. See docs/windows.md.",
 				}
 			default:
 				return Result{

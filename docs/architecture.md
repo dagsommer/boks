@@ -446,9 +446,10 @@ Linux-only by construction.
 blocked by anything about Windows either. A spike ([windows.md](windows.md)) found that the
 reference product runs this exact architecture there — containerd, a nerdbox shim, a Linux
 microVM, virtio-net terminated by a userspace stack — on top of the **Windows Hypervisor
-Platform**, a user-mode hypervisor API. What Boks lacks is a VMM that speaks WHP: libkrun
-targets KVM and Hypervisor.framework, and the VMM Docker substituted is not open source. That
-is the whole gap, and it is a real one.
+Platform**, a user-mode hypervisor API. nerdbox already builds a Windows shim upstream, and
+libkrun's WHP backend has been landing upstream through 2026 for libkrun 2.0. **The one device
+not yet ported is virtio-net** — precisely the one Boks' enforcement depends on. That is the
+whole gap, and it is narrow.
 
 Two things are true there regardless of how it is closed: the exact-path workspace property is
 impossible, because `C:\Users\dag\src\foo` is not a Linux path (both Boks and the reference
