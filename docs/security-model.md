@@ -114,14 +114,14 @@ cannot read it; the exception is credential injection, described under
 | TLS interception for credential-bearing hosts only, local CA (`internal/ca`) | built, demonstrated end to end with a real client, two real HTTPS origins and certificate comparison |
 | Credential injection, encrypted host-side store (`internal/secret`) | built, unit-tested |
 | Network annotations and host-stack supervision (`internal/network`, `internal/enforce`) | built, unit-tested |
-| Policy-aware TCP forwarder in the stack; UDP and ICMP dropped (`internal/network`) | built, exercised against a simulated guest on the real link |
+| Policy-aware TCP forwarder in the stack; UDP and ICMP dropped (`internal/network`) | built, **verified against a real guest** 2026-08-13 |
 | All of it applied to a running sandbox (`boks run`) | **done** |
 | Policy enforced against a real guest **that uses the proxy** | **verified** 2026-08-12 |
-| Policy enforced against a real guest **that ignores the proxy** | **built, unverified against a VM** — see below |
+| Policy enforced against a real guest **that ignores the proxy** | **verified** 2026-08-13 — see below |
 
 > [!IMPORTANT]
-> **This was measured broken, and is now fixed in the stack but not yet re-measured on a
-> VM.** *(measured 2026-08-12, macOS host with a hypervisor.)* A guest that unset
+> **This was measured broken on 2026-08-12 and measured fixed against a real guest on
+> 2026-08-13.** *(macOS host with a hypervisor.)* A guest that unset
 > `http_proxy`/`https_proxy` reached any destination it liked: under `-policy locked -allow
 > example.com`, a direct `https://www.google.com/` returned **HTTP 200**, and a raw Python
 > TLS handshake to `1.1.1.1:443` completed against **the origin's own certificate**
@@ -131,10 +131,17 @@ cannot read it; the exception is credential injection, described under
 > The cause was that the host-side stack was built by gvisor-tap-vsock's
 > `virtualnetwork.New`, whose TCP forwarder dials whatever address the guest puts in a SYN.
 > Boks now assembles the stack itself and installs a forwarder that consults the policy
-> engine first. **Against a simulated guest on the real link socket, the same raw connection
-> is now refused and logged as `transparent`.** Nobody has yet run those probes against a
-> real VM; until someone does, treat `-net nat` as enforced-but-unwitnessed, and see
-> [docs/verification.md](verification.md) for the exact commands that would settle it.
+> engine first. **Re-run against a real guest, that same handshake is
+> `ConnectionRefusedError`**, the denial is logged as `transparent`, and UDP to an external
+> resolver times out. A control in the same sandbox — the address permitted explicitly —
+> connects end to end and presents the origin's real certificate, so the forwarder decides
+> per flow rather than dropping everything that skips the proxy. Full transcript in
+> [docs/verification.md](verification.md).
+>
+> Two consequences worth knowing. Enforcement is on the **address**, so a hostname-only
+> policy denies raw connections *including to the allowed host* — fail-closed, but not what
+> a reader of `-allow example.com` expects. And UDP/ICMP drops are **silent**: nothing is
+> logged for them.
 >
 > `-net none` is unaffected and remains a real boundary.
 
@@ -295,19 +302,23 @@ which hosts will be decrypted.
 
 #### Known limits, stated up front
 
-- **No policy decision has been demonstrated against a real guest.** The strongest honest
-  claim is that a simulated guest on the real link socket — a second network stack speaking
-  real Ethernet over the real link — is filtered exactly as designed, including when it uses
-  no proxy at all. The hypervisor half of the path (libkrun's virtio-net device, nerdbox's
-  annotations) is exercised by nothing in this repository.
+- **Verified on one host, once.** A real guest was refused on macOS/Apple silicon on
+  2026-08-13, through libkrun's virtio-net device and nerdbox's annotations. The Linux/KVM
+  path has never been exercised end to end, and one measurement on one platform is evidence
+  rather than assurance.
+- **A hostname rule does not authorise a raw connection.** Enforcement reads the address in
+  the packet, so `-allow example.com` permits the proxied flow and denies a direct
+  connection to the address that name resolves to. Fail-closed, but surprising.
+- **UDP and ICMP are dropped without a log line.** A guest probing them leaves no trace in
+  `boks policy log`, unlike a denied TCP flow.
 - **A sandbox created before this existed, or by something else, has no wiring** and runs on
   the runtime's default transport, where the guest's `127.0.0.1` is the host's. Boks warns
   loudly when it meets one; the fix is to recreate it, because the mode lives in annotations
   that are fixed when a container is created.
-- **If a supervisor is killed, that sandbox's network is gone until something restarts it.**
-  The next `boks run` or `boks exec` starts a fresh one, but whether a *running* VM re-attaches
-  to a new link socket is unverified; if it does not, the sandbox needs a restart. A guest
-  whose network vanishes fails closed, which is the right direction for the failure to go.
+- **If a supervisor is killed, that sandbox's network is gone until the sandbox is
+  restarted.** The next `boks run` or `boks exec` starts a fresh stack, but a *running* VM
+  does **not** re-attach to it — measured 2026-08-12. A guest whose network vanishes fails
+  closed, which is the right direction for the failure to go, but nothing repairs it.
 - SNI-based filtering can be evaded by clients that omit or lie about SNI; the netstack's
   destination-IP rules are the backstop. The proxy checks the SNI against policy and drops
   the tunnel on a mismatch, but it can only do so *after* answering `200`, so the client
@@ -378,10 +389,8 @@ host)*:
 
 The refusal is the discriminator: the call is being handled by the guest's own loopback
 stack, where nothing listens, rather than performed on the host. That is the whole reason the
-provider is worth its complexity — and it remains all that has been shown *about a real
-guest*. Boks now applies a policy to a running sandbox, and its stack refuses what the policy
-denies when a simulated guest opens the connection; nobody has yet watched a **real** guest be
-refused by it.
+provider is worth its complexity. A real guest has since been refused by that stack: see the
+check 6 transcript in [verification.md](verification.md).
 
 ### Host services
 
@@ -467,10 +476,11 @@ in the sandbox.)*
    just a malicious `Makefile` you later run. Mitigated by review, and eventually clone mode.
 4. **containerd configuration** — a misconfigured or over-privileged containerd undermines
    everything above it.
-5. **Network policy gaps** — the policy is now in the datapath, so the gaps are narrower and
-   more specific: enforcement has never been observed against a real guest, a sandbox created
-   without Boks' annotations still runs on a transport that reaches host loopback, and a
-   sandbox whose supervisor is killed loses its network until something restarts it.
+5. **Network policy gaps** — the policy is in the datapath and enforced against a real
+   guest, so the remaining gaps are specific: a hostname-only rule does not authorise a raw
+   connection to the address it resolves to, UDP and ICMP drops are unlogged, a sandbox
+   created without Boks' annotations still runs on a transport that reaches host loopback,
+   and a sandbox whose supervisor is killed loses its network until something restarts it.
 6. **The network supervisor** — a host process holding one sandbox's credentials and, if that
    sandbox intercepts anything, the CA's signing key. It exposes no API and ends with the
    sandbox, which is what bounds it.
@@ -484,10 +494,9 @@ in the sandbox.)*
 
 - It has **not** been security-reviewed or audited.
 - It has **not** demonstrated the VM boundary in this project's own testing.
-- It has **not** demonstrated its network enforcement against a real guest. The policy, the
-  stack, the proxy and the credential injection are wired into `boks run` and tested against
-  a simulated guest on the real link socket; no VM has ever been refused a destination by
-  Boks.
+- Its network enforcement **has** been demonstrated against a real guest, once, on one host
+  (macOS/Apple silicon, 2026-08-13). One measurement on one platform is evidence, not
+  assurance, and nothing here has been reviewed by anyone but its authors.
 - It does **not** claim that a sandbox created before this wiring existed is contained. Such
   a sandbox runs on the runtime's default transport and reaches host loopback; Boks says so
   when it sees one, and recreating it is the only fix.
