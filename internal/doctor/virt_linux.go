@@ -59,8 +59,21 @@ func virtualizationCheck() Check {
 }
 
 func kvmOpenFailure(err error) Result {
+	// WSL fails in ways a generic message actively misdirects: nested virtualisation is
+	// already on by default there, so "enable nested virtualisation" is usually wrong, and
+	// the real causes — an unloaded module, or a device node no udev ever widened — have
+	// nothing to do with the outer hypervisor. See wsl_linux.go and docs/windows.md.
+	wsl := inWSL()
+
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		if wsl {
+			return Result{
+				Status: StatusFail,
+				Detail: kvmDevice + " missing (WSL)",
+				Remedy: wslKVMMissingRemedy(),
+			}
+		}
 		return Result{
 			Status: StatusFail,
 			Detail: kvmDevice + " missing",
@@ -72,6 +85,13 @@ func kvmOpenFailure(err error) Result {
 				"    do not expose it at all.",
 		}
 	case errors.Is(err, fs.ErrPermission):
+		if wsl {
+			return Result{
+				Status: StatusFail,
+				Detail: kvmDevice + " not accessible (WSL)",
+				Remedy: wslKVMPermissionRemedy(),
+			}
+		}
 		return Result{
 			Status: StatusFail,
 			Detail: kvmDevice + " not accessible",
