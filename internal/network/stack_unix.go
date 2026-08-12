@@ -54,6 +54,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"strconv"
@@ -101,6 +102,10 @@ type hostStack struct {
 	engine *policy.Engine
 	logger io.Writer
 	ctx    context.Context
+	// metadataAccess mirrors the configuration's Ec2MetadataAccess. It is false, and the
+	// field exists so that the forwarder enforces the same closed posture the
+	// configuration declares rather than the two drifting apart.
+	metadataAccess bool
 
 	stack  *stack.Stack
 	sw     *tap.Switch
@@ -132,14 +137,22 @@ func newHostStack(ctx context.Context, plan Plan, engine *policy.Engine, logger 
 	if gatewayIP == nil {
 		return nil, fmt.Errorf("network: the gateway address %q is not IPv4", cfg.GatewayIP)
 	}
+	// NewPlan defaults this, but a Plan can also arrive decoded from another process, so
+	// the range is checked where it is used: the link endpoint takes a uint32 and the DHCP
+	// option a uint16, and a value that wraps either produces a stack that misbehaves a
+	// long way from its cause.
+	if plan.MTU <= 0 || plan.MTU > math.MaxUint16 {
+		return nil, fmt.Errorf("network: MTU %d is out of range (1-%d)", plan.MTU, math.MaxUint16)
+	}
 
 	h := &hostStack{
-		plan:    plan,
-		engine:  engine,
-		logger:  logger,
-		ctx:     ctx,
-		conns:   map[io.Closer]struct{}{},
-		noticed: map[string]struct{}{},
+		plan:           plan,
+		engine:         engine,
+		logger:         logger,
+		ctx:            ctx,
+		metadataAccess: cfg.Ec2MetadataAccess,
+		conns:          map[io.Closer]struct{}{},
+		noticed:        map[string]struct{}{},
 	}
 	if engine == nil {
 		logf(logger, "network: no policy engine was attached to this stack; every destination will be refused")
@@ -316,6 +329,18 @@ func (h *hostStack) forwardTCP(r *tcp.ForwarderRequest) {
 	// network, which is not the same machine the guest was addressing.
 	if h.plan.Subnet.Contains(dst) {
 		h.noteDrop(fmt.Sprintf("tcp to %s:%d inside the sandbox's own network, where nothing answers", dst, port))
+		r.Complete(true)
+		return
+	}
+
+	// Link-local, which contains 169.254.169.254 — the cloud instance metadata endpoint,
+	// and the best credential source on a hosted machine. gvisor-tap-vsock's own forwarder
+	// refused this whenever its Ec2MetadataAccess flag was off, and gatewayConfig asserts
+	// that flag off; refusing it here keeps the assertion true now that Boks owns the
+	// forwarder. It is deliberately not a policy question: every preset denies link-local,
+	// and this makes an explicit `-allow 169.254.169.254` fail too.
+	if !h.metadataAccess && dst.IsLinkLocalUnicast() {
+		h.noteDrop(fmt.Sprintf("tcp to link-local %s:%d, which includes the instance metadata endpoint", dst, port))
 		r.Complete(true)
 		return
 	}
