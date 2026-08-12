@@ -109,8 +109,13 @@ next section is for: that wiring has never been watched from inside a real guest
 
 **Run 2026-08-12**, macOS 26.5.2 / Apple M5 Pro, containerd 2.3.3, nerdbox `cd2c23f`,
 libkrun 1.19.4, against `io.containerd.nerdbox.v1` and the published
-`ghcr.io/dagsommer/boks/base:0.1.0`. Eleven of the twelve checks pass. **Check 6 failed**,
+`ghcr.io/dagsommer/boks/base:0.1.0`. Eleven of the twelve checks passed; **check 6 failed**,
 and it is the one that decides whether any of this is a boundary.
+
+**All twelve now pass.** Check 6 was re-run on 2026-08-13 against a real guest, after the
+stack was rebuilt around a policy-aware forwarder, and a real VM is now refused. The
+caution below records the failure it replaced, because the fix is only meaningful next to
+what it fixed.
 
 > [!CAUTION]
 > **Check 6 failed: policy in `-net nat` was advisory.** A guest that unsets the proxy
@@ -127,14 +132,13 @@ and it is the one that decides whether any of this is a boundary.
 > The certificate is the origin's own, so this is a real end-to-end connection, not the
 > proxy. Neither attempt appears in `boks policy log`: they never reached the policy engine.
 >
-> **The cause has since been found and fixed, and check 6 must be re-run.** The host-side
-> stack was gvisor-tap-vsock's `virtualnetwork.New`, whose TCP forwarder dials whatever
-> address the guest puts in a SYN — no policy, and no hook in its public API to add one.
-> Boks now assembles the stack itself and installs a forwarder that consults the policy
-> engine before dialling; denials are refused with a RST and logged as `transparent`. That
-> is proven against a simulated guest on the real link socket, and against **no VM at all**.
-> Until check 6 is re-run on this host, the honest statement is "the stack refuses it",
-> never "a real guest was refused". See *Re-run check 6* below for the exact commands.
+> **Fixed, and re-verified against a real guest on 2026-08-13.** The host-side stack was
+> gvisor-tap-vsock's `virtualnetwork.New`, whose TCP forwarder dials whatever address the
+> guest puts in a SYN — no policy, and no hook in its public API to add one. Boks now
+> assembles the stack itself and installs a forwarder that consults the policy engine before
+> dialling; denials are refused with a RST and logged as `transparent`. The same probe that
+> produced the certificate above now returns `ConnectionRefusedError`. See
+> *Check 6, re-run and passed* below.
 
 **A trap worth recording, because it manufactures a false pass.** The guest's proxy
 variables are **lowercase** (`http_proxy`, `https_proxy`), while the CLI banner says
@@ -154,7 +158,7 @@ also reads as a pass. Use `curl`, `python3`, and `bash -c` when `/dev/tcp` is wa
 | 3 | Does the guest reach the proxy? | **pass** | `http_proxy=http://192.168.127.1:3128` is reachable and serves every proxied request below |
 | 4 | Is an allowed host allowed? | **pass** | `https://example.com` → `200`, logged `allowed by rule "example.com"` |
 | 5 | Is a denied host denied? | **pass** | `https://www.google.com` through the proxy → curl rc=56; plain HTTP → `403`; logged `denied by default (policy "locked+local" allows only listed destinations)` |
-| 6 | **Is a guest that ignores the proxy still contained?** | **FAIL, since fixed, awaiting re-run** | with all four proxy variables unset, the denied host returned `200`, and a raw Python TLS handshake to `1.1.1.1:443` completed against the origin's own certificate. Nothing reached the policy engine. The stack now judges every TCP connection before dialling it; unverified against a VM |
+| 6 | **Is a guest that ignores the proxy still contained?** | **pass** *(2026-08-13)* | with all four proxy variables unset the denied host gives `http=000` and a raw TLS handshake to `1.1.1.1:443` is `ConnectionRefusedError`; UDP to `8.8.8.8:53` times out. A positive control in the same sandbox — the address allowed explicitly — connects end to end with the origin's real certificate, so the forwarder judges rather than blanket-drops. Every decision logged `transparent`. See *Check 6, re-run and passed* below |
 | 6a | **Are UDP and ICMP dropped?** | **not yet run** | new question, arising from the same fix: the stack carries no UDP except DNS to its own gateway, and no ICMP at all |
 | 7 | Is DNS mediated? | **pass** | `nameserver 192.168.127.1` in the guest, not a copy of the host's file. Note it resolves denied names too — mediated, not filtered. Since the fix it is also the *only* resolver reachable: UDP to any other address is dropped |
 | 8 | Does `-net none` mean none? | **pass** | `lo` only; `curl` → `000`, raw socket → `OSError`. The only posture whose containment has been confirmed against a real guest |
@@ -163,70 +167,106 @@ also reads as a pass. Use `curl`, `python3`, and `bash -c` when `/dev/tcp` is wa
 | 11 | **Does a running VM re-attach to a restarted stack?** | **no** | `kill -9` on the supervisor is detected (`no sandbox network stacks are running`), and a later command starts a fresh one on the same socket — but the running guest never re-attaches: `curl` rc=7, raw socket `OSError`. The VM keeps running; only its network is gone. **A crashed supervisor costs that sandbox its network until the sandbox is restarted** |
 | 12 | Does teardown reach the VM? | **pass** | after `rm -f`: no container, no task, no `boks net serve` process, empty state directory |
 
-Check 6 is the one that decides whether any of this is a boundary, and it failed. Checks 11
-and 12 answered the supervisor question — teardown is clean, and there is no repair path, so
-a crashed supervisor is a restart.
+Check 6 is the one that decides whether any of this is a boundary. It failed on 2026-08-12,
+was fixed in the stack, and **passed against a real guest on 2026-08-13** — see below.
+Checks 11 and 12 answered the supervisor question — teardown is clean, and there is no
+repair path, so a crashed supervisor is a restart.
 
-### Re-run check 6
+### Check 6, re-run and passed
 
-This is the outstanding piece of work on a machine with a hypervisor, and it is the only
-thing that can turn "the stack refuses it" into "a real guest was refused". Run it exactly
-as the failing run was run — all four proxy variables unset, a raw socket rather than
-`curl` — so that a pass cannot be manufactured by the traps recorded above.
+*(2026-08-13, same host: macOS 26.5.2 / Apple M5 Pro, containerd 2.3.3, nerdbox `cd2c23f`,
+libkrun 1.19.4, runtime `io.containerd.nerdbox.v1`, agent image
+`ghcr.io/dagsommer/boks/base:0.1.0`.)*
 
-```bash
-# A policy that permits one destination and nothing else.
-boks run shell . -policy locked -allow example.com -- sh -c '
-  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+**A real guest is refused.** Under `-policy locked -allow example.com`, with every proxy
+variable unset:
 
-  echo "=== denied host, all four proxy vars unset ==="
-  curl -s -o /dev/null -w "http=%{http_code} rc=%{exitcode}\n" https://www.google.com/
-
-  echo "=== raw TCP to a denied address, real TLS handshake ==="
-  python3 - <<EOF
-import socket, ssl
-try:
-    s = ssl.create_default_context().wrap_socket(
-        socket.create_connection(("1.1.1.1", 443), timeout=8), server_hostname="one.one.one.one")
-    print("TLS SUCCEEDED, issuer:", dict(x[0] for x in s.getpeercert()["issuer"]))
-except Exception as e:
-    print("refused or failed:", type(e).__name__, e)
-EOF
-
-  echo "=== udp, which must be dropped ==="
-  python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
-s.sendto(b\"\\x00\", (\"8.8.8.8\", 53))
-try:
-    print(\"UDP ANSWERED:\", s.recvfrom(512))
-except Exception as e:
-    print(\"udp dropped:\", type(e).__name__)
-"
-
-  echo "=== icmp, which must be dropped ==="
-  ping -c1 -W2 1.1.1.1 || echo "icmp dropped"
-
-  echo "=== an allowed destination must still work ==="
-  curl -s -o /dev/null -w "example.com http=%{http_code}\n" https://example.com/
-'
-
-# What the host must show for the same run.
-boks policy log
+```
+=== which tools exist ===
+/usr/bin/curl
+/usr/bin/python3
+=== 1. allowed host, proxy in use (expect: works) ===
+http=200
+=== 2. allowed host, ALL proxy vars unset (expect: works) ===
+http=000
+=== 3. DENIED host, ALL proxy vars unset (MUST FAIL) ===
+http=000
+=== 4. raw TLS to a denied IP, no proxy possible (MUST FAIL) ===
+raw tls refused: ConnectionRefusedError [Errno 111] Connection refused
+=== 5. UDP to a denied host (MUST FAIL) ===
+udp refused: TimeoutError
+=== 6. DNS still resolves (expect: works) ===
+172.66.147.243
 ```
 
-A pass is all of:
+The raw TLS handshake that previously completed against the origin's own certificate is now
+`ConnectionRefusedError` — refused by the forwarder, before anything was dialled.
 
-- the denied host **fails**, not `200` — `curl` reporting `rc=7` (connection refused);
-- the raw TLS handshake to `1.1.1.1:443` is **refused**, with no peer certificate;
-- the UDP probe times out and `ping` fails;
-- `https://example.com/` still returns `200`, because enforcement that only ever says no is
-  indistinguishable from a broken network;
-- and `boks policy log` shows a **`transparent`** row for `1.1.1.1:443` and for whatever
-  address `www.google.com` resolved to — denied, with a reason naming the policy. The log is
-  half the check: a refusal with nothing logged means something failed rather than decided.
+**Step 2 returning `000` is correct, and is the design working.** `-allow example.com` is a
+hostname rule; a raw connection carries no name, so it is judged on the address, and no
+address rule matched. A hostname-only policy therefore denies direct-by-IP flows *including
+to the allowed host*. That fails closed, which is the right direction, but it means
+"allowed" via the proxy and "allowed" on a raw socket are different questions.
 
-Record the output here, pass or fail, and update the check 6 row.
+#### The control that proves it judges rather than blanket-drops
+
+Refusing everything non-proxied would produce the same transcript and would not be
+enforcement. So the same test was run with the addresses allowed explicitly, in one sandbox,
+with no proxy:
+
+```
+=== direct TLS to ALLOWED IPs, proxy irrelevant (positive control) ===
+  172.66.147.243:443 -> CONNECTED, issuer: Cloudflare TLS Issuing ECC CA 3
+  104.20.23.154:443 -> CONNECTED, issuer: Cloudflare TLS Issuing ECC CA 3
+=== plain HTTP GET direct to an allowed IP ===
+  http=200
+=== DENIED IP, same sandbox (negative control) ===
+  1.1.1.1:443 -> refused: ConnectionRefusedError
+```
+
+Permitted addresses connect end to end and present the origin's real certificate; a denied
+address in the same sandbox is refused. The forwarder decides per flow.
+
+#### The flows were seen
+
+`boks policy log`, verbatim rows for that run — every denial `transparent`, and the positive
+control allowed and equally `transparent`:
+
+```
+Blocked requests:
+  SANDBOX                      TYPE     HOST                 PROXY        RULE                                                                                       REASON
+  shell-bokscheck6-7dbd4cc3a4  network  1.1.1.1:443          transparent  no applicable policies for op(action=net:connect:tcp, resource=net:ip:1.1.1.1:443)         denied by default (policy "locked+local" allows only listed destinations)
+  shell-bokscheck6-8a5c83ac00  network  142.251.152.119:443  transparent  no applicable policies for op(action=net:connect:tcp, resource=net:ip:142.251.152.119:443) denied by default (policy "locked+local" allows only listed destinations)
+  shell-bokscheck6-8a5c83ac00  network  172.66.147.243:443   transparent  no applicable policies for op(action=net:connect:tcp, resource=net:ip:172.66.147.243:443)  denied by default (policy "locked+local" allows only listed destinations)
+
+Allowed requests:
+  shell-bokscheck6-7dbd4cc3a4  network  172.66.147.243:443   transparent  172.66.147.243                                                                             allowed by rule "172.66.147.243"
+```
+
+`www.google.com` appears as the nine addresses it resolved to, each denied on its own row.
+The `172.66.147.243` denial in `…8a5c83ac00` is step 2 — the allowed *host*, denied as an
+*address*, which is the fail-closed behaviour described above.
+
+#### Also confirmed in the same session
+
+| Probe | Result |
+|---|---|
+| host loopback (`http://127.0.0.1:9999` with a host server bound there) | `000` |
+| `-net none` to an allowed host | `000` |
+| DNS through the sandbox's own resolver | works (`172.66.147.243`) |
+| DNS to an **external** resolver (`8.8.8.8:53`, hand-built query) | `TimeoutError` — not a covert channel |
+| ICMP echo to a denied address | no reply (`TimeoutError`) |
+| ICMP echo to an **allowed** address | no reply — ICMP is dropped at the link, not policy-filtered |
+
+A raw `SOCK_RAW`/`IPPROTO_ICMP` socket *can* be opened inside the guest; it simply never
+gets a packet anywhere. Opening it is not evidence of reachability, and a probe that only
+checks for `PermissionError` would be measuring the wrong thing.
+
+#### One gap worth naming
+
+UDP and ICMP are dropped **silently**: nothing appears in `boks policy log` for either. TCP
+denials are logged with a reason; a guest quietly probing UDP leaves no trace. That is a
+observability gap, not a containment one.
 
 ### Credential injection, verified inside a real guest
 
@@ -452,20 +492,19 @@ errors that do not name their own cause.
 When this procedure is run again on different hardware, update the "Current status" section
 above with the observed values — the boot_ids, the kernel versions, the vCPU count.
 
-### Confirm on the next macOS run
+### Confirmed on the macOS run of 2026-08-13
 
-Three changes were made after the verification above, on a Linux machine with no hypervisor.
-All are unconfirmed against a booted VM:
+Three changes were made on a Linux machine with no hypervisor and have now all been
+confirmed against a booted VM:
 
-- **the network policy is now enforced in the stack** — every TCP connection judged before it
-  is dialled, UDP and ICMP dropped. This is the important one: it is the fix for check 6, and
-  it has never met a guest. Run *Re-run check 6* above, and until you do, describe `-net nat`
-  as enforced-but-unwitnessed rather than as contained;
-- the `runtime entitlement` check in `boks doctor` (see the codesign note above);
-- Ctrl-C now exits `128+signal` — 130 for SIGINT, 143 for SIGTERM — and prints nothing,
-  instead of exiting 1 with a raw `context canceled` gRPC error. Verified against
-  containerd's `runc` runtime, including that no container, task or shim survives; not yet
-  observed tearing down a real VM.
+- **the network policy is enforced in the stack** — every TCP connection judged before it is
+  dialled, UDP and ICMP dropped. This was the fix for check 6, and it now holds against a
+  real guest: see *Check 6, re-run and passed* above. `-net nat` can be described as
+  enforced;
+- the `runtime entitlement` check in `boks doctor` reports `ok` against a correctly signed
+  shim, and `fail` with an actionable remedy against one signed without the entitlement;
+- Ctrl-C exits `130` for SIGINT and prints nothing. Observed tearing down a real VM: the
+  sandbox, its container, its task and its network supervisor were all gone afterwards.
 
 ### What was proven on the machine with no hypervisor
 
