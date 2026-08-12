@@ -341,11 +341,17 @@ refuses to mount single files, so this costs nothing.
 | **Ownership / permissions** | `Plan9ShareFlagsLinuxMetadata` is always set, so Linux mode/uid/gid ride along in NTFS extended attributes. The exact scheme is not documented in open source (the server is in `vmwp.exe`). No uid/gid mapping options are passed. Windows ACLs are not visible to the guest; actual access is gated by the host token of the VM worker process. |
 | **Share count limit** | **Unknown.** hcsshim has a monotonic counter and no maximum, unlike SCSI and VPMem which both have explicit caps. Any limit lives inside closed-source HCS. |
 
-**The case-insensitivity finding deserves more weight than the path-spelling problem below.**
-A Linux toolchain on a case-insensitive share is a well-known source of quiet breakage —
-`Makefile` versus `makefile`, two Go files differing only in case, npm packages, anything that
-resolves imports by exact name. A Windows Boks user would hit this on real repositories, and
-Boks could not fix it: the flag that would fix it is disabled upstream.
+**Case-insensitivity outlives this section, so it is worth flagging beyond LCOW.** A Linux
+toolchain on a case-insensitive share is a well-known source of quiet breakage — `Makefile`
+versus `makefile`, two Go files differing only in case, npm packages, anything that resolves
+imports by exact name. Here it is unfixable, because the flag that would fix it is disabled
+upstream in hcsshim.
+
+It is not an LCOW problem though; it is an NTFS one. **Any** route from a Linux guest to a
+directory on a Windows volume inherits it — a native WHP port sharing a Windows directory over
+virtiofs, and `/mnt/c` under WSL2, both included. The only route that avoids it entirely is a
+workspace living in a Linux filesystem, which is one more reason section 9 recommends keeping
+workspaces inside the WSL2 distro rather than on the Windows drive.
 
 ---
 
