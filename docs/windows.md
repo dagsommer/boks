@@ -617,8 +617,8 @@ That is the whole reason this section is now a cul-de-sac rather than a verdict.
 
 ## 6. What does the supervisor look like?
 
-**Answer: the primitive exists and is well understood, and on Windows there is nothing for it
-to supervise.**
+**Answer: the design survives intact; the primitive differs in one semantically important way;
+and there is nothing to supervise until a VMM exists.**
 
 `internal/enforce` proves a supervisor is alive by holding an `flock` for the life of the
 process (`lock_unix.go`). The property that makes it correct is that **the kernel releases the
@@ -654,16 +654,23 @@ The Windows equivalent is `LockFileEx` with
   `%LOCALAPPDATA%` paths are long. A named pipe (`\\.\pipe\…`) is the idiomatic Windows answer
   and has no stale-file problem.
 
-**Does the per-sandbox supervisor design survive? The design does; the need does not.** The
-supervisor exists solely to hold one sandbox's link socket and run the netstack behind it. With
-no host-terminated link (section 5), there is no socket to hold and no stack to run. Nothing
-about the shape is wrong on Windows — it is simply unemployed.
+**Does the per-sandbox supervisor design survive? Yes, and unusually cleanly.** The supervisor
+exists to hold one sandbox's link and run the netstack behind it, for exactly the sandbox's
+lifetime. Nothing in that reasoning is Unix-specific: it follows from the stack having to
+outlive the CLI invocation and not outlive the VM. A Windows port would keep the shape, swap
+`flock` for `LockFileEx` with the retry the promptness caveat demands, and quite possibly swap
+the UNIX socket for a named pipe.
 
-**This spike therefore does not implement the lock.** Writing it would produce a correct
-primitive with no caller, and would leave the impression that the supervisor is one file away
-from working. It is not; it is one hypervisor feature away. `lock_windows.go` now records the
-`LockFileEx` design and the promptness caveat in a comment, so that whoever does implement it
-does not have to rediscover them.
+One detail would change and is worth flagging now: `detach` on Unix calls `setsid` so the
+supervisor survives Ctrl-C and the closing terminal. The Windows equivalent is
+`CREATE_NEW_PROCESS_GROUP` (and usually `DETACHED_PROCESS` or `CREATE_NO_WINDOW`) in
+`SysProcAttr.CreationFlags`, which is a different mechanism with different console-inheritance
+consequences, not a rename.
+
+**This spike does not implement any of it**, because there is no VM under it yet: a correct
+lock with no caller would suggest the supervisor is one file away from working, and it is a
+whole VMM away. `lock_windows.go` records the `LockFileEx` design and the promptness caveat in
+a comment so that whoever does implement it does not rediscover them.
 
 ---
 
