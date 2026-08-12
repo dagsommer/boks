@@ -16,11 +16,12 @@ as if it did.
 > changed its mind. If you are reading it to make a decision rather than to follow the
 > reasoning:
 >
+> - **Where a Windows user should start today** (immediately below) — the WSL2 route, which
+>   needs no new code and is the only one that works now.
 > - **Section 7** — what the reference product actually does on Windows. This is the finding
->   that matters, and it overturned the rest.
-> - **Section 8** — the VMM candidates, which is the only remaining question for a native port.
-> - **Section 9** — what a Windows user can do today.
-> - **Section 4** — the workspace-path decision, which is true regardless of backend.
+>   that matters, and it overturned the rest of the document.
+> - **Section 8** — the VMM candidates, the only remaining question for a native port.
+> - **Section 4** — the workspace-path decision, which holds regardless of backend.
 >
 > Sections 1–3, 5 and 6 investigate **LCOW** — Linux containers in a Hyper-V utility VM — which
 > was the assumed path at the start and turned out to be the wrong target. That analysis is
@@ -80,7 +81,7 @@ abandon (section 4) — inside WSL2 a workspace is already a Linux path.
 
 This is not a Windows port and must not be described as one, and nobody here has run it. But it
 is a real answer to "can I use Boks on my Windows machine", it is available now, and it should
-be offered rather than buried. **Section 9** has the requirements, the costs and the one
+be offered rather than buried. **the WSL2 section** has the requirements, the costs and the one
 experiment most worth running.
 
 What has *not* changed is the honesty requirement. None of this has been run. "Docker does it,
@@ -102,6 +103,161 @@ different scales:
 The lesson is narrow and worth stating: *"the API I looked at cannot do X"* is not *"the
 platform cannot do X"*, and the difference is only visible if you go and look at what a working
 implementation actually links against.
+
+---
+
+## Where a Windows user should start today: Boks inside WSL2
+
+**There is a Windows story Boks can offer right now, and it needs no new code: run Boks inside
+WSL2, where it is an ordinary Linux program on an ordinary Linux kernel.**
+
+This is not a Windows port and should never be described as one. But a developer on Windows 11
+who wants Boks can plausibly have it today, and that is worth more than a roadmap entry.
+
+### Why it should work
+
+Boks needs four things from a Linux host. All four are present in a stock WSL2:
+
+| Boks needs | In WSL2 |
+|---|---|
+| `/dev/kvm` | **Nested virtualisation is on by default on Windows 11 x64** — `EnableNestedVirtualization = !Arm64 && IsWindows11OrAbove()` in WSL's source — and it is vendor-agnostic, not the Intel-only feature it was on Hyper-V historically. `CONFIG_KVM=m` in the inbox kernel. |
+| `unixgram` (AF_UNIX `SOCK_DGRAM`) for the link | Fine. `CONFIG_UNIX=y`; the datagram type is unconditional upstream. The link is VMM↔netstack, **both inside the distro**, so Windows' stream-only AF_UNIX never enters it. |
+| containerd | Runs. Less trodden than the dockerd path — Rancher Desktop has an open containerd-in-WSL startup bug — but demonstrably works. |
+| `erofs` + `mkfs.erofs` | `CONFIG_EROFS_FS=m` in the inbox kernel, enabled by Microsoft in 2022. |
+
+cgroups are clean v2 since **WSL 2.5.1**, which also introduced the modules image that makes
+any `=m` symbol loadable at all. That makes **WSL ≥ 2.5.1 a hard floor**, not a recommendation.
+
+### The three things that will actually go wrong
+
+Every ingredient being present is not the same as it working out of the box, and it will not.
+These are the failures a user hits in order, and `doctor` now names each one specifically
+(`internal/doctor/wsl_linux.go`).
+
+**1. The modules are not loaded.** `CONFIG_KVM*` and `CONFIG_EROFS_FS` are `=m`, and WSL's
+boot-time module list is three hardcoded entries — `tun`, `ip_tables`, `br_netfilter`. So both
+of the things Boks needs are absent until asked for:
+
+```bash
+sudo modprobe kvm_amd      # or kvm_intel
+sudo modprobe erofs
+```
+
+To persist, in `%UserProfile%\.wslconfig` on the Windows side, then `wsl --shutdown`:
+
+```ini
+[wsl2]
+loadKernelModules=kvm_amd,erofs
+```
+
+`loadKernelModules` is present in WSL's source but **undocumented on Learn**, so treat it as
+best-effort and keep `modprobe` as the fallback. `nested=1` on the inner KVM module is **not**
+needed — that governs a third level of nesting and is cargo-culted widely.
+
+**2. `/dev/kvm` is `root:root 0600`.** The node appears automatically via devtmpfs, but **WSL
+runs no udev**, so the rule that would widen it on an ordinary distribution never runs. The fix
+is a group, a membership and a boot command in `/etc/wsl.conf`:
+
+```ini
+[boot]
+command = /bin/bash -c 'chown root:kvm /dev/kvm && chmod 660 /dev/kvm'
+```
+
+plus `sudo usermod -aG kvm $USER`. Check `getent group kvm` first — on Debian and Ubuntu that
+group arrives with qemu/libvirt rather than the base system. **Do not use `chmod 666`**, which
+most guides suggest and which hands VM creation to every local account. With
+`[boot] systemd=true` udev runs and the stock rules should give `root:kvm 0660` without the
+command, but systemd is off by default in many images.
+
+**3. `erofs-utils` is too old on the obvious distribution.** containerd's EROFS snapshotter
+needs **≥ 1.8**; **Ubuntu 24.04 LTS ships 1.7.1**. Boks' `doctor` checks that `mkfs.erofs`
+exists but not its version, so this surfaces later as a confusing failure during an image
+unpack. Worth fixing in `snapshotterToolsCheck`, and worth knowing meanwhile.
+
+### Diagnosing it, and the trap in the obvious diagnosis
+
+**Nested virtualisation is already on**, so "add `nestedVirtualization=true` to `.wslconfig`" —
+the advice every generic guide leads with — is usually **not** the fix and sends the user to
+the Windows side for nothing. It genuinely is off only on Windows 10, on ARM64, on a CPU
+predating Haswell or Zen, under `safeMode=true`, or under the `AllowNestedVirtualization`
+enterprise policy.
+
+The three causes are distinguishable from inside the distribution, because the Windows setting
+is literally `ComputeTopology.Processor.ExposeVirtualizationExtensions`:
+
+| Check | nested virt off | on, module unloaded | on, loaded, permissions wrong |
+|---|---|---|---|
+| `grep -Ec '^flags.*\b(vmx\|svm)\b' /proc/cpuinfo` | **0** | ≥1 | ≥1 |
+| `/dev/kvm` exists | no | **no** | yes |
+| open `/dev/kvm` read-write | — | — | **EACCES** |
+
+Two things that look like diagnostics and are not: a **malformed `.wslconfig` fails silently**
+— WSL launches normally with the settings ignored, so a typo'd stanza is indistinguishable from
+no stanza — and the Windows-side error `Nested virtualization is not supported on this machine.`
+goes to `wsl.exe`'s stderr **on the Windows side**, so nothing running inside the distribution
+can ever see it. Do not grep for it.
+
+Note also that `.wslconfig` is **global only**; `/etc/wsl.conf` has no nested-virtualisation
+key. The section name and key are case-sensitive: `[wsl2]`, `nestedVirtualization`.
+
+### Detecting WSL, for anything that has to branch on it
+
+Use **`/bin/wslinfo`**, which WSL's init creates unconditionally in every distribution on every
+boot. The familiar test — matching `microsoft-standard-WSL2` in `/proc/sys/kernel/osrelease` —
+comes from `CONFIG_LOCALVERSION` and disappears under a custom kernel, which is exactly the
+configuration most likely to be missing KVM and therefore most in need of the diagnosis.
+`wslinfo --networking-mode` additionally returns the *live* mode (`nat`, `bridged`, `mirrored`,
+`consomme`, `none`, or the literal `wsl1`), which is worth having because `.wslconfig` lies when
+mirrored mode silently falls back to NAT.
+
+Rejected alternatives, with reasons: `$WSL_DISTRO_NAME` is environment-only and absent under
+systemd units and cron; `/run/WSL` is the interop socket directory and disappears with
+`[interop] enabled=false`; `/mnt/wsl` moves when `[automount] root=` is set.
+
+### What is preserved that a native port would lose
+
+**The exact-path workspace invariant survives completely.** Inside WSL2 a workspace is a Linux
+path — `/home/dag/src/foo` — and Boks mounts it at `/home/dag/src/foo`, exactly as on any Linux
+host. None of section 4 applies. That is a real advantage over a native Windows port, not a
+consolation.
+
+It holds even for a workspace on the Windows drive: `/mnt/c/Users/dag/src/foo` is itself a valid
+Linux path, so exact-path preservation is literally true there too.
+
+### The costs, stated plainly
+
+- **`/mnt/c` is slow.** WSL2 reaches the Windows filesystem over **9p**, which is the same
+  mechanism and the same performance profile as section 3 describes for LCOW. A workspace kept
+  on `/mnt/c` will make `git status` on a large repository painful, and it is then crossing 9p
+  *and* virtiofs to reach the guest. **Keep workspaces in the WSL2 filesystem.** This is the
+  single most important piece of advice for anyone running Boks this way.
+- **`/mnt/c` is case-insensitive** by default, with the same consequences for Linux toolchains
+  described in section 3.
+- **It is two nested VM boundaries.** Boks' microVM runs inside the WSL2 utility VM. The
+  sandbox boundary is still a hypervisor boundary, but the threat model now includes WSL2's
+  own, and nested virtualisation is a less-exercised path than bare-metal KVM.
+- **Do not build a custom WSL kernel.** A custom kernel without a matching modules image
+  silently loses every `=m` symbol — which includes **both KVM and EROFS**, the two things Boks
+  needs most. Use the inbox kernel. This is a live failure mode, not a hypothetical: it is what
+  broke Docker Desktop's bootstrap for a user who built their own 6.18 kernel.
+- **The reference product does not do this.** Docker explicitly supports the native Windows
+  build and calls installing the Linux build inside WSL "best-effort". Boks offering the
+  reverse is a divergence, and an honest one only if labelled as such.
+
+### What is unverified
+
+**All of it, in combination.** Each ingredient is traced to WSL's source, its issue tracker or
+its kernel config; nobody on this project has run Boks inside WSL2, or run anything on Windows
+at all. The `doctor` logic added for this is tested, but only its logic — the values it reads
+have never been read on a real WSL system.
+
+The specific thing most worth testing first is **`/dev/kvm` on an AMD machine**. Nested
+virtualisation is vendor-agnostic in WSL's source, but the empirical record for AMD bare metal
+is thinner than for Intel, and if it fails there this answer covers substantially fewer users
+than it appears to.
+
+That test is cheap — `ls -l /dev/kvm`, `modprobe kvm_amd`, `boks doctor` — and it is the
+highest-value single experiment named anywhere in this document.
 
 ---
 
@@ -350,7 +506,7 @@ upstream in hcsshim.
 It is not an LCOW problem though; it is an NTFS one. **Any** route from a Linux guest to a
 directory on a Windows volume inherits it — a native WHP port sharing a Windows directory over
 virtiofs, and `/mnt/c` under WSL2, both included. The only route that avoids it entirely is a
-workspace living in a Linux filesystem, which is one more reason section 9 recommends keeping
+workspace living in a Linux filesystem, which is one more reason the WSL2 section recommends keeping
 workspaces inside the WSL2 distro rather than on the Windows drive.
 
 ---
@@ -371,7 +527,7 @@ Windows.** No amount of runtime work changes that; it is a statement about two p
 So something must translate, and the only question is what.
 
 **Scope, and it is narrower than it looks.** This applies to a *native* Windows port, where the
-host path is a Windows path. It does **not** apply to Boks running inside WSL2 (section 9),
+host path is a Windows path. It does **not** apply to Boks running inside WSL2 (the WSL2 section),
 where the host is Linux and the workspace path is already a Linux path — `/home/dag/src/foo`
 mounts at `/home/dag/src/foo`, and even a Windows drive reached as `/mnt/c/Users/dag/src/foo`
 is a valid Linux path preserved verbatim. **The invariant holds completely on that route**,
@@ -918,161 +1074,6 @@ requirement 2 it is likely the right answer; if it does not, that is worth knowi
 
 ---
 
-## 9. The answer available today: Boks inside WSL2
-
-**There is a Windows story Boks can offer right now, and it needs no new code: run Boks inside
-WSL2, where it is an ordinary Linux program on an ordinary Linux kernel.**
-
-This is not a Windows port and should never be described as one. But a developer on Windows 11
-who wants Boks can plausibly have it today, and that is worth more than a roadmap entry.
-
-### Why it should work
-
-Boks needs four things from a Linux host. All four are present in a stock WSL2:
-
-| Boks needs | In WSL2 |
-|---|---|
-| `/dev/kvm` | **Nested virtualisation is on by default on Windows 11 x64** — `EnableNestedVirtualization = !Arm64 && IsWindows11OrAbove()` in WSL's source — and it is vendor-agnostic, not the Intel-only feature it was on Hyper-V historically. `CONFIG_KVM=m` in the inbox kernel. |
-| `unixgram` (AF_UNIX `SOCK_DGRAM`) for the link | Fine. `CONFIG_UNIX=y`; the datagram type is unconditional upstream. The link is VMM↔netstack, **both inside the distro**, so Windows' stream-only AF_UNIX never enters it. |
-| containerd | Runs. Less trodden than the dockerd path — Rancher Desktop has an open containerd-in-WSL startup bug — but demonstrably works. |
-| `erofs` + `mkfs.erofs` | `CONFIG_EROFS_FS=m` in the inbox kernel, enabled by Microsoft in 2022. |
-
-cgroups are clean v2 since **WSL 2.5.1**, which also introduced the modules image that makes
-any `=m` symbol loadable at all. That makes **WSL ≥ 2.5.1 a hard floor**, not a recommendation.
-
-### The three things that will actually go wrong
-
-Every ingredient being present is not the same as it working out of the box, and it will not.
-These are the failures a user hits in order, and `doctor` now names each one specifically
-(`internal/doctor/wsl_linux.go`).
-
-**1. The modules are not loaded.** `CONFIG_KVM*` and `CONFIG_EROFS_FS` are `=m`, and WSL's
-boot-time module list is three hardcoded entries — `tun`, `ip_tables`, `br_netfilter`. So both
-of the things Boks needs are absent until asked for:
-
-```bash
-sudo modprobe kvm_amd      # or kvm_intel
-sudo modprobe erofs
-```
-
-To persist, in `%UserProfile%\.wslconfig` on the Windows side, then `wsl --shutdown`:
-
-```ini
-[wsl2]
-loadKernelModules=kvm_amd,erofs
-```
-
-`loadKernelModules` is present in WSL's source but **undocumented on Learn**, so treat it as
-best-effort and keep `modprobe` as the fallback. `nested=1` on the inner KVM module is **not**
-needed — that governs a third level of nesting and is cargo-culted widely.
-
-**2. `/dev/kvm` is `root:root 0600`.** The node appears automatically via devtmpfs, but **WSL
-runs no udev**, so the rule that would widen it on an ordinary distribution never runs. The fix
-is a group, a membership and a boot command in `/etc/wsl.conf`:
-
-```ini
-[boot]
-command = /bin/bash -c 'chown root:kvm /dev/kvm && chmod 660 /dev/kvm'
-```
-
-plus `sudo usermod -aG kvm $USER`. Check `getent group kvm` first — on Debian and Ubuntu that
-group arrives with qemu/libvirt rather than the base system. **Do not use `chmod 666`**, which
-most guides suggest and which hands VM creation to every local account. With
-`[boot] systemd=true` udev runs and the stock rules should give `root:kvm 0660` without the
-command, but systemd is off by default in many images.
-
-**3. `erofs-utils` is too old on the obvious distribution.** containerd's EROFS snapshotter
-needs **≥ 1.8**; **Ubuntu 24.04 LTS ships 1.7.1**. Boks' `doctor` checks that `mkfs.erofs`
-exists but not its version, so this surfaces later as a confusing failure during an image
-unpack. Worth fixing in `snapshotterToolsCheck`, and worth knowing meanwhile.
-
-### Diagnosing it, and the trap in the obvious diagnosis
-
-**Nested virtualisation is already on**, so "add `nestedVirtualization=true` to `.wslconfig`" —
-the advice every generic guide leads with — is usually **not** the fix and sends the user to
-the Windows side for nothing. It genuinely is off only on Windows 10, on ARM64, on a CPU
-predating Haswell or Zen, under `safeMode=true`, or under the `AllowNestedVirtualization`
-enterprise policy.
-
-The three causes are distinguishable from inside the distribution, because the Windows setting
-is literally `ComputeTopology.Processor.ExposeVirtualizationExtensions`:
-
-| Check | nested virt off | on, module unloaded | on, loaded, permissions wrong |
-|---|---|---|---|
-| `grep -Ec '^flags.*\b(vmx\|svm)\b' /proc/cpuinfo` | **0** | ≥1 | ≥1 |
-| `/dev/kvm` exists | no | **no** | yes |
-| open `/dev/kvm` read-write | — | — | **EACCES** |
-
-Two things that look like diagnostics and are not: a **malformed `.wslconfig` fails silently**
-— WSL launches normally with the settings ignored, so a typo'd stanza is indistinguishable from
-no stanza — and the Windows-side error `Nested virtualization is not supported on this machine.`
-goes to `wsl.exe`'s stderr **on the Windows side**, so nothing running inside the distribution
-can ever see it. Do not grep for it.
-
-Note also that `.wslconfig` is **global only**; `/etc/wsl.conf` has no nested-virtualisation
-key. The section name and key are case-sensitive: `[wsl2]`, `nestedVirtualization`.
-
-### Detecting WSL, for anything that has to branch on it
-
-Use **`/bin/wslinfo`**, which WSL's init creates unconditionally in every distribution on every
-boot. The familiar test — matching `microsoft-standard-WSL2` in `/proc/sys/kernel/osrelease` —
-comes from `CONFIG_LOCALVERSION` and disappears under a custom kernel, which is exactly the
-configuration most likely to be missing KVM and therefore most in need of the diagnosis.
-`wslinfo --networking-mode` additionally returns the *live* mode (`nat`, `bridged`, `mirrored`,
-`consomme`, `none`, or the literal `wsl1`), which is worth having because `.wslconfig` lies when
-mirrored mode silently falls back to NAT.
-
-Rejected alternatives, with reasons: `$WSL_DISTRO_NAME` is environment-only and absent under
-systemd units and cron; `/run/WSL` is the interop socket directory and disappears with
-`[interop] enabled=false`; `/mnt/wsl` moves when `[automount] root=` is set.
-
-### What is preserved that a native port would lose
-
-**The exact-path workspace invariant survives completely.** Inside WSL2 a workspace is a Linux
-path — `/home/dag/src/foo` — and Boks mounts it at `/home/dag/src/foo`, exactly as on any Linux
-host. None of section 4 applies. That is a real advantage over a native Windows port, not a
-consolation.
-
-It holds even for a workspace on the Windows drive: `/mnt/c/Users/dag/src/foo` is itself a valid
-Linux path, so exact-path preservation is literally true there too.
-
-### The costs, stated plainly
-
-- **`/mnt/c` is slow.** WSL2 reaches the Windows filesystem over **9p**, which is the same
-  mechanism and the same performance profile as section 3 describes for LCOW. A workspace kept
-  on `/mnt/c` will make `git status` on a large repository painful, and it is then crossing 9p
-  *and* virtiofs to reach the guest. **Keep workspaces in the WSL2 filesystem.** This is the
-  single most important piece of advice for anyone running Boks this way.
-- **`/mnt/c` is case-insensitive** by default, with the same consequences for Linux toolchains
-  described in section 3.
-- **It is two nested VM boundaries.** Boks' microVM runs inside the WSL2 utility VM. The
-  sandbox boundary is still a hypervisor boundary, but the threat model now includes WSL2's
-  own, and nested virtualisation is a less-exercised path than bare-metal KVM.
-- **Do not build a custom WSL kernel.** A custom kernel without a matching modules image
-  silently loses every `=m` symbol — which includes **both KVM and EROFS**, the two things Boks
-  needs most. Use the inbox kernel. This is a live failure mode, not a hypothetical: it is what
-  broke Docker Desktop's bootstrap for a user who built their own 6.18 kernel.
-- **The reference product does not do this.** Docker explicitly supports the native Windows
-  build and calls installing the Linux build inside WSL "best-effort". Boks offering the
-  reverse is a divergence, and an honest one only if labelled as such.
-
-### What is unverified
-
-**All of it, in combination.** Each ingredient is traced to WSL's source, its issue tracker or
-its kernel config; nobody on this project has run Boks inside WSL2, or run anything on Windows
-at all. The `doctor` logic added for this is tested, but only its logic — the values it reads
-have never been read on a real WSL system.
-
-The specific thing most worth testing first is **`/dev/kvm` on an AMD machine**. Nested
-virtualisation is vendor-agnostic in WSL's source, but the empirical record for AMD bare metal
-is thinner than for Intel, and if it fails there this answer covers substantially fewer users
-than it appears to.
-
-That test is cheap — `ls -l /dev/kvm`, `modprobe kvm_amd`, `boks doctor` — and it is the
-highest-value single experiment named anywhere in this document.
-
----
-
 ## The architecture as it would be
 
 The shape that follows from section 7, i.e. the one the reference product demonstrates.
@@ -1365,7 +1366,7 @@ and the most likely outcome is stopping at step 9.
     A Boks port built on this could offer `-net none` and nothing else. That is why section 7
     exists.
 
-### Part D — Boks inside WSL2 (section 9)
+### Part D — Boks inside WSL2
 
 The cheapest and highest-value experiment in this document, and the only one that could produce
 a working Boks sandbox on a Windows machine.
@@ -1435,8 +1436,8 @@ and kernel, the containerd version, and the verbatim output of each step.
 **A step that fails is a result, not a blocked task.** The three most useful outcomes this
 checklist can produce, in order:
 
-1. **Step 11 on an AMD machine** — either result. If `/dev/kvm` is there, section 9 covers
-   most Windows developers and Boks has a Windows answer today. If it is not, section 9 covers
+1. **Step 11 on an AMD machine** — either result. If `/dev/kvm` is there, the WSL2 section covers
+   most Windows developers and Boks has a Windows answer today. If it is not, the WSL2 section covers
    Intel only and should say so.
 2. **Step 1** — `sbx` running with the Hyper-V role disabled. That single observation converts
    section 7 from static analysis into fact and retires sections 1–5 for good.
@@ -1540,7 +1541,7 @@ links against rather than what anyone says about it.
   using memory allocated in the user-mode process of the virtualization stack"; it exposes no
   networking device of any kind
 
-### Boks inside WSL2 (section 9)
+### Boks inside WSL2
 
 - [microsoft/WSL releases](https://github.com/microsoft/WSL/releases) — kernel versions;
   note that Learn's [kernel release notes](https://learn.microsoft.com/en-us/windows/wsl/kernel-release-notes)
