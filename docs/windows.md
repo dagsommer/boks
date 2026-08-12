@@ -664,6 +664,137 @@ does not have to rediscover them.
 
 ---
 
+## 7. What the reference product actually does
+
+**This is the section that decides the document.** Everything above investigates LCOW; Docker
+Sandboxes does not use LCOW.
+
+The evidence is the shipped Windows installer, `DockerSandboxes.msi` v0.38.0, downloaded from
+the project's own releases and unpacked. Static analysis of a signed binary is not the same as
+watching it run, but for questions of the form "what does this link against" it is close to
+conclusive, and it is a great deal better than inference from documentation.
+
+### The installed payload
+
+| File | Note |
+|---|---|
+| `bin\sbx.exe` | the CLI and daemon, Go |
+| `libexec\containerd-shim-nerdbox-v1.exe` | **the nerdbox shim, on Windows** |
+| `libexec\mkfs.erofs.exe`, `libexec\mkfs.ext4.exe` | the same filesystem tools Boks' `doctor` checks for |
+| `libexec\nerdbox-rootfs-x86_64.erofs` | guest rootfs |
+| `libexec\lib\sailor.dll` | the VMM |
+
+Two structural facts about the installer carry as much weight as the file list:
+
+- **There is no `.sys` anywhere in it**, and its MSI tables contain no `ServiceInstall`, no
+  `ServiceControl` and no driver-installation tables. It *cannot* install a kernel driver or a
+  service.
+- **It installs per-user into `%LOCALAPPDATA%`** and needs no administrator rights. A
+  kernel-mode component is structurally impossible under that constraint.
+
+So the answer to "does Docker ship a signed kernel driver to police sandbox traffic on Windows"
+is **no**, and it is no for a reason that cannot be worked around by a different build: the
+product does not install anything privileged.
+
+### What the VMM links against
+
+`sailor.dll`'s import table:
+
+```
+winhvplatform.dll  → WHvCreatePartition, WHvSetupPartition, WHvMapGpaRange,
+                     WHvCreateVirtualProcessor, WHvRunVirtualProcessor, WHvTranslateGva, …
+winhvemulation.dll → WHvEmulatorCreateEmulator, WHvEmulatorTryIoEmulation,
+                     WHvEmulatorTryMmioEmulation
+ws2_32.dll         → socket, connect, WSARecv, send, getaddrinfo, …
+virtdisk.dll       → OpenVirtualDisk, AttachVirtualDisk
+```
+
+What is **absent** matters as much: no `vmcompute.dll` (HCS), no `computenetwork.dll` (HNS/HCN),
+no `fwpuclnt.dll` (WFP), nothing NDIS. The VMM that owns the VM and its NIC never touches the
+Hyper-V management stack or the Windows filtering platform.
+
+`WHvEmulatorTryMmioEmulation` and `WHvEmulatorTryIoEmulation` are the signature of a user-mode
+VMM emulating its own devices: the guest's writes to the virtio queues trap out of
+`WHvRunVirtualProcessor` and are decoded in Docker's own process.
+
+Strings in the same DLL name a Rust `net-stack` crate —
+`crates\net-stack\src\{stack,wire,arp,dhcp,dns,tcp,udp,icmp_proxy,egress,peek,pcap}.rs` — plus
+virtio-net worker messages. That is a complete userspace TCP/IP stack sitting behind a
+userspace virtio-net backend. It is the same object as Boks' gvisor stack behind libkrun's
+virtio-net, built from different parts.
+
+### The data path
+
+```
+guest process
+  → guest Linux virtio-net driver (inside the microVM)
+  → virtio queues in guest physical memory (WHvMapGpaRange'd from the VMM's own heap)
+  → MMIO/PIO trap → WHvRunVirtualProcessor exit → WHvEmulatorTryMmioEmulation
+  → virtio-net backend, user mode
+  → userspace net-stack: wire → arp/dhcp/dns → tcp/udp/icmp → SNI peek → egress
+  → policy decision, and MITM for hosts that need it
+  → ordinary Windows user-mode sockets
+```
+
+Compare Boks on macOS: guest → libkrun's virtio-net → host socket → gvisor netstack → policy →
+host sockets. **The same shape, with the VMM's device backend in place of a socket hop.**
+
+### Enforcement is at full parity on Windows
+
+The Windows `sbx.exe` contains `gvisor.dev/gvisor` and `github.com/elazarl/goproxy` at the
+**same versions as the macOS build**, and its strings include the three proxy modes Boks
+mirrors — `forward`, `forward-bypass`, and a transparent forwarding dialer that peeks SNI on a
+connection the userspace stack has already terminated. Docker's documentation states that UDP
+and ICMP are blocked at the network layer and cannot be re-enabled by policy, and documents
+**no Windows-specific caveat**.
+
+Two conclusions follow, and both matter to Boks:
+
+- **The reference product's guarantee does not weaken on Windows.** It is one implementation on
+  three platforms, not a strong Unix story and a degraded Windows one.
+- **A `transparent` flow on Windows does not imply kernel interposition.** The "network layer"
+  in that phrase is Docker's own stack in ring 3. This is worth stating because it is the
+  natural wrong inference, and it is the one that led this document astray in its first pass.
+
+### Requirements, and what they rule out
+
+Docker's documented Windows requirements are: x86-64, Windows 11, and the Hypervisor Platform
+feature enabled —
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
+```
+
+— and, explicitly, **Docker Desktop is not required**. WSL2 is not listed. The Hyper-V role is
+not listed. `HypervisorPlatform` is the WHP feature: the third-party-VMM API, not the Hyper-V
+management stack.
+
+That disposes of the hypothesis that sandboxes are nested inside the Docker Desktop WSL2
+utility VM. There is no such VM to nest in when Docker Desktop is absent, and a nested Linux
+microVM would be created by KVM ioctls from an ELF binary, not by a Windows PE calling
+`WHvCreatePartition`. Docker's maintainers say the same directly: installing the Linux build
+inside WSL is supported only "best-effort", and the native Windows build is the preferred path.
+
+### What this costs the LCOW analysis
+
+Sections 1–5 remain accurate and are now mostly irrelevant:
+
+- The **LCOW deprecation, the missing UVM boot files and the absent CI** (section 1) no longer
+  block anything, because nothing needs LCOW.
+- **9p and its case-insensitivity** (section 3) do not apply; a WHP VMM would use virtiofs, as
+  Docker's does.
+- The **HCS "no socket-backed NIC" finding** (section 5) is true and is not a limit on Windows.
+  It is kept because it is exactly the reasoning that produces the wrong answer, and the next
+  person to look at this will find `NetworkAdapter{EndpointId, …}` and reach the same false
+  conclusion unless the record says why it does not apply.
+
+What survives untouched is **section 4** — the workspace path problem is a property of Windows
+path grammar, not of any VM backend, and `/c/...` is what the reference product does regardless
+— and **section 6**, since a supervisor's liveness primitive does not care which hypervisor is
+underneath.
+
+---
+
 ## The architecture as it would be
 
 If the network problem were solved upstream, this is the shape. Recorded so the plan exists,
