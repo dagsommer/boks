@@ -1325,14 +1325,15 @@ has been run.
 
 Four parts, in descending order of value:
 
-- **Part D (steps 11–13) — Boks inside WSL2.** The only steps here that could produce a
+- **Part D (steps 15–17) — Boks inside WSL2.** The only steps here that could produce a
   *working* Boks sandbox on a Windows machine, and the cheapest to run. Start here.
 - **Part A (steps 1–4) — corroborate section 7.** That section reverses this document's
   original verdict on the strength of an import table; an afternoon would make it an
   observation.
-- **Part B (steps 5–7) — evaluate a candidate VMM.** The native-port question.
-- **Part C (steps 8–10) — LCOW.** Kept only for anyone who wants to confirm the cul-de-sac is
-  one.
+- **Part B (steps 5–8) — the VMM path.** The native-port question, and one cheap
+  experiment that could short-circuit it.
+- **Part C (steps 9–14) — LCOW.** Kept only for anyone who wants to confirm the cul-de-sac
+  is one.
 
 Parts A, B and C **will not produce a working Boks sandbox**; Boks has no native Windows
 backend, and none of these steps give it one. They establish whether one is worth building.
@@ -1380,34 +1381,58 @@ backend, and none of these steps give it one. They establish whether one is wort
    `/sys/bus` contains `virtio`. A 9p mount or a `vmbus` topology would contradict section 7
    and should be reported.
 
-### Part B — can a candidate VMM give Boks what it needs?
+### Part B — the VMM path
 
-For whichever VMM section 8 identifies, the questions are the same three, in order. Stop at the
-first failure; each is a hard requirement.
+Section 8 establishes that libkrun's WHP backend is in progress upstream and that virtio-net is
+the one device missing. These steps establish whether that assessment survives contact with a
+real machine, and whether there is a shortcut.
 
-5. **Does it run on Windows via WHP, and boot an arbitrary Linux kernel and rootfs?**
-   Evidence: a Linux guest reaching userspace on a machine with the Hyper-V role disabled.
+5. **Confirm the state of libkrun's WHP backend.** Build `libkrun` `main` for
+   `x86_64-pc-windows-msvc` and record exactly what fails.
 
-6. **Does it expose virtio-net with a backend Boks can own?** This is the load-bearing
-   question and the reason for the whole exercise. A NAT'd or host-bridged NIC is **not**
-   sufficient — Boks needs the guest's Ethernet frames delivered to a Boks process, as a
-   socket, a pipe or an in-process callback.
-   Evidence: frames from the guest arriving in a userspace program that is not the VMM, or a
-   documented API that would allow it.
+   Expected, from a static reading: `krun-whp` compiles; `krun-cpuid` fails because it imports
+   `kvm_bindings` unconditionally; `krun-vmm` fails because `vm-memory`'s default `rawfd`
+   feature has a `compile_error!` guard on Windows. Anything better than that is good news and
+   should be reported upstream on `libkrun#798`.
 
-7. **Can it be driven by a containerd shim, one VM per container?**
-   Evidence: either an existing shim, or an embeddable API rather than a CLI-only VMM.
+6. **The twenty-minute experiment: does QEMU's socket netdev work on Windows?** This is the
+   single highest-value step in Part B, because a positive result means a working Windows path
+   exists *today* rather than at the end of the year.
 
-If step 6 fails for every candidate, the honest conclusion is that Boks' Windows story depends
-on writing a VMM or on an upstream project adding a backend — and that should be stated as
-plainly as the rest of this document.
+   ```powershell
+   # terminal 1 — a stack on the far end of the link
+   gvproxy.exe -debug -listen-qemu tcp://127.0.0.1:1234
+
+   # terminal 2
+   qemu-system-x86_64.exe -accel whpx -m 2048 -kernel bzImage -initrd initrd.img `
+       -netdev socket,id=n0,connect=127.0.0.1:1234 `
+       -device virtio-net-pci,netdev=n0,mac=5a:94:ef:e4:0c:ee -nographic
+   ```
+
+   Evidence: the guest gets an address by DHCP from the stack, and `gvproxy` logs frames
+   carrying that MAC. **A failure to bind, connect or parse the netdev is the result to
+   record** — QEMU netdevs have historically been POSIX-only in practice even when the option
+   parses, and gvisor-tap-vsock heads that integration "Run with QEMU (Linux or macOS)".
+
+   If this works, the same test with `-netdev stream,addr.type=unix,addr.path=...` is worth
+   running too, since Windows AF_UNIX supports `SOCK_STREAM`.
+
+7. **Settle the edition question**, which is unknown #2 and cheap to answer: does
+   `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform` succeed on **Windows
+   11 Home**? Microsoft's own documentation sets disagree, and the answer decides how much of
+   the Windows audience a native port could ever serve.
+
+8. **If a VMM candidate boots**, the remaining question is whether it can be driven one-VM-per
+   -container. nerdbox already answers this for libkrun — it loads `krun.dll` on Windows and
+   exposes a `nerdbox.vm-manager.v1` plugin type for anything else — so this is a check that
+   the plugin seam works, not an open design question.
 
 ### Part C — the LCOW path (for completeness only)
 
 Sections 1–5 argue this is the wrong target. These steps confirm that rather than pursue it,
 and the most likely outcome is stopping at step 9.
 
-8. **Enable Hyper-V and install containerd, then confirm the LCOW plugins initialised.**
+9. **Enable Hyper-V and install containerd, then confirm the LCOW plugins initialised.**
 
    ```powershell
    Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All
@@ -1420,7 +1445,7 @@ and the most likely outcome is stopping at step 9.
    be recorded verbatim. Note that containerd's PATH is the service's, not the shell's — the
    same trap `doctor` already warns about on Unix.
 
-9. **Find the boot files.** This is the step most likely to stop everything.
+10. **Find the boot files.** This is the step most likely to stop everything.
 
    ```powershell
    Get-ChildItem "$env:ProgramFiles\Linux Containers"
@@ -1430,9 +1455,8 @@ and the most likely outcome is stopping at step 9.
    not exist, record where you obtained the files, or that you could not.** That answer is the
    single most valuable output of this checklist.
 
-### Does the runtime half work?
 
-5. **Boot an arbitrary Linux image in a utility VM.**
+11. **Boot an arbitrary Linux image in a utility VM.**
 
    ```powershell
    ctr run --rm --snapshotter windows-lcow --runtime io.containerd.runhcs.v1 `
@@ -1443,7 +1467,7 @@ and the most likely outcome is stopping at step 9.
    *kind*, so a shared-kernel container cannot explain it. Record the kernel version — it
    identifies which UVM image is in use.
 
-6. **Confirm the VM boundary with the criteria verification.md already defines.**
+12. **Confirm the VM boundary with the criteria verification.md already defines.**
 
    ```powershell
    ctr run --rm --snapshotter windows-lcow --runtime io.containerd.runhcs.v1 `
@@ -1455,7 +1479,7 @@ and the most likely outcome is stopping at step 9.
    `/sys/bus/vmbus/devices`, **not** `/sys/bus/virtio/devices` — a Hyper-V guest has VMBus
    synthetic devices, and expecting virtio here would produce a false negative.
 
-7. **Share a host directory and find out where it lands.**
+13. **Share a host directory and find out where it lands.**
 
    ```powershell
    mkdir C:\boksprobe\deep\a\b\c\project
@@ -1483,7 +1507,7 @@ and the most likely outcome is stopping at step 9.
    Also worth timing here: `git status` on a large repository, host versus guest, to quantify
    the 9p cost.
 
-10. **Confirm the LCOW network dead end** — the step that makes this path a cul-de-sac rather
+14. **Confirm the LCOW network dead end** — the step that makes this path a cul-de-sac rather
     than an option.
 
     ```powershell
@@ -1503,7 +1527,7 @@ and the most likely outcome is stopping at step 9.
 The cheapest and highest-value experiment in this document, and the only one that could produce
 a working Boks sandbox on a Windows machine.
 
-11. **Confirm `/dev/kvm`.** In a WSL2 distro on Windows 11:
+15. **Confirm `/dev/kvm`.** In a WSL2 distro on Windows 11:
 
     ```bash
     cat /proc/sys/kernel/osrelease      # identifies the WSL kernel
@@ -1515,14 +1539,14 @@ a working Boks sandbox on a Windows machine.
     vendor-agnostic on Windows 11, but the empirical record is thinner for AMD than for Intel,
     and it decides how many users this answer actually covers. Record the CPU vendor either way.
 
-12. **Run `boks doctor`, then a sandbox.** Every check should pass exactly as on any Linux host.
+16. **Run `boks doctor`, then a sandbox.** Every check should pass exactly as on any Linux host.
     Then boot a sandbox and apply the evidence criteria in [verification.md](verification.md) —
     `boot_id`, uptime, `nproc` — which are unchanged, because this *is* Linux.
 
     Evidence: a sandbox whose `boot_id` differs from the WSL2 distro's. Note that there are now
     two nested boundaries, so record the WSL2 distro's own `boot_id` as well as the host's.
 
-13. **Confirm the workspace invariant survives.** With a workspace in the WSL2 filesystem:
+17. **Confirm the workspace invariant survives.** With a workspace in the WSL2 filesystem:
 
     ```bash
     boks run shell ~/src/foo -- pwd
@@ -1537,7 +1561,7 @@ a working Boks sandbox on a Windows machine.
 
 ### Corroborate the Docker Sandboxes findings
 
-14. If Docker Sandboxes is installed, one command corroborates section 4 and section 7 at once:
+18. If Docker Sandboxes is installed, one command corroborates section 4 and section 7 at once:
 
     ```
     sbx run --workspace C:\Users\<you>\src\foo <agent> -- sh -c "pwd; mount; ls /sys/bus; ip -o addr"
@@ -1568,14 +1592,14 @@ and kernel, the containerd version, and the verbatim output of each step.
 **A step that fails is a result, not a blocked task.** The three most useful outcomes this
 checklist can produce, in order:
 
-1. **Step 11 on an AMD machine** — either result. If `/dev/kvm` is usable there, the WSL2
+1. **Step 15 on an AMD machine** — either result. If `/dev/kvm` is usable there, the WSL2
    route covers most Windows developers and Boks has a Windows answer today. If it is not, that
    route covers Intel only and the document should say so.
 2. **Step 1** — `sbx` running with the Hyper-V role disabled. That single observation converts
    section 7 from static analysis into fact and retires sections 1–5 for good.
-3. **Step 6** — a candidate VMM either does or does not expose a virtio-net backend Boks can
-   own. That is the whole native-port question, and a negative is as valuable as a positive
-   because it redirects the effort to upstream work.
+3. **Step 6** — whether QEMU's socket netdev works on Windows. A positive means a working
+   Windows path exists today rather than at the end of the year; a negative redirects the
+   effort to libkrun upstream, which is where it probably belongs anyway.
 
 ---
 
