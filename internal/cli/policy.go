@@ -1,76 +1,64 @@
 package cli
 
 import (
-	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 )
 
-func policyCommand(ctx context.Context, env Env) error {
-	if len(env.Args) == 0 {
-		policyUsage(env.Stderr)
-		return errors.New("a subcommand is required")
+// newPolicyCommand groups the commands that answer "what may this sandbox reach, and what
+// did it try to reach". Subcommands are registered here and nowhere else.
+func newPolicyCommand(env Env) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "policy",
+		Short: "Show network policy rules and recent decisions",
+		Long: `A network policy is what a sandbox may reach. These commands show what a policy resolves
+to before anything runs, and what it decided afterwards.`,
 	}
-	sub := Env{Args: env.Args[1:], Stdin: env.Stdin, Stdout: env.Stdout, Stderr: env.Stderr}
-	switch env.Args[0] {
-	case "-h", "--help", "help":
-		policyUsage(env.Stdout)
-		return nil
-	case "ls":
-		return policyLs(ctx, sub)
-	case "log":
-		return policyLog(ctx, sub)
-	}
-	policyUsage(env.Stderr)
-	return fmt.Errorf("unknown policy subcommand %q", env.Args[0])
+	cmd.AddCommand(
+		newPolicyLsCommand(env),
+		newPolicyLogCommand(env),
+	)
+	return cmd
 }
 
-func policyUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: boks policy <ls|log> [flags]
+func newPolicyLsCommand(env Env) *cobra.Command {
+	presets := &strings.Builder{}
+	for _, name := range policy.PresetNames() {
+		fmt.Fprintf(presets, "  %-9s %s\n", name, policy.PresetDescription(name))
+	}
 
-  ls    show the rules a policy resolves to
-  log   show recent policy decisions
-
-Run 'boks policy ls -h' or 'boks policy log -h' for flags.
-`)
-}
-
-func policyLs(_ context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks policy ls", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	var flags policyFlags
-	flags.register(fset)
-	fset.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks policy ls [flags]
-
-Resolves a preset plus any -allow/-deny rules and prints the result, deny rules first
+	cmd := &cobra.Command{
+		Use:   "ls [flags]",
+		Short: "Show the rules a policy resolves to",
+		Long: `Resolves a preset plus any --allow/--deny rules and prints the result, deny rules first
 because they always win. Nothing here contacts the network or a sandbox.
 
 Presets:
-`)
-		for _, name := range policy.PresetNames() {
-			fmt.Fprintf(env.Stderr, "  %-9s %s\n", name, policy.PresetDescription(name))
-		}
-		fmt.Fprint(env.Stderr, "\nFlags:\n")
-		fset.PrintDefaults()
+` + presets.String(),
+		Args: noArgs,
 	}
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
-		}
-		return err
-	}
+	var flags policyFlags
+	flags.register(cmd.Flags())
 
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		return policyLs(env, &flags)
+	}
+	return cmd
+}
+
+func policyLs(env Env, flags *policyFlags) error {
 	p, err := flags.resolve()
 	if err != nil {
 		return err
@@ -123,24 +111,17 @@ Presets:
 	return nil
 }
 
-func policyLog(_ context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks policy log", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	var (
-		limit = fset.Int("n", 500, "read at most this many decisions (0 for all)")
-		path  = fset.String("file", policy.DefaultLogPath(), "decision log file")
-		raw   = fset.Bool("raw", false, "one line per decision instead of one per destination")
-	)
-	fset.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks policy log [flags]
-
-Shows recent network policy decisions: what was allowed or denied, how the flow was
+func newPolicyLogCommand(env Env) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "log [flags]",
+		Short: "Show recent policy decisions",
+		Long: `Shows recent network policy decisions: what was allowed or denied, how the flow was
 carried, and why. Decisions are written by the sandbox's network stack and by the proxy
 inside it. The log stays on this machine and is never uploaded anywhere.
 
 Identical decisions are collapsed into one row with a count, because a single dependency
 install produces hundreds of them and the one denial that explains a failure should not be
-buried. Use -raw for the unaggregated form.
+buried. Use --raw for the unaggregated form.
 
 The PROXY column is the part to read when you care about confidentiality:
 
@@ -149,46 +130,48 @@ The PROXY column is the part to read when you care about confidentiality:
   forward-bypass   tunnelled untouched; end-to-end TLS, boks saw ciphertext only
   transparent      judged in the network stack, by address and port, without the proxy
                    being involved at all — what a raw socket or a non-HTTP protocol
-                   produces. boks saw a destination, and nothing else.
-
-Flags:
-`)
-		fset.PrintDefaults()
+                   produces. boks saw a destination, and nothing else.`,
+		Args: noArgs,
 	}
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
+	var (
+		limit int
+		path  string
+		raw   bool
+	)
+	cmd.Flags().IntVarP(&limit, "limit", "n", 500, "read at most this many decisions (0 for all)")
+	cmd.Flags().StringVar(&path, "file", policy.DefaultLogPath(), "decision log file")
+	cmd.Flags().BoolVar(&raw, "raw", false, "one line per decision instead of one per destination")
+
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		f, err := os.Open(path)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				fmt.Fprintf(env.Stdout, "no decisions recorded yet (%s does not exist)\n", path)
+				fmt.Fprint(env.Stdout, "Decisions appear once traffic passes through 'boks proxy'.\n")
+				return nil
+			}
+			return fmt.Errorf("opening decision log: %w", err)
 		}
-		return err
-	}
+		defer f.Close()
 
-	f, err := os.Open(*path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			fmt.Fprintf(env.Stdout, "no decisions recorded yet (%s does not exist)\n", *path)
-			fmt.Fprint(env.Stdout, "Decisions appear once traffic passes through 'boks proxy'.\n")
+		decisions, err := policy.ReadDecisions(f, limit)
+		if err != nil {
+			return err
+		}
+		if len(decisions) == 0 {
+			fmt.Fprintf(env.Stdout, "no decisions recorded in %s\n", path)
 			return nil
 		}
-		return fmt.Errorf("opening decision log: %w", err)
-	}
-	defer f.Close()
-
-	decisions, err := policy.ReadDecisions(f, *limit)
-	if err != nil {
-		return err
-	}
-	if len(decisions) == 0 {
-		fmt.Fprintf(env.Stdout, "no decisions recorded in %s\n", *path)
-		return nil
-	}
-	if *raw {
-		for _, d := range decisions {
-			fmt.Fprintln(env.Stdout, d)
+		if raw {
+			for _, d := range decisions {
+				fmt.Fprintln(env.Stdout, d)
+			}
+			return nil
 		}
+		writeDecisionTable(env.Stdout, policy.Aggregated(decisions), time.Now())
 		return nil
 	}
-	writeDecisionTable(env.Stdout, policy.Aggregated(decisions), time.Now())
-	return nil
+	return cmd
 }
 
 // writeDecisionTable prints aggregated decisions, blocked first.
