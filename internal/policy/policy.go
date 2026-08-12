@@ -77,6 +77,17 @@ type Rule struct {
 	// Why explains the rule to a human reading `boks policy ls`. Presets fill it in;
 	// rules from the command line leave it empty.
 	Why string
+	// Scope says where the rule came from — a preset, a profile, the global store, one
+	// sandbox's own rules, or a flag on this run. It carries no weight in the decision:
+	// deny beats allow no matter which scope either sits in. It exists so that a verdict
+	// can name the thing a user would have to edit to change it.
+	Scope string
+}
+
+// WithScope labels a rule with where it came from.
+func (r Rule) WithScope(scope string) Rule {
+	r.Scope = scope
+	return r
 }
 
 // ParseRule builds a rule from an action and a "host[:ports]" specification.
@@ -140,6 +151,11 @@ type Policy struct {
 }
 
 // Evaluate decides a target, applying deny precedence.
+//
+// Precedence is over the whole rule set, not over the scopes that contributed to it. A deny
+// written for one sandbox and a deny written globally are the same kind of thing once they
+// are here, and either beats every allow. That is what makes "deny wins" a property a user
+// can hold in their head after adding a sandbox-scoped rule.
 func (p Policy) Evaluate(t Target) Verdict {
 	for i := range p.Rules {
 		r := p.Rules[i]
@@ -147,6 +163,7 @@ func (p Policy) Evaluate(t Target) Verdict {
 			return Verdict{
 				Allowed: false,
 				Rule:    r.Spec(),
+				Scope:   r.Scope,
 				Reason:  fmt.Sprintf("denied by rule %q", r.Spec()),
 			}
 		}
@@ -157,6 +174,7 @@ func (p Policy) Evaluate(t Target) Verdict {
 			return Verdict{
 				Allowed: true,
 				Rule:    r.Spec(),
+				Scope:   r.Scope,
 				Reason:  fmt.Sprintf("allowed by rule %q", r.Spec()),
 			}
 		}
@@ -164,11 +182,13 @@ func (p Policy) Evaluate(t Target) Verdict {
 	if p.Default == Allow {
 		return Verdict{
 			Allowed: true,
+			Scope:   "default",
 			Reason:  fmt.Sprintf("allowed by default (policy %q allows anything not denied)", p.Name),
 		}
 	}
 	return Verdict{
 		Allowed: false,
+		Scope:   "default",
 		Reason:  fmt.Sprintf("denied by default (policy %q allows only listed destinations)", p.Name),
 	}
 }
@@ -187,6 +207,7 @@ func (p Policy) EvaluateDeny(t Target) Verdict {
 			return Verdict{
 				Allowed: false,
 				Rule:    r.Spec(),
+				Scope:   r.Scope,
 				Reason:  fmt.Sprintf("denied by rule %q", r.Spec()),
 			}
 		}
@@ -210,6 +231,10 @@ func (p Policy) With(rules ...Rule) Policy {
 type Verdict struct {
 	Allowed bool
 	// Rule is the matched rule's specification, empty when the default applied.
-	Rule   string
+	Rule string
+	// Scope is where the matching rule was written — "preset standard", "global",
+	// "sandbox web", "flag -deny" — or "default" when no rule matched. It tells a user
+	// which file or flag to change, which is the question they ask next.
+	Scope  string
 	Reason string
 }
