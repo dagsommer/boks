@@ -233,7 +233,7 @@ type Verdict struct {
 	// Rule is the matched rule's specification, empty when the default applied.
 	Rule string
 	// Scope is where the matching rule was written — "preset standard", "global",
-	// "sandbox web", "flag -deny" — or "default" when no rule matched. It tells a user
+	// "sandbox web", "flag --deny" — or "default" when no rule matched. It tells a user
 	// which file or flag to change, which is the question they ask next.
 	Scope  string
 	Reason string

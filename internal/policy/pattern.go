@@ -126,7 +126,7 @@ func (p Pattern) IsAny() bool { return p.kind == patternAny }
 //
 // The distinction matters to anyone writing rules: a raw socket carries no name, so a policy
 // built only from hostnames denies every direct-by-IP flow — including flows to the very host
-// it names. That is the safe direction, but it is not what `-allow example.com` looks like it
+// it names. That is the safe direction, but it is not what `--allow example.com` looks like it
 // promises, so the CLI says so rather than leaving it to be discovered.
 func (p Pattern) MatchesNameOnly() bool {
 	return p.kind == patternExact || p.kind == patternSuffix
