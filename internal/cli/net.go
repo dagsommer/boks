@@ -2,13 +2,13 @@ package cli
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"maps"
 	"text/tabwriter"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/enforce"
 	"github.com/dagsommer/boks/internal/network"
@@ -16,42 +16,18 @@ import (
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
-// netCommand inspects and controls the per-sandbox network stacks.
+// newNetCommand inspects and controls the per-sandbox network stacks.
 //
 // A sandbox's network lives in a process of its own, because the stack terminates the
 // guest's NIC and has to last exactly as long as the VM does — see internal/enforce. That
 // process is spawned on demand by `run`, `exec` and `start`, and it ends when the sandbox
 // stops. This command is how a person sees it and ends it by hand: a background process
 // nobody can list or stop is a thing users are right to distrust.
-func netCommand(ctx context.Context, env Env) error {
-	if len(env.Args) == 0 {
-		netUsage(env.Stderr)
-		return errors.New("a subcommand is required")
-	}
-	sub := Env{Args: env.Args[1:], Stdin: env.Stdin, Stdout: env.Stdout, Stderr: env.Stderr}
-	switch env.Args[0] {
-	case "-h", "--help", "help":
-		netUsage(env.Stdout)
-		return nil
-	case "ls", "list":
-		return netLs(ctx, sub)
-	case "stop":
-		return netStop(ctx, sub)
-	case "serve":
-		return netServe(ctx, sub)
-	}
-	netUsage(env.Stderr)
-	return fmt.Errorf("unknown net subcommand %q", env.Args[0])
-}
-
-func netUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: boks net <ls|stop|serve> [flags]
-
-  ls      list the running sandbox network stacks
-  stop    end a sandbox's network stack
-  serve   run one stack in the foreground, reading its configuration from stdin
-
-A sandbox's network is a host-side stack that terminates the guest's virtual NIC, with a
+func newNetCommand(env Env) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "net",
+		Short: "Inspect or stop the network stack serving a sandbox",
+		Long: `A sandbox's network is a host-side stack that terminates the guest's virtual NIC, with a
 filtering proxy listening inside the sandbox's own virtual network. It runs in a process of
 its own so that it lasts as long as the sandbox's VM does rather than as long as the command
 that started it: a build running in a sandbox does not lose the network because you pressed
@@ -61,96 +37,94 @@ One process per running sandbox, started on demand and never at boot. It exits w
 sandbox's task exits, so 'boks stop' takes it with the sandbox.
 
 'boks net serve' is what the others spawn. It is a normal command rather than a hidden one
-so that the background process can be reproduced, watched and debugged.
-`)
+so that the background process can be reproduced, watched and debugged.`,
+	}
+	cmd.AddCommand(newNetLsCommand(env), newNetStopCommand(env), newNetServeCommand(env))
+	return cmd
 }
 
-func netLs(_ context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks net ls", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
-		}
-		return err
+func newNetLsCommand(env Env) *cobra.Command {
+	return &cobra.Command{
+		Use:     "ls",
+		Aliases: []string{"list"},
+		Short:   "List the running sandbox network stacks",
+		Args:    noArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			states := enforce.List(policy.StateDir())
+			if len(states) == 0 {
+				fmt.Fprintln(env.Stderr, "no sandbox network stacks are running")
+				return nil
+			}
+			w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
+			fmt.Fprintln(w, "SANDBOX\tMODE\tPROXY\tINTERCEPT\tPID\tUPTIME")
+			for _, st := range states {
+				proxy := st.ProxyURL
+				if proxy == "" {
+					proxy = "-"
+				}
+				intercept := "no"
+				if st.Intercept {
+					intercept = "yes"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
+					st.Sandbox, st.Mode, proxy, intercept, st.PID,
+					time.Since(st.Started).Round(time.Second))
+			}
+			return w.Flush()
+		},
 	}
-
-	states := enforce.List(policy.StateDir())
-	if len(states) == 0 {
-		fmt.Fprintln(env.Stderr, "no sandbox network stacks are running")
-		return nil
-	}
-	w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "SANDBOX\tMODE\tPROXY\tINTERCEPT\tPID\tUPTIME")
-	for _, st := range states {
-		proxy := st.ProxyURL
-		if proxy == "" {
-			proxy = "-"
-		}
-		intercept := "no"
-		if st.Intercept {
-			intercept = "yes"
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
-			st.Sandbox, st.Mode, proxy, intercept, st.PID, time.Since(st.Started).Round(time.Second))
-	}
-	return w.Flush()
 }
 
-func netStop(_ context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks net stop", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
-		}
-		return err
+func newNetStopCommand(env Env) *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop SANDBOX...",
+		Short: "End a sandbox's network stack",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return usagef("a sandbox name is required; run 'boks net ls' to see what is running")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			for _, name := range args {
+				if err := enforce.Stop(policy.StateDir(), name); err != nil {
+					return err
+				}
+				fmt.Fprintf(env.Stderr, "stopped the network stack for %s\n", name)
+			}
+			return nil
+		},
 	}
-	if fset.NArg() == 0 {
-		return errors.New("a sandbox name is required; run 'boks net ls' to see what is running")
-	}
-	for _, name := range fset.Args() {
-		if err := enforce.Stop(policy.StateDir(), name); err != nil {
-			return err
-		}
-		fmt.Fprintf(env.Stderr, "stopped the network stack for %s\n", name)
-	}
-	return nil
 }
 
-// netServe is the supervisor process. It reads its specification from stdin rather than
-// from flags so that the secret values it needs never appear in a command line, where every
-// other process on the host could read them.
-func netServe(ctx context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks net serve", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	fset.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks net serve < spec.json
-
-Runs one sandbox's network stack in the foreground: the host-side stack that terminates the
+// newNetServeCommand is the supervisor process. It reads its specification from stdin rather
+// than from flags so that the secret values it needs never appear in a command line, where
+// every other process on the host could read them.
+func newNetServeCommand(env Env) *cobra.Command {
+	return &cobra.Command{
+		Use:   "serve < spec.json",
+		Short: "Run one stack in the foreground, reading its configuration from stdin",
+		Long: `Runs one sandbox's network stack in the foreground: the host-side stack that terminates the
 guest's NIC, and the filtering proxy inside the sandbox's virtual network. It exits when the
 sandbox's task exits, or on SIGTERM.
 
 The specification arrives on stdin as JSON, because it carries the credential values the
-proxy attaches to requests and those must not be visible in the process table.
-`)
+proxy attaches to requests and those must not be visible in the process table.`,
+		Args: noArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			spec, err := enforce.ReadSpec(env.Stdin)
+			if err != nil {
+				return err
+			}
+			return enforce.Serve(cmd.Context(), spec, env.Stdout, func(ctx context.Context) error {
+				// The stack's life is the VM's life. Watching the task is what
+				// makes that true without a second supervision mechanism:
+				// containerd already knows.
+				return sandbox.WaitUntilStopped(ctx, spec.Address, spec.Sandbox,
+					enforce.TaskAppearTimeout, enforce.TaskPollInterval)
+			})
+		},
 	}
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
-		}
-		return err
-	}
-
-	spec, err := enforce.ReadSpec(env.Stdin)
-	if err != nil {
-		return err
-	}
-	return enforce.Serve(ctx, spec, env.Stdout, func(ctx context.Context) error {
-		// The stack's life is the VM's life. Watching the task is what makes that true
-		// without a second supervision mechanism: containerd already knows.
-		return sandbox.WaitUntilStopped(ctx, spec.Address, spec.Sandbox, enforce.TaskAppearTimeout, enforce.TaskPollInterval)
-	})
 }
 
 // networkFor decides which network a sandbox gets, honouring what an existing sandbox was

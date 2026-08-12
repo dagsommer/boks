@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"context"
 	"strings"
 	"testing"
 
@@ -17,13 +16,7 @@ func TestRunRejectsAMalformedRule(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 	dir := t.TempDir()
 
-	var out, errOut bytes.Buffer
-	err := runCommand(context.Background(), Env{
-		Args:   []string{dir, "-allow", "*.*.example.com"},
-		Stdin:  strings.NewReader(""),
-		Stdout: &out,
-		Stderr: &errOut,
-	})
+	_, _, err := runCLI(t, "", "run", dir, "--allow", "*.*.example.com")
 	if err == nil {
 		t.Fatal("an invalid -allow rule was accepted")
 	}
@@ -40,8 +33,8 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
 	flags := &policyFlags{
-		allow:  stringList{"example.com:443"},
-		inject: stringList{"anthropic@api.anthropic.com=x-api-key"},
+		allow:  []string{"example.com:443"},
+		inject: []string{"anthropic@api.anthropic.com=x-api-key"},
 	}
 	spec := enforce.Spec{
 		Sandbox:   "boks-test",
@@ -81,7 +74,7 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 func TestDescribeNetworkForNoNetwork(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
-	flags := &policyFlags{mode: "none", allow: stringList{"example.com"}}
+	flags := &policyFlags{mode: "none", allow: []string{"example.com"}}
 	var errOut bytes.Buffer
 	if err := describeNetwork(flags, enforce.Spec{Sandbox: "boks-test"}, network.ModeNone, &errOut); err != nil {
 		t.Fatalf("describeNetwork: %v", err)
@@ -136,7 +129,7 @@ func TestPolicyFlagsSpecified(t *testing.T) {
 	if f.specified() {
 		t.Error("empty flags reported as specified")
 	}
-	f.allow = stringList{"example.com"}
+	f.allow = []string{"example.com"}
 	if !f.specified() {
 		t.Error("-allow was not detected")
 	}
