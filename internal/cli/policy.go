@@ -89,6 +89,7 @@ Presets:
 	} else {
 		fmt.Fprintf(env.Stdout, "  guest %s via gateway %s, resolver %s\n",
 			plan.GuestAddr, plan.Gateway, plan.Gateway)
+		fmt.Fprint(env.Stdout, hostnameRuleCaveat(p))
 	}
 	keys := make([]string, 0, len(plan.Annotations()))
 	for k := range plan.Annotations() {

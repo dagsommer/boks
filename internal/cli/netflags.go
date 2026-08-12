@@ -118,9 +118,11 @@ and readable refusals, and gains it nothing: a raw socket is still judged, just 
 addresses rather than names. A policy written only in hostnames therefore denies raw
 flows rather than permitting the addresses those names resolve to.
 
-Not yet demonstrated: no policy has been enforced against a real guest anywhere in
-this project — that needs a hypervisor. The stack is tested against a simulated guest
-on the link. See docs/security-model.md.`
+Measured against a real guest on 2026-08-12, on macOS with a hypervisor: a sandbox
+with every proxy variable unset was refused a denied host and a denied address, and
+reached an allowed address end to end with the origin's own certificate. Both showed
+up in the log as transparent. See docs/verification.md for the transcript, and
+docs/security-model.md for what is still open — Linux is not covered by that run.`
 
 // noNetworkNotice is what -net none says for itself. It is the strongest containment Boks
 // offers and the only one whose enforcement does not depend on code that has yet to meet a
@@ -179,3 +181,32 @@ const proxyCaveat = `NOTE: a forward proxy filters only the traffic a client sen
       there, the sandbox's network stack judges every connection by address
       before it is dialled, cooperating client or not.
 `
+
+// hostnameRuleCaveat warns when a policy would permit destinations only by name.
+//
+// A raw socket carries no hostname, so the netstack judges those flows on the address alone
+// and a name-only allow rule can never match one. The effect surprised a careful tester:
+// `-allow example.com` denied a direct-by-IP connection *to example.com*, which is correct
+// and fail-closed, but reads like a bug unless you already know how the two layers differ.
+// Docker Sandboxes has the same property and documents it; this says it at the moment the
+// rules are shown, which is where someone writing them is looking.
+func hostnameRuleCaveat(p policy.Policy) string {
+	names, addresses := 0, 0
+	for _, r := range p.Rules {
+		if r.Action != policy.Allow {
+			continue
+		}
+		if r.Host.MatchesNameOnly() {
+			names++
+		} else {
+			addresses++
+		}
+	}
+	if names == 0 || addresses > 0 {
+		return ""
+	}
+	return "\n  Every allow rule here names a host. Traffic through the proxy is matched by\n" +
+		"  name, but a connection made straight to an address carries none — so a guest\n" +
+		"  that dials an IP is refused even when that IP belongs to an allowed host.\n" +
+		"  Add an address or CIDR rule if a sandbox needs to reach one directly.\n\n"
+}
