@@ -1,13 +1,13 @@
 package cli
 
 import (
-	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+
+	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/ca"
 	"github.com/dagsommer/boks/internal/policy"
@@ -15,141 +15,137 @@ import (
 	"github.com/dagsommer/boks/internal/secret"
 )
 
-// proxyCommand runs the host forward proxy on its own.
+// newProxyCommand runs the host forward proxy on its own.
 //
 // It is separate from `boks run` on purpose. The proxy is not wired into a sandbox's
 // datapath, because doing so would mean setting HTTP_PROXY in the guest and calling the
 // result a network policy — and a guest that ignores the variable would be unaffected.
 // Running it standalone lets the policy engine, the filtering and the credential path be
 // exercised for real while the enforcement question is settled elsewhere.
-func proxyCommand(ctx context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks proxy", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	var (
-		listen  = fset.String("listen", "127.0.0.1:0", "address to listen on")
-		logPath = fset.String("log", policy.DefaultLogPath(), "append decisions to this file")
-		verbose = fset.Bool("v", false, "print every decision as it is made")
-		store   = fset.String("secrets", "", "encrypted secret store (default: the one 'boks secret' uses)")
-		caPath  = fset.String("ca", "", "certificate authority directory (default: the one 'boks ca' uses)")
-		noMITM  = fset.Bool("no-intercept", false,
-			"never terminate TLS; credential rules then apply to plaintext HTTP only")
-	)
-	var flags policyFlags
-	flags.register(fset)
-
-	fset.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks proxy [flags]
-
-Runs the host forward proxy: HTTP and HTTPS (via CONNECT) are filtered against a network
-policy, and credentials configured with -secret are attached to requests for the hosts
+func newProxyCommand(env Env) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "proxy [flags]",
+		Short: "Run the host forward proxy on its own, outside any sandbox",
+		Long: `Runs the host forward proxy: HTTP and HTTPS (via CONNECT) are filtered against a network
+policy, and credentials configured with --inject are attached to requests for the hosts
 they name, without the value ever existing inside a sandbox.
 
-Hosts named by a -secret rule are the only ones whose TLS is terminated: for those, and
+Hosts named by an --inject rule are the only ones whose TLS is terminated: for those, and
 only those, the proxy presents a certificate from the local boks CA, verifies the origin
 itself, and can read the traffic. Every other destination is tunnelled untouched, with
 the origin's own certificate chain intact. 'boks policy log' shows which was which.
 
-Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks run'.
-
-Examples:
-  boks proxy -policy standard
-  boks proxy -policy locked -allow api.example.com:443 -v
-  boks proxy -secret 'api.anthropic.com=anthropic:header:x-api-key'
-
-Flags:
-`)
-		fset.PrintDefaults()
+Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks run'.`,
+		Example: `  boks proxy --policy standard
+  boks proxy --policy locked --allow api.example.com:443 -v
+  boks proxy --inject 'anthropic@api.anthropic.com=header:x-api-key'`,
+		Args: noArgs,
 	}
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
-		}
-		return err
-	}
+	var (
+		listen  string
+		logPath string
+		verbose bool
+		store   string
+		caPath  string
+		noMITM  bool
+	)
+	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:0", "address to listen on")
+	cmd.Flags().StringVar(&logPath, "log", policy.DefaultLogPath(), "append decisions to this file")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "print every decision as it is made")
+	cmd.Flags().StringVar(&store, "secrets", "", "encrypted secret store (default: the one 'boks secret' uses)")
+	cmd.Flags().StringVar(&caPath, "ca", "", "certificate authority directory (default: the one 'boks ca' uses)")
+	cmd.Flags().BoolVar(&noMITM, "no-intercept", false,
+		"never terminate TLS; credential rules then apply to plaintext HTTP only")
 
-	pol, err := flags.resolve()
-	if err != nil {
-		return err
-	}
-	rules, err := flags.credentialRules()
-	if err != nil {
-		return err
-	}
+	var flags policyFlags
+	flags.register(cmd.Flags())
 
-	var provider secret.Provider
-	if len(rules) > 0 {
-		provider, err = openSecretStore(*store)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		pol, err := flags.resolve()
 		if err != nil {
 			return err
 		}
-	}
-	injector, err := secret.NewInjector(provider, rules...)
-	if err != nil {
-		return err
-	}
-
-	// The authority is created only when a credential rule exists to justify it. A proxy
-	// with no injection configured never terminates anything and has no reason to own a
-	// signing key.
-	var authority *ca.Authority
-	if len(rules) > 0 && !*noMITM {
-		authority, err = ca.OpenOrCreate(caDir(*caPath))
+		rules, err := flags.credentialRules()
 		if err != nil {
 			return err
 		}
-	}
 
-	decisions := policy.NewLog(policy.DefaultCapacity)
-	if *logPath != "" {
-		sink, err := policy.NewFileSink(*logPath)
+		var provider secret.Provider
+		if len(rules) > 0 {
+			provider, err = openSecretStore(store)
+			if err != nil {
+				return err
+			}
+		}
+		injector, err := secret.NewInjector(provider, rules...)
 		if err != nil {
 			return err
 		}
-		defer sink.Close()
-		decisions.AddSink(sink)
-	}
-	if *verbose {
-		decisions.AddSink(stderrSink{w: env.Stderr})
-	}
 
-	srv, err := proxy.New(proxy.Config{
-		Engine:   policy.NewEngine(pol, decisions),
-		Injector: injector,
-		CA:       authority,
-		ErrorLog: log.New(env.Stderr, "boks proxy: ", 0),
-	})
-	if err != nil {
-		return err
-	}
+		// The authority is created only when a credential rule exists to justify it. A
+		// proxy with no injection configured never terminates anything and has no
+		// reason to own a signing key.
+		var authority *ca.Authority
+		if len(rules) > 0 && !noMITM {
+			authority, err = ca.OpenOrCreate(caDir(caPath))
+			if err != nil {
+				return err
+			}
+		}
 
-	l, err := net.Listen("tcp", *listen)
-	if err != nil {
-		return fmt.Errorf("listening on %s: %w", *listen, err)
-	}
-	defer l.Close()
+		decisions := policy.NewLog(policy.DefaultCapacity)
+		if logPath != "" {
+			sink, err := policy.NewFileSink(logPath)
+			if err != nil {
+				return err
+			}
+			defer sink.Close()
+			decisions.AddSink(sink)
+		}
+		if verbose {
+			decisions.AddSink(stderrSink{w: env.Stderr})
+		}
 
-	fmt.Fprint(env.Stderr, pol.Describe())
-	fmt.Fprintf(env.Stderr, "\nlistening on http://%s\n", l.Addr())
-	fmt.Fprintf(env.Stderr, "  export HTTP_PROXY=http://%s HTTPS_PROXY=http://%s\n", l.Addr(), l.Addr())
-	if *logPath != "" {
-		fmt.Fprintf(env.Stderr, "decisions: %s  (boks policy log)\n", *logPath)
-	}
-	switch {
-	case authority != nil:
-		fmt.Fprintf(env.Stderr, "\n%s", interceptionNotice(rules))
-		fmt.Fprintf(env.Stderr, "CA: %s\n    sha256 %s\n", authority.CertPath(), authority.Fingerprint())
-	case len(rules) > 0:
-		fmt.Fprint(env.Stderr, "\nNOTE: -no-intercept is set, so TLS is never terminated and the credential rules\n"+
-			"      above apply to plaintext HTTP only. Requests to those hosts over HTTPS go out\n"+
-			"      unauthenticated, carrying whatever placeholder the client sent.\n")
-	}
-	fmt.Fprintf(env.Stderr, "\n%s\n", proxyCaveat)
+		srv, err := proxy.New(proxy.Config{
+			Engine:   policy.NewEngine(pol, decisions),
+			Injector: injector,
+			CA:       authority,
+			ErrorLog: log.New(env.Stderr, "boks proxy: ", 0),
+		})
+		if err != nil {
+			return err
+		}
 
-	go func() {
-		<-ctx.Done()
-		srv.Close()
-	}()
-	return srv.Serve(l)
+		l, err := net.Listen("tcp", listen)
+		if err != nil {
+			return fmt.Errorf("listening on %s: %w", listen, err)
+		}
+		defer l.Close()
+
+		fmt.Fprint(env.Stderr, pol.Describe())
+		fmt.Fprintf(env.Stderr, "\nlistening on http://%s\n", l.Addr())
+		fmt.Fprintf(env.Stderr, "  export HTTP_PROXY=http://%s HTTPS_PROXY=http://%s\n", l.Addr(), l.Addr())
+		if logPath != "" {
+			fmt.Fprintf(env.Stderr, "decisions: %s  (boks policy log)\n", logPath)
+		}
+		switch {
+		case authority != nil:
+			fmt.Fprintf(env.Stderr, "\n%s", interceptionNotice(rules))
+			fmt.Fprintf(env.Stderr, "CA: %s\n    sha256 %s\n", authority.CertPath(), authority.Fingerprint())
+		case len(rules) > 0:
+			fmt.Fprint(env.Stderr, "\nNOTE: --no-intercept is set, so TLS is never terminated and the credential rules\n"+
+				"      above apply to plaintext HTTP only. Requests to those hosts over HTTPS go out\n"+
+				"      unauthenticated, carrying whatever placeholder the client sent.\n")
+		}
+		fmt.Fprintf(env.Stderr, "\n%s\n", proxyCaveat)
+
+		go func() {
+			<-cmd.Context().Done()
+			srv.Close()
+		}()
+		return srv.Serve(l)
+	}
+	return cmd
 }
 
 // stderrSink prints decisions as they happen, for watching a workload and building an
