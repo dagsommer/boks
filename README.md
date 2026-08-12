@@ -175,7 +175,8 @@ Useful flags, named after sbx's:
 | `-m`, `-memory` | guest memory, binary units (`1024m`, `8g`; default half the host's, max 32g) |
 | `-env KEY=VALUE` | set an environment variable (repeatable) |
 | `-net none\|nat` | no network at all, or a policed one (default `nat`) |
-| `-policy`, `-allow`, `-deny` | the network policy the sandbox runs under |
+| `-profile NAME` | apply a stored policy profile (`boks policy profile ls`) |
+| `-policy`, `-allow`, `-deny` | override the stored policy for this run |
 | `-inject`, `-guest-credential` | attach a host-held credential to named hosts |
 
 A pseudo-terminal is allocated when stdin and stdout are both terminals, and never when
@@ -191,11 +192,38 @@ for a read-only share.
                -guest-credential 'anthropic=ANTHROPIC_API_KEY=sk-ant-placeholder' shell .
 
 ./bin/boks net ls                            # the stacks currently serving sandboxes
-./bin/boks policy ls -policy standard        # what a preset resolves to, and why
 ./bin/boks policy log                        # what was allowed or denied, and why
 ./bin/boks secret set github                 # a credential the guest never receives
 ./bin/boks proxy -policy locked -v           # the same proxy, standalone, for anything
 ```
+
+### Policy is state, not an argument
+
+Rules written with `boks policy` survive the command that wrote them, and are what `boks run`,
+`boks start` and `boks exec` all serve a sandbox. A rule applies to every sandbox, or to one:
+
+```bash
+./bin/boks policy init -preset locked                     # choose the base posture
+./bin/boks policy allow github.com:443 -note "git"        # every sandbox
+./bin/boks policy allow -sandbox claude-myproject api.example.com:443
+./bin/boks policy deny  metadata.example.com              # deny always wins, in every scope
+
+./bin/boks policy check -sandbox claude-myproject api.example.com:443   # would this be permitted?
+./bin/boks policy ls -sandbox claude-myproject                          # stored rules, and what they resolve to
+./bin/boks policy profile create ci -preset locked -allow proxy.golang.org:443
+./bin/boks run -profile ci shell .
+```
+
+**Precedence, in one sentence:** a deny in any scope beats an allow in any scope, and only the
+base preset — chosen by `policy init`, a profile, or a `-policy` flag — decides what happens to
+a destination no rule mentions. A sandbox-scoped rule can add access the machine's policy
+already tolerates and can take access away; it can never widen past a deny someone wrote down.
+
+The `-policy`, `-allow`, `-deny` and `-net` flags are a Boks addition rather than sbx parity:
+they override the stored policy for one run. `-policy` and `-allow` replace the posture and the
+allow list; `-deny` is *added* to what the sandbox already denies, because a prohibition must
+not disappear because this invocation typed a different one. A sandbox remembers the selection
+it was created with, so a later `boks start` serves the same containment.
 
 The mode is fixed when a sandbox is created, because it is expressed in annotations the
 runtime reads at boot: `-net` on a sandbox that already exists is reported, not obeyed.
