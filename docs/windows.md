@@ -1248,10 +1248,20 @@ a working Boks sandbox on a Windows machine.
 
 ### Recording results
 
-As in verification.md: record the host build (`winver`), the containerd and hcsshim versions,
-the UVM kernel version, and the verbatim output of each step. **A step that fails is a result,
-not a blocked task** — step 4 failing, or step 8 producing exactly the expected HNS endpoint,
-are the two most useful outcomes this checklist can have.
+As in verification.md: record the host build (`winver`), **the CPU vendor**, the WSL version
+and kernel, the containerd version, and the verbatim output of each step.
+
+**A step that fails is a result, not a blocked task.** The three most useful outcomes this
+checklist can produce, in order:
+
+1. **Step 11 on an AMD machine** — either result. If `/dev/kvm` is there, section 9 covers
+   most Windows developers and Boks has a Windows answer today. If it is not, section 9 covers
+   Intel only and should say so.
+2. **Step 1** — `sbx` running with the Hyper-V role disabled. That single observation converts
+   section 7 from static analysis into fact and retires sections 1–5 for good.
+3. **Step 6** — a candidate VMM either does or does not expose a virtio-net backend Boks can
+   own. That is the whole native-port question, and a negative is as valuable as a positive
+   because it redirects the effort to upstream work.
 
 ---
 
