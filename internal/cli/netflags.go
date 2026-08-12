@@ -106,14 +106,21 @@ func (f *policyFlags) credentialRules() ([]secret.Credential, error) {
 // fails. What is still unproven is stated in the same breath, because this project has
 // never seen a policy applied to a real VM.
 const enforcementNote = `The sandbox's network is terminated on the host: the guest's NIC ends in a network
-stack in a boks process, and destinations no rule permits have nothing to answer them.
+stack in a boks process, which judges every TCP connection the guest opens against
+these rules — from the address and port in the packet — before it dials anything.
+A denied destination is refused there, whether or not the guest cooperated, and both
+outcomes appear in 'boks policy log' as transparent. UDP and ICMP are dropped, apart
+from DNS to the sandbox's own resolver.
+
 HTTP_PROXY and HTTPS_PROXY point the guest at the filtering proxy inside its own
-virtual network; ignoring them costs the guest hostname rules, credential injection
-and readable refusals, and gains it nothing.
+virtual network. Ignoring them costs the guest hostname rules, credential injection
+and readable refusals, and gains it nothing: a raw socket is still judged, just on
+addresses rather than names. A policy written only in hostnames therefore denies raw
+flows rather than permitting the addresses those names resolve to.
 
 Not yet demonstrated: no policy has been enforced against a real guest anywhere in
-this project — that needs a hypervisor. The datapath is tested against a simulated
-guest on the link. See docs/security-model.md.`
+this project — that needs a hypervisor. The stack is tested against a simulated guest
+on the link. See docs/security-model.md.`
 
 // noNetworkNotice is what -net none says for itself. It is the strongest containment Boks
 // offers and the only one whose enforcement does not depend on code that has yet to meet a
@@ -157,8 +164,18 @@ A guest must trust the boks CA for these hosts to work at all:
 	return b.String()
 }
 
-// proxyCaveat is printed by anything that starts the proxy for real.
+// proxyCaveat is printed by 'boks proxy', which runs the filtering proxy on the host with no
+// sandbox behind it.
+//
+// It still says what it always said, because for *this* command it is still true: there is
+// no network stack under a standalone proxy, so a client that declines to use it is not
+// filtered by anything. Inside a sandbox the picture is different — the stack judges the
+// flow whether the client cooperates or not — and that difference is exactly why this note
+// is worded for the command it is printed by rather than for proxies in general.
 const proxyCaveat = `NOTE: a forward proxy filters only the traffic a client sends to it.
-      A guest that ignores HTTP_PROXY and opens a raw socket is not affected.
-      This is a cooperating-client mechanism, not an enforcement boundary.
+      A client that ignores HTTP_PROXY and opens a raw socket is not affected.
+      Run standalone like this, it is a cooperating-client mechanism and not an
+      enforcement boundary. Inside a sandbox ('boks run') it is layered on one:
+      there, the sandbox's network stack judges every connection by address
+      before it is dialled, cooperating client or not.
 `

@@ -135,8 +135,8 @@ func policyLog(_ context.Context, env Env) error {
 		fmt.Fprint(env.Stderr, `Usage: boks policy log [flags]
 
 Shows recent network policy decisions: what was allowed or denied, how the flow was
-carried, and why. Decisions are written by the host proxy ('boks proxy'). The log stays on
-this machine and is never uploaded anywhere.
+carried, and why. Decisions are written by the sandbox's network stack and by the proxy
+inside it. The log stays on this machine and is never uploaded anywhere.
 
 Identical decisions are collapsed into one row with a count, because a single dependency
 install produces hundreds of them and the one denial that explains a failure should not be
@@ -147,7 +147,9 @@ The PROXY column is the part to read when you care about confidentiality:
   forward          boks handled this at the HTTP level and could read it — plaintext
                    HTTP, or HTTPS terminated because the host has a credential rule
   forward-bypass   tunnelled untouched; end-to-end TLS, boks saw ciphertext only
-  transparent      judged at the network layer, without the proxy (not produced yet)
+  transparent      judged in the network stack, by address and port, without the proxy
+                   being involved at all — what a raw socket or a non-HTTP protocol
+                   produces. boks saw a destination, and nothing else.
 
 Flags:
 `)
@@ -229,7 +231,8 @@ func writeDecisionTable(w io.Writer, rows []policy.Aggregate, now time.Time) {
 	}
 	section("Blocked requests:", blocked)
 	section("Allowed requests:", allowed)
-	fmt.Fprint(w, "PROXY: forward = boks read this flow · forward-bypass = tunnelled, ciphertext only\n")
+	fmt.Fprint(w, "PROXY: forward = boks read this flow · forward-bypass = tunnelled, ciphertext only · "+
+		"transparent = judged in the network stack, by address\n")
 }
 
 // since renders an age the way a person reads one.
