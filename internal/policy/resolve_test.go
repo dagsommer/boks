@@ -129,7 +129,7 @@ func TestScopePrecedence(t *testing.T) {
 			allowed: true, scope: scopeFlagAllow,
 		},
 		{
-			name: "-policy open cannot resurrect a destination the store denies",
+			name: "--policy open cannot resurrect a destination the store denies",
 			req: func(t *testing.T) Request {
 				return Request{
 					Store:   storeWith(t, PresetLocked, []RuleSpec{denyRule(host)}, nil),
@@ -140,7 +140,7 @@ func TestScopePrecedence(t *testing.T) {
 			allowed: false, scope: "global",
 		},
 		{
-			name: "-policy open does widen what nothing denies",
+			name: "--policy open does widen what nothing denies",
 			req: func(t *testing.T) Request {
 				return Request{Store: storeWith(t, PresetLocked, nil, nil), Sandbox: "web", Preset: PresetOpen}
 			},
@@ -281,10 +281,10 @@ func TestResolveRejectsWhatItCannotEnforce(t *testing.T) {
 		t.Error("an unknown preset was accepted")
 	}
 	if _, err := (Request{Store: s, Allow: []string{"*.*.bad"}}).Resolve(); err == nil {
-		t.Error("an unusable -allow was accepted")
+		t.Error("an unusable --allow was accepted")
 	}
 	if _, err := (Request{Store: s, Deny: []string{"[::1"}}).Resolve(); err == nil {
-		t.Error("an unusable -deny was accepted")
+		t.Error("an unusable --deny was accepted")
 	}
 }
 
@@ -333,7 +333,7 @@ func TestSandboxPolicyRecord(t *testing.T) {
 	if rec.IsZero() {
 		t.Error("a record with a preset is not empty")
 	}
-	if got := rec.String(); got != "-policy locked -allow a.test:443" {
+	if got := rec.String(); got != "--policy locked --allow a.test:443" {
 		t.Errorf("record renders as %q", got)
 	}
 	req := rec.Request(NewStore(""), "web")
