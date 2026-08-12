@@ -97,7 +97,7 @@ without touching the CLI or the workspace logic.
    virtiofs shares, and starts the process under the guest init.
 6. Boks waits on the process, streams stdio, and propagates the guest exit code.
 7. A persistent sandbox stays up: only the exec'd process is reaped. `boks stop` kills and
-   deletes the task, and `boks rm` deletes the container and its snapshot. With `-rm` all of
+   deletes the task, and `boks rm` deletes the container and its snapshot. With `--rm` all of
    that happens when the command exits — on signal too, so nothing is left behind.
 
 ## Workspace sharing
@@ -243,7 +243,7 @@ Consequences Boks' design has to carry:
 - **A network-less mode exists today, for free.** Emitting only the VM-level annotation
   attaches the NIC — which is what turns TSI off — while never wiring the container to it.
   The container then has `lo` and nothing else, and host loopback is refused. That is
-  `-net none`, and it is the strongest containment Boks can currently offer, as well as the
+  `--net none`, and it is the strongest containment Boks can currently offer, as well as the
   only one confirmed against a real guest.
 
 ### How it is wired into a run (`internal/enforce`)
@@ -353,13 +353,13 @@ rules, each naming a domain, a header and a value format with one `%s` (`bearer`
 one stored secret — an enterprise Git host and its API endpoint, a feed and its mirror —
 without repeating the scheme, which is how a rotation ends up applied to three places out of
 four. On the command line that is
-`-inject service@host[,host…]=bearer|basic[:user]|header[:format]`, with host patterns from
+`--inject service@host[,host…]=bearer|basic[:user]|header[:format]`, with host patterns from
 the same matcher the policy uses, and a catch-all is rejected: sending a token "wherever this
 request is going" is the failure this exists to prevent, and under the interception design it
 would also decide to decrypt everything.
 
 The placeholder a guest holds belongs to the credential
-(`-guest-credential service=[ENV=]placeholder`) rather than being a constant, because clients
+(`--guest-credential service=[ENV=]placeholder`) rather than being a constant, because clients
 validate credential format locally: a marker like `boks-managed` makes `gh` and friends fail
 before a request ever reaches the proxy. Values are wrapped in a type whose `String`,
 `GoString` and JSON forms are redacted, and a test asserts a secret cannot be printed.
@@ -418,14 +418,14 @@ containerd, it belongs under the platform's state directory (`~/.local/state/bok
 `~/Library/Application Support/boks` on macOS) — not a hardcoded Linux path.
 
 Identity: the sandbox name is derived from the agent and the workspace's directory name
-(`<agent>-<dir>`, as sbx does) unless `-name` says otherwise, which is what makes a second
+(`<agent>-<dir>`, as sbx does) unless `--name` says otherwise, which is what makes a second
 `boks run` with the same agent in the same directory re-attach instead of duplicating. The
 name *is* the identity — there is no separate key — so the derivation has to answer for
 characters containerd rejects, two directories sharing a basename, filesystem roots and
 containerd's length limit. Each of those decisions, and their consequences, is in section 2a
 of [docker-sandbox-parity.md](docker-sandbox-parity.md).
 
-`boks run -rm` keeps the original ephemeral behaviour: the command is the container process
+`boks run --rm` keeps the original ephemeral behaviour: the command is the container process
 and the container, task and snapshot are gone when it exits — and so are its network stack,
 its link socket and the copy of the CA that was shared into it.
 
@@ -440,7 +440,26 @@ authoritative, and deleting them while the sandbox is stopped costs the sandbox 
 
 Linux first (KVM). macOS second — libkrun and nerdbox both support it via
 Hypervisor.framework, and containerd 2.2+ runs natively there, so nothing in the design is
-Linux-only by construction. Windows waits for nerdbox support.
+Linux-only by construction.
+
+**Windows does not wait for nerdbox**, which is what this document used to say, and it is not
+blocked by anything about Windows either. A spike ([windows.md](windows.md)) found that the
+reference product runs this exact architecture there — containerd, a nerdbox shim, a Linux
+microVM, virtio-net terminated by a userspace stack — on top of the **Windows Hypervisor
+Platform**, a user-mode hypervisor API. nerdbox already builds a Windows shim upstream, and
+libkrun's WHP backend has been landing upstream through 2026 for libkrun 2.0. **The one device
+not yet ported is virtio-net** — precisely the one Boks' enforcement depends on. That is the
+whole gap, and it is narrow.
+
+Two things are true there regardless of how it is closed: the exact-path workspace property is
+impossible, because `C:\Users\dag\src\foo` is not a Linux path (both Boks and the reference
+product would map it to `/c/Users/dag/src/foo`), and the `unixgram` link would need a different
+socket type, because Windows' AF_UNIX is stream-only.
+
+Until a VMM exists, the Windows answer is **WSL2 with nested virtualisation**, where Boks is
+just a Linux program: `/dev/kvm` and EROFS are both in the inbox kernel, the link is a normal
+`unixgram` socket inside the distro, and workspace paths are Linux paths so exact-path mounting
+holds unchanged. Untested, and not a port.
 
 Code that touches platform specifics is kept behind build tags and interfaces, and `doctor`
 is structured as a list of checks each of which knows whether it applies to the current
@@ -491,7 +510,7 @@ Honest statement of what has actually been observed, as of this commit:
   (2026-08-11, macOS/Apple silicon). Guest ran Linux 6.12.44 on a Darwin host, with its own
   boot_id, uptime and vCPU/memory topology.
 - resource annotations (`io.containerd.nerdbox.resources.*`) reaching the VMM: **observed**
-  — guest `nproc` and `MemTotal` track `-cpus`/`-memory`.
+  — guest `nproc` and `MemTotal` track `--cpus`/`--memory`.
 - the Linux/KVM path: **not observed**. Verification so far is macOS-only.
 - network isolation: **observed absent in the default configuration**. With nerdbox's
   defaults the guest reaches the host's loopback services via TSI; see
@@ -512,7 +531,7 @@ Honest statement of what has actually been observed, as of this commit:
   under the sandbox's name.
 - the wiring into `boks run`: **exercised against a real containerd on the non-VM dev
   runtime**. The annotations and the guest environment were read back from the container
-  spec, `-net none` produced the VM NIC annotation and nothing else, the CA reached the guest
+  spec, `--net none` produced the VM NIC annotation and nothing else, the CA reached the guest
   as a read-only mount, and stopping or removing a sandbox left no socket, no supervisor
   process and no state behind. The runc runtime ignores the nerdbox annotations, so this says
   the spec is correct — **not** that a NIC was ever attached.

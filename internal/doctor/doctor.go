@@ -179,10 +179,21 @@ func platformCheck() Check {
 					}
 				}
 				return Result{Status: StatusOK, Detail: detail}
+			case "windows":
+				// Not "blocked on runtime support", and not a platform limitation
+				// either — Windows supports this design and the reference product
+				// ships on it. See virt_windows.go and docs/windows.md.
+				return Result{
+					Status: StatusFail, Detail: detail,
+					Remedy: "Boks does not run sandboxes on Windows yet. The platform can host them, and\n" +
+						"libkrun's Windows Hypervisor Platform backend is in progress upstream — but\n" +
+						"virtio-net, the one device Boks' enforcement needs, is not ported yet.\n" +
+						"Run Boks inside WSL2 in the meantime. See docs/windows.md.",
+				}
 			default:
 				return Result{
 					Status: StatusFail, Detail: detail,
-					Remedy: "Boks supports Linux today and macOS next. Windows is blocked on runtime support.",
+					Remedy: "Boks supports Linux today and macOS next.",
 				}
 			}
 		},

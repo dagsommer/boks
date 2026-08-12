@@ -1,9 +1,10 @@
 package cli
 
 import (
-	"flag"
 	"path/filepath"
 	"strings"
+
+	"github.com/spf13/pflag"
 
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
@@ -17,25 +18,31 @@ type policyFlags struct {
 	preset  string
 	profile string
 	mode    string
-	allow   stringList
-	deny    stringList
-	inject  stringList
-	guest   stringList
+	allow   []string
+	deny    []string
+	inject  []string
+	guest   []string
 }
 
 // register adds the flags to a flag set. The preset default is empty rather than
 // "standard" so that a caller can tell "the user asked for the default" apart from "the
 // user said nothing", which matters while the policy is not enforced.
-func (f *policyFlags) register(fs *flag.FlagSet) {
+//
+// Every repeatable flag is a StringArray rather than a StringSlice: a StringSlice splits its
+// value on commas, and an -inject rule naming two hosts contains one. Splitting there would
+// turn a valid rule into two invalid ones.
+func (f *policyFlags) register(fs *pflag.FlagSet) {
 	fs.StringVar(&f.preset, "policy", "", "network policy preset: "+strings.Join(policy.PresetNames(), ", ")+
 		" (default "+policy.DefaultPreset+")")
 	fs.StringVar(&f.profile, "profile", "", "stored policy profile to apply ('boks policy profile ls')")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
-	fs.Var(&f.allow, "allow", "allow a destination, host[:ports] (repeatable)")
-	fs.Var(&f.deny, "deny", "deny a destination, host[:ports] (repeatable); deny always wins")
-	fs.Var(&f.inject, "inject", "attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
-	fs.Var(&f.guest, "guest-credential", "what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
+	fs.StringArrayVar(&f.allow, "allow", nil, "allow a destination, host[:ports] (repeatable)")
+	fs.StringArrayVar(&f.deny, "deny", nil, "deny a destination, host[:ports] (repeatable); deny always wins")
+	fs.StringArrayVar(&f.inject, "inject", nil,
+		"attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
+	fs.StringArrayVar(&f.guest, "guest-credential", nil,
+		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
 }
 
 // specified reports whether the user set any of them.
@@ -102,8 +109,8 @@ func (f *policyFlags) resolve() (policy.Policy, error) {
 //
 //   - the preset and the profile are *replaced* by a flag that names one, because choosing a
 //     posture for one run is what those flags are for;
-//   - `-allow` *replaces* the sandbox's recorded allow list, so a one-off run can narrow;
-//   - `-deny` is *added to* the recorded denies. A prohibition a sandbox was created with
+//   - `--allow` *replaces* the sandbox's recorded allow list, so a one-off run can narrow;
+//   - `--deny` is *added to* the recorded denies. A prohibition a sandbox was created with
 //     does not disappear because this invocation typed a different one.
 //
 // A run that names no policy flags at all gets exactly what the sandbox was created with,
@@ -132,7 +139,7 @@ func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (
 // once.
 //
 // It is a union rather than a replacement because a prohibition must not disappear because
-// this invocation typed a different one. It is deduplicated because a `boks create -deny x`
+// this invocation typed a different one. It is deduplicated because a `boks create --deny x`
 // supplies the same rule twice — once as the flag and once as the record built from it — and
 // a policy that lists the same deny twice is a policy a user cannot check against what they
 // wrote.
@@ -202,9 +209,11 @@ and readable refusals, and gains it nothing: a raw socket is still judged, just 
 addresses rather than names. A policy written only in hostnames therefore denies raw
 flows rather than permitting the addresses those names resolve to.
 
-Not yet demonstrated: no policy has been enforced against a real guest anywhere in
-this project — that needs a hypervisor. The stack is tested against a simulated guest
-on the link. See docs/security-model.md.`
+Measured against a real guest on 2026-08-12, on macOS with a hypervisor: a sandbox
+with every proxy variable unset was refused a denied host and a denied address, and
+reached an allowed address end to end with the origin's own certificate. Both showed
+up in the log as transparent. See docs/verification.md for the transcript, and
+docs/security-model.md for what is still open — Linux is not covered by that run.`
 
 // noNetworkNotice is what -net none says for itself. It is the strongest containment Boks
 // offers and the only one whose enforcement does not depend on code that has yet to meet a
@@ -263,3 +272,32 @@ const proxyCaveat = `NOTE: a forward proxy filters only the traffic a client sen
       there, the sandbox's network stack judges every connection by address
       before it is dialled, cooperating client or not.
 `
+
+// hostnameRuleCaveat warns when a policy would permit destinations only by name.
+//
+// A raw socket carries no hostname, so the netstack judges those flows on the address alone
+// and a name-only allow rule can never match one. The effect surprised a careful tester:
+// `-allow example.com` denied a direct-by-IP connection *to example.com*, which is correct
+// and fail-closed, but reads like a bug unless you already know how the two layers differ.
+// Docker Sandboxes has the same property and documents it; this says it at the moment the
+// rules are shown, which is where someone writing them is looking.
+func hostnameRuleCaveat(p policy.Policy) string {
+	names, addresses := 0, 0
+	for _, r := range p.Rules {
+		if r.Action != policy.Allow {
+			continue
+		}
+		if r.Host.MatchesNameOnly() {
+			names++
+		} else {
+			addresses++
+		}
+	}
+	if names == 0 || addresses > 0 {
+		return ""
+	}
+	return "\n  Every allow rule here names a host. Traffic through the proxy is matched by\n" +
+		"  name, but a connection made straight to an address carries none — so a guest\n" +
+		"  that dials an IP is refused even when that IP belongs to an allowed host.\n" +
+		"  Add an address or CIDR rule if a sandbox needs to reach one directly.\n\n"
+}

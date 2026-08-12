@@ -465,6 +465,16 @@ func (e *Engine) Note(stage Stage, t Target, m Mode, reason string) Decision {
 	return e.record(stage, t, Verdict{Allowed: true, Reason: reason}, m)
 }
 
+// NoteRefused records that a flow was refused for a reason no rule expresses — UDP and ICMP
+// are dropped categorically, and the link refuses them before any policy check happens.
+//
+// It exists because Note asserts Allowed, and a dropped datagram recorded as allowed is
+// worse than one not recorded at all: the log would claim Boks carried traffic it threw
+// away. The reason is written by Boks, never taken from traffic.
+func (e *Engine) NoteRefused(stage Stage, t Target, m Mode, reason string) Decision {
+	return e.record(stage, t, Verdict{Allowed: false, Reason: reason}, m)
+}
+
 func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode) Decision {
 	resource := ResourceOf(t)
 	rule := v.Rule

@@ -1,4 +1,4 @@
-//go:build !linux && !darwin
+//go:build !linux && !darwin && !windows
 
 package doctor
 
@@ -16,8 +16,7 @@ func virtualizationCheck() Check {
 			return Result{
 				Status: StatusFail,
 				Detail: "no VM backend for " + runtime.GOOS,
-				Remedy: "Boks has no virtual machine backend on this platform yet.\n" +
-					"Linux (KVM) is supported; macOS on Apple silicon is next.",
+				Remedy: unsupportedRemedy(),
 			}
 		},
 	}
@@ -26,3 +25,16 @@ func virtualizationCheck() Check {
 func extraChecks() []Check                   { return nil }
 func hypervisorLibraryNames() []string       { return nil }
 func hypervisorLibrarySearchPaths() []string { return nil }
+
+// unsupportedRemedy is for platforms with no VM backend at all.
+//
+// Windows is not one of them and is not handled here — see virt_windows.go, whose build tag
+// excludes this file. That separation exists because the Windows answer is specific, and the
+// generic one this function used to give was wrong in a way worth not repeating: it said the
+// nerdbox shim does not build for Windows. It does. `GOOS=windows go build` produces the shim
+// binary from upstream today, and a shipping product runs exactly that binary.
+func unsupportedRemedy() string {
+	return "Boks has no virtual machine backend on this platform.\n" +
+		"macOS on Apple silicon is the verified platform; Linux with KVM is supported\n" +
+		"but has not been exercised end to end."
+}

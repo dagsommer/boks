@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"context"
 	"strings"
 	"testing"
 
@@ -17,13 +16,7 @@ func TestRunRejectsAMalformedRule(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 	dir := t.TempDir()
 
-	var out, errOut bytes.Buffer
-	err := runCommand(context.Background(), Env{
-		Args:   []string{dir, "-allow", "*.*.example.com"},
-		Stdin:  strings.NewReader(""),
-		Stdout: &out,
-		Stderr: &errOut,
-	})
+	_, _, err := runCLI(t, "", "run", dir, "--allow", "*.*.example.com")
 	if err == nil {
 		t.Fatal("an invalid -allow rule was accepted")
 	}
@@ -40,8 +33,8 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
 	flags := &policyFlags{
-		allow:  stringList{"example.com:443"},
-		inject: stringList{"anthropic@api.anthropic.com=x-api-key"},
+		allow:  []string{"example.com:443"},
+		inject: []string{"anthropic@api.anthropic.com=x-api-key"},
 	}
 	resolution, err := flags.resolution("boks-test", nil)
 	if err != nil {
@@ -59,18 +52,24 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 	}
 	got := errOut.String()
 	for _, want := range []string{
-		"example.com",            // the policy it resolved to
-		"TLS INTERCEPTION",       // the notice that had no call site before
-		"api.anthropic.com",      // and the host it applies to
-		"terminated on the host", // where enforcement actually happens
-		"Not yet demonstrated",   // and what has not been shown
+		"example.com",                   // the policy it resolved to
+		"TLS INTERCEPTION",              // the notice that had no call site before
+		"api.anthropic.com",             // and the host it applies to
+		"terminated on the host",        // where enforcement actually happens
+		"Measured against a real guest", // and the evidence for it
+		"Linux is not covered",          // and the limit of that evidence
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the description does not mention %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "NOT enforced") {
-		t.Errorf("the obsolete unenforced-policy warning is still printed:\n%s", got)
+	for _, stale := range []string{
+		"NOT enforced",         // the obsolete unenforced-policy warning
+		"Not yet demonstrated", // superseded once a real guest was refused
+	} {
+		if strings.Contains(got, stale) {
+			t.Errorf("obsolete wording %q is still printed:\n%s", stale, got)
+		}
 	}
 }
 
@@ -79,7 +78,7 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 func TestDescribeNetworkForNoNetwork(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
-	flags := &policyFlags{mode: "none", allow: stringList{"example.com"}}
+	flags := &policyFlags{mode: "none", allow: []string{"example.com"}}
 	var errOut bytes.Buffer
 	if err := describeNetwork(flags, enforce.Spec{Sandbox: "boks-test"}, network.ModeNone, &errOut); err != nil {
 		t.Fatalf("describeNetwork: %v", err)
@@ -134,7 +133,7 @@ func TestPolicyFlagsSpecified(t *testing.T) {
 	if f.specified() {
 		t.Error("empty flags reported as specified")
 	}
-	f.allow = stringList{"example.com"}
+	f.allow = []string{"example.com"}
 	if !f.specified() {
 		t.Error("-allow was not detected")
 	}

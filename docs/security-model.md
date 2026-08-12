@@ -124,7 +124,7 @@ cannot read it; the exception is credential injection, described under
 > [!IMPORTANT]
 > **This was measured broken on 2026-08-12 and measured fixed against a real guest on
 > 2026-08-13.** *(macOS host with a hypervisor.)* A guest that unset
-> `http_proxy`/`https_proxy` reached any destination it liked: under `-policy locked -allow
+> `http_proxy`/`https_proxy` reached any destination it liked: under `--policy locked --allow
 > example.com`, a direct `https://www.google.com/` returned **HTTP 200**, and a raw Python
 > TLS handshake to `1.1.1.1:443` completed against **the origin's own certificate**
 > (`SSL.com SSL Intermediate CA ECC R2`). Neither appeared in `boks policy log`, because
@@ -140,12 +140,16 @@ cannot read it; the exception is credential injection, described under
 > per flow rather than dropping everything that skips the proxy. Full transcript in
 > [docs/verification.md](verification.md).
 >
-> Two consequences worth knowing. Enforcement is on the **address**, so a hostname-only
+> One consequence worth knowing. Enforcement is on the **address**, so a hostname-only
 > policy denies raw connections *including to the allowed host* — fail-closed, but not what
-> a reader of `-allow example.com` expects. And UDP/ICMP drops are **silent**: nothing is
-> logged for them.
+> a reader of `--allow example.com` expects. `boks policy ls` now says so when every allow
+> rule it resolved names a host, rather than leaving it to be discovered by a refusal.
 >
-> `-net none` is unaffected and remains a real boundary.
+> UDP and ICMP drops are no longer silent: they are recorded as `transparent` refusals, once
+> per destination and capped, so a guest probing them appears in `boks policy log` without
+> being able to choose how large that log grows.
+>
+> `--net none` is unaffected and remains a real boundary.
 
 **The proxy is not the enforcement boundary; the stack under it is.** A forward proxy filters
 only traffic a client chooses to send it, so if `HTTP_PROXY` were all Boks did, a three-line
@@ -191,7 +195,7 @@ a real listener to reach, and it still cannot get there.
 
 Link-local (`169.254.0.0/16`, which contains the `169.254.169.254` instance metadata
 endpoint) is refused the same way: in the forwarder, before the policy is asked, so that an
-explicit `-allow 169.254.169.254` does not buy it either. Every preset also denies it, but
+explicit `--allow 169.254.169.254` does not buy it either. Every preset also denies it, but
 that is the weaker of the two statements.
 
 Three things that verification changed, all of them reflected in the code:
@@ -205,7 +209,7 @@ Three things that verification changed, all of them reflected in the code:
   language covers v6 from the start rather than as an addition.
 - **A genuinely network-less mode exists now.** Attaching the NIC to the VM without wiring
   the container to it turns TSI off and leaves the container with loopback only. That is
-  `-net none`, and it is the strongest containment Boks can currently offer — the only
+  `--net none`, and it is the strongest containment Boks can currently offer — the only
   posture whose enforcement has been confirmed against a real guest.
 
 A fourth thing the 2026-08-12 run changed: **a stack is not a boundary until something in it
@@ -219,20 +223,20 @@ Policy is durable state, not an argument to a run. Rules live in `<state>/policy
 — versioned JSON, `0600` in a `0700` directory, replaced by an atomic rename — and are read by
 every command that brings a sandbox's network up. Three scopes write into it: **global** (every
 sandbox on this machine), **per-sandbox**, and **profile** (a named policy a run selects with
-`-profile`).
+`--profile`).
 
 **The scoping rule is one sentence, and it is a security property rather than an ergonomic
 one: a deny in any scope beats an allow in any scope.** There is no specificity ordering, no
 "closer scope wins", and no way for a narrower scope to unsay a wider one. A sandbox-scoped
 rule can add access the machine's policy already tolerates, and can take access away; it can
 never widen past a prohibition someone wrote down. Only the base preset — chosen by
-`policy init`, by a profile, or by a `-policy` flag — decides what happens to a destination no
+`policy init`, by a profile, or by a `--policy` flag — decides what happens to a destination no
 rule mentions, so no stored rule can turn a deny-by-default machine into an allow-by-default
 one. Every ordered pair of scopes is tested for this.
 
-The per-run `-policy`, `-allow` and `-deny` flags are a **Boks addition**, not something sbx
-has, and they are overrides rather than a second policy: `-policy` and `-allow` replace the
-posture and the allow list, while `-deny` is *added* to what the sandbox already denies. A run
+The per-run `--policy`, `--allow` and `--deny` flags are a **Boks addition**, not something sbx
+has, and they are overrides rather than a second policy: `--policy` and `--allow` replace the
+posture and the allow list, while `--deny` is *added* to what the sandbox already denies. A run
 therefore cannot drop a prohibition by typing a different one.
 
 **The store fails closed.** A store that cannot be read — malformed, unreadable, or written by
@@ -354,10 +358,11 @@ which hosts will be decrypted.
   path has never been exercised end to end, and one measurement on one platform is evidence
   rather than assurance.
 - **A hostname rule does not authorise a raw connection.** Enforcement reads the address in
-  the packet, so `-allow example.com` permits the proxied flow and denies a direct
+  the packet, so `--allow example.com` permits the proxied flow and denies a direct
   connection to the address that name resolves to. Fail-closed, but surprising.
-- **UDP and ICMP are dropped without a log line.** A guest probing them leaves no trace in
-  `boks policy log`, unlike a denied TCP flow.
+- **UDP and ICMP carry no reason a rule could express.** They are refused categorically, so
+  the log records the refusal and the category rather than a matching rule — there is no rule
+  to name. Recorded once per destination and capped, since the guest chooses the packet rate.
 - **A sandbox created before this existed, or by something else, has no wiring** and runs on
   the runtime's default transport, where the guest's `127.0.0.1` is the host's. Boks warns
   loudly when it meets one; the fix is to recreate it, because the mode lives in annotations
@@ -365,7 +370,7 @@ which hosts will be decrypted.
 - **A sandbox created before it recorded its policy has no record**, so `boks start` serves it
   the default preset plus whatever the store says about it, exactly as it did before. It is
   not distinguishable from a sandbox that named no policy, and the fix is the same: recreate
-  it, or write its rules into the store with `boks policy allow -sandbox <name>`.
+  it, or write its rules into the store with `boks policy allow --sandbox NAME`.
 - **Credential rules are still per-invocation.** The policy a sandbox remembers covers
   destinations, not credentials, so `boks start` and `boks exec` bring up a stack with no
   injection configured. Deliberate: resolving a credential needs the passphrase to the
@@ -437,7 +442,7 @@ which Boks can see or drop a flow.
 
 **This baseline is what a sandbox gets when Boks does *not* wire it** — the runtime's own
 default. Every sandbox `boks run` creates now carries the annotations that replace it, and
-`-net none` is the same replacement without the container being wired to the NIC at all.
+`--net none` is the same replacement without the container being wired to the NIC at all.
 
 The same probes with an external network provider attached *(verified 2026-08-11, same
 host)*:

@@ -17,7 +17,7 @@ account, no cloud service, no telemetry.
 The VM boundary is **verified**. On 2026-08-11, on an Apple M5 Pro running macOS 26.5.2,
 `boks run` booted a real microVM: the guest reported **Linux 6.12.44 aarch64** while the
 host ran **Darwin 25.5.0**, with its own `boot_id`, an uptime of 0.03 s against the host's
-28 days, and vCPU and memory counts matching `-cpus`/`-memory` rather than the host's 18
+28 days, and vCPU and memory counts matching `--cpus`/`--memory` rather than the host's 18
 cores and 48 GiB. A shared-kernel container cannot produce any of that. Full evidence and
 procedure: [docs/verification.md](docs/verification.md).
 
@@ -28,12 +28,12 @@ What works, tested locally:
 - `boks run [agent] [workspace...]` — agent-first, like `sbx run`. Creates a sandbox
   through containerd or re-attaches to the one that agent and directory already have, runs
   the agent (or a command after `--`), streams its output, and returns its exit code.
-  `-rm` makes it ephemeral instead.
+  `--rm` makes it ephemeral instead.
 - **Agents with prepared images** — `claude`, `codex`, `copilot`, `cursor`, `docker-agent`,
   `droid`, `gemini`, `opencode` and `shell` each resolve to an image at
   `ghcr.io/dagsommer/boks/`, built from [`images/`](images/): a shared Debian base with the
   toolchain preinstalled, plus one thin layer per agent. `kiro` is registered without an
-  image and needs an explicit `-template`. Published to GHCR and public. The base image has
+  image and needs an explicit `--template`. Published to GHCR and public. The base image has
   since run inside a microVM; the agent CLIs on top of it have not. See
   [images/README.md](images/README.md), including why nothing in them is installed by a
   package manager.
@@ -60,7 +60,7 @@ What works, tested locally:
   and ICMP are dropped. **Verified against a real guest on 2026-08-13**: with every proxy
   variable unset, a denied address is refused before anything is dialled, while an address
   the policy permits connects end to end — so the stack judges each flow rather than simply
-  dropping what does not use the proxy. `-net none` gives a sandbox no network at all. The
+  dropping what does not use the proxy. `--net none` gives a sandbox no network at all. The
   stack lives in a small
   per-sandbox process so that it lasts as long as the sandbox's VM rather than as long as
   your command — a build running in a sandbox does not lose the network when you press
@@ -73,7 +73,7 @@ What works, tested locally:
 What is **not** done:
 
 - **A hostname-only policy denies raw connections, including to the allowed host.** A raw
-  socket carries no name, so it is judged on the address; `-allow example.com` therefore does
+  socket carries no name, so it is judged on the address; `--allow example.com` therefore does
   not permit a direct connection to example.com's address. That fails closed, which is the
   safe direction, but "allowed through the proxy" and "allowed on a raw socket" are different
   questions and the CLI does not say so at the point you write the rule.
@@ -128,7 +128,7 @@ make build
 ./bin/boks run                              # a shell in the current directory
 ./bin/boks run shell . -- uname -a
 ./bin/boks run shell . -- sh -lc 'pwd && ls'
-./bin/boks run -rm shell /home/alice/src/foo -- go test ./...
+./bin/boks run --rm shell /home/alice/src/foo -- go test ./...
 ```
 
 The agent comes first and decides what the sandbox contains; the workspaces follow and
@@ -155,46 +155,54 @@ re-attaches to it, so installed packages, caches and shell state are still there
 `shell-boks` for the `shell` agent in `~/git_repos/boks` — and that derived name is what a
 second run looks up, so naming and re-attach are the same mechanism. Two different
 directories with the same name are not merged: the second one gets
-`<agent>-<dir>-<digest>` and is told why. `-name` overrides the derivation, which is how one
+`<agent>-<dir>-<digest>` and is told why. `--name` overrides the derivation, which is how one
 workspace gets several sandboxes, and how a sandbox is reached from anywhere:
 
 ```bash
-./bin/boks run -name shell-boks  # re-attach by name, from any directory
+./bin/boks run --name shell-boks  # re-attach by name, from any directory
 ```
 
 Useful flags, named after sbx's:
 
 | Flag | Meaning |
 |---|---|
-| `-t`, `-template` | guest root filesystem (default: the agent's image) |
-| `-name` | name the sandbox instead of deriving it from agent and workspace |
-| `-d`, `-detached` | print the sandbox name and exit instead of attaching |
-| `-rm` | destroy the sandbox when the command exits |
-| `-mount PATH[:ro]` | share an extra directory (repeatable) |
-| `-cpus` | guest vCPUs (0: all host CPUs) |
-| `-m`, `-memory` | guest memory, binary units (`1024m`, `8g`; default half the host's, max 32g) |
-| `-env KEY=VALUE` | set an environment variable (repeatable) |
-| `-net none\|nat` | no network at all, or a policed one (default `nat`) |
-| `-profile NAME` | apply a stored policy profile (`boks policy profile ls`) |
-| `-policy`, `-allow`, `-deny` | override the stored policy for this run |
-| `-inject`, `-guest-credential` | attach a host-held credential to named hosts |
+| `-t`, `--template` | guest root filesystem (default: the agent's image) |
+| `--name` | name the sandbox instead of deriving it from agent and workspace |
+| `-d`, `--detached` | print the sandbox name and exit instead of attaching |
+| `--rm` | destroy the sandbox when the command exits |
+| `--cpus` | guest vCPUs (0: all host CPUs) |
+| `-m`, `--memory` | guest memory, binary units (`1024m`, `8g`; default half the host's, max 32g) |
+| `--env KEY=VALUE` | set an environment variable (repeatable) |
+| `--net none\|nat` | no network at all, or a policed one (default `nat`) |
+| `--profile NAME` | apply a stored policy profile (`boks policy profile ls`) |
+| `--policy`, `--allow`, `--deny` | override the stored policy for this run |
+| `--inject`, `--guest-credential` | attach a host-held credential to named hosts |
 
 A pseudo-terminal is allocated when stdin and stdout are both terminals, and never when
-either is a pipe, so there is no flag for it. A workspace argument may carry a `:ro` suffix
-for a read-only share.
+either is a pipe, so there is no flag for it. Extra directories are extra `PATH` arguments,
+each of which may carry a `:ro` suffix for a read-only share — there is no `--mount`, because
+one way to say a thing is enough:
+
+```bash
+./bin/boks run shell ~/src/foo ~/src/lib:ro
+```
+
+Flags follow the usual conventions: `--long`, `-s` for the short forms sbx has, and
+`boks completion bash|zsh|fish|powershell` prints a completion script. `boks <command>
+--help` lists what that command takes.
 
 ### The network a sandbox gets
 
 ```bash
-./bin/boks run -net none shell .                    # no network at all: the strongest containment
-./bin/boks run -policy locked -allow api.example.com:443 shell .
-./bin/boks run -inject 'anthropic@api.anthropic.com=x-api-key' \
-               -guest-credential 'anthropic=ANTHROPIC_API_KEY=sk-ant-placeholder' shell .
+./bin/boks run --net none shell .                    # no network at all: the strongest containment
+./bin/boks run --policy locked --allow api.example.com:443 shell .
+./bin/boks run --inject 'anthropic@api.anthropic.com=x-api-key' \
+               --guest-credential 'anthropic=ANTHROPIC_API_KEY=sk-ant-placeholder' shell .
 
 ./bin/boks net ls                            # the stacks currently serving sandboxes
 ./bin/boks policy log                        # what was allowed or denied, and why
 ./bin/boks secret set github                 # a credential the guest never receives
-./bin/boks proxy -policy locked -v           # the same proxy, standalone, for anything
+./bin/boks proxy --policy locked -v           # the same proxy, standalone, for anything
 ```
 
 ### Policy is state, not an argument
@@ -203,30 +211,30 @@ Rules written with `boks policy` survive the command that wrote them, and are wh
 `boks start` and `boks exec` all serve a sandbox. A rule applies to every sandbox, or to one:
 
 ```bash
-./bin/boks policy init -preset locked                     # choose the base posture
-./bin/boks policy allow github.com:443 -note "git"        # every sandbox
-./bin/boks policy allow -sandbox claude-myproject api.example.com:443
-./bin/boks policy deny  metadata.example.com              # deny always wins, in every scope
+./bin/boks policy init --preset locked                     # choose the base posture
+./bin/boks policy allow github.com:443 --note "git"        # every sandbox
+./bin/boks policy allow --sandbox claude-myproject api.example.com:443
+./bin/boks policy deny  metadata.example.com               # deny always wins, in every scope
 
-./bin/boks policy check -sandbox claude-myproject api.example.com:443   # would this be permitted?
-./bin/boks policy ls -sandbox claude-myproject                          # stored rules, and what they resolve to
-./bin/boks policy profile create ci -preset locked -allow proxy.golang.org:443
-./bin/boks run -profile ci shell .
+./bin/boks policy check --sandbox claude-myproject api.example.com:443   # would this be permitted?
+./bin/boks policy ls --sandbox claude-myproject                          # stored rules, and what they resolve to
+./bin/boks policy profile create ci --preset locked --allow proxy.golang.org:443
+./bin/boks run --profile ci shell .
 ```
 
 **Precedence, in one sentence:** a deny in any scope beats an allow in any scope, and only the
-base preset — chosen by `policy init`, a profile, or a `-policy` flag — decides what happens to
+base preset — chosen by `policy init`, a profile, or a `--policy` flag — decides what happens to
 a destination no rule mentions. A sandbox-scoped rule can add access the machine's policy
 already tolerates and can take access away; it can never widen past a deny someone wrote down.
 
-The `-policy`, `-allow`, `-deny` and `-net` flags are a Boks addition rather than sbx parity:
-they override the stored policy for one run. `-policy` and `-allow` replace the posture and the
-allow list; `-deny` is *added* to what the sandbox already denies, because a prohibition must
+The `--policy`, `--allow`, `--deny` and `--net` flags are a Boks addition rather than sbx parity:
+they override the stored policy for one run. `--policy` and `--allow` replace the posture and the
+allow list; `--deny` is *added* to what the sandbox already denies, because a prohibition must
 not disappear because this invocation typed a different one. A sandbox remembers the selection
 it was created with, so a later `boks start` serves the same containment.
 
 The mode is fixed when a sandbox is created, because it is expressed in annotations the
-runtime reads at boot: `-net` on a sandbox that already exists is reported, not obeyed.
+runtime reads at boot: `--net` on a sandbox that already exists is reported, not obeyed.
 
 **A sandbox with nothing attached still has its network.** It lives in a `boks net serve`
 process, one per running sandbox, started on demand and never at boot; it exits when the
@@ -282,7 +290,7 @@ public documentation using open-source components; it is not derived from Docker
 | workspace `:ro`, no parent exposure | yes | **yes**, verified |
 | sandbox lifecycle (`ls`/`exec`/`stop`/`rm`/`cp`) | yes | **yes**, not yet exercised behind a VM |
 | agent-first CLI, readable sandbox names | yes | **yes** — same grammar, same naming rule |
-| prepared agent images | yes, ten of them | **nine of ten**, multi-arch on a shared base; `kiro` needs `-template` |
+| prepared agent images | yes, ten of them | **nine of ten**, multi-arch on a shared base; `kiro` needs `--template` |
 | terminal dashboard for bare `sbx` | yes | no — see the parity matrix |
 | network policy enforced outside the guest | yes | **yes** — the host stack judges every TCP connection by address before dialling; verified against a real guest |
 | UDP and ICMP blocked at the network layer | yes | **yes**, except DNS to the sandbox's own resolver |
@@ -303,14 +311,19 @@ enforces — what matters most is watching it work against a real guest.
 
 1. A repair path for a crashed network supervisor: the VM does not re-attach to a restarted
    stack, so today the sandbox loses its network until it is restarted
-2. Policy over names for raw flows, so that `-allow example.com` can authorise a direct
+2. Policy over names for raw flows, so that `--allow example.com` can authorise a direct
    connection to the address it resolves to rather than denying it
 3. The interactive dashboard that bare `boks` should open
 4. Clone mode, so guest writes do not land on the host by default
 5. Docker daemon inside the guest
 6. Port publishing, and the `PORTS` column that has nothing to show without it
 8. Kits / declarative configuration
-9. Windows, once the runtime supports it
+9. Windows — **investigated; the obstacle is one device driver, not the platform.** libkrun's
+   Windows Hypervisor Platform backend is in progress upstream for libkrun 2.0, and nerdbox
+   already builds a Windows shim for it. **virtio-net is the single device not yet ported** —
+   which is exactly the one Boks' enforcement depends on. In the meantime Boks should run
+   **inside WSL2** with nested virtualisation: unchanged, with workspace paths preserved
+   exactly. Untested, but every ingredient is there. See [docs/windows.md](docs/windows.md)
 
 ## Development
 
