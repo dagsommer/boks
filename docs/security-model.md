@@ -111,16 +111,37 @@ injection, described under [TLS interception](#tls-interception-and-the-boks-ca)
 | TLS interception for credential-bearing hosts only, local CA (`internal/ca`) | built, demonstrated end to end with a real client, two real HTTPS origins and certificate comparison |
 | Credential injection, encrypted host-side store (`internal/secret`) | built, unit-tested |
 | Network annotations and host-stack supervision (`internal/network`, `internal/enforce`) | built, unit-tested |
-| All of it applied to a running sandbox (`boks run`) | **done**, and exercised against a *simulated* guest only |
-| Any of it enforcing against a real guest | **never observed** — no hypervisor here |
+| All of it applied to a running sandbox (`boks run`) | **done** |
+| Policy enforced against a real guest **that uses the proxy** | **verified** 2026-08-12 |
+| Policy enforced against a real guest **that ignores the proxy** | **fails** — see below |
 
-**The proxy is not the enforcement boundary; the stack behind it is.** A forward proxy
-filters only traffic a client chooses to send it, so if `HTTP_PROXY` were all Boks did, a
-three-line program in the guest would walk past it. What `boks run` now builds is a host-side
-network stack terminating the guest's NIC, with the proxy listening *inside* that virtual
-network. A guest that ignores the proxy loses hostname rules, credential injection and
-readable refusals; it does not gain a route. **This has been tested against a simulated guest
-on the real link socket, and never against a real VM.**
+> [!CAUTION]
+> **In `-net nat`, network policy is advisory.** *(verified 2026-08-12, macOS host with a
+> hypervisor.)* A guest that unsets `http_proxy`/`https_proxy` reaches any destination it
+> likes, whatever the policy says. Measured, under `-policy locked -allow example.com`:
+> a direct `https://www.google.com/` returned **HTTP 200**, and a raw Python TLS handshake
+> to `1.1.1.1:443` completed against **the origin's own certificate** (`SSL.com SSL
+> Intermediate CA ECC R2`) — end to end with the real host, not with the proxy. Neither
+> attempt appears in `boks policy log`, because neither reached the policy engine.
+>
+> `-net none` is unaffected and remains a real boundary.
+
+**The proxy is not the enforcement boundary — and today nothing else is either.** A forward
+proxy filters only traffic a client chooses to send it, so if `HTTP_PROXY` is all Boks does,
+a three-line program in the guest walks past it. That is exactly what was measured. The
+host-side stack does terminate the guest's NIC and the proxy does listen inside that virtual
+network, so the *place* to enforce exists — but the stack is configured as a NAT that
+forwards what it is given. It consults no policy on the direct path, so a guest that ignores
+the proxy **does gain a route**.
+
+An earlier draft of this document claimed the opposite ("it does not gain a route"). That
+claim was written against a simulated guest and is false against a real one.
+
+What this means for the threat model: policy, hostname rules and credential injection are
+**cooperation features**, valuable against a well-behaved agent that honours its environment
+and useful for observability, and worth nothing against hostile code. Until the netstack
+itself drops unpermitted flows, the only postures that contain a hostile guest are `-net
+none` and the hypervisor boundary itself.
 
 Two properties of the listener are worth stating because they were design choices, not
 accidents:
@@ -139,8 +160,12 @@ displace TSI. With nerdbox's defaults the guest has `lo` only and a host service
 `127.0.0.1` answers it; with a virtio-net link to a host-side stack, the guest has `eth0`
 and the same probe is **refused** — the connection is handled by the guest's own loopback
 stack instead of being impersonated on the host. So there is now a point at which Boks can
-see and drop a flow. **No policy has yet been enforced against a real guest**; the transport
-is verified, the enforcement built on it is not.
+see and drop a flow.
+
+*(re-verified 2026-08-12 through `boks run` itself: a host `python3 -m http.server 9999
+--bind 127.0.0.1` was unreachable from the guest — `curl` returned rc=7 and a Python
+`connect()` raised `ConnectionRefusedError`. The host-loopback hole TSI left open is
+closed.)* **That point exists but is not yet used to drop anything**: see the caution above.
 
 Three things that verification changed, all of them reflected in the code:
 
