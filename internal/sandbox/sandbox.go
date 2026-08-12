@@ -38,6 +38,7 @@ import (
 	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
+	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/runtimecfg"
 	"github.com/dagsommer/boks/internal/workspace"
 )
@@ -112,6 +113,10 @@ type Config struct {
 	// configured this way — networking, for instance — so exposing them lets a
 	// capability be tried before Boks grows a first-class flag for it.
 	Annotations map[string]string
+	// Policy is how this sandbox's network policy was chosen, recorded on the container
+	// so that a later `boks start` or `boks exec` — neither of which has policy flags —
+	// serves the sandbox the containment it was created with rather than the default.
+	Policy *policy.SandboxPolicy
 	// TTY allocates a pseudo-terminal for the guest process.
 	TTY bool
 	// Ephemeral removes the sandbox, its task and its snapshot when the command exits.
@@ -372,10 +377,18 @@ func containerLabels(ctx context.Context, image client.Image, cfg Config) (map[s
 		return nil, err
 	}
 
+	policyJSON, err := encodePolicyLabel(cfg.Policy)
+	if err != nil {
+		return nil, err
+	}
+
 	labels := map[string]string{
 		LabelManaged:    "1",
 		LabelWorkspaces: workspacesJSON,
 		LabelCommand:    commandJSON,
+	}
+	if policyJSON != "" {
+		labels[LabelPolicy] = policyJSON
 	}
 	if cfg.Agent != "" {
 		labels[LabelAgent] = cfg.Agent

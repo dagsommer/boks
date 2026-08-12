@@ -40,13 +40,26 @@ func testSpec(t *testing.T, mode network.Mode) Spec {
 	if err != nil {
 		t.Fatalf("NewPlan: %v", err)
 	}
-	return Spec{
+	spec := Spec{
 		Sandbox:  "boks-test",
 		Plan:     plan,
-		Preset:   policy.PresetOpen,
 		StateDir: dir,
 		CADir:    filepath.Join(dir, "ca"),
 	}
+	setPolicy(t, &spec, policy.PresetOpen, nil, nil)
+	return spec
+}
+
+// setPolicy gives a spec the policy a run would have resolved for it. Specs carry a resolved
+// policy rather than the ingredients, so tests resolve one the same way the CLI does instead
+// of constructing rules by hand.
+func setPolicy(t *testing.T, spec *Spec, preset string, allow, deny []string) {
+	t.Helper()
+	res, err := (policy.Request{Preset: preset, Allow: allow, Deny: deny}).Resolve()
+	if err != nil {
+		t.Fatalf("resolving the test policy: %v", err)
+	}
+	spec.Resolution = &res
 }
 
 // TestTheSocketLandsWhereTheSupervisorLooks pins an invariant that spans two packages and
@@ -292,9 +305,7 @@ func TestProxyAnswersInsideTheVirtualNetwork(t *testing.T) {
 	originHost := strings.TrimPrefix(origin.URL, "http://")
 
 	spec := testSpec(t, network.ModeNAT)
-	spec.Preset = policy.PresetLocked
-	spec.Allow = []string{originHost}
-	spec.Deny = []string{"blocked.example.com"}
+	setPolicy(t, &spec, policy.PresetLocked, []string{originHost}, []string{"blocked.example.com"})
 	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
 
 	session, err := Open(context.Background(), spec, io.Discard)
@@ -561,8 +572,7 @@ const deniedDestination = "203.0.113.7:443"
 // a real VM being refused; nobody has seen that. See docs/verification.md.
 func TestRawFlowToADeniedAddressIsRefusedAndLogged(t *testing.T) {
 	spec := testSpec(t, network.ModeNAT)
-	spec.Preset = policy.PresetLocked // deny by default
-	spec.Deny = []string{"203.0.113.9:443"}
+	setPolicy(t, &spec, policy.PresetLocked, nil, []string{"203.0.113.9:443"}) // deny by default
 	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
 
 	session, err := Open(context.Background(), spec, io.Discard)
@@ -629,8 +639,7 @@ func TestRawFlowToAnAllowedAddressIsCarriedAndLogged(t *testing.T) {
 	defer origin.Close()
 
 	spec := testSpec(t, network.ModeNAT)
-	spec.Preset = policy.PresetLocked
-	spec.Allow = []string{originHost}
+	setPolicy(t, &spec, policy.PresetLocked, []string{originHost}, nil)
 	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
 
 	session, err := Open(context.Background(), spec, io.Discard)
@@ -680,8 +689,7 @@ func TestRawFlowToAnAllowedAddressIsCarriedAndLogged(t *testing.T) {
 // question, and `-allow 169.254.169.254` must not buy it.
 func TestTheMetadataEndpointIsRefusedEvenWhenAllowed(t *testing.T) {
 	spec := testSpec(t, network.ModeNAT)
-	spec.Preset = policy.PresetLocked
-	spec.Allow = []string{"169.254.169.254:80"}
+	setPolicy(t, &spec, policy.PresetLocked, []string{"169.254.169.254:80"}, nil)
 	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
 
 	session, err := Open(context.Background(), spec, io.Discard)
@@ -718,8 +726,7 @@ func TestCloseTearsDownAFlowInProgress(t *testing.T) {
 	before := boksGoroutines(t)
 
 	spec := testSpec(t, network.ModeNAT)
-	spec.Preset = policy.PresetLocked
-	spec.Allow = []string{originHost}
+	setPolicy(t, &spec, policy.PresetLocked, []string{originHost}, nil)
 
 	session, err := Open(context.Background(), spec, io.Discard)
 	if err != nil {
@@ -779,8 +786,7 @@ func TestTheGuestCannotAddressTheHostsLoopback(t *testing.T) {
 	originHost := strings.TrimPrefix(origin.URL, "http://")
 
 	spec := testSpec(t, network.ModeNAT)
-	spec.Preset = policy.PresetLocked
-	spec.Allow = []string{originHost} // deliberately permitted, and still unreachable
+	setPolicy(t, &spec, policy.PresetLocked, []string{originHost}, nil) // deliberately permitted, and still unreachable
 	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
 
 	session, err := Open(context.Background(), spec, io.Discard)
