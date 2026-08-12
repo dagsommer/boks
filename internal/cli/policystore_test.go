@@ -351,6 +351,102 @@ func TestPolicyRejectsAmbiguousScope(t *testing.T) {
 	}
 }
 
+// TestRecordedPolicyIsWhatARestartServes is the CLI half of the restart fix: a command with
+// no policy flags — which is what `boks start` and `boks exec` are — must resolve the policy
+// the sandbox recorded, not the default preset.
+func TestRecordedPolicyIsWhatARestartServes(t *testing.T) {
+	policyState(t)
+	mustPolicy(t, "allow", "-sandbox", "web", "stored.test:443")
+
+	record := &policy.SandboxPolicy{
+		V:      policy.SandboxPolicyVersion,
+		Preset: policy.PresetLocked,
+		Allow:  []string{"allowed.test:443"},
+		Deny:   []string{"blocked.test"},
+	}
+
+	var noFlags policyFlags
+	res, err := noFlags.resolution("web", record)
+	if err != nil {
+		t.Fatalf("resolution: %v", err)
+	}
+	pol, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		destination string
+		allowed     bool
+	}{
+		{"allowed.test:443", true},  // the sandbox's own -allow, remembered
+		{"stored.test:443", true},   // a rule added to the store after it was created
+		{"blocked.test:443", false}, // its own -deny, remembered
+		{"github.com:443", false},   // in the default preset, and so the tell-tale of a fallback
+	} {
+		target, err := policy.ParseTarget(tc.destination, 443)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v := pol.Evaluate(target); v.Allowed != tc.allowed {
+			t.Errorf("%s allowed=%v, want %v (%s)", tc.destination, v.Allowed, tc.allowed, v.Reason)
+		}
+	}
+}
+
+// TestPerRunFlagsOverrideARecordWithoutLoosening pins the merge rule: a flag replaces the
+// posture and the allow list, and adds to the denies. A run cannot drop a prohibition the
+// sandbox was created with by typing a different one.
+func TestPerRunFlagsOverrideARecordWithoutLoosening(t *testing.T) {
+	policyState(t)
+	record := &policy.SandboxPolicy{
+		V:      policy.SandboxPolicyVersion,
+		Preset: policy.PresetLocked,
+		Allow:  []string{"recorded.test:443"},
+		Deny:   []string{"blocked.test"},
+	}
+	flags := policyFlags{
+		allow: stringList{"oneoff.test:443"},
+		deny:  stringList{"blocked.test", "alsoblocked.test"},
+	}
+	res, err := flags.resolution("web", record)
+	if err != nil {
+		t.Fatalf("resolution: %v", err)
+	}
+	pol, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		destination string
+		allowed     bool
+	}{
+		{"oneoff.test:443", true},       // the flag's allow applies
+		{"recorded.test:443", false},    // and replaces the recorded one
+		{"blocked.test:443", false},     // the recorded deny survives
+		{"alsoblocked.test:443", false}, // and the flag's deny is added
+	} {
+		target, err := policy.ParseTarget(tc.destination, 443)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v := pol.Evaluate(target); v.Allowed != tc.allowed {
+			t.Errorf("%s allowed=%v, want %v (%s)", tc.destination, v.Allowed, tc.allowed, v.Reason)
+		}
+	}
+
+	// A deny that appears in both the record and the flags is one rule, not two: a policy
+	// that lists the same prohibition twice cannot be checked against what was written.
+	blocked := 0
+	for _, r := range res.Rules {
+		if r.Action == policy.Deny && r.Spec == "blocked.test" {
+			blocked++
+		}
+	}
+	if blocked != 1 {
+		t.Errorf("the same deny appears %d times in the resolved policy", blocked)
+	}
+}
+
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return s[:i]
