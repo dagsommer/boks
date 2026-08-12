@@ -75,20 +75,16 @@ A full boot, command and teardown takes **~0.23 s**.
 
 ### Not yet verified behind that boundary
 
-The persistent sandbox lifecycle — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`,
-`cp`, and re-attaching to a workspace's sandbox — was built and tested against a real
-containerd on a host with **no hypervisor**, using the runc dev runtime
+The persistent sandbox lifecycle was built and tested against a real containerd on a host
+with **no hypervisor**, using the runc dev runtime
 (`-runtime io.containerd.runc.v2 -snapshotter native -i-know-this-is-not-isolated`). That
-proves the containerd orchestration and that files written in a sandbox survive stop/start
-over the same snapshot. It proves nothing about the VM boundary.
+proved the containerd orchestration and nothing about the VM boundary.
 
-What still needs a capable host to confirm:
+`stop`, `start`, `exec`, `rm` and snapshot persistence have since been confirmed behind a
+real hypervisor — see *Lifecycle behind a real VM* below. What still needs confirming:
 
-- that `stop` tears the microVM down and `start` boots a *new* VM over the same writable
-  snapshot, with in-guest state intact (check `boot_id` and uptime differ across the stop);
 - that an `exec`'d process runs inside the *same* VM as the sandbox's own process (compare
   `boot_id`, and check the exec'd process sees the sandbox's PID namespace);
-- that `rm` leaves no VM, shim, snapshot or mount behind;
 - that `cp` works when the guest is reached through vsock rather than a local FIFO.
 
 Run the suite unmodified — it defaults to the isolating runtime:
@@ -109,36 +105,106 @@ succeed, raw TCP connects, ICMP fails (`Network unreachable`), and a host servic
 `boks run` now wires every sandbox it creates to a host-side stack instead, which is what the
 next section is for: that wiring has never been watched from inside a real guest.
 
-## Confirming the network enforcement, on a host with a hypervisor
+## The network enforcement, answered on a host with a hypervisor
 
-Everything below is **unverified**. The datapath was built and tested on a machine with no
-hypervisor, against a simulated guest attached to the real link socket
-(`internal/network/vnettest`): real Ethernet frames, ARP, a TCP handshake and HTTP through
-the proxy, with an allowed host fetched and a denied one refused. That exercises the host
-side and says nothing about libkrun's virtio-net device, nerdbox's annotations, or how a real
-guest behaves.
+**Run 2026-08-12**, macOS 26.5.2 / Apple M5 Pro, containerd 2.3.3, nerdbox `cd2c23f`,
+libkrun 1.19.4, against `io.containerd.nerdbox.v1` and the published
+`ghcr.io/dagsommer/boks/base:0.1.0`. Eleven of the twelve checks pass. **Check 6 fails**,
+and it is the one that decides whether any of this is a boundary.
 
-These are the checks that would settle it, in the order they build on each other. Run them
-with the isolating runtime — the runc dev runtime ignores the nerdbox annotations entirely,
-so a pass there means only that the *spec* is right.
+> [!CAUTION]
+> **Check 6 failed: policy in `-net nat` is advisory.** A guest that unsets the proxy
+> variables reaches denied destinations. Under `-policy locked -allow example.com`:
+>
+> ```
+> === denied host, unsetting ALL FOUR proxy vars ===
+>   http=200
+> === raw TCP to denied 1.1.1.1:443, real TLS handshake via python ===
+>   TLS to 1.1.1.1 SUCCEEDED, peer cert issuer: {'countryName': 'US', ...,
+>     'commonName': 'SSL.com SSL Intermediate CA ECC R2'}
+> ```
+>
+> The certificate is the origin's own, so this is a real end-to-end connection, not the
+> proxy. Neither attempt appears in `boks policy log`: they never reached the policy engine.
 
-| # | Question | How to answer it | What a pass looks like |
+**A trap worth recording, because it manufactures a false pass.** The guest's proxy
+variables are **lowercase** (`http_proxy`, `https_proxy`), while the CLI banner says
+`HTTP_PROXY and HTTPS_PROXY`. A probe that unsets only the uppercase pair still goes through
+the proxy and is correctly refused — which reads exactly like enforcement working. Several
+runs during this session looked like passes for that reason. **Unset all four**, and prefer
+a raw socket over `curl` for the decisive check.
+
+The base image also carries no `wget`, `nslookup` or `nc`, and its `/bin/sh` is dash, so
+`/dev/tcp` is unavailable there. A `wget`-based probe fails with `command not found`, which
+also reads as a pass. Use `curl`, `python3`, and `bash -c` when `/dev/tcp` is wanted.
+
+| # | Question | Result | Observed |
 |---|---|---|---|
-| 1 | Does the guest get the NIC Boks asked for? | `boks run shell . -- sh -c 'ls /sys/class/net; ip -4 addr show eth0'` | `eth0` exists with `192.168.127.2/24` — the address from the container annotation, not DHCP |
-| 2 | Is the host's loopback gone? | run a host service on `127.0.0.1:9999`, then probe it from the guest | connection refused, where TSI answered |
-| 3 | Does the guest reach the proxy? | `boks run shell . -- sh -c 'echo > /dev/tcp/192.168.127.1/3128'` | connects; the stack's log shows the flow |
-| 4 | Is an allowed host allowed? | `boks run -allow example.com:443 shell . -- curl -sSI https://example.com` | `200`, and an `allow` line in `boks policy log` for that sandbox |
-| 5 | Is a denied host denied? | the same `curl` for a host no rule permits | `403` from the proxy with the reason, and a `deny` line in the log |
-| 6 | **Is a guest that ignores `HTTP_PROXY` still contained?** | in the guest, `env -u HTTP_PROXY -u http_proxy curl -sS https://example.com`, and a raw TCP connect to a public address | it fails: the stack NATs nothing, so there is no route out except through the proxy. **This is the single most important check** — it is the difference between an enforcement boundary and a suggestion |
-| 7 | Is DNS mediated? | `cat /etc/resolv.conf` in the guest | `nameserver 192.168.127.1`, not a copy of the host's file |
-| 8 | Does `-net none` mean none? | `boks run -net none shell . -- sh -c 'ls /sys/class/net; curl -sS https://example.com'` | `lo` only, and nothing reachable |
-| 9 | Is the CA usable inside the guest? | with an `-inject` rule: `curl` the intercepted host from the guest | the certificate is Boks-issued, and the origin receives the real credential while the guest held only the placeholder |
-| 10 | Does the network survive the command that started it? | `boks run -d`, then `boks exec <name> curl …` from a fresh shell | it still works; `boks net ls` shows the same PID |
-| 11 | **Does a running VM re-attach to a restarted stack?** | `boks net stop <name>`, then `boks exec <name> true` to start a fresh one, then probe from the guest | unknown, and it decides how gracefully a crashed supervisor recovers. If the guest cannot get its network back, the honest fix is a restart, and Boks should say so rather than appear to have repaired it |
-| 12 | Does teardown reach the VM? | `boks stop <name>`; then `boks ls`, `ps` for `boks net serve`, and the state directory | no supervisor, no socket, no directory |
+| 1 | Does the guest get the NIC Boks asked for? | **pass** | `eth0` and `lo` in `/sys/class/net`; a ninth virtio device, id `1` (`VIRTIO_ID_NET`), appears only when the annotations are set |
+| 2 | Is the host's loopback gone? | **pass** | host `python3 -m http.server 9999 --bind 127.0.0.1` unreachable: `curl` rc=7, Python `ConnectionRefusedError`. TSI answered this probe; the stack refuses it |
+| 3 | Does the guest reach the proxy? | **pass** | `http_proxy=http://192.168.127.1:3128` is reachable and serves every proxied request below |
+| 4 | Is an allowed host allowed? | **pass** | `https://example.com` → `200`, logged `allowed by rule "example.com"` |
+| 5 | Is a denied host denied? | **pass** | `https://www.google.com` through the proxy → curl rc=56; plain HTTP → `403`; logged `denied by default (policy "locked+local" allows only listed destinations)` |
+| 6 | **Is a guest that ignores the proxy still contained?** | **FAIL** | with all four proxy variables unset, the denied host returns `200`, and a raw Python TLS handshake to `1.1.1.1:443` completes against the origin's own certificate. Nothing reaches the policy engine |
+| 7 | Is DNS mediated? | **pass** | `nameserver 192.168.127.1` in the guest, not a copy of the host's file. Note it resolves denied names too — mediated, not filtered |
+| 8 | Does `-net none` mean none? | **pass** | `lo` only; `curl` → `000`, raw socket → `OSError`. The one posture that contains a hostile guest today |
+| 9 | Is the CA usable inside the guest? | **pass** | see *Credential injection* below |
+| 10 | Does the network survive the command that started it? | **pass** | `boks run -d` then `boks exec` from a fresh shell works; `boks net ls` shows the same PID |
+| 11 | **Does a running VM re-attach to a restarted stack?** | **no** | `kill -9` on the supervisor is detected (`no sandbox network stacks are running`), and a later command starts a fresh one on the same socket — but the running guest never re-attaches: `curl` rc=7, raw socket `OSError`. The VM keeps running; only its network is gone. **A crashed supervisor costs that sandbox its network until the sandbox is restarted** |
+| 12 | Does teardown reach the VM? | **pass** | after `rm -f`: no container, no task, no `boks net serve` process, empty state directory |
 
-Check 6 is the one that decides whether any of this is a boundary. Checks 11 and 12 decide
-whether the per-sandbox supervisor is the right shape or whether it needs a repair path.
+Check 6 is the one that decides whether any of this is a boundary, and it failed: in
+`-net nat` the policy is a cooperation feature, not containment. Checks 11 and 12 answered
+the supervisor question — teardown is clean, and there is no repair path, so a crashed
+supervisor is a restart.
+
+### Credential injection, verified inside a real guest
+
+*(2026-08-12.)* The property that matters is that the secret never enters the VM, and it
+holds. With the secret `REAL-SECRET-VALUE-12345` stored host-side and
+
+```
+-inject 'demo@postman-echo.com=x-api-key' -guest-credential 'demo=DEMO_KEY=placeholder-not-the-secret'
+```
+
+the guest printed `placeholder-not-the-secret`, a grep of the guest's whole environment for
+the real value returned `0`, and the origin received:
+
+```
+{"headers":{"host":"postman-echo.com", ... ,"x-api-key":"REAL-SECRET-VALUE-12345", ...}}
+```
+
+Interception is scoped to hosts that have a credential rule, confirmed by comparing issuers
+through the proxy in one guest:
+
+| Host | Credential rule | Certificate issuer seen by the guest |
+|---|---|---|
+| `postman-echo.com` | yes | `O=Boks, CN=Boks local CA (CFP2C7WKW7)` |
+| `example.com` | no | `C=US, O=SSL Corporation, CN=Cloudflare TLS Issuing ECC CA 3` |
+
+`boks policy log` recorded `forward` for the intercepted host and `forward-bypass` for the
+other, as designed.
+
+Note the spelling: the attachment is `header-name[:format]`, so `x-api-key` is right and
+`header:x-api-key:%s` sets a header literally named `header`. The flag help reads
+`bearer|basic[:user]|header[:format]`, where `header` is a placeholder for the name — easy
+to misread as a keyword.
+
+### Lifecycle behind a real VM
+
+*(2026-08-12.)* Verified with the isolating runtime, replacing the runc-based results below:
+
+- **`stop` then `start` preserves the writable snapshot**: a file written to `~` before the
+  stop read back as `persisted` after the start.
+- **`start` boots a new VM, it does not resume one.** `boot_id` changed across the stop
+  (`45be14e1-…` → `82408573-…`) and guest uptime was `2s`. In-guest state survives because
+  the snapshot does, not because the VM does.
+- **`rm -f` leaves nothing**: no container, no task, no shim, no supervisor, empty state
+  directory.
+- **Ctrl-C cleans up but reports badly.** SIGINT to a running `boks run` leaves nothing
+  behind, but exits **1** and prints
+  `boks: sandbox process failed: rpc error: code = Canceled desc = context canceled`
+  rather than exiting 130 silently.
 
 ## TLS interception, verified on the host
 

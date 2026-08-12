@@ -8,10 +8,12 @@ account, no cloud service, no telemetry.
 
 > [!WARNING]
 > **Boks is experimental and incomplete.** The VM boundary is real and has been measured
-> (see [Status](#status)). Network policy is now applied to a running sandbox — the guest's
-> NIC is terminated by a host-side stack that drops what no rule permits — but **that has
-> never been demonstrated against a real guest**, because it was built on a machine with no
-> hypervisor. Treat it as designed and tested, not proven. Do not rely on Boks to contain
+> (see [Status](#status)). **Network policy is not.** Tested against a real guest on
+> 2026-08-12, a sandbox that unsets `http_proxy`/`https_proxy` reaches any destination it
+> likes — a denied host returned HTTP 200 and a raw TLS handshake to a denied address
+> completed against the origin's own certificate. In `-net nat` the policy filters only
+> traffic the guest chooses to send to the proxy, so treat it as a cooperation feature, not
+> containment. `-net none` is a real boundary. Do not rely on Boks to contain
 > hostile code today.
 
 ## Status
@@ -35,12 +37,14 @@ What works, tested locally:
   `droid`, `gemini`, `opencode` and `shell` each resolve to an image at
   `ghcr.io/dagsommer/boks/`, built from [`images/`](images/): a shared Debian base with the
   toolchain preinstalled, plus one thin layer per agent. `kiro` is registered without an
-  image and needs an explicit `-template`. Every CLI has been run; none has yet been run
-  inside a microVM. See [images/README.md](images/README.md), including why nothing in them
-  is installed by a package manager.
+  image and needs an explicit `-template`. Published to GHCR and public. The base image has
+  since run inside a microVM; the agent CLIs on top of it have not. See
+  [images/README.md](images/README.md), including why nothing in them is installed by a
+  package manager.
 - **The sandbox lifecycle** — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`, `cp`.
-  Sandboxes persist until removed, and files written inside one survive stop/start. *Tested
-  end to end against containerd on the non-VM dev runtime only* — see below.
+  Sandboxes persist until removed, and files written inside one survive stop/start —
+  confirmed behind a real microVM, where `start` boots a *new* VM (the `boot_id` changes)
+  over the same writable snapshot.
 - **Exact-path workspace sharing** — the workspace appears inside the guest at its absolute
   host path, writes reach the host, `:ro` is honoured, and directories above the workspace
   are not exposed.
@@ -52,12 +56,15 @@ What works, tested locally:
 
 - **Network policy is applied to a sandbox.** `boks run` gives the sandbox a virtual NIC
   whose far end is a userspace network stack in a Boks process, and points the guest at a
-  filtering proxy *inside* that virtual network. Destinations no rule permits have nothing
-  to answer them; `-net none` gives a sandbox no network at all. The stack lives in a small
-  per-sandbox process so that it lasts as long as the sandbox's VM rather than as long as
-  your command — a build running in a sandbox does not lose the network when you press
-  Ctrl-C. `boks net ls` shows them, `boks stop` takes them down.
-  **Not demonstrated against a real guest:** see the warning above.
+  filtering proxy *inside* that virtual network. Verified against a real guest: an allowed
+  host is fetched, a denied one is refused with a reason, DNS is mediated, and the host's
+  own loopback services — which the old TSI transport exposed — are now unreachable.
+  `-net none` gives a sandbox no network at all, and is the one posture that holds against
+  a guest that does not cooperate. The stack lives in a small per-sandbox process so that it
+  lasts as long as the sandbox's VM rather than as long as your command — a build running in
+  a sandbox does not lose the network when you press Ctrl-C. `boks net ls` shows them,
+  `boks stop` takes them down.
+  **A guest that ignores the proxy escapes the policy entirely:** see the warning above.
 - **Credential injection in a sandbox**, over HTTP and HTTPS. The guest holds a placeholder
   in the environment variable its tooling reads; the real secret stays on the host and is
   attached to requests for the hosts you named. Those hosts — and only those — have their
@@ -65,23 +72,24 @@ What works, tested locally:
 
 What is **not** done:
 
-- **None of the enforcement has met a real guest.** Everything above is exercised against a
-  simulated guest attached to the real link socket, on a host with no hypervisor. The
-  transport it rests on *was* verified on real hardware; the enforcement built on it was
-  not.
+- **The policy is not enforced on the datapath.** It is applied by the proxy, so it binds a
+  guest that uses the proxy and nothing else. The host-side stack that terminates the
+  guest's NIC is the place to enforce it, and it currently forwards rather than filters.
+  Until that changes, hostname rules and credential injection are cooperation features.
+  Measured against a real guest — see
+  [docs/verification.md](docs/verification.md#the-network-enforcement-answered-on-a-host-with-a-hypervisor).
 - **No nested Docker**, no kits, no port publishing.
-- **The agent images have never run in a microVM.** They were built and exercised with
-  `docker run`, which proves each CLI is installed and starts — and nothing at all about
-  isolation. `kiro` has no image (see [images/README.md](images/README.md) for why), and
-  there is still no way to define an agent in a file rather than in code.
-- **The images are not published until a release tag is pushed.** Until then the references
-  in the agent registry resolve to nothing; build them locally with `make images`.
+- **Only the base image has run in a microVM.** The agent layers were exercised with
+  `docker run`, which proves each CLI is installed and starts — and nothing about isolation.
+  `kiro` has no image (see [images/README.md](images/README.md) for why), and there is still
+  no way to define an agent in a file rather than in code.
 - **No terminal dashboard** for bare `boks`, no `--clone`, `--kit`, `--profile` or
   `--publish`. See the CLI surface section of the parity matrix.
-- **The lifecycle commands have not been exercised behind a VM.** They were built and tested
-  against a real containerd on a host with no hypervisor, using the runc dev runtime. The
-  containerd orchestration is verified; the VM-specific behaviour of `stop`/`start` (a
-  microVM being torn down and rebooted over the same snapshot) is not.
+- **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather
+  than exiting 130 silently.
+- **A crashed network supervisor is unrecoverable without a restart.** The running VM does
+  not re-attach to a fresh stack on the same socket, so the sandbox keeps running with no
+  network at all.
 - **Linux is untested in practice.** The boundary was verified on macOS/Apple silicon;
   the Linux/KVM path is designed for but has not been exercised end to end.
 
@@ -216,9 +224,10 @@ Two things to understand before using Boks:
 - **Workspace writes are live on your host.** A sandbox can modify `Makefile`,
   `package.json` scripts, Git hooks or CI config, which then run on *your* machine. Review
   diffs before running anything from a workspace a sandbox touched.
-- **The network enforcement has never met a real guest.** A sandbox is wired to a host-side
-  stack that drops what policy forbids, and that path is tested — against a simulated guest,
-  on a machine with no hypervisor. Nobody has yet watched a real VM be refused.
+- **A guest that ignores the proxy is not policed at all.** Measured against a real VM on
+  2026-08-12: with `http_proxy`/`https_proxy` unset, a denied host answered normally and a
+  raw TLS handshake to a denied address reached the real origin. The policy binds cooperating
+  clients only. `-net none` is the posture that does not.
 - **Hosts you configure a credential for are decrypted by Boks**, by design, and `boks run`
   tells you which. Everything else is tunnelled with the origin's own certificate chain.
 
@@ -241,8 +250,8 @@ public documentation using open-source components; it is not derived from Docker
 | agent-first CLI, readable sandbox names | yes | **yes** — same grammar, same naming rule |
 | prepared agent images | yes, ten of them | **nine of ten**, multi-arch on a shared base; `kiro` needs `-template` |
 | terminal dashboard for bare `sbx` | yes | no — see the parity matrix |
-| network policy enforced outside the guest | yes | **yes** — host-side netstack per sandbox; never seen a real guest |
-| credential injection by host proxy | yes | **yes**, HTTP and HTTPS; same caveat |
+| network policy enforced outside the guest | yes | **no** — the proxy applies it; a guest that ignores the proxy is unfiltered |
+| credential injection by host proxy | yes | **yes**, HTTP and HTTPS, verified inside a real guest |
 | Docker daemon inside the sandbox | yes | planned |
 | kits / declarative config | yes | planned |
 | account required | yes | **never** |
@@ -257,11 +266,12 @@ Feature-by-feature detail with priorities:
 Ordered by what unblocks the most. The VM boundary is done and the network datapath is
 wired — what matters now is watching it work against a real guest.
 
-1. **Confirm the enforcement against a real hypervisor.** Does the guest reach the gateway,
-   is a denied host refused, does a running VM re-attach if its stack is restarted? See
-   [docs/verification.md](docs/verification.md)
-2. Confirm the lifecycle against a real hypervisor — it has so far only been exercised
-   without one, so stop/start over a live microVM is unverified
+1. **Enforce the policy on the datapath, not just in the proxy.** The host-side stack sees
+   every packet and currently forwards them all; a guest that unsets the proxy variables
+   walks straight out. This is the gap between Boks and its own security claims — see
+   [docs/verification.md](docs/verification.md#the-network-enforcement-answered-on-a-host-with-a-hypervisor)
+2. A repair path for a crashed network supervisor: the VM does not re-attach to a restarted
+   stack, so today the sandbox loses its network until it is restarted
 3. The interactive dashboard that bare `boks` should open
 4. Clone mode, so guest writes do not land on the host by default
 5. Docker daemon inside the guest
