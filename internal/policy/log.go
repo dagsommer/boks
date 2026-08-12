@@ -119,6 +119,17 @@ func ResourceOf(t Target) string {
 	return fmt.Sprintf("net:%s:%s:%d", kind, t.Host, t.Port)
 }
 
+// NoRuleFor is what the decision log records when nothing matched: the same structured
+// action/resource vocabulary a matching rule is reported in, rather than an empty field the
+// reader has to interpret.
+//
+// It is exported because `boks policy check` has to say exactly what the log would say. The
+// value of that command is being the same answer the engine gives, and two spellings of "no
+// rule matched" would be two answers.
+func NoRuleFor(t Target) string {
+	return fmt.Sprintf("no applicable policies for op(action=%s, resource=%s)", ActionConnectTCP, ResourceOf(t))
+}
+
 func (d Decision) String() string {
 	verb := "DENY "
 	if d.Allowed {
@@ -458,10 +469,7 @@ func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode) Decision {
 	resource := ResourceOf(t)
 	rule := v.Rule
 	if rule == "" {
-		// Say that nothing matched, in the same structured terms a matching rule would
-		// be reported in, rather than leaving the field empty and making the reader
-		// infer it.
-		rule = fmt.Sprintf("no applicable policies for op(action=%s, resource=%s)", ActionConnectTCP, resource)
+		rule = NoRuleFor(t)
 	}
 	d := Decision{
 		Time:     e.now(),
