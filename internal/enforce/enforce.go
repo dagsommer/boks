@@ -341,9 +341,6 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 		return nil, err
 	}
 	n.SetLogger(logger)
-	if err := n.Start(ctx); err != nil {
-		return nil, err
-	}
 	s := &Session{spec: spec, net: n}
 
 	if spec.Plan.Mode == network.ModeNone {
@@ -351,10 +348,27 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 		// nothing else does. No stack, no proxy, no listener, no policy to evaluate —
 		// the containment is the absent wiring, not a decision anything takes at
 		// runtime.
+		if err := n.Start(ctx); err != nil {
+			return nil, err
+		}
 		return s, nil
 	}
 
-	if err := s.startProxy(spec, logger); err != nil {
+	// The engine is built before the stack, not with the proxy, because the stack is the
+	// enforcement point: it judges every connection the guest opens, cooperating or not.
+	// One engine and one decision log serve both, so a flow that the stack allowed and the
+	// proxy later refused appears twice in one log rather than in two that disagree.
+	engine, err := s.newEngine(spec)
+	if err != nil {
+		return nil, err
+	}
+	n.SetPolicy(engine)
+	if err := n.Start(ctx); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+
+	if err := s.startProxy(spec, engine, logger); err != nil {
 		// Undo the stack: a half-open session would leave a socket behind and a guest
 		// with a link to nothing.
 		_ = s.Close()
@@ -363,11 +377,25 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 	return s, nil
 }
 
-func (s *Session) startProxy(spec Spec, logger io.Writer) error {
+// newEngine resolves the policy and opens the decision log both enforcement points share.
+func (s *Session) newEngine(spec Spec) (*policy.Engine, error) {
 	pol, err := spec.Policy()
 	if err != nil {
-		return err
+		return nil, err
 	}
+	decisions := policy.NewLog(policy.DefaultCapacity)
+	if spec.LogPath != "" {
+		sink, err := policy.NewFileSink(spec.LogPath)
+		if err != nil {
+			return nil, err
+		}
+		s.sink = sink
+		decisions.AddSink(sink)
+	}
+	return policy.NewEngine(pol, decisions).WithSandbox(spec.Sandbox), nil
+}
+
+func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer) error {
 	credentials, err := spec.Credentials()
 	if err != nil {
 		return err
@@ -392,18 +420,8 @@ func (s *Session) startProxy(spec Spec, logger io.Writer) error {
 		}
 	}
 
-	decisions := policy.NewLog(policy.DefaultCapacity)
-	if spec.LogPath != "" {
-		sink, err := policy.NewFileSink(spec.LogPath)
-		if err != nil {
-			return err
-		}
-		s.sink = sink
-		decisions.AddSink(sink)
-	}
-
 	srv, err := proxy.New(proxy.Config{
-		Engine:   policy.NewEngine(pol, decisions).WithSandbox(spec.Sandbox),
+		Engine:   engine,
 		Injector: injector,
 		CA:       authority,
 		ErrorLog: log.New(orDiscard(logger), "boks net "+spec.Sandbox+": ", log.LstdFlags),

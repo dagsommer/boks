@@ -7,13 +7,23 @@
 //
 // # What this package is not
 //
-// A policy engine is not an enforcement boundary on its own. Today the only thing that
-// consults it is the host forward proxy (internal/proxy), and a guest reaches that proxy
-// only if it chooses to — Boks' current VM runtime uses libkrun's TSI, which performs the
-// guest's connections on the host with no point at which Boks can drop a flow. **An
-// environment variable is not a security boundary.** Until the guest's traffic is
-// terminated by a host-side network stack, treat every decision here as advisory: it
-// describes what a cooperating client is permitted to do.
+// A policy engine is not an enforcement boundary on its own; it is the thing an
+// enforcement point asks. Two ask it, and the difference is worth keeping straight:
+//
+//   - the host-side network stack (internal/network) judges every TCP connection the guest
+//     opens, before it dials it, from the address and port in the SYN. That decision holds
+//     whether or not the guest cooperates, and is logged with mode "transparent".
+//   - the forward proxy (internal/proxy) judges what a cooperating client sends it, where
+//     there is a hostname to judge and a readable refusal to return.
+//
+// **An environment variable is still not a security boundary**, and the proxy is still
+// reachable only by a client that chooses it. What changed is that ignoring the proxy no
+// longer means escaping the policy: it means being judged on addresses instead of names.
+//
+// One caveat that no amount of stack-level enforcement removes: a hostname rule cannot be
+// applied to a raw flow, because a SYN carries no name. A policy written entirely in
+// hostnames therefore denies raw flows by default rather than permitting the addresses
+// those names resolve to.
 //
 // # Evaluation order
 //
