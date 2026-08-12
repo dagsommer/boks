@@ -179,10 +179,20 @@ func platformCheck() Check {
 					}
 				}
 				return Result{Status: StatusOK, Detail: detail}
+			case "windows":
+				// Not "blocked on runtime support": the runtime half exists. See
+				// virt_windows.go and docs/windows.md for what actually blocks it.
+				return Result{
+					Status: StatusFail, Detail: detail,
+					Remedy: "Boks does not run sandboxes on Windows. A Linux VM can be booted there\n" +
+						"through containerd and the runhcs shim, but the guest's network cannot be\n" +
+						"terminated by a host process, so no policy could be enforced on it.\n" +
+						"See docs/windows.md.",
+				}
 			default:
 				return Result{
 					Status: StatusFail, Detail: detail,
-					Remedy: "Boks supports Linux today and macOS next. Windows is blocked on runtime support.",
+					Remedy: "Boks supports Linux today and macOS next.",
 				}
 			}
 		},
