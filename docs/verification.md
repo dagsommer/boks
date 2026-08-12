@@ -478,20 +478,27 @@ Driven through the real CLI — `boks net serve` holding the stack, `boks policy
 the decisions — under `-policy locked` with one allowed destination:
 
 ```
-raw TCP to 172.17.0.9:8099: CONNECTED after 1.001s
-raw TCP to 1.1.1.1:443:     FAILED: connect tcp 1.1.1.1:443: connection was refused
-raw TCP to 203.0.113.7:443: FAILED: connect tcp 203.0.113.7:443: connection was refused
+raw TCP to 172.17.0.9:8099:     CONNECTED after 1.006s
+raw TCP to 1.1.1.1:443:         FAILED: connect tcp 1.1.1.1:443: connection was refused
+raw TCP to 169.254.169.254:80:  FAILED: connect tcp 169.254.169.254:80: connection was refused
 
+$ boks policy log
 Blocked requests:
-  SANDBOX  TYPE     HOST             PROXY        REASON
-  rawdemo  network  203.0.113.7:443  transparent  denied by default (policy "locked+local" …)
-  rawdemo  network  1.1.1.1:443      transparent  denied by default (policy "locked+local" …)
+  SANDBOX  TYPE     HOST         PROXY        REASON
+  rawdemo  network  1.1.1.1:443  transparent  denied by default (policy "locked+local" …)
 
 Allowed requests:
   SANDBOX  TYPE     HOST             PROXY        REASON
   rawdemo  network  172.17.0.9:8099  transparent  allowed by rule "172.17.0.9:8099"
+
+$ cat …/net/rawdemo/stack.log
+network: dropped tcp to link-local 169.254.169.254:80, which includes the instance metadata endpoint
 ```
 
-No proxy was configured in that guest at all. This is the same shape of probe that returned
-`http=200` on the Mac — and it is *not* evidence about a VM, because nothing here crossed a
-hypervisor.
+No proxy was configured in that guest at all. Three things to read out of it: a denied
+address is refused *and recorded*, an allowed one is carried and recorded, and the metadata
+endpoint is refused before the policy is consulted — which is why it appears in the stack's
+own log rather than as a decision.
+
+This is the same shape of probe that returned `http=200` on the Mac — and it is *not*
+evidence about a VM, because nothing here crossed a hypervisor.
