@@ -167,6 +167,35 @@ func validHostname(h string) error {
 	return nil
 }
 
+// ProbeTarget builds the destination a rule specification names, for the callers that want
+// to ask the engine what a rule they just typed would actually do.
+//
+// It reports false for a pattern that names a set rather than a place — a wildcard or a CIDR
+// prefix — because there is no single destination to ask about, and inventing one would
+// produce an answer about a host the user never mentioned. The port defaults to 443 when the
+// spec names none, which is the port every check that matters is about.
+func ProbeTarget(spec string) (Target, bool) {
+	host, port, err := splitHostPort(spec)
+	if err != nil || strings.Contains(host, "*") || strings.Contains(host, "/") {
+		return Target{}, false
+	}
+	p := 443
+	if port != "" {
+		// A port set ("80,443", "8000-8100") has no single member to probe with; only a
+		// plain port does.
+		n, err := strconv.Atoi(port)
+		if err != nil {
+			return Target{}, false
+		}
+		p = n
+	}
+	t, err := NewTarget(host, p)
+	if err != nil {
+		return Target{}, false
+	}
+	return t, true
+}
+
 // TargetFromAddr builds a Target for an already-resolved address, used when a decision
 // must be re-checked against the address a name resolved to.
 func TargetFromAddr(ap netip.AddrPort) Target {

@@ -9,12 +9,31 @@ import (
 	"io/fs"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 )
+
+// policySubcommands is the command table. The names are sbx's, in sbx's order, wherever the
+// semantics match; each entry is a plain function with its own flag set so that a move to a
+// different dispatcher touches this table and nothing else.
+func policySubcommands() []command {
+	return []command{
+		{name: "allow", summary: "Add an allow rule, globally or scoped to one sandbox", run: policyAllow},
+		{name: "check", summary: "Report whether a destination would be permitted, without contacting it", run: policyCheck},
+		{name: "deny", summary: "Add a deny rule; deny always wins", run: policyDeny},
+		{name: "init", summary: "Create the durable policy store", run: policyInit},
+		{name: "inspect", summary: "Show a scope or a single rule in detail", run: policyInspect},
+		{name: "log", summary: "Show recent policy decisions", run: policyLog},
+		{name: "ls", alias: "list", summary: "List stored rules and what they resolve to", run: policyLs},
+		{name: "profile", summary: "Manage named policies a run can select", run: policyProfile},
+		{name: "reset", summary: "Restore the defaults, destroying stored rules", run: policyReset},
+		{name: "rm", summary: "Remove a stored rule", run: policyRm},
+	}
+}
 
 func policyCommand(ctx context.Context, env Env) error {
 	if len(env.Args) == 0 {
@@ -26,35 +45,57 @@ func policyCommand(ctx context.Context, env Env) error {
 	case "-h", "--help", "help":
 		policyUsage(env.Stdout)
 		return nil
-	case "ls":
-		return policyLs(ctx, sub)
-	case "log":
-		return policyLog(ctx, sub)
+	}
+	for _, cmd := range policySubcommands() {
+		if cmd.matches(env.Args[0]) {
+			return cmd.run(ctx, sub)
+		}
 	}
 	policyUsage(env.Stderr)
 	return fmt.Errorf("unknown policy subcommand %q", env.Args[0])
 }
 
 func policyUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: boks policy <ls|log> [flags]
+	fmt.Fprint(w, `Usage: boks policy <subcommand> [flags]
 
-  ls    show the rules a policy resolves to
-  log   show recent policy decisions
+Network policy is durable state, not an argument to a run: rules written here survive the
+command that wrote them and are what 'boks run', 'boks start' and 'boks exec' all serve a
+sandbox. Rules apply to every sandbox, or are scoped to one with -sandbox.
 
-Run 'boks policy ls -h' or 'boks policy log -h' for flags.
+Subcommands:
+`)
+	for _, cmd := range policySubcommands() {
+		name := cmd.name
+		if cmd.alias != "" {
+			name += ", " + cmd.alias
+		}
+		fmt.Fprintf(w, "  %-9s %s\n", name, cmd.summary)
+	}
+	fmt.Fprint(w, `
+Precedence, in one sentence: a deny in any scope beats an allow in any scope, and only the
+base preset — chosen by 'policy init', a profile, or a -policy flag — decides what happens to
+a destination no rule mentions.
+
+Run 'boks policy <subcommand> -h' for flags.
 `)
 }
 
 func policyLs(_ context.Context, env Env) error {
 	fset := flag.NewFlagSet("boks policy ls", flag.ContinueOnError)
 	fset.SetOutput(env.Stderr)
+	sandbox := fset.String("sandbox", "", "resolve as this sandbox, including rules scoped to it")
+	stored := fset.Bool("stored", false, "print only the stored rules, without resolving them")
 	var flags policyFlags
 	flags.register(fset)
 	fset.Usage = func() {
 		fmt.Fprint(env.Stderr, `Usage: boks policy ls [flags]
 
-Resolves a preset plus any -allow/-deny rules and prints the result, deny rules first
-because they always win. Nothing here contacts the network or a sandbox.
+Two things, because they are two halves of one question. First what is written down — the
+stored rules, by scope — and then what they resolve to for a run, deny rules first because
+they always win. Nothing here contacts the network or a sandbox.
+
+The -policy, -allow, -deny and -profile flags resolve a hypothetical: they show what a run
+given those flags would get, on top of what is stored.
 
 Presets:
 `)
@@ -71,11 +112,26 @@ Presets:
 		return err
 	}
 
-	p, err := flags.resolve()
+	store, err := openPolicyStore()
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(env.Stdout, p.Describe())
+	writeStoredPolicy(env.Stdout, store)
+	if *stored {
+		return nil
+	}
+
+	resolution, err := flags.resolution(*sandbox, nil)
+	if err != nil {
+		return err
+	}
+	if *sandbox == "" {
+		fmt.Fprint(env.Stdout, "effective policy (for a sandbox with no rules of its own; "+
+			"pass -sandbox <name> for one that has):\n\n")
+	} else {
+		fmt.Fprintf(env.Stdout, "effective policy for sandbox %s:\n\n", *sandbox)
+	}
+	fmt.Fprint(env.Stdout, resolution.Describe())
 
 	// The network mode decides whether there is a network for the policy to apply to at
 	// all, so show it alongside the rules rather than in a separate command.
@@ -121,6 +177,65 @@ Presets:
 	}
 	fmt.Fprintf(env.Stdout, "\n%s\n", enforcementNote)
 	return nil
+}
+
+// writeStoredPolicy prints what is written down, scope by scope.
+//
+// It comes before the resolved policy because it answers a different question — "what did I
+// configure" rather than "what will happen" — and because it is the part a user edits. An
+// uninitialised machine says so rather than printing an empty list, since "no rules" and "no
+// policy store" look identical otherwise and only one of them is worth acting on.
+func writeStoredPolicy(w io.Writer, store *policy.Store) {
+	fmt.Fprintf(w, "stored policy: %s\n", store.Path())
+	if !store.Exists() {
+		fmt.Fprint(w, "  not initialised — the built-in defaults apply. 'boks policy init' creates it.\n\n")
+		return
+	}
+	base := store.Preset
+	if base == "" {
+		base = policy.DefaultPreset + " (built-in default)"
+	}
+	fmt.Fprintf(w, "  base preset: %s\n", base)
+	if store.Count() == 0 && len(store.ProfileNames()) == 0 {
+		fmt.Fprint(w, "  no rules stored. 'boks policy allow <destination>' writes one.\n\n")
+		return
+	}
+
+	if len(store.Global) > 0 {
+		fmt.Fprint(w, "\n  global (every sandbox):\n")
+		writeIndentedRules(w, store.Global)
+	}
+	for _, name := range store.SandboxNames() {
+		rules, _ := store.Rules(policy.SandboxScope(name))
+		fmt.Fprintf(w, "\n  sandbox %s:\n", name)
+		writeIndentedRules(w, rules)
+	}
+	for _, name := range store.ProfileNames() {
+		p := store.Profiles[name]
+		preset := p.Preset
+		if preset == "" {
+			preset = policy.DefaultPreset
+		}
+		fmt.Fprintf(w, "\n  profile %s (preset %s)", name, preset)
+		if p.Description != "" {
+			fmt.Fprintf(w, " — %s", p.Description)
+		}
+		fmt.Fprintln(w, ":")
+		writeIndentedRules(w, p.Rules)
+	}
+	fmt.Fprintln(w)
+}
+
+func writeIndentedRules(w io.Writer, rules []policy.RuleSpec) {
+	if len(rules) == 0 {
+		fmt.Fprint(w, "    (none)\n")
+		return
+	}
+	var b strings.Builder
+	writeStoredRules(&b, rules)
+	for _, line := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
+		fmt.Fprintf(w, "  %s\n", line)
+	}
 }
 
 func policyLog(_ context.Context, env Env) error {
