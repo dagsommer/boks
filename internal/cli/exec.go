@@ -1,102 +1,105 @@
 package cli
 
 import (
-	"context"
-	"flag"
-	"fmt"
+	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
-func execCommand(ctx context.Context, env Env) error {
-	fs := flag.NewFlagSet("boks exec", flag.ContinueOnError)
-	fs.SetOutput(env.Stderr)
-
-	interactive := fs.Bool("interactive", false, "keep stdin open")
-	fs.BoolVar(interactive, "i", false, "alias for -interactive")
-	tty := fs.Bool("tty", false, "allocate a pseudo-terminal")
-	fs.BoolVar(tty, "t", false, "alias for -tty")
-	// -it is how everyone types it, and the flag package would otherwise read it as a
-	// flag named "it" and fail with a message about an unknown flag.
-	both := fs.Bool("it", false, "shorthand for -i -t")
-	workdir := fs.String("workdir", "", "working directory inside the sandbox")
-	fs.StringVar(workdir, "w", "", "alias for -workdir")
-	user := fs.String("user", "", "user to run as, UID or UID:GID")
-	fs.StringVar(user, "u", "", "alias for -user")
-	address := addressFlag(fs)
-	var envVars stringList
-	fs.Var(&envVars, "env", "extra environment variable KEY=VALUE (repeatable)")
-	fs.Var(&envVars, "e", "alias for -env")
-
-	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks exec [flags] <name> <command> [args...]
-
-Runs a command inside a sandbox, alongside whatever is already in it. The command inherits
+func newExecCommand(env Env, dev *devFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "exec [flags] SANDBOX COMMAND [ARG...]",
+		Short: "Run an additional command inside a sandbox",
+		Long: `Runs a command inside a sandbox, alongside whatever is already in it. The command inherits
 the sandbox's environment and working directory, and its exit code becomes boks'. A stopped
 sandbox is started first.
 
-Flags must come before the sandbox name; everything after the name belongs to the guest.
-
-Examples:
-  boks exec web ls -l
+Flags must come before the sandbox name; everything after the name belongs to the guest, so
+'boks exec web ls -l' sends -l to ls rather than to boks.`,
+		Example: `  boks exec web ls -l
   boks exec -it web sh
-  boks exec -w /tmp web -- git status
-
-Flags:
-`)
-		fs.PrintDefaults()
+  boks exec -w /tmp web -- git status`,
 	}
 
-	name, command, err := parseLeadingFlags(fs, env.Args)
-	if err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
+	var (
+		interactive bool
+		tty         bool
+		workdir     string
+		user        string
+		envVars     []string
+	)
+	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "keep stdin open")
+	cmd.Flags().BoolVarP(&tty, "tty", "t", false, "allocate a pseudo-terminal")
+	cmd.Flags().StringVarP(&workdir, "workdir", "w", "", "working directory inside the sandbox")
+	cmd.Flags().StringVarP(&user, "user", "u", "", "user to run as, UID or UID:GID")
+	cmd.Flags().StringArrayVarP(&envVars, "env", "e", nil,
+		"extra environment variable KEY=VALUE (repeatable)")
+
+	// Everything after the sandbox name belongs to the guest, flags included. pflag with
+	// interspersed parsing turned off stops at the first positional and hands the rest
+	// back untouched, which is exactly this grammar — and it splits `-it` into -i -t on
+	// the way, so there is no combined-shorthand special case to write.
+	cmd.Flags().SetInterspersed(false)
+
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return usagef("a sandbox name is required; run 'boks ls' to see what is running")
 		}
-		return err
-	}
-	if name == "" {
-		fs.Usage()
-		return fmt.Errorf("a sandbox name is required; run 'boks ls' to see what is running")
-	}
-	if len(command) == 0 {
-		return fmt.Errorf("a command is required; for example 'boks exec %s sh'", name)
+		if len(commandFor(args)) == 0 {
+			return usagef("a command is required; for example 'boks exec %s sh'", args[0])
+		}
+		return nil
 	}
 
-	if *both {
-		*interactive, *tty = true, true
-	}
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		name, command := args[0], commandFor(args)
 
-	// `boks exec` starts a stopped sandbox, so it can be the command that boots the VM —
-	// and a VM that boots without something holding its link socket comes up with a NIC
-	// connected to nothing. The stack it starts outlives this command, as the sandbox
-	// does.
-	if err := ensureNetworkForExisting(ctx, name, *address, env.Stderr); err != nil {
-		return err
-	}
+		// `boks exec` starts a stopped sandbox, so it can be the command that boots the
+		// VM — and a VM that boots without something holding its link socket comes up
+		// with a NIC connected to nothing. The stack it starts outlives this command, as
+		// the sandbox does.
+		if err := ensureNetworkForExisting(cmd.Context(), name, dev.address, env.Stderr); err != nil {
+			return err
+		}
 
-	cfg := sandbox.ExecConfig{
-		Address: *address,
-		Name:    name,
-		Command: command,
-		Env:     envVars,
-		Cwd:     *workdir,
-		User:    *user,
-		TTY:     *tty,
-		Stdout:  env.Stdout,
-		Stderr:  env.Stderr,
-	}
-	// Without -i the guest gets no stdin at all, so a command that reads it sees EOF
-	// immediately instead of holding the terminal open.
-	if *interactive || *tty {
-		cfg.Stdin = env.Stdin
-	}
+		cfg := sandbox.ExecConfig{
+			Address: dev.address,
+			Name:    name,
+			Command: command,
+			Env:     envVars,
+			Cwd:     workdir,
+			User:    user,
+			TTY:     tty,
+			Stdout:  env.Stdout,
+			Stderr:  env.Stderr,
+		}
+		// Without -i the guest gets no stdin at all, so a command that reads it sees EOF
+		// immediately instead of holding the terminal open.
+		if interactive || tty {
+			cfg.Stdin = env.Stdin
+		}
 
-	code, err := sandbox.Exec(ctx, cfg)
-	if err != nil {
-		return err
+		code, err := sandbox.Exec(cmd.Context(), cfg)
+		if err != nil {
+			return err
+		}
+		if code != 0 {
+			return &ExitError{Code: code}
+		}
+		return nil
 	}
-	if code != 0 {
-		return &ExitError{Code: code}
+	return cmd
+}
+
+// commandFor returns the guest command from `exec`'s positionals.
+//
+// Parsing stops at the sandbox name, so a "--" written after it is still in the arguments
+// rather than recorded by pflag. Dropping one leading separator makes both
+// `boks exec web -- ls -l` and `boks exec web ls -l` mean the same thing.
+func commandFor(args []string) []string {
+	rest := args[1:]
+	if len(rest) > 0 && rest[0] == "--" {
+		rest = rest[1:]
 	}
-	return nil
+	return rest
 }
