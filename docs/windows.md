@@ -881,6 +881,48 @@ a comment so that whoever does implement it does not rediscover them.
 
 ---
 
+## 7a. Measured on a real Windows machine running sbx
+
+Everything above section 7 was reasoned from source and documentation. On 2026-08-12 a
+Windows 11 machine with Docker Sandboxes installed was inspected directly, read-only. It
+confirms the architecture and settles three questions that were open.
+
+**No kernel driver, no elevation.** No `.sys` file anywhere under the install, and no
+registered driver or service belonging to sbx. `sbx diagnose` reports 8 checks passing, all
+user-level, with no admin requirement. Network enforcement on Windows is entirely user-mode,
+so nothing about it is closed to an open-source project.
+
+**It ships the same components Boks does.** The install contains `sbx.exe`,
+**`containerd-shim-nerdbox-v1.exe`**, `sailor.dll` (a libkrun-ABI VMM), `mkfs.erofs.exe` and
+`mkfs.ext4.exe`. That is Boks' own stack: containerd's nerdbox shim, a libkrun-compatible
+VMM, and EROFS tooling. The Windows shim is not theoretical — it is in production.
+
+**virtio-net works on Windows today.** The guest's `/sys/bus/virtio/devices/*/modalias`
+decodes to: `d00000001` = **net** (one), `d00000002` = block (four), `d0000001A` = virtio-fs
+(four), balloon, console, and vsock. A userspace VMM on this machine is emulating virtio-net
+right now. Whatever upstream libkrun's WHP backend lacks, the device is demonstrably
+achievable on the platform — this is the single most useful fact for the upstream
+contribution, because it converts "this ought to work" into "the reference product ships it".
+
+**No Hyper-V worker process.** Neither `vmwp.exe` nor `vmmem` is present; the long-running
+process holding the VM is `containerd-shim-nerdbox-v1.exe` itself. Consistent with a
+user-mode VMM on Windows Hypervisor Platform rather than Hyper-V managing the machine.
+*(Inferred — confirming the WHP API calls directly would need ETW or a debugger, which was
+out of scope for a read-only pass.)*
+
+**Workspaces are virtiofs at `/c/...`.** `/proc/mounts` shows
+`bind-f366aeed8fafcfc3 /c/Users/E194604/source/repos/DigitalPostNy virtiofs rw,relatime`, for
+a host path of `C:\Users\E194604\source\repos\DigitalPostNy`. So the `/c/` convention in
+section 4 is right, and the sharing mechanism is **virtiofs** — not the 9p that the LCOW
+analysis in section 3 expected, because this is not LCOW. `/etc/resolv.conf` and `/etc/hosts`
+arrive as separate read-only virtiofs mounts, exactly as they do in the macOS guest.
+`/var/lib/docker` is a real virtio-blk disk (`/dev/vdc`, ext4).
+
+**Network enforcement is at full parity with macOS.** All three proxy modes appear in
+`sbx policy log` on Windows, and a raw TLS connection to `1.1.1.1` with every proxy variable
+unset was refused and logged as `transparent` / blocked. There is no weaker platform story
+here — the boundary holds the same way it does elsewhere.
+
 ## 7. What the reference product actually does
 
 **This is the section that decides the document.** Everything above investigates LCOW; Docker
