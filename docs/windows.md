@@ -79,10 +79,13 @@ carries both KVM and EROFS.
 It also **preserves the exact-path workspace invariant**, which a native port would have to
 abandon (section 4) — inside WSL2 a workspace is already a Linux path.
 
+It will not work out of the box — the kvm and erofs modules are not loaded at boot, and
+`/dev/kvm` is `root:root 0600` because WSL runs no udev. `boks doctor` now diagnoses both, and
+the section below has the fixes.
+
 This is not a Windows port and must not be described as one, and nobody here has run it. But it
 is a real answer to "can I use Boks on my Windows machine", it is available now, and it should
-be offered rather than buried. **the WSL2 section** has the requirements, the costs and the one
-experiment most worth running.
+be offered rather than buried.
 
 What has *not* changed is the honesty requirement. None of this has been run. "Docker does it,
 so it is possible" is a strong existence proof and a weak implementation plan.
