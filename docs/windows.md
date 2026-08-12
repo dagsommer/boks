@@ -1286,17 +1286,25 @@ Ranked by how much it would change the conclusion.
    and it decides whether the route this document now leads with covers most Windows
    developers or only those on Intel. Nothing else here is both this consequential and this
    easy to settle.
-2. **Whether an open-source WHP-capable VMM exists that can do virtio-net with a backend Boks
-   can own.** The entire native-port question; section 8 assesses it and does not close it.
-3. **Whether the nerdbox shim's Windows support is upstream or Docker's own.** Docker ships
-   `containerd-shim-nerdbox-v1.exe`; whether that comes from `containerd/nerdbox` or a private
-   fork decides whether Boks could use it or would have to port it.
-4. **What form a WHP VMM's virtio-net backend would take** — a host socket, a callback, a
-   named pipe — and therefore what the Windows gateway looks like.
-5. Whether that VMM would be a separate process or linked in, which decides whether the
+2. **Whether the Windows Hypervisor Platform requires Windows Pro, Enterprise or Education.**
+   Sources disagree — Microsoft's MAUI documentation says it needs one of those editions,
+   Android Studio's says only "Windows 10 1803 or higher" with no edition restriction. If WHP
+   is genuinely Pro-and-above, it materially shrinks the addressable audience for a native
+   port. Weak counter-evidence: the same constraint would apply to Docker Sandboxes, which
+   does not advertise one. **Settle this on real hardware before planning around it.**
+3. **When libkrun 2.0 actually ships, and whether virtio-net is in it.** The maintainer's
+   target is "end of the year"; the WHP work is explicitly "not buildable yet". A slip moves
+   Boks' Windows story out by however long.
+4. **Whether QEMU's `-netdev socket`/`-netdev stream` works on a Windows host build.** The one
+   cheap experiment that could produce a working path today; see section 8.
+5. Whether the VMM would be a separate process or linked in, which decides whether the
    supervisor's lifetime argument survives unchanged.
 6. **Whether the whole WSL2 route works end to end.** Every ingredient is sourced; the
    combination has never been run.
+
+Two questions that were unknown a draft ago are now answered, in section 8: an open-source
+WHP-capable VMM does exist and is libkrun's own in-progress backend, and nerdbox's Windows
+support is **upstream** rather than a Docker fork.
 
 The LCOW-specific unknowns are retired rather than answered: where to obtain UVM boot files,
 whether the LCOW kernel has TUN, whether LCOW works at current versions, whether its Windows
@@ -1664,6 +1672,43 @@ links against rather than what anyone says about it.
   a user-mode API for third-party virtualization stacks; guest physical memory is "populated
   using memory allocated in the user-mode process of the virtualization stack"; it exposes no
   networking device of any kind
+
+### The VMM candidates (section 8)
+
+- [containers/libkrun](https://github.com/containers/libkrun) — `src/whp/`, `src/arch/src/x86_64/windows/`,
+  `src/utils/src/windows/`, `src/devices/src/legacy/ioapic_whp.rs`, and
+  `src/devices/src/virtio/net/{backend,unixstream}.rs` (the unported one). Merged WHP PRs
+  [#665](https://github.com/containers/libkrun/pull/665), [#675](https://github.com/containers/libkrun/pull/675),
+  [#691](https://github.com/containers/libkrun/pull/691), [#692](https://github.com/containers/libkrun/pull/692),
+  [#709](https://github.com/containers/libkrun/pull/709), [#716](https://github.com/containers/libkrun/pull/716),
+  [#730](https://github.com/containers/libkrun/pull/730), [#733](https://github.com/containers/libkrun/pull/733),
+  [#780](https://github.com/containers/libkrun/pull/780); open [#779](https://github.com/containers/libkrun/pull/779) (vsock)
+- [libkrun#798](https://github.com/containers/libkrun/issues/798) — the maintainer's status
+  statement quoted in section 8: libkrun 2.0, end of year, "not buildable yet"
+- [libkrunfw#122](https://github.com/containers/libkrunfw/pull/122) — `libkrunfw.dll`, the WHP
+  guest kernel bundle
+- [A3S-Lab/Box](https://github.com/A3S-Lab/Box) — a third-party MIT fork shipping a prebuilt
+  `krun.dll` for Windows, with `docs/windows-whpx.md` reporting Alpine OCI workloads on real
+  hardware and **no networking**
+- [containerd/nerdbox](https://github.com/containerd/nerdbox) — `.github/workflows/build-shim.yml`
+  (windows/amd64 and arm64), `internal/vm/libkrun/instance.go` (the `krun.dll` load path),
+  `pkg/vm/vm.go` (the hypervisor-agnostic interface), `plugins/types.go`
+  (`nerdbox.vm-manager.v1`); Windows PRs [#110](https://github.com/containerd/nerdbox/pull/110),
+  [#120](https://github.com/containerd/nerdbox/pull/120), [#131](https://github.com/containerd/nerdbox/pull/131),
+  [#191](https://github.com/containerd/nerdbox/pull/191), [#218](https://github.com/containerd/nerdbox/pull/218)
+- [microsoft/openvmm](https://github.com/microsoft/openvmm) and [openvmm.dev/guide](https://openvmm.dev/guide/) —
+  MIT, WHP on x64 and arm64, Linux direct boot, the pluggable `net_backend` trait, the
+  Consomme userspace stack, and the "no API or feature-set stability guarantees whatsoever"
+  disclaimer
+- [QEMU WHPX documentation](https://www.qemu.org/docs/master/system/whpx.html) — maintained,
+  x86_64 and arm64, with its documented limits
+- [cloud-hypervisor#3453](https://github.com/cloud-hypervisor/cloud-hypervisor/discussions/3453) —
+  a maintainer confirming no WHP port is planned
+- [crosvm book: hypervisors](https://crosvm.dev/book/hypervisors.html) — WHPX "not tested
+  upstream"; Windows networking is built-in libslirp with no `--net` flag
+- [intel/haxm](https://github.com/intel/haxm) — archived 2023
+- [Windows Hypervisor Platform API](https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/hypervisor-platform) —
+  the full surface, containing no networking API of any kind
 
 ### Boks inside WSL2
 
