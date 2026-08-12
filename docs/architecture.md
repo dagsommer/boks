@@ -156,7 +156,7 @@ gateway address Boks configures.)*
 
 That is the property we need: enforcement does not depend on the guest honouring
 `HTTP_PROXY`. A guest that opens a raw socket still has its packets terminated by a host
-stack that can drop them. The intended shape:
+stack that can drop them. The shape:
 
 ```
 guest --virtio-net--> unix socket --> gvisor netstack (host) --> policy engine --> upstream
@@ -164,12 +164,38 @@ guest --virtio-net--> unix socket --> gvisor netstack (host) --> policy engine -
                                               +--> boks proxy (HTTP/HTTPS) --> credential injection
 ```
 
-Raw TCP/UDP to unapproved destinations is dropped by the netstack; HTTP and HTTPS are
-steered to a host-side forward proxy that filters on hostname. For HTTPS the proxy reads the
-`CONNECT` target and the TLS SNI without decrypting anything — **except** for hosts that
-have a credential injection rule, which are terminated and re-originated so a header can be
-attached. That is the only interception Boks performs, and every logged flow says which it
-was: `forward` (read by Boks) or `forward-bypass` (tunnelled, ciphertext only).
+Raw TCP to unapproved destinations is refused by the netstack, UDP and ICMP are dropped
+outright; HTTP and HTTPS are steered to a host-side forward proxy that filters on hostname.
+For HTTPS the proxy reads the `CONNECT` target and the TLS SNI without decrypting anything —
+**except** for hosts that have a credential injection rule, which are terminated and
+re-originated so a header can be attached. That is the only interception Boks performs, and
+every logged flow says which it was: `forward` (read by Boks), `forward-bypass` (tunnelled,
+ciphertext only) or `transparent` (judged in the stack, by address, with the proxy not
+involved).
+
+**The netstack has to be assembled by hand, and this is the reason.** gvisor-tap-vsock's
+`virtualnetwork.New` installs its own TCP forwarder, whose handler is a bare
+`net.Dial` to whatever address the guest put in the SYN — no policy, and no hook in the
+public API to add one. A stack built that way terminates the guest's NIC and then forwards
+everything it is handed, which is not a boundary; it was measured not being one, on a real
+VM (see [verification.md](verification.md)). Boks therefore does the same assembly itself
+from the library's exported pieces — `tap.NewLinkEndpoint`, `tap.NewSwitch`, gvisor's
+`stack.New` — and installs its own forwarder via `SetTransportProtocolHandler`, which
+consults the policy engine before dialling and records both outcomes. No fork, and no
+vendored patch: the link layer and the netstack are still the library's, and only the
+decision is ours.
+
+Three consequences of that decision, each of them deliberate:
+
+- **UDP has no forwarder at all**, and datagrams are dropped at the link unless they are DNS
+  to the sandbox's own gateway (or DHCP, which is served inside the stack). Forwarding UDP
+  would hand the guest a data path with no connection to judge, and DNS to a server of its
+  choosing is a channel around every hostname rule. The reference product blocks both and
+  does not let a policy re-enable them; this matches.
+- **ICMP is dropped**, rather than answered by the stack on behalf of addresses it is not.
+- **A denial is a RST, not silence.** A denied destination fails the way a closed port fails,
+  immediately, instead of hanging until something times out and leaving the user to guess
+  whether it was the policy or the network.
 
 **Configuration (`internal/network`).** Two annotations are required, and each does half the
 job. Both were confirmed against nerdbox's source (`internal/shim/task/networking.go` and
@@ -200,18 +226,25 @@ Consequences Boks' design has to carry:
 - **Deny-by-default is asserted, not assumed.** The observed unreachability of the host was a
   property of one configuration, not a guarantee: gvisor-tap-vsock can be told to translate
   an address onto the host's loopback, forward host ports inward, answer on extra gateway
-  addresses, or proxy the EC2 metadata service. Boks sets all four explicitly closed.
+  addresses, or proxy the EC2 metadata service. Boks sets all four explicitly closed — and,
+  since it assembles the stack itself, implements none of the four at all.
+- **Host loopback is closed at the IP layer, not by a rule.** A packet addressed to
+  `127.0.0.0/8` arriving on a NIC that is not the loopback interface is a martian and is
+  discarded by gvisor before the forwarder sees it. A test gives a simulated guest a policy
+  that *permits* the host's loopback and a real listener to reach; it still cannot get there.
 - **DNS is mediated.** The container's resolver is set to the gateway rather than inherited
   from a copy of the host's `resolv.conf`, so name resolution is answered by a stack Boks
-  controls. That is the hook a policy on names attaches to; it does not by itself close DNS
-  as an exfiltration channel.
+  controls — and since UDP to anything else is dropped, it is the only resolver the guest can
+  reach. That is the hook a policy on names attaches to; it does not by itself close DNS as an
+  exfiltration channel, because the gateway still resolves whatever it is asked.
 - **IPv6 is live surface now.** TSI had none; a guest with a real NIC brings up link-local
   v6 by itself (the spike saw MLD reports). Boks assigns no routable v6 address and no v6
   gateway, and the policy language covers v6 from the start.
 - **A network-less mode exists today, for free.** Emitting only the VM-level annotation
   attaches the NIC — which is what turns TSI off — while never wiring the container to it.
   The container then has `lo` and nothing else, and host loopback is refused. That is
-  `-net none`, and it is the strongest containment Boks can currently offer.
+  `-net none`, and it is the strongest containment Boks can currently offer, as well as the
+  only one confirmed against a real guest.
 
 ### How it is wired into a run (`internal/enforce`)
 
@@ -225,21 +258,27 @@ boks run ─┬─ Plan            socket path, addressing, MACs (deterministic 
           ├─ annotations  ─> the container, so the VM gets a NIC wired to that socket
           ├─ guest env    ─> HTTP_PROXY/HTTPS_PROXY/NO_PROXY, the CA, credential placeholders
           └─ boks net serve   one process per running sandbox:
-                                gvisor netstack on the link
+                                gvisor netstack on the link, judging every TCP connection
                                 + proxy listening at 192.168.127.1:3128 *inside* it
 ```
 
-**The proxy listens inside the virtual network, not on the host.** `virtualnetwork.Listen`
-returns a listener that exists only in one sandbox's network, so nothing is bound on the
-host: no other process, no other sandbox and nothing on the LAN can reach it, and two
+The policy engine is built **before** either of them and handed to both, so one set of rules
+and one decision log serve the stack and the proxy. A flow the stack allowed and the proxy
+then refused appears twice in one log rather than in two logs that disagree.
+
+**The proxy listens inside the virtual network, not on the host.** The listener comes from
+the sandbox's own stack, so it exists only in one sandbox's network and nothing is bound on
+the host: no other process, no other sandbox and nothing on the LAN can reach it, and two
 sandboxes cannot collide on a port. A host port would have failed all three.
 
 **The guest environment is a convenience, not the control.** `HTTP_PROXY`, `HTTPS_PROXY`,
 `NO_PROXY`, the CA (as `BOKS_CA_CERT_B64`, as a read-only mount at `/etc/boks`, and through
 `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` for the
 runtimes that ignore the system trust store) let a cooperating client get hostname rules,
-credential injection and readable refusals. A guest that ignores all of it loses the
-diagnostics and keeps the restrictions, because the stack is what enforces. Two details
+credential injection and readable refusals. A guest that ignores all of it loses those and
+keeps the restrictions, because the stack is what enforces — it is judged on addresses and
+ports instead of names, which is stricter, not looser: a policy written entirely in hostnames
+denies its raw flows. Two details
 follow from that distinction and are worth stating: the replacing variables are set only when
 Boks could bundle the CA with a public root store, since pointing `SSL_CERT_FILE` at a
 Boks-only file would break every host Boks does *not* intercept; and the placeholder a guest

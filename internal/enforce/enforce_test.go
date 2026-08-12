@@ -262,34 +262,37 @@ func TestNoNetworkHasNoStackAndNoListener(t *testing.T) {
 	}
 }
 
-// TestProxyAnswersInsideTheVirtualNetwork is the end-to-end datapath test.
+// TestProxyAnswersInsideTheVirtualNetwork is the cooperating-guest datapath test.
 //
 // A fake guest is attached to the real link socket and speaks HTTP through the proxy at the
 // gateway address, exactly as a guest honouring HTTP_PROXY would: real Ethernet frames over
 // the real socket, a real ARP exchange, a real TCP handshake, a real HTTP request. An
 // allowed destination is fetched and a denied one is refused with a reason.
 //
-// What this does not show: any of it happening across a hypervisor boundary. A real guest
-// reaches this socket through libkrun's virtio-net device and nerdbox's annotations, and
-// neither is exercised here — there is no hypervisor on the machine this was written on.
+// The origin is on the host's loopback, and that is deliberate. This test is about the
+// *proxy* path, where the guest never addresses the origin itself: it addresses the proxy
+// inside its own virtual network and names the origin in a request line, and the outbound
+// connection is made by the proxy on the host, where loopback is an ordinary address. An
+// earlier version bound the origin to whatever non-loopback interface address the machine
+// happened to have, because the presets deny loopback — and that made the test depend on the
+// host being willing to accept a connection to its own LAN address, which a macOS host is
+// not. The rule being dodged was a policy rule, so the fix is to choose a policy: `locked`
+// carries no deny rules at all, and this test names the one destination it needs. That the
+// *presets* refuse loopback is asserted where it belongs, in the policy tests.
+//
+// What no version of this test shows: any of it happening across a hypervisor boundary. A
+// real guest reaches this socket through libkrun's virtio-net device and nerdbox's
+// annotations, and neither is exercised here — there is no hypervisor on the machine this
+// was written on.
 func TestProxyAnswersInsideTheVirtualNetwork(t *testing.T) {
-	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "hello from the origin")
 	}))
-	// The origin must not be on loopback: every preset denies the host's own loopback,
-	// because under the runtime's default transport the guest's 127.0.0.1 is the host's.
-	// Binding to a real interface address is what makes an allow rule meaningful here.
-	addr := hostAddress(t)
-	listener, err := net.Listen("tcp", net.JoinHostPort(addr, "0"))
-	if err != nil {
-		t.Fatalf("listening on %s: %v", addr, err)
-	}
-	origin.Listener = listener
-	origin.Start()
 	defer origin.Close()
 	originHost := strings.TrimPrefix(origin.URL, "http://")
 
 	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
 	spec.Allow = []string{originHost}
 	spec.Deny = []string{"blocked.example.com"}
 	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
@@ -300,10 +303,7 @@ func TestProxyAnswersInsideTheVirtualNetwork(t *testing.T) {
 	}
 	defer session.Close()
 
-	guest, err := vnettest.Attach(spec.Plan.Socket, spec.Plan.GuestAddr.Addr().String(), spec.Plan.MTU)
-	if err != nil {
-		t.Fatalf("attaching the fake guest: %v", err)
-	}
+	guest := attachGuest(t, spec)
 	defer guest.Close()
 
 	client, err := guest.HTTPClient(session.ProxyURL())
@@ -391,10 +391,7 @@ func TestCloseLeavesNothingBehind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	guest, err := vnettest.Attach(spec.Plan.Socket, spec.Plan.GuestAddr.Addr().String(), spec.Plan.MTU)
-	if err != nil {
-		t.Fatalf("attaching the fake guest: %v", err)
-	}
+	guest := attachGuest(t, spec)
 	client, err := guest.HTTPClient(session.ProxyURL())
 	if err != nil {
 		t.Fatal(err)
@@ -472,25 +469,366 @@ func goroutineDump() string {
 	return string(buf[:runtime.Stack(buf, true)])
 }
 
-// hostAddress returns an address on a real interface, for a test origin that must not be on
-// loopback. A machine with no such address cannot run this test.
-func hostAddress(t *testing.T) string {
+// attachGuest puts a fake guest on the far end of a started sandbox's link, configured the
+// way Boks' annotations configure a real one: one address in the subnet, and a default route
+// through the gateway.
+func attachGuest(t *testing.T, spec Spec) *vnettest.Guest {
+	t.Helper()
+	guest, err := vnettest.Attach(vnettest.Config{
+		Socket:    spec.Plan.Socket,
+		GuestIP:   spec.Plan.GuestAddr.Addr().String(),
+		GatewayIP: spec.Plan.Gateway.String(),
+		Subnet:    spec.Plan.Subnet.String(),
+		MTU:       spec.Plan.MTU,
+	})
+	if err != nil {
+		t.Fatalf("attaching the fake guest: %v", err)
+	}
+	return guest
+}
+
+// originTheGuestCouldAddress starts a test origin at an address a guest is able to *put in a
+// packet*, and verifies that this machine can actually connect to it.
+//
+// Loopback will not do here, and the reason is a property worth naming: a packet addressed
+// to 127.0.0.0/8 arriving on a NIC that is not the loopback interface is a martian, and the
+// host-side stack drops it at the IP layer, before any policy is consulted. The guest cannot
+// address the host's own loopback at all — not "is denied by every preset", cannot. So a raw
+// flow needs an origin on a real interface address.
+//
+// Whether such an address is usable is a property of the machine, not of Boks: a host that
+// refuses connections to its own interface address (a macOS firewall, a local-network
+// privacy prompt nobody can answer in a test run) cannot host an origin for this. That is
+// checked here with a real connection rather than assumed, so the test skips with a reason
+// instead of failing as though the policy were wrong.
+func originTheGuestCouldAddress(t *testing.T, body string) (*httptest.Server, string) {
 	t.Helper()
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		t.Skipf("no interface addresses: %v", err)
+		t.Skipf("this machine's interface addresses could not be read: %v", err)
 	}
 	for _, a := range addrs {
 		ipnet, ok := a.(*net.IPNet)
-		if !ok || ipnet.IP.IsLoopback() || ipnet.IP.IsLinkLocalUnicast() {
+		if !ok || ipnet.IP.IsLoopback() || ipnet.IP.IsLinkLocalUnicast() || ipnet.IP.To4() == nil {
 			continue
 		}
-		if v4 := ipnet.IP.To4(); v4 != nil {
-			return v4.String()
+		listener, err := net.Listen("tcp", net.JoinHostPort(ipnet.IP.To4().String(), "0"))
+		if err != nil {
+			continue
+		}
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, body)
+		}))
+		srv.Listener = listener
+		srv.Start()
+
+		// The host-side stack will reach this origin with an ordinary net.Dial from this
+		// process. If that cannot work, nothing downstream can, and the failure has
+		// nothing to do with the policy under test.
+		conn, err := net.DialTimeout("tcp", srv.Listener.Addr().String(), 2*time.Second)
+		if err == nil {
+			conn.Close()
+			return srv, strings.TrimPrefix(srv.URL, "http://")
+		}
+		srv.Close()
+	}
+	t.Skip("this machine cannot host a test origin the sandbox's stack could dial: " +
+		"no non-loopback IPv4 address accepts a connection from this process")
+	return nil, ""
+}
+
+// deniedDestination is in TEST-NET-3 (RFC 5737), which is reserved for documentation and is
+// not routable anywhere. If a deny ever failed open, this address would still not connect —
+// which is exactly why the test that uses it asserts the *decision*, not just the failure.
+const deniedDestination = "203.0.113.7:443"
+
+// TestRawFlowToADeniedAddressIsRefusedAndLogged is the finding this whole datapath exists to
+// fix, turned into a test.
+//
+// A guest with no proxy configured at all — no HTTP_PROXY, no cooperation, a socket and an
+// address — opens a TCP connection straight at a destination the policy denies. Before the
+// stack judged flows, that connection was dialled by gvisor-tap-vsock's own forwarder with a
+// bare net.Dial and never reached the policy engine: on a real VM it completed a TLS
+// handshake to a denied address and `boks policy log` showed nothing at all.
+//
+// Two things are asserted, and the second is the one that matters. The connection is refused
+// — but a refusal on its own proves little, since an unroutable address would also fail to
+// connect. So the decision log must show that Boks *decided* this: a denial, at the network
+// stage, in transparent mode, naming the rule that decided it. A deny that failed open would
+// leave an allow in the log, or nothing.
+//
+// This is the stack refusing a flow from a simulated guest on a real link socket. It is not
+// a real VM being refused; nobody has seen that. See docs/verification.md.
+func TestRawFlowToADeniedAddressIsRefusedAndLogged(t *testing.T) {
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked // deny by default
+	spec.Deny = []string{"203.0.113.9:443"}
+	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer session.Close()
+
+	guest := attachGuest(t, spec)
+	defer guest.Close()
+
+	for _, tc := range []struct {
+		name, addr, wantRule string
+	}{
+		{"denied by default", deniedDestination, "no applicable policies"},
+		{"denied by rule", "203.0.113.9:443", "203.0.113.9:443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			conn, err := guest.Dial(ctx, tc.addr)
+			if err == nil {
+				conn.Close()
+				t.Fatalf("a raw connection to %s succeeded; the policy denies it", tc.addr)
+			}
+			if !vnettest.Refused(err) {
+				t.Errorf("the guest saw %v; a denied destination must be refused, not left to hang", err)
+			}
+
+			host, _, _ := net.SplitHostPort(tc.addr)
+			d, ok := findDecision(t, spec.LogPath, host)
+			if !ok {
+				t.Fatalf("nothing was logged for %s; a flow that never reaches the log is a flow "+
+					"nobody can see was denied", tc.addr)
+			}
+			if d.Allowed {
+				t.Errorf("the decision for %s was an allow: %+v", tc.addr, d)
+			}
+			if d.Mode != policy.ModeTransparent {
+				t.Errorf("mode = %q, want %q: this flow never touched the proxy", d.Mode, policy.ModeTransparent)
+			}
+			if d.Stage != policy.StageNetwork {
+				t.Errorf("stage = %q, want %q", d.Stage, policy.StageNetwork)
+			}
+			if !strings.Contains(d.Rule, tc.wantRule) {
+				t.Errorf("rule = %q, want something containing %q", d.Rule, tc.wantRule)
+			}
+			if d.Sandbox != spec.Sandbox {
+				t.Errorf("the decision is not attributed to the sandbox: %+v", d)
+			}
+		})
+	}
+}
+
+// TestRawFlowToAnAllowedAddressIsCarriedAndLogged is the other half: enforcement that only
+// ever says no is indistinguishable from a broken network.
+//
+// The same uncooperating guest — no proxy anywhere in the path — reaches an origin the policy
+// permits, and the flow is recorded as a transparent allow. The body coming back is what
+// makes it an end-to-end statement rather than a claim about a decision: the stack judged the
+// SYN, dialled the destination itself, and spliced the two halves together.
+func TestRawFlowToAnAllowedAddressIsCarriedAndLogged(t *testing.T) {
+	origin, originHost := originTheGuestCouldAddress(t, "hello from the origin")
+	defer origin.Close()
+
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
+	spec.Allow = []string{originHost}
+	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer session.Close()
+
+	guest := attachGuest(t, spec)
+	defer guest.Close()
+
+	resp, err := guest.RawHTTPClient().Get(origin.URL)
+	if err != nil {
+		t.Fatalf("a raw connection to an allowed destination failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "hello from the origin" {
+		t.Fatalf("the allowed raw flow returned %d %q", resp.StatusCode, body)
+	}
+
+	host, _, _ := net.SplitHostPort(originHost)
+	d, ok := findDecision(t, spec.LogPath, host)
+	if !ok {
+		t.Fatalf("the allowed raw flow was carried but not recorded; the log must show what a " +
+			"sandbox reached, not only what it was refused")
+	}
+	if !d.Allowed {
+		t.Errorf("the decision for %s was a denial: %+v", originHost, d)
+	}
+	if d.Mode != policy.ModeTransparent || d.Stage != policy.StageNetwork {
+		t.Errorf("mode/stage = %q/%q, want %q/%q", d.Mode, d.Stage, policy.ModeTransparent, policy.StageNetwork)
+	}
+	if !strings.Contains(d.Resource, "net:ip:") {
+		t.Errorf("resource = %q; a raw flow carries no hostname and must be recorded as an address",
+			d.Resource)
+	}
+}
+
+// TestTheMetadataEndpointIsRefusedEvenWhenAllowed: 169.254.169.254 is the cloud instance
+// metadata service, and on a hosted machine it is the most reliable credential source there
+// is. gvisor-tap-vsock's forwarder refused link-local unless its EC2 flag was set; Boks
+// asserts that flag off and now owns the forwarder, so the refusal has to be reimplemented
+// here or the assertion becomes decorative.
+//
+// The test permits the address explicitly, which is the point: this one is not a policy
+// question, and `-allow 169.254.169.254` must not buy it.
+func TestTheMetadataEndpointIsRefusedEvenWhenAllowed(t *testing.T) {
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
+	spec.Allow = []string{"169.254.169.254:80"}
+	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer session.Close()
+
+	guest := attachGuest(t, spec)
+	defer guest.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if conn, err := guest.Dial(ctx, "169.254.169.254:80"); err == nil {
+		conn.Close()
+		t.Fatal("the guest reached the instance metadata endpoint")
+	}
+	if d, ok := findDecision(t, spec.LogPath, "169.254.169.254"); ok && d.Allowed {
+		t.Errorf("the metadata endpoint was allowed by the policy engine: %+v", d)
+	}
+}
+
+// TestCloseTearsDownAFlowInProgress: "this sandbox no longer has a network" has to be true
+// of the connection the guest opened a moment ago, not only of the next one it tries.
+//
+// A spliced flow holds two sockets and three goroutines on the host. If Close left them
+// alive, a guest would keep a working connection to a destination Boks believes it has taken
+// away, for as long as the far end kept it open — and the goroutines would accumulate one
+// set per sandbox the process ever served.
+func TestCloseTearsDownAFlowInProgress(t *testing.T) {
+	origin, originHost := originTheGuestCouldAddress(t, "hello from the origin")
+	defer origin.Close()
+
+	before := boksGoroutines(t)
+
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
+	spec.Allow = []string{originHost}
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	guest := attachGuest(t, spec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := guest.Dial(ctx, originHost)
+	if err != nil {
+		t.Fatalf("dialling an allowed destination: %v", err)
+	}
+	defer conn.Close()
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	guest.Close()
+
+	// The guest's end of the flow is gone: a read returns rather than blocking on a
+	// connection Boks no longer carries.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Error("a flow that was open when the network was closed is still carrying data")
+	} else if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "timed out") {
+		t.Errorf("the flow was left hanging rather than torn down: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for boksGoroutines(t) > before && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if after := boksGoroutines(t); after > before {
+		t.Errorf("goroutines running Boks code went from %d to %d after tearing down a live flow:\n%s",
+			before, after, goroutineDump())
+	}
+}
+
+// TestTheGuestCannotAddressTheHostsLoopback is the property the verification run on a real
+// VM saw as `curl rc=7`, pinned here so it cannot regress quietly.
+//
+// A packet addressed to 127.0.0.0/8 arriving on a NIC that is not the loopback interface is
+// a martian: the host-side stack drops it at the IP layer, before the forwarder is reached
+// and before any policy is consulted. That is stronger than a deny rule, and this test says
+// so by giving the guest a policy that *permits* the address it is trying to reach and a
+// real listener to reach. It still cannot get there.
+//
+// If this ever fails, every unauthenticated dev server, database and debug endpoint on the
+// developer's machine is inside the sandbox's reach.
+func TestTheGuestCannotAddressTheHostsLoopback(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "this must never reach a sandbox")
+	}))
+	defer origin.Close()
+	originHost := strings.TrimPrefix(origin.URL, "http://")
+
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
+	spec.Allow = []string{originHost} // deliberately permitted, and still unreachable
+	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer session.Close()
+
+	guest := attachGuest(t, spec)
+	defer guest.Close()
+
+	// Long enough for a handshake that was going to work, short enough not to pad the
+	// suite: the SYN is dropped, so this is a wait for silence.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := guest.Dial(ctx, originHost)
+	if err == nil {
+		conn.Close()
+		t.Fatalf("the guest reached the host's loopback at %s", originHost)
+	}
+
+	// And nothing was decided about it, because the packet never got as far as a decision.
+	// This is the one case where an empty log is the correct outcome.
+	if d, ok := findDecision(t, spec.LogPath, "127.0.0.1"); ok {
+		t.Errorf("a loopback destination reached the policy engine: %+v", d)
+	}
+}
+
+// findDecision returns the most recent decision recorded for a host.
+func findDecision(t *testing.T, path, host string) (policy.Decision, bool) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("no decision log was written: %v", err)
+	}
+	defer f.Close()
+	decisions, err := policy.ReadDecisions(f, 0)
+	if err != nil {
+		t.Fatalf("reading the decision log: %v", err)
+	}
+	var found policy.Decision
+	var ok bool
+	for _, d := range decisions {
+		if d.Host == host {
+			found, ok = d, true
 		}
 	}
-	t.Skip("this machine has no non-loopback IPv4 address to host a test origin on")
-	return ""
+	return found, ok
 }
 
 func envMap(env []string) map[string]string {

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // Network is a started, or startable, host-side network for one sandbox.
@@ -23,6 +25,7 @@ type Network struct {
 	plan     Plan
 	provider provider
 	logger   io.Writer
+	engine   *policy.Engine
 
 	mu      sync.Mutex
 	started bool
@@ -34,7 +37,11 @@ type Network struct {
 type provider interface {
 	// start binds the link socket and begins serving. It must return only once the
 	// socket exists, because the VM will connect to it as soon as the task starts.
-	start(ctx context.Context, plan Plan, logger io.Writer) error
+	//
+	// The engine is the policy every flow the guest opens is judged against, in the
+	// stack, before it is dialled. A provider that is given none must refuse everything:
+	// a network whose judge is missing is not an open network.
+	start(ctx context.Context, plan Plan, engine *policy.Engine, logger io.Writer) error
 	// listen returns a listener *inside* the virtual network, at addr. See
 	// (*Network).Listen for why that is the only place Boks' proxy should listen.
 	listen(addr string) (net.Listener, error)
@@ -126,6 +133,23 @@ func (n *Network) Annotations() map[string]string { return n.plan.Annotations() 
 // SetLogger routes the provider's diagnostics somewhere. Nil discards them.
 func (n *Network) SetLogger(w io.Writer) { n.logger = w }
 
+// SetPolicy attaches the engine the stack judges the guest's connections with. It must be
+// called before Start; afterwards it has no effect, because a policy that could change under
+// a flow already in progress would make the decision log a description of nothing.
+//
+// This is the enforcement point, not a hint to it. Every TCP connection the guest opens is
+// checked against this engine from the address and port in its SYN, whether or not the guest
+// used the proxy, and both outcomes are recorded with mode "transparent". A Network started
+// without one refuses every destination.
+func (n *Network) SetPolicy(e *policy.Engine) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.started {
+		return
+	}
+	n.engine = e
+}
+
 // Start creates the socket directory and starts the host-side stack.
 //
 // It must be called before the container task starts: libkrun connects to the socket
@@ -152,7 +176,7 @@ func (n *Network) Start(ctx context.Context) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	n.cancel = cancel
-	if err := n.provider.start(runCtx, n.plan, n.logger); err != nil {
+	if err := n.provider.start(runCtx, n.plan, n.engine, n.logger); err != nil {
 		cancel()
 		_ = os.RemoveAll(dir)
 		return err
@@ -198,7 +222,7 @@ type blackhole struct {
 	done chan struct{}
 }
 
-func (b *blackhole) start(ctx context.Context, plan Plan, logger io.Writer) error {
+func (b *blackhole) start(ctx context.Context, plan Plan, _ *policy.Engine, _ io.Writer) error {
 	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: plan.Socket, Net: "unixgram"})
 	if err != nil {
 		return fmt.Errorf("network: binding the link socket %s: %w", plan.Socket, err)

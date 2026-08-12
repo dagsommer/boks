@@ -19,8 +19,19 @@
 // stack logs frames from the VM's MAC, and the guest's resolv.conf switches from a copy of
 // the host's to the gateway this package configures.)*
 //
+// # What this package now enforces
+//
+// The stack it runs is assembled here rather than taken whole from gvisor-tap-vsock, and the
+// reason is the whole point of the package: the library's own TCP forwarder dials whatever
+// address the guest puts in a SYN, with no policy consulted. Boks installs its own, which
+// asks the policy engine first, refuses what is denied, and records both outcomes. UDP and
+// ICMP are dropped at the link, apart from DNS to the gateway's own resolver. See
+// stack_unix.go for the assembly and the reasoning.
+//
 // **Nothing in this package has yet enforced a policy against a real guest.** The transport
-// change is verified; the enforcement built on it is not. Do not describe it as such.
+// change is verified against a real VM; the enforcement built on it is verified only against
+// a simulated guest on the real link socket (internal/network/vnettest). "The stack refuses
+// it" is proven. "A real VM was refused" is not. Do not describe it as such.
 //
 // # The two annotations
 //
@@ -68,14 +79,15 @@ type Mode string
 const (
 	// ModeNone gives the sandbox no network. A NIC is attached to the VM — which is
 	// what turns TSI off — but the container is never wired to it, so it has loopback
-	// and nothing else. Use this whenever the workload does not need the network: it is
-	// the only posture whose enforcement does not depend on code Boks has yet to
-	// finish.
+	// and nothing else. Use this whenever the workload does not need the network: its
+	// containment is an absence of wiring rather than a decision anything takes at
+	// runtime, and it is the only posture that has been confirmed against a real guest.
 	ModeNone Mode = "none"
 
 	// ModeNAT connects the sandbox to a userspace network stack running on the host,
-	// which NATs permitted flows out through the host's real network. This is the mode
-	// a network policy is meant to be enforced in.
+	// which carries permitted flows out through the host's real network and refuses the
+	// rest. This is the mode a network policy is enforced in: the stack judges every TCP
+	// connection the guest opens before it dials it, and drops UDP and ICMP outright.
 	ModeNAT Mode = "nat"
 )
 
@@ -83,8 +95,8 @@ const (
 //
 // It is ModeNAT rather than ModeNone because a sandbox with no network at all would
 // surprise every user who expects `go build` to work — but note that ModeNAT's containment
-// is only as good as the enforcement built on top of it, which is not finished. ModeNone is
-// the honest choice when in doubt.
+// is only as good as the enforcement built on top of it, which has never been exercised
+// against a real guest. ModeNone is the honest choice when in doubt.
 const DefaultMode = ModeNAT
 
 // Modes lists the modes in decreasing order of containment.

@@ -4,8 +4,16 @@
 //
 // The enforcement point is the host-side network stack (internal/network), not the proxy
 // and emphatically not the guest's environment. The stack terminates the guest's virtio-net
-// link, so every frame the guest emits is handled by code on the host: a destination that
-// no rule permits has nothing to answer it, whether the guest was cooperating or not.
+// link, so every frame the guest emits is handled by code on the host: each TCP connection
+// is judged against the policy, by address and port, before anything is dialled, and a
+// destination no rule permits is refused there — whether the guest was cooperating or not.
+//
+// This is a recent and hard-won property, and it is worth recording what it replaced. The
+// stack used to be gvisor-tap-vsock's, built by its virtualnetwork.New, whose TCP forwarder
+// dials whatever the guest asks for with no policy in the path; a guest that unset the proxy
+// variables reached the internet unfiltered and unlogged. One engine and one decision log
+// now serve both this stack and the proxy inside it, which is why Open builds the engine
+// before it starts either.
 //
 // The filtering proxy listens **inside** that virtual network, on the gateway address, and
 // the guest is told about it with HTTP_PROXY and friends. Those variables are a
@@ -14,7 +22,7 @@
 // guest that ignores them does not escape anything — it loses the diagnostics and keeps the
 // restrictions. **Never describe HTTP_PROXY as the boundary.** If the proxy were the only
 // thing standing between a guest and the internet, a three-line Go program would be enough
-// to walk past it.
+// to walk past it — and for a while, one was.
 //
 // Nothing is bound on the host. The listener comes from the sandbox's own virtual network,
 // so it is reachable from that one sandbox and nowhere else: not from the host, not from
@@ -24,11 +32,13 @@
 //
 // The datapath here is exercised by tests with a fake guest attached to a real link socket
 // (internal/network/vnettest): a real TCP handshake into the virtual network, a real HTTP
-// client through the proxy, allow and deny both observed. What is **not** demonstrated
-// anywhere in this repository is a real VM reaching this stack through libkrun's virtio-net
-// device — that needs a hypervisor, and the machine this was written on has none. The
-// transport was verified separately (see docs/architecture.md); the enforcement built on it
-// has never met a guest.
+// client through the proxy, and — the case that matters — a guest with no proxy configured
+// at all, refused on a denied address and carried on an allowed one, with a transparent
+// decision logged for each. What is **not** demonstrated anywhere in this repository is a
+// real VM reaching this stack through libkrun's virtio-net device — that needs a hypervisor,
+// and the machine this was written on has none. The transport was verified separately (see
+// docs/architecture.md); the enforcement built on it has never met a guest. "The stack
+// refuses it" is proven; "a real VM was refused" is not, and the two must not be confused.
 package enforce
 
 import (
@@ -341,9 +351,6 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 		return nil, err
 	}
 	n.SetLogger(logger)
-	if err := n.Start(ctx); err != nil {
-		return nil, err
-	}
 	s := &Session{spec: spec, net: n}
 
 	if spec.Plan.Mode == network.ModeNone {
@@ -351,10 +358,27 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 		// nothing else does. No stack, no proxy, no listener, no policy to evaluate —
 		// the containment is the absent wiring, not a decision anything takes at
 		// runtime.
+		if err := n.Start(ctx); err != nil {
+			return nil, err
+		}
 		return s, nil
 	}
 
-	if err := s.startProxy(spec, logger); err != nil {
+	// The engine is built before the stack, not with the proxy, because the stack is the
+	// enforcement point: it judges every connection the guest opens, cooperating or not.
+	// One engine and one decision log serve both, so a flow that the stack allowed and the
+	// proxy later refused appears twice in one log rather than in two that disagree.
+	engine, err := s.newEngine(spec)
+	if err != nil {
+		return nil, err
+	}
+	n.SetPolicy(engine)
+	if err := n.Start(ctx); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+
+	if err := s.startProxy(spec, engine, logger); err != nil {
 		// Undo the stack: a half-open session would leave a socket behind and a guest
 		// with a link to nothing.
 		_ = s.Close()
@@ -363,11 +387,25 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 	return s, nil
 }
 
-func (s *Session) startProxy(spec Spec, logger io.Writer) error {
+// newEngine resolves the policy and opens the decision log both enforcement points share.
+func (s *Session) newEngine(spec Spec) (*policy.Engine, error) {
 	pol, err := spec.Policy()
 	if err != nil {
-		return err
+		return nil, err
 	}
+	decisions := policy.NewLog(policy.DefaultCapacity)
+	if spec.LogPath != "" {
+		sink, err := policy.NewFileSink(spec.LogPath)
+		if err != nil {
+			return nil, err
+		}
+		s.sink = sink
+		decisions.AddSink(sink)
+	}
+	return policy.NewEngine(pol, decisions).WithSandbox(spec.Sandbox), nil
+}
+
+func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer) error {
 	credentials, err := spec.Credentials()
 	if err != nil {
 		return err
@@ -392,18 +430,8 @@ func (s *Session) startProxy(spec Spec, logger io.Writer) error {
 		}
 	}
 
-	decisions := policy.NewLog(policy.DefaultCapacity)
-	if spec.LogPath != "" {
-		sink, err := policy.NewFileSink(spec.LogPath)
-		if err != nil {
-			return err
-		}
-		s.sink = sink
-		decisions.AddSink(sink)
-	}
-
 	srv, err := proxy.New(proxy.Config{
-		Engine:   policy.NewEngine(pol, decisions).WithSandbox(spec.Sandbox),
+		Engine:   engine,
 		Injector: injector,
 		CA:       authority,
 		ErrorLog: log.New(orDiscard(logger), "boks net "+spec.Sandbox+": ", log.LstdFlags),
