@@ -16,8 +16,10 @@ import (
 // traffic in a userspace network stack. That is Boks' architecture, running on Windows, in a
 // shipping product. So the platform is not the obstacle and this check must not imply it is.
 //
-// The obstacle is that Boks' VMM does not speak WHP. libkrun targets KVM and
-// Hypervisor.framework; Docker substituted a VMM of their own, which is not open source.
+// The obstacle is one device. libkrun has carried a WHP backend since mid-2026 — vCPU loop,
+// instruction emulator, virtio-fs, -blk, -console, -balloon and -rng — targeting libkrun 2.0,
+// and upstream nerdbox already builds a Windows shim that loads it as krun.dll. The single
+// device not ported is **virtio-net**, which is the one Boks' enforcement depends on.
 //
 // This check deliberately probes for nothing — not the Hypervisor Platform feature, not
 // containerd, not a shim. Probing would imply that installing the missing pieces leads
@@ -35,10 +37,13 @@ func virtualizationCheck() Check {
 				Remedy: "Boks does not run sandboxes on Windows yet, and the platform is not the reason.\n" +
 					"Windows exposes a user-mode hypervisor API — the Windows Hypervisor Platform —\n" +
 					"which supports exactly the microVM-plus-userspace-netstack design Boks uses, and\n" +
-					"the reference product ships on it. What Boks lacks is a VMM that speaks it:\n" +
-					"libkrun targets KVM and Hypervisor.framework only.\n" +
-					"Enabling Hyper-V or the Hypervisor Platform will not help until that exists.\n" +
-					"See docs/windows.md for the evidence and the options.",
+					"the reference product ships on it. libkrun's WHP backend is in progress upstream\n" +
+					"for libkrun 2.0, and virtio-net is the one device still unported — which is the\n" +
+					"one Boks needs. Enabling Hyper-V or the Hypervisor Platform will not help until\n" +
+					"it lands.\n" +
+					"\n" +
+					"To use Boks on this machine today, run it inside WSL2 with nested\n" +
+					"virtualisation, where it is an ordinary Linux program. See docs/windows.md.",
 			}
 		},
 	}
