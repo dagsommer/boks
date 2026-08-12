@@ -25,7 +25,7 @@ Last reviewed against Docker's docs: 2026-08-11.
 | Hypervisor per platform | Apple Virtualization Framework on Apple silicon; KVM on Linux | libkrun: Hypervisor.framework on macOS, KVM on Linux | P0 | partial | macOS path verified; Linux/KVM path still unexercised |
 | Guest OS | Ubuntu-based Linux image | Any OCI image; the Boks agent images are Debian 13 (trixie) | P0 | partial | Boks takes an image reference, not a fixed distro. Debian over Ubuntu: smaller slim image, newer glibc, and uid 1000 is free rather than taken by a distro user |
 | Root in guest | Agent has full control incl. `sudo` inside the VM | Same — the VM is the boundary, not in-guest permissions | P0 | done | Guest sees only its own processes; PID 1 is the sandboxed command |
-| Resource sizing | Not documented in detail; root fs defaults to 20 GB | vCPU/memory via flags → nerdbox annotations | P1 | done | Verified: guest `nproc`/`MemTotal` track `-cpus`/`-memory` |
+| Resource sizing | Not documented in detail; root fs defaults to 20 GB | vCPU/memory via flags → nerdbox annotations | P1 | done | Verified: guest `nproc`/`MemTotal` track `--cpus`/`--memory` |
 | Multiple containers per VM | Not exposed | Not planned; one VM per sandbox | P2 | none | nerdbox lists multi-container-per-VM as future work |
 
 ## 2. Lifecycle
@@ -37,11 +37,11 @@ Last reviewed against Docker's docs: 2026-08-11.
 | `create` | Builds in background without attaching | `boks create` | P1 | partial | Creates without starting; verified on the non-VM runtime |
 | `start` / `stop` | `stop` exists; **no top-level `start`** — run and exec start a sandbox implicitly | `boks stop`; `boks start` is a Boks addition | P1 | partial | Stop kills the task, keeps container + snapshot, and TERMs every process in the guest first; verified on the non-VM runtime |
 | `rm` | Deletes sandbox and everything in it; `--force` for active | `boks rm`, `-f` | P1 | partial | Deletes the snapshot too; verified on the non-VM runtime |
-| `ls` | Lists sandboxes with status and port mappings | `boks ls`/`boks list`, `-q`, `-json` | P1 | partial | sbx's columns exactly: SANDBOX AGENT STATUS PORTS WORKSPACE. PORTS renders empty — nothing publishes ports yet |
+| `ls` | Lists sandboxes with status and port mappings | `boks ls`/`boks list`, `-q`, `--json` | P1 | partial | sbx's columns exactly: SANDBOX AGENT STATUS PORTS WORKSPACE. PORTS renders empty — nothing publishes ports yet |
 | `inspect` | **Not a top-level command** — sbx has only `policy inspect` | `boks inspect`, JSON output | P2 | partial | A deliberate Boks addition, not parity: the detail `ls` no longer shows has to be reachable |
 | `exec` | `sbx exec [flags] SANDBOX COMMAND [ARG...]`, docker-exec flags; starts a stopped sandbox first | `boks exec [-i] [-t] [-it] [-e] [-w] [-u]` | P1 | partial | Starts a stopped sandbox, as sbx does. Streams IO, propagates the exit code; raw mode and resize unverified in a VM. `-u` takes numeric ids only; `--detach`, `--detach-keys`, `--env-file`, `--privileged` not implemented |
 | Persistence across stop/start | Packages, Docker images, config, shell history persist until `rm` | Same, via the container's writable snapshot | P1 | partial | Confirmed across stop/start on the non-VM runtime |
-| Naming | `--name`; reconnect from any directory | Same, `-name` | P1 | done | An explicit name overrides the derived one, and a `-name` run with no workspace argument does not re-mount the current directory — it reaches that sandbox from anywhere |
+| Naming | `--name`; reconnect from any directory | Same, `--name` | P1 | done | An explicit name overrides the derived one, and a `--name` run with no workspace argument does not re-mount the current directory — it reaches that sandbox from anywhere |
 | `reset` | Stops sandboxes gracefully (30s), clears image cache, registries, all sandbox state, policies and stored secrets, signs out, stops the daemon, removes state/cache/config dirs. Prompts `y/N`; `-f/--force` skips it, `--preserve-secrets` keeps credentials | `boks reset`, minus the account and daemon steps | P2 | none | Copy the confirmation prompt and `--preserve-secrets`: losing every stored credential to a cleanup command is a bad surprise |
 
 ## 2a. CLI surface — where Boks matches sbx, and where it does not
@@ -58,11 +58,11 @@ output, plus a live `sbx ls`.
 |---|---|---|---|---|
 | `run` argument order | `sbx run [flags] [AGENT] [PATH...] [-- AGENT_ARGS...]` — the agent is the first positional, workspaces follow, and the primary workspace defaults to the current directory | Same grammar, same defaults: `boks run`, `boks run shell`, `boks run shell . ~/lib:ro` | P0 | done |
 | Meaning of `--` | Arguments for the agent, appended to its command (`sbx run claude -- --continue`) | Same. Per-agent: an agent with its own command gets them appended, the shell agent takes them *as* the command, since that is what arguments to a shell are | P0 | done |
-| Agents as a concept | A named set: `claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode, shell`. Each selects an image and a startup command | `internal/agent`: all ten names registered, nine with an image at `ghcr.io/dagsommer/boks/<name>`. Only `kiro` still reports "no image yet" and needs an explicit `-template` | P0 | partial |
+| Agents as a concept | A named set: `claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode, shell`. Each selects an image and a startup command | `internal/agent`: all ten names registered, nine with an image at `ghcr.io/dagsommer/boks/<name>`. Only `kiro` still reports "no image yet" and needs an explicit `--template` | P0 | partial |
 | User-defined agents | Real and in use: a live `sbx ls` shows `udi-copilot-default` and `udi-copilot-yolo` beside the built-ins | `Registry.Add` is the seam, including override-a-built-in. **No loader and no file format** — deliberately not designed until there are runtime features worth declaring | P1 | partial |
 | Arbitrary commands | `shell` is an agent, so a plain shell is inside the same grammar | Same: `boks run shell . -- uname -a` | P1 | done |
 | Default sandbox name | `<agent>-<workspace directory name>`, case, dots and hyphens preserved: `claude-finndato.no`, `udi-copilot-yolo-efm-integrasjonspunkt` | Same, plus the decisions sbx's rule leaves open (see below) | P0 | done |
-| `-name` without an agent | The agent positional is optional when the named sandbox exists, and is read from its spec; passing both re-attaches *and* asserts the agent | Same, including the assertion: a mismatch is an error naming both agents | P1 | done |
+| `--name` without an agent | The agent positional is optional when the named sandbox exists, and is read from its spec; passing both re-attaches *and* asserts the agent | Same, including the assertion: a mismatch is an error naming both agents | P1 | done |
 | `ls` columns | `SANDBOX  AGENT  STATUS  PORTS  WORKSPACE` | Identical. PORTS is rendered empty rather than omitted — nothing publishes ports yet | P1 | done |
 | `ls` alias | `sbx list` | `boks list` | P2 | done |
 | Image flag | `-t, --template` — "Container image to use for the sandbox (default: agent-specific image)" | Same name and alias. Was `-image` | P1 | done |
@@ -73,7 +73,7 @@ output, plus a live `sbx ls`.
 | `--clone`, `--kit`, `--profile`, `-p/--publish` | Run flags for clone mode, kits, profiles and port publishing | Not implemented; nothing in the current design blocks them | P1 | none |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
-| Boks-only commands | — | `boks start`, `boks inspect`, `boks run -rm`, `boks doctor`, `boks proxy`, `boks secret`, `boks policy` have no sbx equivalent at that spelling. Kept deliberately; none of them contradicts sbx's shape | — | done |
+| Boks-only commands | — | `boks start`, `boks inspect`, `boks run --rm`, `boks doctor`, `boks proxy`, `boks secret`, `boks policy` have no sbx equivalent at that spelling. Kept deliberately; none of them contradicts sbx's shape | — | done |
 
 **What the naming rule leaves open, and what Boks decided.** sbx's `<agent>-<workspace>` is
 confirmed, but three cases follow from it that a listing cannot show:
@@ -99,7 +99,7 @@ confirmed, but three cases follow from it that a listing cannot show:
 
 **Naming and re-attach are the same mechanism.** There is no separate identity: running the
 same agent in the same directory derives the same name, and that name is what finds the
-sandbox. `-name` overrides the derivation, which is what lets one workspace hold several
+sandbox. `--name` overrides the derivation, which is what lets one workspace hold several
 sandboxes and lets a sandbox be reached from any directory.
 
 ### 2b. Command inventory
@@ -110,10 +110,10 @@ website documents.
 | sbx command | Purpose | Boks |
 |---|---|---|
 | *(bare)* / `tui` | Interactive dashboard; `tui` also opens it explicitly | none |
-| `run` | Run an agent in a sandbox | `run`, command-first — realignment in progress |
+| `run` | Run an agent in a sandbox | `run`, agent-first, same grammar |
 | `create` | Create a sandbox for an agent | `create` |
-| `exec` | Execute a command in a sandbox; **starts it first if stopped** | `exec`, but errors instead of auto-starting |
-| `ls` / `list` | List sandboxes | `ls` (no `list` alias) |
+| `exec` | Execute a command in a sandbox; **starts it first if stopped** | `exec`, starting a stopped sandbox as sbx does |
+| `ls` / `list` | List sandboxes | `ls`, `list` |
 | `stop` | Stop without removing | `stop` |
 | `rm` | Remove sandboxes | `rm` |
 | `cp` | Copy between sandbox and host | `cp` |
@@ -121,19 +121,38 @@ website documents.
 | `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | `policy ls`, `policy log` only |
 | `secret` | Manage stored secrets | `secret set/ls/rm` |
 | `kit` | (Experimental) Manage kit artifacts | none |
-| `template` | Manage sandbox templates (the image an agent runs in) | none; `-image` flag only |
+| `template` | Manage sandbox templates (the image an agent runs in) | none; `-t, --template` flag only |
 | `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
 | `daemon` | `start`, `stop`, `status`, `log-level` for the `sandboxd` daemon | no daemon; `boks net ls\|stop` covers the one background process Boks has — see below |
 | `diagnose` | Diagnose installation issues | `doctor` (same job, different name) |
 | `setup` | (Experimental) Detect host configuration and prepare | partly `doctor`'s remedies |
 | `reset` | Reset all sandboxes and clean up state | none |
 | `login` / `logout` | Sign in to Docker | **won't** — no accounts, ever |
-| `completion` | Shell autocompletion | none |
-| `version` | Version information | `version` |
+| `completion` | Shell autocompletion | `completion`, for bash, zsh, fish and powershell |
+| `version` | Version information | `version`, plus `-v, --version` |
 
 Boks additionally has `start` and `inspect`, which sbx does not: sbx starts implicitly via
 `run`/`exec`, and its only `inspect` is `policy inspect`. These are deliberate additions, not
 parity gaps.
+
+**Both command lines are cobra, so the shapes match rather than resemble each other.** Boks
+moved off a hand-written dispatcher and the standard `flag` package once it had sixteen
+top-level commands and twelve subcommands. That buys the format sbx prints — `Usage:`,
+`Available Commands:`, `Flags:`, `Global Flags:`, `-h, --help   help for run` — and the
+parsing habits that go with it:
+
+| Behaviour | Spelling |
+|---|---|
+| Long flags | `--template`, `--name`, `--allow`. **`-template` no longer works**: one dash means shorthands, so `-name web` is an error about the letters `n`, `a`, `m`, `e` rather than a silent misreading |
+| Short forms | Only where sbx has one: `-t/--template`, `-m/--memory`, `-d/--detached`, `-q/--quiet`, `-f/--force`. `exec` keeps docker's `-i`, `-t`, `-e`, `-w`, `-u`, and `-it` is now a combined shorthand rather than a flag Boks had to name |
+| Flags among positionals | `boks run -t img .` and `boks run . -t img` both parse, natively |
+| `--` | Everything after it is the agent's, including a second `--`; pflag records where it fell |
+| Completion | `boks completion <shell>`, generated |
+| Developer flags | `--runtime`, `--snapshotter`, `--containerd-address` and `--i-know-this-is-not-isolated` are accepted by every command and hidden from its help. They are not product surface, and the isolation refusal names its own opt-out where someone will actually read it |
+
+Dropped in the same change: `--mount`, which shared a job with the positional `[PATH...]`
+that already supports a `:ro` suffix. Two spellings for one thing is a defect, and sbx has
+only the positional.
 
 **sbx runs one daemon; Boks runs one short-lived process per running sandbox.** `sandboxd`
 presumably owns VM supervision and state, which is the natural consequence of managing
@@ -261,7 +280,7 @@ and a typed resource, leaving formatting and aggregation to the display layer.
 | Exact-path mounting | Workspace appears at the same absolute path as on host | Same | P0 | done | Verified in a VM, including deep paths; symlinks are resolved first, so `/tmp/x` becomes `/private/tmp/x` on macOS |
 | Passthrough mechanism | virtiofs, caching on by default (`DOCKER_SANDBOXES_ENABLE_VIRTIOFS_CACHE=0` disables) | virtiofs via nerdbox | P0 | done | Cache tuning not exposed yet |
 | Only workspace exposed | Parent directories are not shared | Same; parents exist as empty guest dirs | P0 | done | Verified: intermediate dirs auto-created, each holding only the next path component |
-| Multiple workspaces | Extra paths mount alongside the primary one | `-mount` repeated | P1 | partial | Implemented; covered by an integration test but not yet run behind a VM |
+| Multiple workspaces | Extra paths mount alongside the primary one | Extra `PATH` positionals, each optionally `:ro` | P1 | partial | Implemented; covered by an integration test but not yet run behind a VM. A `--mount` flag that duplicated this was removed when the CLI moved to cobra |
 | Read-only mounts | `path:ro` suffix | Same suffix | P1 | done | Verified: guest writes rejected, nothing reaches the host |
 | Clone mode | `--clone` makes an in-VM Git clone; host repo read-only at `/run/sandbox/source`; fixed at creation | Equivalent planned; keep the read-only host mount idea | P1 | none | Good default for hostile code |
 | Live host writes | Direct mode changes are immediately live on the host | Same, and documented as a real risk | P0 | done | See security-model.md |
@@ -288,7 +307,7 @@ socket. No VM has ever been refused a destination by Boks. See
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
 | Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor's, driven through gvisor-tap-vsock's link layer, embedded as a library) | P0 | partial | Wired into `run`, `exec`, `create` and `start`. Every TCP connection is judged in the stack before it is dialled; UDP and ICMP are dropped at the link. gvisor-tap-vsock's own forwarder dialled anything the guest asked for, so Boks assembles the stack itself. Transport verified on hardware; **the enforcement on top of it only against a simulated guest** |
-| No-network mode | Not offered as such | `-net none`: NIC on the VM, container not wired to it | P0 | done | End to end: VM NIC annotation only, no stack, no proxy, no listener, no proxy environment. Strongest containment available |
+| No-network mode | Not offered as such | `--net none`: NIC on the VM, container not wired to it | P0 | done | End to end: VM NIC annotation only, no stack, no proxy, no listener, no proxy environment. Strongest containment available |
 | Egress via proxy | All outbound HTTP/HTTPS routed through a host proxy | Same | P0 | partial | The proxy listens *inside* the sandbox's virtual network — nothing is bound on the host — and the guest is pointed at it. `boks proxy` still runs standalone |
 | Default deny | Deny-by-default with an allowlist | Same | P0 | partial | Default preset `standard` is deny-by-default, applied to every run; asserted explicitly in the netstack config too |
 | Policy presets | Open / Balanced / Locked Down, chosen at first run | `open` / `standard` / `locked` | P1 | done | `standard` is the default; entries justified in `internal/policy/preset.go` |
@@ -296,11 +315,11 @@ socket. No VM has ever been refused a destination by Boks. See
 | Host pattern forms | v2 grammar: exact, host with port, single-label wildcard, multi-label wildcard, port ranges, port wildcard, CIDR | Exact, host with port, one wildcard form, port ranges and wildcard, CIDR | P1 | partial | **Gap:** Boks' `*.example.com` matches any subdomain depth, so "exactly one label" cannot be expressed. Not yet worth a second syntax |
 | Deny precedence | Local deny rules still apply under org governance | Deny always wins over allow | P0 | done | Order- and specificity-independent; tested |
 | Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | Decisions recorded as JSON lines under the state dir; local only |
-| Per-run allow flags | Policy configured per sandbox/host | `-allow`/`-deny` repeatable, `-policy <preset>`, `-net <mode>` | P0 | partial | Applied to the sandbox. **Not persisted**: the rules belong to the process serving that sandbox's network, so `boks start` and `boks exec` on a stopped sandbox use the default preset and say so |
+| Per-run allow flags | Policy configured per sandbox/host | `--allow`/`--deny` repeatable, `--policy <preset>`, `--net <mode>` | P0 | partial | Applied to the sandbox. **Not persisted**: the rules belong to the process serving that sandbox's network, so `boks start` and `boks exec` on a stopped sandbox use the default preset and say so |
 | TLS interception | Used for credential injection, not for filtering: a "Docker Sandboxes Proxy CA" sits in the guest trust store and is also exposed as `PROXY_CA_CERT_B64` | Terminate **only** for hosts with a credential rule; local CA, certificate handed over as a file and as `BOKS_CA_CERT_B64` | P0 | done | Demonstrated end to end: the intercepted host presents a Boks-issued certificate, an unconfigured host presents the origin's own chain |
 | Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | done | All three are produced and attributed to the sandbox they came from. `transparent` comes from the netstack's own decisions, taken on address and port for flows that never touched the proxy |
 | Structured decisions | Blocked rows read `no applicable policies for op(action=net:connect:tcp, resource=net:domain:<host>:<port>)` | Same action/resource vocabulary on every decision | P1 | done | Recorded as fields rather than formatted prose, so the display layer can group, filter and aggregate |
-| Aggregated log display | Rows deduplicated per destination with `LAST SEEN` and `COUNT`, split into blocked and allowed | Same | P1 | done | One dependency install produces hundreds of identical allows; `-raw` still prints every decision |
+| Aggregated log display | Rows deduplicated per destination with `LAST SEEN` and `COUNT`, split into blocked and allowed | Same | P1 | done | One dependency install produces hundreds of identical allows; `--raw` still prints every decision |
 | SNI cross-check | Not documented | Deny a tunnel whose ClientHello names a forbidden host | P1 | done | Only possible after the `200`, so the client sees a broken handshake; the reason is in the log |
 | Resolved-address recheck | Not documented | Deny rules re-applied to the address a permitted name resolved to | P1 | done | Stops `allowed.test A 127.0.0.1` from becoming a path to host services |
 | Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same | P1 | partial | UDP and ICMP are dropped at the link, with DNS to the sandbox's own gateway the single exception; no policy re-enables them. Non-HTTP **TCP** is carried when an address rule permits it, and refused otherwise. Never observed against a real guest, and a dropped datagram produces a note in the stack's log rather than a policy decision — the guest chooses that volume |
@@ -326,19 +345,19 @@ hosts and no others — see
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
 | Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | partial | Applied by `boks run` for HTTP and HTTPS. Never exercised against a real guest |
-| Credential grammar | v2 `credentials[]`: one service owns many `inject` rules, each with a domain, a header and a `format` or `scheme`, plus `proxyManaged` and an env var name | Same two-level shape | P1 | done | `-inject service@host[,host]=bearer\|basic[:user]\|header[:format]`; several hosts share one stored secret |
+| Credential grammar | v2 `credentials[]`: one service owns many `inject` rules, each with a domain, a header and a `format` or `scheme`, plus `proxyManaged` and an env var name | Same two-level shape | P1 | done | `--inject service@host[,host]=bearer\|basic[:user]\|header[:format]`; several hosts share one stored secret |
 | Schemes | `format` (`Bearer %s`) or `scheme` (`bearer`/`basic` with `username`), mutually exclusive | Same, with the same exclusivity enforced | P0 | done | A format string covers every vendor; basic auth keeps a username field because its value is base64(user:secret) |
-| Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | done | `-guest-credential service=ENV=placeholder` sets it in the sandbox's environment; a test drives a canary secret through and asserts only the placeholder arrives |
+| Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | done | `--guest-credential service=ENV=placeholder` sets it in the sandbox's environment; a test drives a canary secret through and asserts only the placeholder arrives |
 | OAuth credentials | v2 `oauth`: sentinel access and refresh tokens in a guest credential file, swapped by the proxy for `resourceHosts` | Not implemented | P2 | none | The model leaves room for it: a credential is not assumed to be a single header |
 | HTTPS injection | Supported | Supported, by terminating TLS for the configured hosts only | P0 | done | Demonstrated: origin received the real secret, client had sent only a placeholder. Every other host stays a blind tunnel |
 | Interception CA | Self-signed proxy CA installed in the guest and exposed as an env var | Local CA under the state dir; `boks ca show/export/env/regenerate` | P0 | done | Private key never leaves the host; leaves minted from the policy target, never from the guest's ClientHello |
 | Secret storage | OS keychain; Linux uses desktop keyring or an encrypted file | Encrypted local file first, keychains later | P1 | partial | AES-256-GCM, PBKDF2-HMAC-SHA256 over `BOKS_SECRETS_PASSPHRASE`; names encrypted too |
 | Keychain providers | macOS Keychain, Secret Service, Credential Manager | Same, behind the `Provider` interface | P1 | none | Interface exists; no implementation |
-| Scope | `serviceDomains` (v1) / `inject[].domain` (v2) are separate from the network allowlist | Only explicitly configured hosts; separate from `-allow` | P0 | done | A catch-all is rejected outright. Reachable and credential-bearing are different sets: the second is also exactly the set that gets decrypted |
+| Scope | `serviceDomains` (v1) / `inject[].domain` (v2) are separate from the network allowlist | Only explicitly configured hosts; separate from `--allow` | P0 | done | A catch-all is rejected outright. Reachable and credential-bearing are different sets: the second is also exactly the set that gets decrypted |
 | Placeholder replacement | Guest holds a placeholder | Existing header is overwritten, never appended | P0 | done | A surviving placeholder would be a silent auth failure at best |
 | Guest secret access | Guest never receives raw values | Same; no host API for the guest to query | P0 | done | The store's only consumer is the proxy's request path. Adding a lookup endpoint would end the guarantee |
 | Never logged | Not documented | Values redacted in every printed and serialised form | P1 | done | Enforced by the `Value` type and asserted by tests |
-| `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set` | P1 | done | Reads from stdin by default; `-value` documented as visible in the process list |
+| `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set` | P1 | done | Reads from stdin by default; `--value` documented as visible in the process list |
 | Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | partial | The mechanism exists (basic auth with a username, over an intercepted flow); never exercised against a real Git host |
 | SSH agent forwarding | Supported; SSH key signing works, GPG/S-MIME do not | Host agent socket forwarding | P2 | none | |
 | OAuth device login | Agent login inside sandbox; session tokens stay on host | Out of scope near-term | P2 | none | |
@@ -431,7 +450,7 @@ hosts and no others — see
    confirmed against a live `sbx ls` and against `sbx run --help` — and that derived name is
    what a second invocation looks up, so naming and re-attach are one mechanism rather than
    two. The earlier answer, a `boks-<12 hex path digest>` identifier, was collision-free but
-   unreadable and impossible to guess; it is gone. `-name` still overrides the derivation,
+   unreadable and impossible to guess; it is gone. `--name` still overrides the derivation,
    which is what lets one workspace hold several sandboxes and lets a sandbox be reached from
    any directory. Section 2a records the three cases the readable rule leaves open —
    characters containerd rejects, two directories sharing a basename, roots and long paths —

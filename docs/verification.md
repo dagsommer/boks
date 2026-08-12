@@ -4,6 +4,11 @@ A sandbox is only worth the name if the command really ran behind a hypervisor. 
 `running in sandbox`" proves nothing. This document defines what counts as evidence, and the
 procedure for collecting it.
 
+> Flags throughout are written the way the CLI spells them today — `--cpus`, `--net none`,
+> `--allow`. Runs recorded before the command line moved to cobra used the single-dash
+> spellings (`-cpus`, `-net none`); only the spelling changed, and every observation below
+> is reported exactly as it was made.
+
 ## Current status
 
 **Verified on 2026-08-11.** `boks run` boots a genuine microVM through
@@ -28,7 +33,7 @@ for any of it.
 ### Host versus guest
 
 Collected from the same machine, minutes apart. Guest values are from
-`boks run shell . -- …` with `-cpus 2 -memory 2048`. (Those were the defaults at the time;
+`boks run shell . -- …` with `--cpus 2 --memory 2048`. (Those were the defaults at the time;
 the defaults are now all host CPUs and half the host's memory, so a repeat run reports the
 values you pass rather than these.)
 
@@ -38,8 +43,8 @@ values you pass rather than these.)
 | kernel build | `xnu-12377.121.10~1/RELEASE_ARM64_T6050` | `gcc (Debian 12.2.0) … #1 SMP Tue Aug 11 17:34:15 UTC 2026` |
 | `boot_id` | no procfs; macOS has none | `39e1d653-fa1d-420c-945f-97467b87c3b8`, **new on every run** |
 | uptime | 28 days, 7:21 | `0.03` seconds |
-| CPUs | 18 | 2 (tracks `-cpus`) |
-| memory | 48 GiB | `MemTotal: 2044888 kB` (tracks `-memory`) |
+| CPUs | 18 | 2 (tracks `--cpus`) |
+| memory | 48 GiB | `MemTotal: 2044888 kB` (tracks `--memory`) |
 | virtio devices | — | `virtio0`…`virtio7` (fs, block ×3, console, rng, balloon, vsock) |
 | PID 1 | `launchd` | the sandboxed process itself |
 
@@ -47,9 +52,9 @@ Resource requests reach the VMM rather than being advisory:
 
 | Flags | guest `nproc` | guest `MemTotal` |
 |---|---|---|
-| `-cpus 1 -memory 512` | 1 | 500532 kB |
-| `-cpus 4 -memory 4096` | 4 | 4041812 kB |
-| `-cpus 8 -memory 1024` | 8 | 1013764 kB |
+| `--cpus 1 --memory 512` | 1 | 500532 kB |
+| `--cpus 4 --memory 4096` | 4 | 4041812 kB |
+| `--cpus 8 --memory 1024` | 8 | 1013764 kB |
 
 A full boot, command and teardown takes **~0.23 s**.
 
@@ -77,7 +82,7 @@ A full boot, command and teardown takes **~0.23 s**.
 
 The persistent sandbox lifecycle was built and tested against a real containerd on a host
 with **no hypervisor**, using the runc dev runtime
-(`-runtime io.containerd.runc.v2 -snapshotter native -i-know-this-is-not-isolated`). That
+(`--runtime io.containerd.runc.v2 --snapshotter native --i-know-this-is-not-isolated`). That
 proved the containerd orchestration and nothing about the VM boundary.
 
 `stop`, `start`, `exec`, `rm` and snapshot persistence have since been confirmed behind a
@@ -118,8 +123,8 @@ caution below records the failure it replaced, because the fix is only meaningfu
 what it fixed.
 
 > [!CAUTION]
-> **Check 6 failed: policy in `-net nat` was advisory.** A guest that unsets the proxy
-> variables reached denied destinations. Under `-policy locked -allow example.com`:
+> **Check 6 failed: policy in `--net nat` was advisory.** A guest that unsets the proxy
+> variables reached denied destinations. Under `--policy locked --allow example.com`:
 >
 > ```
 > === denied host, unsetting ALL FOUR proxy vars ===
@@ -161,7 +166,7 @@ also reads as a pass. Use `curl`, `python3`, and `bash -c` when `/dev/tcp` is wa
 | 6 | **Is a guest that ignores the proxy still contained?** | **pass** *(2026-08-13)* | with all four proxy variables unset the denied host gives `http=000` and a raw TLS handshake to `1.1.1.1:443` is `ConnectionRefusedError`; UDP to `8.8.8.8:53` times out. A positive control in the same sandbox — the address allowed explicitly — connects end to end with the origin's real certificate, so the forwarder judges rather than blanket-drops. Every decision logged `transparent`. See *Check 6, re-run and passed* below |
 | 6a | **Are UDP and ICMP dropped?** | **not yet run** | new question, arising from the same fix: the stack carries no UDP except DNS to its own gateway, and no ICMP at all |
 | 7 | Is DNS mediated? | **pass** | `nameserver 192.168.127.1` in the guest, not a copy of the host's file. Note it resolves denied names too — mediated, not filtered. Since the fix it is also the *only* resolver reachable: UDP to any other address is dropped |
-| 8 | Does `-net none` mean none? | **pass** | `lo` only; `curl` → `000`, raw socket → `OSError`. The only posture whose containment has been confirmed against a real guest |
+| 8 | Does `--net none` mean none? | **pass** | `lo` only; `curl` → `000`, raw socket → `OSError`. The only posture whose containment has been confirmed against a real guest |
 | 9 | Is the CA usable inside the guest? | **pass** | see *Credential injection* below |
 | 10 | Does the network survive the command that started it? | **pass** | `boks run -d` then `boks exec` from a fresh shell works; `boks net ls` shows the same PID |
 | 11 | **Does a running VM re-attach to a restarted stack?** | **no** | `kill -9` on the supervisor is detected (`no sandbox network stacks are running`), and a later command starts a fresh one on the same socket — but the running guest never re-attaches: `curl` rc=7, raw socket `OSError`. The VM keeps running; only its network is gone. **A crashed supervisor costs that sandbox its network until the sandbox is restarted** |
@@ -178,7 +183,7 @@ repair path, so a crashed supervisor is a restart.
 libkrun 1.19.4, runtime `io.containerd.nerdbox.v1`, agent image
 `ghcr.io/dagsommer/boks/base:0.1.0`.)*
 
-**A real guest is refused.** Under `-policy locked -allow example.com`, with every proxy
+**A real guest is refused.** Under `--policy locked --allow example.com`, with every proxy
 variable unset:
 
 ```
@@ -202,7 +207,7 @@ udp refused: TimeoutError
 The raw TLS handshake that previously completed against the origin's own certificate is now
 `ConnectionRefusedError` — refused by the forwarder, before anything was dialled.
 
-**Step 2 returning `000` is correct, and is the design working.** `-allow example.com` is a
+**Step 2 returning `000` is correct, and is the design working.** `--allow example.com` is a
 hostname rule; a raw connection carries no name, so it is judged on the address, and no
 address rule matched. A hostname-only policy therefore denies direct-by-IP flows *including
 to the allowed host*. That fails closed, which is the right direction, but it means
@@ -252,7 +257,7 @@ The `172.66.147.243` denial in `…8a5c83ac00` is step 2 — the allowed *host*,
 | Probe | Result |
 |---|---|
 | host loopback (`http://127.0.0.1:9999` with a host server bound there) | `000` |
-| `-net none` to an allowed host | `000` |
+| `--net none` to an allowed host | `000` |
 | DNS through the sandbox's own resolver | works (`172.66.147.243`) |
 | DNS to an **external** resolver (`8.8.8.8:53`, hand-built query) | `TimeoutError` — not a covert channel |
 | ICMP echo to a denied address | no reply (`TimeoutError`) |
@@ -274,7 +279,7 @@ observability gap, not a containment one.
 holds. With the secret `REAL-SECRET-VALUE-12345` stored host-side and
 
 ```
--inject 'demo@postman-echo.com=x-api-key' -guest-credential 'demo=DEMO_KEY=placeholder-not-the-secret'
+--inject 'demo@postman-echo.com=x-api-key' --guest-credential 'demo=DEMO_KEY=placeholder-not-the-secret'
 ```
 
 the guest printed `placeholder-not-the-secret`, a grep of the guest's whole environment for
@@ -365,7 +370,7 @@ kernel:
    host's process table contains no such process tree.
 5. **Distinct device topology.** The guest's `/proc/cpuinfo`, `/sys/class/block` and
    `/proc/meminfo` reflect the vCPU and memory the sandbox was given
-   (`-cpus`, `-memory`), not the host's hardware.
+   (`--cpus`, `--memory`), not the host's hardware.
 6. **virtio devices present.** `ls /sys/bus/virtio/devices` is non-empty in the guest and
    lists the virtiofs and, if configured, virtio-net devices.
 7. **Kernel modification is contained.** Something that would change host kernel state —
@@ -397,11 +402,11 @@ On a host with hardware virtualisation (bare metal Linux with KVM, or Apple sili
 3. **Collect the same from a sandbox.**
 
    ```
-   boks run shell . -cpus 2 -m 2048m -- sh -c 'uname -r; cat /proc/sys/kernel/random/boot_id; cat /proc/uptime; nproc'
+   boks run shell . --cpus 2 -m 2048m -- sh -c 'uname -r; cat /proc/sys/kernel/random/boot_id; cat /proc/uptime; nproc'
    ```
 
 4. **Compare.** The boot_id must differ, the guest uptime must be far smaller than the
-   host's, and `nproc` must equal the `-cpus` value rather than the host's core count.
+   host's, and `nproc` must equal the `--cpus` value rather than the host's core count.
 
 5. **Check the device topology.**
 
@@ -499,7 +504,7 @@ confirmed against a booted VM:
 
 - **the network policy is enforced in the stack** — every TCP connection judged before it is
   dialled, UDP and ICMP dropped. This was the fix for check 6, and it now holds against a
-  real guest: see *Check 6, re-run and passed* above. `-net nat` can be described as
+  real guest: see *Check 6, re-run and passed* above. `--net nat` can be described as
   enforced;
 - the `runtime entitlement` check in `boks doctor` reports `ok` against a correctly signed
   shim, and `fail` with an actionable remedy against one signed without the entitlement;
@@ -514,7 +519,7 @@ end of the same `SOCK_DGRAM` link socket a VM would use, with its own address in
 subnet and a default route through the gateway, speaking real Ethernet, ARP and TCP.
 
 Driven through the real CLI — `boks net serve` holding the stack, `boks policy log` reading
-the decisions — under `-policy locked` with one allowed destination:
+the decisions — under `--policy locked` with one allowed destination:
 
 ```
 raw TCP to 172.17.0.9:8099:     CONNECTED after 1.006s
