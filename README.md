@@ -282,7 +282,12 @@ enforces — what matters most is watching it work against a real guest.
 5. Docker daemon inside the guest
 6. Port publishing, and the `PORTS` column that has nothing to show without it
 8. Kits / declarative configuration
-9. Windows, once the runtime supports it
+9. Windows — **investigated; the obstacle is one device driver, not the platform.** libkrun's
+   Windows Hypervisor Platform backend is in progress upstream for libkrun 2.0, and nerdbox
+   already builds a Windows shim for it. **virtio-net is the single device not yet ported** —
+   which is exactly the one Boks' enforcement depends on. In the meantime Boks should run
+   **inside WSL2** with nested virtualisation: unchanged, with workspace paths preserved
+   exactly. Untested, but every ingredient is there. See [docs/windows.md](docs/windows.md)
 
 ## Development
 
