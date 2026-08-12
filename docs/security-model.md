@@ -138,10 +138,14 @@ cannot read it; the exception is credential injection, described under
 > per flow rather than dropping everything that skips the proxy. Full transcript in
 > [docs/verification.md](verification.md).
 >
-> Two consequences worth knowing. Enforcement is on the **address**, so a hostname-only
+> One consequence worth knowing. Enforcement is on the **address**, so a hostname-only
 > policy denies raw connections *including to the allowed host* — fail-closed, but not what
-> a reader of `-allow example.com` expects. And UDP/ICMP drops are **silent**: nothing is
-> logged for them.
+> a reader of `-allow example.com` expects. `boks policy ls` now says so when every allow
+> rule it resolved names a host, rather than leaving it to be discovered by a refusal.
+>
+> UDP and ICMP drops are no longer silent: they are recorded as `transparent` refusals, once
+> per destination and capped, so a guest probing them appears in `boks policy log` without
+> being able to choose how large that log grows.
 >
 > `-net none` is unaffected and remains a real boundary.
 
@@ -309,8 +313,9 @@ which hosts will be decrypted.
 - **A hostname rule does not authorise a raw connection.** Enforcement reads the address in
   the packet, so `-allow example.com` permits the proxied flow and denies a direct
   connection to the address that name resolves to. Fail-closed, but surprising.
-- **UDP and ICMP are dropped without a log line.** A guest probing them leaves no trace in
-  `boks policy log`, unlike a denied TCP flow.
+- **UDP and ICMP carry no reason a rule could express.** They are refused categorically, so
+  the log records the refusal and the category rather than a matching rule — there is no rule
+  to name. Recorded once per destination and capped, since the guest chooses the packet rate.
 - **A sandbox created before this existed, or by something else, has no wiring** and runs on
   the runtime's default transport, where the guest's `127.0.0.1` is the host's. Boks warns
   loudly when it meets one; the fix is to recreate it, because the mode lives in annotations
