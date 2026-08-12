@@ -110,6 +110,8 @@ cannot read it; the exception is credential injection, described under
 | Piece | State |
 |---|---|
 | Policy engine — exact/wildcard hosts, IP and CIDR rules, ports, deny precedence, presets, decision log (`internal/policy`) | built, unit-tested |
+| Durable, scoped policy store — global, per-sandbox and profile scopes (`internal/policy/store.go`) | built, unit-tested |
+| A sandbox remembering the policy it was created with (`dev.boks.policy`) | built, integration-tested against containerd |
 | Host forward proxy — HTTP, `CONNECT`, SNI cross-check (`internal/proxy`) | built, exercised end to end against real TLS origins |
 | TLS interception for credential-bearing hosts only, local CA (`internal/ca`) | built, demonstrated end to end with a real client, two real HTTPS origins and certificate comparison |
 | Credential injection, encrypted host-side store (`internal/secret`) | built, unit-tested |
@@ -211,6 +213,48 @@ says no.** The library's stack terminated the guest's NIC and then forwarded eve
 was handed. Terminating the link is necessary and nowhere near sufficient, and a design that
 stops at "we control the far end of the NIC" has stopped one step early.
 
+#### Where a policy lives, and what a scope can do
+
+Policy is durable state, not an argument to a run. Rules live in `<state>/policy/policy.json`
+— versioned JSON, `0600` in a `0700` directory, replaced by an atomic rename — and are read by
+every command that brings a sandbox's network up. Three scopes write into it: **global** (every
+sandbox on this machine), **per-sandbox**, and **profile** (a named policy a run selects with
+`-profile`).
+
+**The scoping rule is one sentence, and it is a security property rather than an ergonomic
+one: a deny in any scope beats an allow in any scope.** There is no specificity ordering, no
+"closer scope wins", and no way for a narrower scope to unsay a wider one. A sandbox-scoped
+rule can add access the machine's policy already tolerates, and can take access away; it can
+never widen past a prohibition someone wrote down. Only the base preset — chosen by
+`policy init`, by a profile, or by a `-policy` flag — decides what happens to a destination no
+rule mentions, so no stored rule can turn a deny-by-default machine into an allow-by-default
+one. Every ordered pair of scopes is tested for this.
+
+The per-run `-policy`, `-allow` and `-deny` flags are a **Boks addition**, not something sbx
+has, and they are overrides rather than a second policy: `-policy` and `-allow` replace the
+posture and the allow list, while `-deny` is *added* to what the sandbox already denies. A run
+therefore cannot drop a prohibition by typing a different one.
+
+**The store fails closed.** A store that cannot be read — malformed, unreadable, or written by
+a newer Boks whose schema this build does not understand — is an error on every path that
+touches it, so no sandbox starts. A single rule that does not parse rejects the whole file
+rather than being skipped, because the rule that failed to parse may be a deny. A *missing*
+store is not an error: it is the uninitialised state, and it resolves to the built-in
+deny-by-default preset.
+
+**A sandbox remembers its own selection.** The profile, preset and per-run rules a sandbox was
+created with are recorded in a container label (`dev.boks.policy`) and read back by `boks
+start` and `boks exec`, neither of which has policy flags. Before that existed, restarting a
+sandbox served it the *default* preset instead of the policy it was created under — a
+containment that silently widened on restart, which is exactly the direction a failure must not
+go. The label records the selection and not the resolved rules, so a rule added to the store
+after a sandbox was created still reaches it, and so the record stays well inside containerd's
+label size limit; a record that would exceed it is refused rather than truncated.
+
+Nothing in the store or the label is a secret. Both hold destinations, preset names and
+dispositions. Credential *rules* name a service and are not recorded on a sandbox at all;
+credential *values* live only in the encrypted store and travel to the supervisor on a pipe.
+
 #### The network supervisor
 
 A sandbox's network is served by one `boks net serve` process per *running* sandbox, started
@@ -218,7 +262,10 @@ on demand by whichever command starts the VM and ending when the sandbox's task 
 is trusted with, and what bounds it:
 
 - It holds the **policy** for one sandbox, the **credential values** for that sandbox only,
-  and the CA's signing key if that sandbox intercepts anything.
+  and the CA's signing key if that sandbox intercepts anything. The policy arrives already
+  resolved: the supervisor never reads the policy store itself, so the rules a sandbox is
+  running under are fixed at the moment it starts, and editing the store cannot widen a
+  sandbox that is already running.
 - It is given those values **on a pipe at startup, never in its command line or environment**,
   and it is never given the passphrase to the encrypted store. A supervisor cannot obtain a
   credential the run was not configured with.
@@ -315,6 +362,21 @@ which hosts will be decrypted.
   the runtime's default transport, where the guest's `127.0.0.1` is the host's. Boks warns
   loudly when it meets one; the fix is to recreate it, because the mode lives in annotations
   that are fixed when a container is created.
+- **A sandbox created before it recorded its policy has no record**, so `boks start` serves it
+  the default preset plus whatever the store says about it, exactly as it did before. It is
+  not distinguishable from a sandbox that named no policy, and the fix is the same: recreate
+  it, or write its rules into the store with `boks policy allow -sandbox <name>`.
+- **Credential rules are still per-invocation.** The policy a sandbox remembers covers
+  destinations, not credentials, so `boks start` and `boks exec` bring up a stack with no
+  injection configured. Deliberate: resolving a credential needs the passphrase to the
+  encrypted store, and prompting for one inside `boks start` is a worse trade than a missing
+  header. It fails in the safe direction — a request goes out unauthenticated rather than a
+  secret going somewhere unexpected — but it is a surprise, and it is unbuilt rather than
+  decided against.
+- **Two `boks policy` commands running at once can lose a rule.** The store is read, modified
+  and written back without a lock; the write itself is atomic, so the file is never
+  half-written, but a concurrent pair of writers can leave one of the two rules out. Adding a
+  rule is an interactive act, so this has been left rather than solved.
 - **If a supervisor is killed, that sandbox's network is gone until the sandbox is
   restarted.** The next `boks run` or `boks exec` starts a fresh stack, but a *running* VM
   does **not** re-attach to it — measured 2026-08-12. A guest whose network vanishes fails
