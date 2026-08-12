@@ -440,7 +440,15 @@ authoritative, and deleting them while the sandbox is stopped costs the sandbox 
 
 Linux first (KVM). macOS second — libkrun and nerdbox both support it via
 Hypervisor.framework, and containerd 2.2+ runs natively there, so nothing in the design is
-Linux-only by construction. Windows waits for nerdbox support.
+Linux-only by construction.
+
+**Windows does not wait for nerdbox**, which is what this document used to say. A spike into
+it ([windows.md](windows.md)) found the runtime half already solved by containerd and
+Microsoft's `hcsshim` — and the *enforcement* half unavailable, because Hyper-V exposes no
+socket-backed NIC and so no host userspace process can terminate a guest's traffic. A native
+Windows port would produce a sandbox whose network policy is decorative, which is why there
+is not one. The exact-path workspace property is separately impossible there:
+`C:\Users\dag\src\foo` is not a Linux path.
 
 Code that touches platform specifics is kept behind build tags and interfaces, and `doctor`
 is structured as a list of checks each of which knows whether it applies to the current
