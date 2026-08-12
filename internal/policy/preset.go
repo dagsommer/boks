@@ -50,7 +50,7 @@ func PresetDescription(name string) string {
 	case PresetStandard:
 		return "deny by default; allow a small set of package registries and source hosts over HTTPS"
 	case PresetLocked:
-		return "deny everything; every destination must be added with -allow"
+		return "deny everything; every destination must be added with --allow"
 	}
 	return ""
 }
@@ -76,7 +76,7 @@ func PresetDescription(name string) string {
 // Private LAN ranges are deliberately *not* denied here: reaching a machine on your own
 // network is a plausible thing to want from a policy called "open", and unlike loopback it
 // is not an artefact of how the runtime happens to work. Use standard or locked if you
-// disagree; deny rules cannot be removed by -allow, so the ones that remain here are the
+// disagree; deny rules cannot be removed by --allow, so the ones that remain here are the
 // ones worth being unable to unsay.
 func openPolicy() Policy {
 	return Policy{
@@ -101,12 +101,12 @@ func openPolicy() Policy {
 // it is right to. A wildcard over a multi-tenant domain (googleapis.com, amazonaws.com,
 // blob.core.windows.net, githubusercontent.com) allows every tenant's bucket, which means
 // it allows an exfiltration destination that the attacker controls and you have never
-// heard of. If a tool needs one, add it deliberately with -allow and know what you bought.
+// heard of. If a tool needs one, add it deliberately with --allow and know what you bought.
 //
 // Everything is restricted to port 443. Allowing port 80 adds a plaintext path to the same
 // host, which is a downgrade target for anything that follows redirects; the OS package
 // managers that still default to HTTP (apt, apk) are therefore absent, and adding
-// `-allow deb.debian.org:80` is an explicit choice rather than a default.
+// `--allow deb.debian.org:80` is an explicit choice rather than a default.
 //
 // Also absent on purpose:
 //   - raw.githubusercontent.com — arbitrary attacker-controlled content, and the fetch half
@@ -140,36 +140,6 @@ func standardPolicy() Policy {
 // by watching `boks policy log` and adding what the workload actually asked for.
 func lockedPolicy() Policy {
 	return Policy{Name: PresetLocked, Default: Deny}
-}
-
-// Resolve builds the effective policy for a run: a preset, then extra allow and deny rules
-// from the command line. Deny still beats allow afterwards, so appending an allow rule can
-// never widen past a deny the preset already made.
-func Resolve(preset string, allow, deny []string) (Policy, error) {
-	p, err := Preset(preset)
-	if err != nil {
-		return Policy{}, err
-	}
-	var extra []Rule
-	for _, spec := range deny {
-		r, err := ParseRule(Deny, spec)
-		if err != nil {
-			return Policy{}, fmt.Errorf("-deny %s: %w", spec, err)
-		}
-		extra = append(extra, r)
-	}
-	for _, spec := range allow {
-		r, err := ParseRule(Allow, spec)
-		if err != nil {
-			return Policy{}, fmt.Errorf("-allow %s: %w", spec, err)
-		}
-		extra = append(extra, r)
-	}
-	p = p.With(extra...)
-	if len(allow) > 0 || len(deny) > 0 {
-		p.Name = p.Name + "+local"
-	}
-	return p, nil
 }
 
 // Describe renders a policy for `boks policy ls`, deny rules first because they are the

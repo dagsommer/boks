@@ -144,7 +144,11 @@ func TestAStackWithNoPolicyRefusesEverything(t *testing.T) {
 // show. Both outcomes have to be recorded, and both have to say they were judged on an
 // address rather than read.
 func TestEveryRawDecisionIsLoggedAsTransparent(t *testing.T) {
-	pol, err := policy.Resolve(policy.PresetLocked, []string{"203.0.113.8:443"}, nil)
+	res, err := (policy.Request{Preset: policy.PresetLocked, Allow: []string{"203.0.113.8:443"}}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := res.Policy()
 	if err != nil {
 		t.Fatal(err)
 	}

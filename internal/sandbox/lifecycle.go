@@ -12,6 +12,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 
+	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/runtimecfg"
 )
 
@@ -42,9 +43,12 @@ type Info struct {
 	// sandbox is wired to, and a later command that has to bring it back up reads its
 	// network mode from here rather than guessing.
 	Annotations map[string]string `json:"annotations,omitempty"`
-	Cwd         string            `json:"cwd,omitempty"`
-	PID         uint32            `json:"pid,omitempty"`
-	ExitCode    *uint32           `json:"exit_code,omitempty"`
+	// Policy is how the sandbox's network policy was chosen, as recorded when it was
+	// created. Nil for a sandbox that named no policy, or one made before Boks recorded it.
+	Policy   *policy.SandboxPolicy `json:"policy,omitempty"`
+	Cwd      string                `json:"cwd,omitempty"`
+	PID      uint32                `json:"pid,omitempty"`
+	ExitCode *uint32               `json:"exit_code,omitempty"`
 }
 
 // Workspace returns the sandbox's primary workspace host path, or "" if it has none.
@@ -428,6 +432,7 @@ func describe(ctx context.Context, container client.Container) (Info, error) {
 		Ephemeral:   info.Labels[LabelEphemeral] == "1",
 		Workspaces:  decodeWorkspaces(info.Labels),
 		Command:     decodeCommand(info.Labels),
+		Policy:      decodePolicy(info.Labels),
 	}
 
 	if spec, err := container.Spec(ctx); err == nil {

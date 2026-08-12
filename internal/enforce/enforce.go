@@ -93,9 +93,14 @@ type Spec struct {
 	// It is passed rather than recomputed so both ends agree exactly.
 	Plan network.Plan `json:"plan"`
 
-	Preset string   `json:"preset,omitempty"`
-	Allow  []string `json:"allow,omitempty"`
-	Deny   []string `json:"deny,omitempty"`
+	// Resolution is the sandbox's policy, already assembled from the durable store, the
+	// sandbox's own recorded selection and this run's flags.
+	//
+	// It travels resolved rather than as the ingredients, because the supervisor must not
+	// re-read the store: the rules a sandbox runs under are fixed when it starts, so
+	// editing the policy file cannot widen a sandbox that is already running, and the CLI
+	// that printed the policy and the process that enforces it cannot disagree about it.
+	Resolution *policy.Resolution `json:"policy,omitempty"`
 
 	// Inject and GuestCredentials are the -inject and -guest-credential specs verbatim.
 	Inject           []string `json:"inject,omitempty"`
@@ -131,13 +136,16 @@ func (s Spec) String() string {
 // GoString covers %#v, which would otherwise print every field.
 func (s Spec) GoString() string { return s.String() }
 
-// Policy resolves the preset and the per-run rules into the policy to enforce.
+// Policy compiles the resolved rules into the policy to enforce.
+//
+// A spec that carries no resolution gets the default preset rather than an empty policy.
+// That is the fail-closed direction — the default is deny-by-default — and it keeps a
+// hand-built spec (a test, a piped `boks net serve`) from silently enforcing nothing.
 func (s Spec) Policy() (policy.Policy, error) {
-	preset := s.Preset
-	if preset == "" {
-		preset = policy.DefaultPreset
+	if s.Resolution == nil {
+		return policy.Preset(policy.DefaultPreset)
 	}
-	return policy.Resolve(preset, s.Allow, s.Deny)
+	return s.Resolution.Policy()
 }
 
 // Credentials assembles the credential rules.
