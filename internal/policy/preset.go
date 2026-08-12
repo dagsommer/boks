@@ -142,36 +142,6 @@ func lockedPolicy() Policy {
 	return Policy{Name: PresetLocked, Default: Deny}
 }
 
-// Resolve builds the effective policy for a run: a preset, then extra allow and deny rules
-// from the command line. Deny still beats allow afterwards, so appending an allow rule can
-// never widen past a deny the preset already made.
-func Resolve(preset string, allow, deny []string) (Policy, error) {
-	p, err := Preset(preset)
-	if err != nil {
-		return Policy{}, err
-	}
-	var extra []Rule
-	for _, spec := range deny {
-		r, err := ParseRule(Deny, spec)
-		if err != nil {
-			return Policy{}, fmt.Errorf("-deny %s: %w", spec, err)
-		}
-		extra = append(extra, r)
-	}
-	for _, spec := range allow {
-		r, err := ParseRule(Allow, spec)
-		if err != nil {
-			return Policy{}, fmt.Errorf("-allow %s: %w", spec, err)
-		}
-		extra = append(extra, r)
-	}
-	p = p.With(extra...)
-	if len(allow) > 0 || len(deny) > 0 {
-		p.Name = p.Name + "+local"
-	}
-	return p, nil
-}
-
 // Describe renders a policy for `boks policy ls`, deny rules first because they are the
 // ones that win.
 func (p Policy) Describe() string {

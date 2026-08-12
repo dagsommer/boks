@@ -80,7 +80,12 @@ Flags:
 	if err != nil {
 		return err
 	}
-	spec, err := netFlags.enforceSpec(ctx, inv.name, *flags.address, mode)
+	// The policy selection is recorded on the container alongside the wiring, and for the
+	// same reason: `boks start` and `boks exec` have no policy flags, so a sandbox that did
+	// not carry its own would come up under the default preset instead of the one it was
+	// created with.
+	record := netFlags.sandboxRecord()
+	spec, err := netFlags.enforceSpec(ctx, inv.name, *flags.address, mode, record)
 	if err != nil {
 		return err
 	}
@@ -91,6 +96,7 @@ Flags:
 	if err != nil {
 		return err
 	}
+	cfg.Policy = record
 	cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
 	cfg.Env = append(cfg.Env, guest.Env...)
 	cfg.Mounts = guest.Mounts
