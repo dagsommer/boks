@@ -63,17 +63,22 @@ demonstration.
 
 | Half | Status |
 |---|---|
-| A Linux microVM per sandbox on Windows, driven through containerd | **Available in principle.** The reference product ships `containerd-shim-nerdbox-v1.exe` — the same shim family Boks targets — so the orchestration layer is known to port. |
-| Terminating the guest's network in a host userspace process | **Architecturally available.** A user-mode VMM owns the virtio-net backend; nothing in the platform stands in the way. |
-| **A VMM Boks can use to do it** | **Missing.** libkrun targets KVM and Hypervisor.framework. Docker substituted a VMM of their own, which is not open source. |
+| A Linux microVM per sandbox on Windows, driven through containerd | **Already upstream.** `containerd/nerdbox` builds its shim for `windows/amd64` and `windows/arm64` and loads a VMM DLL named `krun.dll`. |
+| Terminating the guest's network in a host userspace process | **Architecturally available.** WHP has no networking API at all: every device, the NIC included, is emulated in the VMM's own process. Networking is entirely the VMM's business. |
+| **A VMM Boks can use to do it** | **Being built, upstream, now.** libkrun has an in-tree WHP backend targeting libkrun 2.0 at the end of 2026 — with virtio-fs, -blk, -console, -balloon and -rng ported and **virtio-net the single exception.** |
 
-The recommendation therefore changes shape. It is **not** "do not build a Windows backend
-because policy could not be enforced" — that was wrong. It is:
+That last row is the whole answer, and it is much narrower than "Boks needs a VMM". Every device
+libkrun needs on Windows has been ported except the one that carries packets — which is exactly
+and only the one Boks depends on.
 
-**Do not build a native Windows backend until there is a WHP-capable VMM to build it on, and
-treat finding or building one as the entire question.** Everything else — the shim, the
-snapshotter, the workspace mapping, the netstack, the proxy, the policy engine — is either
-already portable or a known, bounded piece of work. Section 8 assesses the candidates.
+The recommendation therefore changes shape twice over. It is **not** "do not build a Windows
+backend because policy could not be enforced" — that was wrong. Nor is it "find or write a VMM".
+It is:
+
+**Wait for libkrun 2.0, and if Windows is wanted sooner, contribute the one missing piece:
+port libkrun's `virtio-net` backend from `nix`/`RawFd` to WinSock.** Boks changes nothing
+architectural. Section 8 has the evidence, the second-choice option (OpenVMM), and one cheap
+experiment that could produce a working path today.
 
 ### And there is an answer for Windows users today
 
