@@ -95,12 +95,15 @@ Two real risks remain, both inherited from the "mount the live workspace" model:
 The design principle: **an environment variable is not a security boundary.** A guest that
 ignores `HTTP_PROXY` and opens a raw socket must still be stopped.
 
-Intended enforcement is a host-side userspace network stack terminating the guest's
-virtio-net link, so every packet is examined on the host and unapproved flows are dropped
-regardless of guest cooperation. HTTP/HTTPS is steered to a host forward proxy that filters
-on the `CONNECT` target and TLS SNI. Almost all traffic is tunnelled without interception,
-so end-to-end TLS is preserved and the proxy cannot read it; the exception is credential
-injection, described under [TLS interception](#tls-interception-and-the-boks-ca) below.
+Enforcement is a host-side userspace network stack terminating the guest's virtio-net link.
+Every TCP connection the guest opens is judged there — against the address and port in the
+packet, before anything is dialled — so a denied destination is refused whether or not the
+guest cooperated. UDP and ICMP are dropped at the link, with DNS to the sandbox's own
+resolver as the only exception. HTTP/HTTPS is *additionally* steered to a forward proxy
+inside the same virtual network, which filters on the `CONNECT` target and TLS SNI. Almost
+all traffic is tunnelled without interception, so end-to-end TLS is preserved and the proxy
+cannot read it; the exception is credential injection, described under
+[TLS interception](#tls-interception-and-the-boks-ca) below.
 
 #### What exists today
 
@@ -111,37 +114,41 @@ injection, described under [TLS interception](#tls-interception-and-the-boks-ca)
 | TLS interception for credential-bearing hosts only, local CA (`internal/ca`) | built, demonstrated end to end with a real client, two real HTTPS origins and certificate comparison |
 | Credential injection, encrypted host-side store (`internal/secret`) | built, unit-tested |
 | Network annotations and host-stack supervision (`internal/network`, `internal/enforce`) | built, unit-tested |
+| Policy-aware TCP forwarder in the stack; UDP and ICMP dropped (`internal/network`) | built, exercised against a simulated guest on the real link |
 | All of it applied to a running sandbox (`boks run`) | **done** |
 | Policy enforced against a real guest **that uses the proxy** | **verified** 2026-08-12 |
-| Policy enforced against a real guest **that ignores the proxy** | **fails** — see below |
+| Policy enforced against a real guest **that ignores the proxy** | **built, unverified against a VM** — see below |
 
-> [!CAUTION]
-> **In `-net nat`, network policy is advisory.** *(verified 2026-08-12, macOS host with a
-> hypervisor.)* A guest that unsets `http_proxy`/`https_proxy` reaches any destination it
-> likes, whatever the policy says. Measured, under `-policy locked -allow example.com`:
-> a direct `https://www.google.com/` returned **HTTP 200**, and a raw Python TLS handshake
-> to `1.1.1.1:443` completed against **the origin's own certificate** (`SSL.com SSL
-> Intermediate CA ECC R2`) — end to end with the real host, not with the proxy. Neither
-> attempt appears in `boks policy log`, because neither reached the policy engine.
+> [!IMPORTANT]
+> **This was measured broken, and is now fixed in the stack but not yet re-measured on a
+> VM.** *(measured 2026-08-12, macOS host with a hypervisor.)* A guest that unset
+> `http_proxy`/`https_proxy` reached any destination it liked: under `-policy locked -allow
+> example.com`, a direct `https://www.google.com/` returned **HTTP 200**, and a raw Python
+> TLS handshake to `1.1.1.1:443` completed against **the origin's own certificate**
+> (`SSL.com SSL Intermediate CA ECC R2`). Neither appeared in `boks policy log`, because
+> neither reached the policy engine.
+>
+> The cause was that the host-side stack was built by gvisor-tap-vsock's
+> `virtualnetwork.New`, whose TCP forwarder dials whatever address the guest puts in a SYN.
+> Boks now assembles the stack itself and installs a forwarder that consults the policy
+> engine first. **Against a simulated guest on the real link socket, the same raw connection
+> is now refused and logged as `transparent`.** Nobody has yet run those probes against a
+> real VM; until someone does, treat `-net nat` as enforced-but-unwitnessed, and see
+> [docs/verification.md](verification.md) for the exact commands that would settle it.
 >
 > `-net none` is unaffected and remains a real boundary.
 
-**The proxy is not the enforcement boundary — and today nothing else is either.** A forward
-proxy filters only traffic a client chooses to send it, so if `HTTP_PROXY` is all Boks does,
-a three-line program in the guest walks past it. That is exactly what was measured. The
-host-side stack does terminate the guest's NIC and the proxy does listen inside that virtual
-network, so the *place* to enforce exists — but the stack is configured as a NAT that
-forwards what it is given. It consults no policy on the direct path, so a guest that ignores
-the proxy **does gain a route**.
+**The proxy is not the enforcement boundary; the stack under it is.** A forward proxy filters
+only traffic a client chooses to send it, so if `HTTP_PROXY` were all Boks did, a three-line
+program in the guest would walk past it — which is precisely what was measured. What the
+proxy provides, and only for a cooperating client, is the set of things that need a
+conversation rather than a packet: hostname rules, credential injection, and a refusal that
+explains itself. A guest that declines all of that is judged on addresses and ports instead.
 
-An earlier draft of this document claimed the opposite ("it does not gain a route"). That
-claim was written against a simulated guest and is false against a real one.
-
-What this means for the threat model: policy, hostname rules and credential injection are
-**cooperation features**, valuable against a well-behaved agent that honours its environment
-and useful for observability, and worth nothing against hostile code. Until the netstack
-itself drops unpermitted flows, the only postures that contain a hostile guest are `-net
-none` and the hypervisor boundary itself.
+The residue that no stack can remove: **a hostname rule cannot be applied to a raw flow**,
+because a SYN carries no name. A policy written entirely in hostnames therefore *denies* raw
+flows rather than permitting the addresses those names resolve to. That fails in the safe
+direction, and it is why an agent that needs a non-HTTP protocol needs an address rule.
 
 Two properties of the listener are worth stating because they were design choices, not
 accidents:
@@ -165,7 +172,13 @@ see and drop a flow.
 *(re-verified 2026-08-12 through `boks run` itself: a host `python3 -m http.server 9999
 --bind 127.0.0.1` was unreachable from the guest — `curl` returned rc=7 and a Python
 `connect()` raised `ConnectionRefusedError`. The host-loopback hole TSI left open is
-closed.)* **That point exists but is not yet used to drop anything**: see the caution above.
+closed.)* That point is now used: the stack drops what the policy denies.
+
+Host loopback is closed twice over, and the stronger of the two is not the policy. A packet
+addressed to `127.0.0.0/8` arriving on a NIC that is not the loopback interface is a martian,
+and the host-side stack discards it at the IP layer — before the forwarder, before any rule
+is consulted. A test gives a simulated guest a policy that *permits* the host's loopback and
+a real listener to reach, and it still cannot get there.
 
 Three things that verification changed, all of them reflected in the code:
 
@@ -179,7 +192,12 @@ Three things that verification changed, all of them reflected in the code:
 - **A genuinely network-less mode exists now.** Attaching the NIC to the VM without wiring
   the container to it turns TSI off and leaves the container with loopback only. That is
   `-net none`, and it is the strongest containment Boks can currently offer — the only
-  posture that does not depend on unfinished enforcement code.
+  posture whose enforcement has been confirmed against a real guest.
+
+A fourth thing the 2026-08-12 run changed: **a stack is not a boundary until something in it
+says no.** The library's stack terminated the guest's NIC and then forwarded everything it
+was handed. Terminating the link is necessary and nowhere near sufficient, and a design that
+stops at "we control the far end of the NIC" has stopped one step early.
 
 #### The network supervisor
 
@@ -265,14 +283,18 @@ like.
 
 **Transparency.** Every logged flow records how it was carried, using Docker Sandboxes' own
 vocabulary: `forward` (Boks handled it at the HTTP level and could read it — plaintext HTTP,
-or HTTPS it terminated), `forward-bypass` (tunnelled, ciphertext only), `transparent`
-(judged at the network layer without the proxy; Boks cannot produce this yet). `boks policy
-ls` and `boks proxy` both state, unprompted, which hosts will be decrypted.
+or HTTPS it terminated), `forward-bypass` (tunnelled, ciphertext only), `transparent` (judged
+in the network stack by address and port, with the proxy not involved at all — Boks saw a
+destination and nothing else). `boks policy ls` and `boks proxy` both state, unprompted,
+which hosts will be decrypted.
 
 #### Known limits, stated up front
 
-- **Nothing here has been demonstrated against a real guest.** The strongest honest claim is
-  that a simulated guest on the real link socket is filtered exactly as designed.
+- **No policy decision has been demonstrated against a real guest.** The strongest honest
+  claim is that a simulated guest on the real link socket — a second network stack speaking
+  real Ethernet over the real link — is filtered exactly as designed, including when it uses
+  no proxy at all. The hypervisor half of the path (libkrun's virtio-net device, nerdbox's
+  annotations) is exercised by nothing in this repository.
 - **A sandbox created before this existed, or by something else, has no wiring** and runs on
   the runtime's default transport, where the guest's `127.0.0.1` is the host's. Boks warns
   loudly when it meets one; the fix is to recreate it, because the mode lives in annotations
@@ -286,12 +308,21 @@ ls` and `boks proxy` both state, unprompted, which hosts will be decrypted.
   the tunnel on a mismatch, but it can only do so *after* answering `200`, so the client
   sees a broken handshake and the reason lives in the decision log.
 - Encrypted Client Hello removes the SNI signal entirely.
-- Hostname rules are meaningless for raw sockets — only IP/port rules apply there.
+- Hostname rules are meaningless for raw sockets — only IP/port rules apply there. The stack
+  judges raw flows on addresses, so a hostname-only policy denies them.
 - A hostname allow says nothing about the address it resolves to. The proxy re-checks the
   resolved address against the deny rules before dialling, which stops `evil.test A
   127.0.0.1`; it cannot stop a name whose address changes between check and connect.
-- DNS is a covert channel unless resolution is also mediated. Pointing the guest's resolver
-  at the host-side gateway is the hook for that; it does not by itself close the channel.
+- **DNS is mediated but not filtered.** The guest's resolver is the sandbox's own gateway,
+  and UDP to any other destination is dropped, so a guest cannot query a nameserver of its
+  choosing over UDP — which closes the "DNS as a free covert channel" hole. What it does not
+  do is judge the *names*: the gateway resolves whatever it is asked through the host's
+  resolver, so query names still leak upstream and a low-bandwidth channel remains in the
+  names themselves. Rules over names are the natural next thing to attach there, and are
+  unbuilt.
+- **UDP and ICMP are dropped, and no policy re-enables them.** That matches the reference
+  product, and it costs the guest QUIC (clients fall back to TCP), `ping`, and any UDP
+  protocol. A workload that genuinely needs one has no way to ask for it today.
 - **Every allowed host is an exfiltration destination.** An allowlist bounds *where* data can
   go, not whether it goes. This is why the default preset is short and exact.
 - A flow marked for interception that turns out not to be TLS for the host that was judged —
@@ -343,8 +374,9 @@ host)*:
 The refusal is the discriminator: the call is being handled by the guest's own loopback
 stack, where nothing listens, rather than performed on the host. That is the whole reason the
 provider is worth its complexity — and it remains all that has been shown *about a real
-guest*. Boks now applies a policy to a running sandbox; nobody has yet watched a real guest
-be refused by it.
+guest*. Boks now applies a policy to a running sandbox, and its stack refuses what the policy
+denies when a simulated guest opens the connection; nobody has yet watched a **real** guest be
+refused by it.
 
 ### Host services
 
