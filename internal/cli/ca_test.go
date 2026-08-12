@@ -12,7 +12,7 @@ import (
 
 func TestCaShowWithoutAnAuthority(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ca")
-	out, _, err := runCLI(t, "", "ca", "show", "-dir", dir)
+	out, _, err := runCLI(t, "", "ca", "show", "--dir", dir)
 	if err != nil {
 		t.Fatalf("ca show: %v", err)
 	}
@@ -23,7 +23,7 @@ func TestCaShowWithoutAnAuthority(t *testing.T) {
 
 func TestCaShowCreatesAndDescribes(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ca")
-	out, _, err := runCLI(t, "", "ca", "show", "-dir", dir, "-create")
+	out, _, err := runCLI(t, "", "ca", "show", "--dir", dir, "--create")
 	if err != nil {
 		t.Fatalf("ca show -create: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestCaShowCreatesAndDescribes(t *testing.T) {
 
 func TestCaExportWritesOnlyTheCertificate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ca")
-	out, _, err := runCLI(t, "", "ca", "export", "-dir", dir)
+	out, _, err := runCLI(t, "", "ca", "export", "--dir", dir)
 	if err != nil {
 		t.Fatalf("ca export: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestCaExportWritesOnlyTheCertificate(t *testing.T) {
 	}
 
 	file := filepath.Join(t.TempDir(), "boks-ca.pem")
-	if _, _, err := runCLI(t, "", "ca", "export", "-dir", dir, "-o", file); err != nil {
+	if _, _, err := runCLI(t, "", "ca", "export", "--dir", dir, "-o", file); err != nil {
 		t.Fatalf("ca export -o: %v", err)
 	}
 	data, err := os.ReadFile(file)
@@ -68,11 +68,11 @@ func TestCaExportWritesOnlyTheCertificate(t *testing.T) {
 // Python ignore the system trust store, so it has to carry exactly what the file does.
 func TestCaEnvCarriesTheSameCertificate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ca")
-	pem, _, err := runCLI(t, "", "ca", "export", "-dir", dir)
+	pem, _, err := runCLI(t, "", "ca", "export", "--dir", dir)
 	if err != nil {
 		t.Fatalf("ca export: %v", err)
 	}
-	out, _, err := runCLI(t, "", "ca", "env", "-dir", dir)
+	out, _, err := runCLI(t, "", "ca", "env", "--dir", dir)
 	if err != nil {
 		t.Fatalf("ca env: %v", err)
 	}
@@ -97,15 +97,15 @@ func TestCaEnvCarriesTheSameCertificate(t *testing.T) {
 
 func TestCaRegenerateNeedsConfirmationAndChangesTheFingerprint(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ca")
-	before, _, err := runCLI(t, "", "ca", "export", "-dir", dir)
+	before, _, err := runCLI(t, "", "ca", "export", "--dir", dir)
 	if err != nil {
 		t.Fatalf("ca export: %v", err)
 	}
 
-	if _, _, err := runCLI(t, "n\n", "ca", "regenerate", "-dir", dir); err == nil {
+	if _, _, err := runCLI(t, "n\n", "ca", "regenerate", "--dir", dir); err == nil {
 		t.Error("regenerate proceeded without confirmation")
 	}
-	unchanged, _, err := runCLI(t, "", "ca", "export", "-dir", dir)
+	unchanged, _, err := runCLI(t, "", "ca", "export", "--dir", dir)
 	if err != nil {
 		t.Fatalf("ca export: %v", err)
 	}
@@ -113,10 +113,10 @@ func TestCaRegenerateNeedsConfirmationAndChangesTheFingerprint(t *testing.T) {
 		t.Error("a refused regeneration still replaced the authority")
 	}
 
-	if _, _, err := runCLI(t, "y\n", "ca", "regenerate", "-dir", dir); err != nil {
+	if _, _, err := runCLI(t, "y\n", "ca", "regenerate", "--dir", dir); err != nil {
 		t.Fatalf("ca regenerate: %v", err)
 	}
-	after, _, err := runCLI(t, "", "ca", "export", "-dir", dir)
+	after, _, err := runCLI(t, "", "ca", "export", "--dir", dir)
 	if err != nil {
 		t.Fatalf("ca export: %v", err)
 	}
@@ -128,10 +128,10 @@ func TestCaRegenerateNeedsConfirmationAndChangesTheFingerprint(t *testing.T) {
 // TestPolicyLsDisclosesInterception: configuring a credential rule buys TLS interception
 // for that host, and the user has to be told so without asking.
 func TestPolicyLsDisclosesInterception(t *testing.T) {
-	out, _, err := runCLI(t, "", "policy", "ls", "-policy", "locked",
-		"-allow", "api.example.com:443",
-		"-inject", "tok@api.example.com=x-api-key",
-		"-guest-credential", "tok=EXAMPLE_TOKEN=sk-example-placeholder0000000000")
+	out, _, err := runCLI(t, "", "policy", "ls", "--policy", "locked",
+		"--allow", "api.example.com:443",
+		"--inject", "tok@api.example.com=x-api-key",
+		"--guest-credential", "tok=EXAMPLE_TOKEN=sk-example-placeholder0000000000")
 	if err != nil {
 		t.Fatalf("policy ls: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestPolicyLsDisclosesInterception(t *testing.T) {
 // TestPolicyLsSaysNothingAboutInterceptionWithoutRules: the notice must not become
 // background noise that appears on every run.
 func TestPolicyLsSaysNothingAboutInterceptionWithoutRules(t *testing.T) {
-	out, _, err := runCLI(t, "", "policy", "ls", "-policy", "locked", "-allow", "api.example.com:443")
+	out, _, err := runCLI(t, "", "policy", "ls", "--policy", "locked", "--allow", "api.example.com:443")
 	if err != nil {
 		t.Fatalf("policy ls: %v", err)
 	}
