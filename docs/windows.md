@@ -805,6 +805,70 @@ underneath.
 
 ---
 
+## 9. The answer available today: Boks inside WSL2
+
+**There is a Windows story Boks can offer right now, and it needs no new code: run Boks inside
+WSL2, where it is an ordinary Linux program on an ordinary Linux kernel.**
+
+This is not a Windows port and should never be described as one. But a developer on Windows 11
+who wants Boks can plausibly have it today, and that is worth more than a roadmap entry.
+
+### Why it should work
+
+Boks needs four things from a Linux host. All four are present in a stock WSL2:
+
+| Boks needs | In WSL2 |
+|---|---|
+| `/dev/kvm` | **Nested virtualisation is on by default on Windows 11 x64**, and is vendor-agnostic — not Intel-only, which it was on Hyper-V historically. `CONFIG_KVM=m` in the inbox kernel. |
+| `unixgram` (AF_UNIX `SOCK_DGRAM`) for the link | Fine. `CONFIG_UNIX=y`; the datagram type is unconditional upstream. The link is VMM↔netstack, **both inside the distro**, so Windows' stream-only AF_UNIX never enters it. |
+| containerd | Runs. Less trodden than the dockerd path — Rancher Desktop has an open containerd-in-WSL startup bug — but demonstrably works. |
+| `erofs` + `mkfs.erofs` | `CONFIG_EROFS_FS=m` in the inbox kernel, enabled by Microsoft since 2022. |
+
+cgroups are clean v2 since **WSL 2.5.1**, which removed the old hybrid v1+v2 layout that used to
+break container runtimes. That makes **WSL ≥ 2.5.1 a hard floor**, not a recommendation.
+
+### What is preserved that a native port would lose
+
+**The exact-path workspace invariant survives completely.** Inside WSL2 a workspace is a Linux
+path — `/home/dag/src/foo` — and Boks mounts it at `/home/dag/src/foo`, exactly as on any Linux
+host. None of section 4 applies. That is a real advantage over a native Windows port, not a
+consolation.
+
+It holds even for a workspace on the Windows drive: `/mnt/c/Users/dag/src/foo` is itself a valid
+Linux path, so exact-path preservation is literally true there too.
+
+### The costs, stated plainly
+
+- **`/mnt/c` is slow.** WSL2 reaches the Windows filesystem over **9p**, which is the same
+  mechanism and the same performance profile as section 3 describes for LCOW. A workspace kept
+  on `/mnt/c` will make `git status` on a large repository painful, and it is then crossing 9p
+  *and* virtiofs to reach the guest. **Keep workspaces in the WSL2 filesystem.** This is the
+  single most important piece of advice for anyone running Boks this way.
+- **`/mnt/c` is case-insensitive** by default, with the same consequences for Linux toolchains
+  described in section 3.
+- **It is two nested VM boundaries.** Boks' microVM runs inside the WSL2 utility VM. The
+  sandbox boundary is still a hypervisor boundary, but the threat model now includes WSL2's
+  own, and nested virtualisation is a less-exercised path than bare-metal KVM.
+- **Do not build a custom WSL kernel.** A custom kernel without a matching modules VHD silently
+  loses every `=m` symbol — which includes **both KVM and EROFS**, the two things Boks needs
+  most. Use the inbox kernel.
+- **The reference product does not do this.** Docker explicitly supports the native Windows
+  build and calls installing the Linux build inside WSL "best-effort". Boks offering the
+  reverse is a divergence, and an honest one only if labelled as such.
+
+### What is unverified
+
+**All of it, in combination.** Each ingredient is documented; nobody on this project has run
+Boks inside WSL2. The specific thing most worth testing first is **`/dev/kvm` on an AMD
+machine**: nested virtualisation is documented as vendor-agnostic on Windows 11, but the
+empirical record for AMD bare metal is thinner than for Intel, and if it fails there this
+answer covers substantially fewer users than it appears to.
+
+That test is cheap — enable nested virt, open `/dev/kvm`, run `boks doctor` — and it is the
+highest-value single experiment named anywhere in this document.
+
+---
+
 ## The architecture as it would be
 
 The shape that follows from section 7, i.e. the one the reference product demonstrates.
