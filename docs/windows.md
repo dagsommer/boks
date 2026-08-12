@@ -932,13 +932,99 @@ Boks needs four things from a Linux host. All four are present in a stock WSL2:
 
 | Boks needs | In WSL2 |
 |---|---|
-| `/dev/kvm` | **Nested virtualisation is on by default on Windows 11 x64**, and is vendor-agnostic — not Intel-only, which it was on Hyper-V historically. `CONFIG_KVM=m` in the inbox kernel. |
+| `/dev/kvm` | **Nested virtualisation is on by default on Windows 11 x64** — `EnableNestedVirtualization = !Arm64 && IsWindows11OrAbove()` in WSL's source — and it is vendor-agnostic, not the Intel-only feature it was on Hyper-V historically. `CONFIG_KVM=m` in the inbox kernel. |
 | `unixgram` (AF_UNIX `SOCK_DGRAM`) for the link | Fine. `CONFIG_UNIX=y`; the datagram type is unconditional upstream. The link is VMM↔netstack, **both inside the distro**, so Windows' stream-only AF_UNIX never enters it. |
 | containerd | Runs. Less trodden than the dockerd path — Rancher Desktop has an open containerd-in-WSL startup bug — but demonstrably works. |
-| `erofs` + `mkfs.erofs` | `CONFIG_EROFS_FS=m` in the inbox kernel, enabled by Microsoft since 2022. |
+| `erofs` + `mkfs.erofs` | `CONFIG_EROFS_FS=m` in the inbox kernel, enabled by Microsoft in 2022. |
 
-cgroups are clean v2 since **WSL 2.5.1**, which removed the old hybrid v1+v2 layout that used to
-break container runtimes. That makes **WSL ≥ 2.5.1 a hard floor**, not a recommendation.
+cgroups are clean v2 since **WSL 2.5.1**, which also introduced the modules image that makes
+any `=m` symbol loadable at all. That makes **WSL ≥ 2.5.1 a hard floor**, not a recommendation.
+
+### The three things that will actually go wrong
+
+Every ingredient being present is not the same as it working out of the box, and it will not.
+These are the failures a user hits in order, and `doctor` now names each one specifically
+(`internal/doctor/wsl_linux.go`).
+
+**1. The modules are not loaded.** `CONFIG_KVM*` and `CONFIG_EROFS_FS` are `=m`, and WSL's
+boot-time module list is three hardcoded entries — `tun`, `ip_tables`, `br_netfilter`. So both
+of the things Boks needs are absent until asked for:
+
+```bash
+sudo modprobe kvm_amd      # or kvm_intel
+sudo modprobe erofs
+```
+
+To persist, in `%UserProfile%\.wslconfig` on the Windows side, then `wsl --shutdown`:
+
+```ini
+[wsl2]
+loadKernelModules=kvm_amd,erofs
+```
+
+`loadKernelModules` is present in WSL's source but **undocumented on Learn**, so treat it as
+best-effort and keep `modprobe` as the fallback. `nested=1` on the inner KVM module is **not**
+needed — that governs a third level of nesting and is cargo-culted widely.
+
+**2. `/dev/kvm` is `root:root 0600`.** The node appears automatically via devtmpfs, but **WSL
+runs no udev**, so the rule that would widen it on an ordinary distribution never runs. The fix
+is a group, a membership and a boot command in `/etc/wsl.conf`:
+
+```ini
+[boot]
+command = /bin/bash -c 'chown root:kvm /dev/kvm && chmod 660 /dev/kvm'
+```
+
+plus `sudo usermod -aG kvm $USER`. Check `getent group kvm` first — on Debian and Ubuntu that
+group arrives with qemu/libvirt rather than the base system. **Do not use `chmod 666`**, which
+most guides suggest and which hands VM creation to every local account. With
+`[boot] systemd=true` udev runs and the stock rules should give `root:kvm 0660` without the
+command, but systemd is off by default in many images.
+
+**3. `erofs-utils` is too old on the obvious distribution.** containerd's EROFS snapshotter
+needs **≥ 1.8**; **Ubuntu 24.04 LTS ships 1.7.1**. Boks' `doctor` checks that `mkfs.erofs`
+exists but not its version, so this surfaces later as a confusing failure during an image
+unpack. Worth fixing in `snapshotterToolsCheck`, and worth knowing meanwhile.
+
+### Diagnosing it, and the trap in the obvious diagnosis
+
+**Nested virtualisation is already on**, so "add `nestedVirtualization=true` to `.wslconfig`" —
+the advice every generic guide leads with — is usually **not** the fix and sends the user to
+the Windows side for nothing. It genuinely is off only on Windows 10, on ARM64, on a CPU
+predating Haswell or Zen, under `safeMode=true`, or under the `AllowNestedVirtualization`
+enterprise policy.
+
+The three causes are distinguishable from inside the distribution, because the Windows setting
+is literally `ComputeTopology.Processor.ExposeVirtualizationExtensions`:
+
+| Check | nested virt off | on, module unloaded | on, loaded, permissions wrong |
+|---|---|---|---|
+| `grep -Ec '^flags.*\b(vmx\|svm)\b' /proc/cpuinfo` | **0** | ≥1 | ≥1 |
+| `/dev/kvm` exists | no | **no** | yes |
+| open `/dev/kvm` read-write | — | — | **EACCES** |
+
+Two things that look like diagnostics and are not: a **malformed `.wslconfig` fails silently**
+— WSL launches normally with the settings ignored, so a typo'd stanza is indistinguishable from
+no stanza — and the Windows-side error `Nested virtualization is not supported on this machine.`
+goes to `wsl.exe`'s stderr **on the Windows side**, so nothing running inside the distribution
+can ever see it. Do not grep for it.
+
+Note also that `.wslconfig` is **global only**; `/etc/wsl.conf` has no nested-virtualisation
+key. The section name and key are case-sensitive: `[wsl2]`, `nestedVirtualization`.
+
+### Detecting WSL, for anything that has to branch on it
+
+Use **`/bin/wslinfo`**, which WSL's init creates unconditionally in every distribution on every
+boot. The familiar test — matching `microsoft-standard-WSL2` in `/proc/sys/kernel/osrelease` —
+comes from `CONFIG_LOCALVERSION` and disappears under a custom kernel, which is exactly the
+configuration most likely to be missing KVM and therefore most in need of the diagnosis.
+`wslinfo --networking-mode` additionally returns the *live* mode (`nat`, `bridged`, `mirrored`,
+`consomme`, `none`, or the literal `wsl1`), which is worth having because `.wslconfig` lies when
+mirrored mode silently falls back to NAT.
+
+Rejected alternatives, with reasons: `$WSL_DISTRO_NAME` is environment-only and absent under
+systemd units and cron; `/run/WSL` is the interop socket directory and disappears with
+`[interop] enabled=false`; `/mnt/wsl` moves when `[automount] root=` is set.
 
 ### What is preserved that a native port would lose
 
@@ -962,22 +1048,27 @@ Linux path, so exact-path preservation is literally true there too.
 - **It is two nested VM boundaries.** Boks' microVM runs inside the WSL2 utility VM. The
   sandbox boundary is still a hypervisor boundary, but the threat model now includes WSL2's
   own, and nested virtualisation is a less-exercised path than bare-metal KVM.
-- **Do not build a custom WSL kernel.** A custom kernel without a matching modules VHD silently
-  loses every `=m` symbol — which includes **both KVM and EROFS**, the two things Boks needs
-  most. Use the inbox kernel.
+- **Do not build a custom WSL kernel.** A custom kernel without a matching modules image
+  silently loses every `=m` symbol — which includes **both KVM and EROFS**, the two things Boks
+  needs most. Use the inbox kernel. This is a live failure mode, not a hypothetical: it is what
+  broke Docker Desktop's bootstrap for a user who built their own 6.18 kernel.
 - **The reference product does not do this.** Docker explicitly supports the native Windows
   build and calls installing the Linux build inside WSL "best-effort". Boks offering the
   reverse is a divergence, and an honest one only if labelled as such.
 
 ### What is unverified
 
-**All of it, in combination.** Each ingredient is documented; nobody on this project has run
-Boks inside WSL2. The specific thing most worth testing first is **`/dev/kvm` on an AMD
-machine**: nested virtualisation is documented as vendor-agnostic on Windows 11, but the
-empirical record for AMD bare metal is thinner than for Intel, and if it fails there this
-answer covers substantially fewer users than it appears to.
+**All of it, in combination.** Each ingredient is traced to WSL's source, its issue tracker or
+its kernel config; nobody on this project has run Boks inside WSL2, or run anything on Windows
+at all. The `doctor` logic added for this is tested, but only its logic — the values it reads
+have never been read on a real WSL system.
 
-That test is cheap — enable nested virt, open `/dev/kvm`, run `boks doctor` — and it is the
+The specific thing most worth testing first is **`/dev/kvm` on an AMD machine**. Nested
+virtualisation is vendor-agnostic in WSL's source, but the empirical record for AMD bare metal
+is thinner than for Intel, and if it fails there this answer covers substantially fewer users
+than it appears to.
+
+That test is cheap — `ls -l /dev/kvm`, `modprobe kvm_amd`, `boks doctor` — and it is the
 highest-value single experiment named anywhere in this document.
 
 ---
