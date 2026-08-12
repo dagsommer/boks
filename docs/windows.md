@@ -1178,15 +1178,21 @@ and `linux/amd64`, `darwin/arm64` and `windows/amd64` all build.
 
 Ranked by how much it would change the conclusion.
 
-1. **Whether an open-source WHP-capable VMM exists that can do virtio-net with a backend Boks
-   can own.** This is now the entire question; section 8 assesses it.
-2. **Whether the nerdbox shim's Windows support is upstream or Docker's own.** Docker ships
+1. **Whether `/dev/kvm` is actually usable in WSL2 on an AMD machine.** Cheapest to answer,
+   and it decides whether the route this document now leads with covers most Windows
+   developers or only those on Intel. Nothing else here is both this consequential and this
+   easy to settle.
+2. **Whether an open-source WHP-capable VMM exists that can do virtio-net with a backend Boks
+   can own.** The entire native-port question; section 8 assesses it and does not close it.
+3. **Whether the nerdbox shim's Windows support is upstream or Docker's own.** Docker ships
    `containerd-shim-nerdbox-v1.exe`; whether that comes from `containerd/nerdbox` or a private
-   fork decides whether Boks can use it or would have to port it.
-3. **What form a WHP VMM's virtio-net backend would take** — a host socket, a callback, a
+   fork decides whether Boks could use it or would have to port it.
+4. **What form a WHP VMM's virtio-net backend would take** — a host socket, a callback, a
    named pipe — and therefore what the Windows gateway looks like.
-4. Whether the VMM would need to be a separate process or could be linked in, which decides
-   whether the supervisor's lifetime argument still holds unchanged.
+5. Whether that VMM would be a separate process or linked in, which decides whether the
+   supervisor's lifetime argument survives unchanged.
+6. **Whether the whole WSL2 route works end to end.** Every ingredient is sourced; the
+   combination has never been run.
 
 The LCOW-specific unknowns are retired rather than answered: where to obtain UVM boot files,
 whether the LCOW kernel has TUN, whether LCOW works at current versions, whether its Windows
