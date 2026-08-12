@@ -1,55 +1,84 @@
 # Boks on Windows
 
 Status: **feasibility spike, no implementation.** Nothing in this document has been executed.
-No machine on this project has Windows or Hyper-V, and none of the findings below were
-obtained by running anything on Windows. They are read from the source of `microsoft/hcsshim`,
-`containerd`, `gvisor-tap-vsock` and Go's standard library, from Microsoft Learn, and from the
-CI configuration those projects ship. Every claim is labelled **verified** (read from a
-primary source, with a pointer), **inferred** (reasoned from one), or **unknown**.
+No machine on this project has Windows or a hypervisor for it, and none of the findings below
+were obtained by running anything on Windows. They are read from the source of
+`microsoft/hcsshim`, `containerd` and `gvisor-tap-vsock`, from Microsoft's documentation, from
+the CI configuration those projects ship, and — for the section that matters most — from the
+shipped Windows binaries of the reference product. Every claim is labelled **verified** (traced
+to a primary source), **inferred** (reasoned from one), or **unknown**.
 
 The one thing that *was* demonstrated is that `GOOS=windows GOARCH=amd64 go build ./...`
 succeeds. That demonstrates nothing about whether a sandbox would run, and it is not offered
 as if it did.
 
+> **Read section 7 first.** Sections 1–6 investigate LCOW — Linux containers in a Hyper-V
+> utility VM — which was the assumed path when this spike started and turned out to be the
+> wrong target entirely. That analysis is kept because it is correct, because it disposes of
+> an option someone will otherwise propose again, and because its workspace and supervisor
+> findings hold whatever the VM backend is. But the answer to "how does this work on Windows"
+> is in section 7.
+
 ## The verdict
 
-**Boks cannot enforce network policy on Windows, and that is not a missing dependency — it is
-a property of the platform's hypervisor.** Everything else in Boks' design ports; this one
-thing does not, and it is the thing the project's security claims rest on.
+**Windows can host exactly the sandbox Boks builds, including the network enforcement. Boks
+cannot build one there because it has no VMM that speaks the platform's hypervisor API — and
+that is the whole gap.**
 
-Split the question in two, because the answer differs:
+This reverses the conclusion this document reached on its first pass, which was that Windows
+structurally could not support host-terminated guest networking. That conclusion was drawn
+from the Host Compute Service, and it is true *of HCS*. It is not true of Windows, because the
+interesting path does not go through HCS at all.
+
+The reference product settles it. Docker Sandboxes runs Linux microVMs on Windows 11 and
+offers the same network policy presets there as on Linux and macOS. It does that with:
+
+- the **Windows Hypervisor Platform** (`winhvplatform.dll`, `winhvemulation.dll`) — a
+  **user-mode** hypervisor API, not the Hyper-V management stack;
+- its own VMM, which maps guest memory into its own process and **emulates virtio-net in user
+  space**;
+- a **userspace network stack** that terminates the guest's TCP/IP, applies policy, and
+  re-originates flows as ordinary host sockets;
+- **no kernel driver at all** — the installer ships no `.sys`, registers no service, and
+  installs per-user into `%LOCALAPPDATA%` without administrator rights.
+
+That is Boks' architecture, on Windows, in a shipping product. So the question "can a host
+userspace process terminate and judge a guest's every packet on Windows" is answered *yes*, by
+demonstration.
 
 | Half | Status |
 |---|---|
-| Booting a Linux microVM per sandbox, from an arbitrary OCI image, with a writable snapshot, driven through containerd | **The mechanism exists**; containerd and hcsshim already do this, and Boks needs no new one. But the Linux utility VM it boots has **no public 2026 source** for its kernel and rootfs, and no public CI in either project ever boots one. Call it *plausible and unproven*, not *available*. |
-| Terminating the guest's network in a host userspace process, so every flow can be judged | **Not available, by any supported mechanism.** Not unproven — precluded by the HCS device schema. |
+| A Linux microVM per sandbox on Windows, driven through containerd | **Available in principle.** The reference product ships `containerd-shim-nerdbox-v1.exe` — the same shim family Boks targets — so the orchestration layer is known to port. |
+| Terminating the guest's network in a host userspace process | **Architecturally available.** A user-mode VMM owns the virtio-net backend; nothing in the platform stands in the way. |
+| **A VMM Boks can use to do it** | **Missing.** libkrun targets KVM and Hypervisor.framework. Docker substituted a VMM of their own, which is not open source. |
 
-The asymmetry matters. The first row is a research risk: someone could sit down with a Windows
-machine and find out. The second is not a risk, it is a finding — there is no experiment that
-would make Hyper-V hand a userspace process the guest's Ethernet frames, because it exposes no
-device that does that.
+The recommendation therefore changes shape. It is **not** "do not build a Windows backend
+because policy could not be enforced" — that was wrong. It is:
 
-A Windows port built today would produce a sandbox with a real VM boundary and a network Boks
-could not police. Boks already has a name for the honest version of that — `-net none` — and
-it is the only mode that could ship truthfully.
+**Do not build a Windows backend until there is a WHP-capable VMM to build it on, and treat
+finding or building one as the entire question.** Everything else — the shim, the snapshotter,
+the workspace mapping, the netstack, the proxy, the policy engine — is either already portable
+or a known, bounded piece of work. Section 8 assesses the candidates.
 
-The recommendation is therefore: **do not build a native Windows backend.** Not because the
-work is large, but because the result would either be a sandbox with no network at all, or a
-sandbox whose network policy is decorative. The second is the failure mode this project exists
-to avoid, and it is the easiest one to ship by accident.
+What has *not* changed is the honesty requirement. None of this has been run. "Docker does it,
+so it is possible" is a strong existence proof and a weak implementation plan.
 
-## Why the previous answer was wrong
+## Why the earlier answers were wrong
 
-The repository used to say Windows was "blocked on nerdbox" — that is, blocked on a VM runtime
-gaining Windows support. That framing is wrong in both directions, and correcting it is the
-main result of this spike:
+Twice, and both errors are worth keeping visible because they are the same mistake at
+different scales:
 
-- The runtime is **less** of a problem than assumed. Windows already has a VM-backed container
-  runtime that runs Linux containers, it is in containerd's tree, and Boks depends on both
-  halves of it *today* as indirect modules.
-- The network is **much** more of a problem than assumed. It was assumed to be a transport
-  gap (gvisor-tap-vsock lacking a Windows `unixgram`). It is not a transport gap. It is that
-  Hyper-V has no device that can hand a VM's Ethernet frames to a userspace process at all.
+1. The repository used to say Windows was **"blocked on nerdbox"** — blocked on a VM runtime
+   gaining Windows support. Wrong: Docker ships a Windows nerdbox shim, so the shim is the
+   least of it.
+2. This document's first pass said Windows **structurally could not** terminate guest traffic
+   in userspace, because the HCS device schema exposes only an HNS endpoint. That is a correct
+   reading of HCS generalised into a false claim about the platform. HCS is one consumer of the
+   hypervisor; WHP is another, and it is the one that matters here.
+
+The lesson is narrow and worth stating: *"the API I looked at cannot do X"* is not *"the
+platform cannot do X"*, and the difference is only visible if you go and look at what a working
+implementation actually links against.
 
 ---
 
