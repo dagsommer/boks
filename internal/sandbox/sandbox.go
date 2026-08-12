@@ -323,8 +323,9 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	if len(processArgs) > 0 {
 		specOpts = append(specOpts, oci.WithProcessArgs(processArgs...))
 	}
-	if len(cfg.Env) > 0 {
-		specOpts = append(specOpts, oci.WithEnv(cfg.Env))
+	env := append(gitSafeDirectoryEnv(cfg.Workspaces), cfg.Env...)
+	if len(env) > 0 {
+		specOpts = append(specOpts, oci.WithEnv(env))
 	}
 	if cfg.TTY && cfg.Ephemeral {
 		specOpts = append(specOpts, oci.WithTTY)
@@ -685,4 +686,37 @@ func mentionsCommand(msg, command string) bool {
 		return true
 	}
 	return strings.HasPrefix(command, "/") && strings.Contains(msg, command)
+}
+
+// gitSafeDirectoryEnv marks each workspace as a directory git may operate in.
+//
+// A workspace is a live virtiofs mount of a host directory, so inside the guest it is owned
+// by the host user's uid — 501 on a Mac — while the process runs as whatever the image
+// specifies, usually root. Git refuses that combination:
+//
+//	fatal: detected dubious ownership in repository at '/private/tmp/project'
+//
+// which is the first thing a coding agent hits, on every command it runs. `git diff` fails
+// worse than the rest, reporting "Not a git repository" — an agent that believes that may
+// decide the repository is broken and act on it.
+//
+// Git only honours safe.directory from protected configuration, which rules out writing it
+// into the repository and rules out the guest's own config file. GIT_CONFIG_COUNT is the
+// command scope, which is protected, so this fixes it without writing anything into the
+// guest and without a global config the sandbox would then carry around.
+//
+// The user's own -env wins: this is prepended, and oci.WithEnv lets a later assignment
+// replace an earlier one, so someone who sets GIT_CONFIG_COUNT themselves is not overridden —
+// they simply take responsibility for the whole set, which is the correct trade.
+func gitSafeDirectoryEnv(workspaces []workspace.Workspace) []string {
+	if len(workspaces) == 0 {
+		return nil
+	}
+	env := []string{fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(workspaces))}
+	for i, ws := range workspaces {
+		env = append(env,
+			fmt.Sprintf("GIT_CONFIG_KEY_%d=safe.directory", i),
+			fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, ws.GuestPath))
+	}
+	return env
 }

@@ -346,7 +346,7 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stder
 	notice := interceptionNotice(credentials)
 
 	if !f.specified() && notice == "" {
-		fmt.Fprintf(stderr, "network: %s, policy %s — 'boks policy ls -sandbox %s' for the rules, "+
+		fmt.Fprintf(stderr, "network: %s, policy %s — 'boks policy ls --sandbox %s' for the rules, "+
 			"'boks policy log' for what they decided.\n", mode, pol.Name, spec.Sandbox)
 		return nil
 	}
