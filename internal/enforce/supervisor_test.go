@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/dagsommer/boks/internal/network"
-	"github.com/dagsommer/boks/internal/network/vnettest"
 )
 
 // The supervisor is a *process*, and the things most likely to go wrong about it — that it
@@ -78,10 +77,7 @@ func TestSupervisorServesAndIsReusedAndStops(t *testing.T) {
 	}
 
 	// It is serving for real: a guest on the far end of the link reaches the proxy.
-	guest, err := vnettest.Attach(spec.Plan.Socket, spec.Plan.GuestAddr.Addr().String(), spec.Plan.MTU)
-	if err != nil {
-		t.Fatalf("attaching the fake guest: %v", err)
-	}
+	guest := attachGuest(t, spec)
 	client, err := guest.HTTPClient(state.ProxyURL)
 	if err != nil {
 		t.Fatal(err)

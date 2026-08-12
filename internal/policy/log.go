@@ -32,6 +32,11 @@ const (
 	// StageRequest is a request read inside a flow Boks terminated. It exists only for
 	// inspected flows, because it is the one thing a blind tunnel cannot show.
 	StageRequest Stage = "request"
+	// StageNetwork is a connection judged in the host-side network stack, before it was
+	// dialled — a flow that never used the proxy at all. It carries no hostname, because
+	// the guest put an address in a SYN and nothing else; the destination is whatever the
+	// packet said. This is the stage that decides for a guest that is not cooperating.
+	StageNetwork Stage = "network"
 )
 
 // Mode records how a flow reached its destination, and therefore how much of it Boks could
@@ -59,10 +64,10 @@ const (
 	// Only address and port rules can apply there, because a raw connection carries no
 	// hostname.
 	//
-	// Boks does not produce this mode yet: nothing terminates the guest's NIC in the
-	// datapath, so there is no network-layer enforcement point to record. The value
-	// exists because the log format has to have room for it before that lands, not
-	// because anything writes it today.
+	// This is what the host-side network stack writes (internal/network): every TCP
+	// connection the guest opens is judged before it is dialled, whether or not the guest
+	// used the proxy. A decision in this mode says Boks saw an address and a port and
+	// nothing else — not that it read anything.
 	ModeTransparent Mode = "transparent"
 )
 
