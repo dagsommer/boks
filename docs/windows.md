@@ -841,6 +841,83 @@ underneath.
 
 ---
 
+## 8. What a VMM would have to provide, and how little Boks would have to change
+
+Section 7 reduces the native-Windows question to one thing: **a VMM that runs on the Windows
+Hypervisor Platform and gives Boks the guest's Ethernet frames.** This section states the
+requirement precisely and measures the Boks-side cost, which turns out to be very small.
+
+### The requirement, in order of how hard it is to satisfy
+
+1. **Runs on Windows against WHP**, and boots an arbitrary Linux kernel and rootfs.
+2. **Exposes virtio-net with a backend a separate process can own.** A NAT'd or host-bridged
+   NIC is useless here — Boks needs the frames, not connectivity. This is the load-bearing
+   requirement and the one that eliminates most candidates.
+3. **Shares a host directory into the guest**, ideally virtiofs.
+4. **Is drivable one-VM-per-container**, ideally by a containerd shim, so Boks' orchestration
+   layer is unchanged.
+
+### The Boks side is nearly free, and this is measured
+
+Two findings from reading Boks' own code and gvisor-tap-vsock's, and they are better than
+expected.
+
+**The link format Boks needs is already implemented, and it is a stream.** gvisor-tap-vsock's
+`tap.Switch.Accept` takes a `net.Conn` and a protocol constant; the `qemu` protocol is a plain
+4-byte big-endian length prefix per frame, and declares `Stream() bool { return true }`
+(`pkg/tap/protocols.go`). Boks' stack calls:
+
+```go
+return h.sw.Accept(ctx, conn, types.VfkitProtocol)   // stack_unix.go
+```
+
+**Supporting a QEMU-style link is that constant plus a listener.** Everything above the link —
+the forwarder, the policy hook, DHCP, DNS, the proxy — is untouched.
+
+**And the transport can be TCP, which sidesteps the Windows socket problem entirely.**
+gvisor-tap-vsock documents QEMU with `-netdev socket,connect=127.0.0.1:1234` against
+`gvproxy -listen-qemu tcp://…`, and its generic listener supports the `tcp` scheme on every
+platform. So the fact that Windows' AF_UNIX has no `SOCK_DGRAM` — which looked like a blocker
+in section 6 — stops mattering: a stream protocol over loopback TCP works on Windows today.
+
+That leaves the VMM as the only genuinely missing piece, which is the point of this section.
+
+**One security consequence to design for, not to discover.** A loopback TCP link is reachable
+by *any* local process, unlike a UNIX socket in a mode-0700 directory. Whoever implements this
+must close that: bind to `127.0.0.1` on an ephemeral port, and authenticate or otherwise
+constrain the peer. Today Boks relies on filesystem permissions for this and it is invisible
+because it is free; on TCP it would have to be deliberate. A Windows named pipe with a
+restrictive DACL is the idiomatic alternative and keeps the stream shape.
+
+### The candidates
+
+Assessed against requirement 2, which is where they are decided. **This assessment is the least
+settled part of the document** — it is the live question, and it should be treated as a
+starting point for the Part B checklist rather than a conclusion.
+
+| Candidate | Runs on Windows/WHP | virtio-net backend Boks could own |
+|---|---|---|
+| **libkrun** — what Boks uses today | **No.** KVM and Hypervisor.framework only | n/a |
+| **cloud-hypervisor** | No. Its `mshv` backend is for Linux running on Microsoft Hypervisor, not Windows userland | n/a |
+| **Firecracker** | No. Linux/KVM only | n/a |
+| **QEMU** with the WHPX accelerator | Yes in principle — `-accel whpx` is upstream | **Yes** — `-netdev socket` / `-netdev stream` with `virtio-net-pci`, which is exactly the integration gvisor-tap-vsock documents |
+| **crosvm** | Has a Windows port | unassessed |
+| **OpenVMM** (Microsoft, Rust, open source) | Targets Windows via WHP | unassessed |
+
+**QEMU + WHPX is the obvious first thing to try**, because it is the only candidate where
+requirement 2 is already known to be satisfied *and* already known to work with the exact
+library Boks uses. Its weaknesses are equally obvious and should be checked before anyone
+invests: WHPX's maintenance status and performance, whether a full QEMU is an acceptable
+dependency for a tool that currently embeds its VMM, and the absence of a containerd shim
+driving QEMU in the shape Boks wants — requirement 4, where libkrun-plus-nerdbox is doing a
+lot of work for Boks today that QEMU alone would not.
+
+**OpenVMM is the most interesting unknown.** A Microsoft-authored, open-source, Rust VMM
+targeting WHP is on paper the closest thing to an open `sailor.dll`. If it satisfies
+requirement 2 it is likely the right answer; if it does not, that is worth knowing early.
+
+---
+
 ## 9. The answer available today: Boks inside WSL2
 
 **There is a Windows story Boks can offer right now, and it needs no new code: run Boks inside
