@@ -55,10 +55,25 @@ demonstration.
 The recommendation therefore changes shape. It is **not** "do not build a Windows backend
 because policy could not be enforced" — that was wrong. It is:
 
-**Do not build a Windows backend until there is a WHP-capable VMM to build it on, and treat
-finding or building one as the entire question.** Everything else — the shim, the snapshotter,
-the workspace mapping, the netstack, the proxy, the policy engine — is either already portable
-or a known, bounded piece of work. Section 8 assesses the candidates.
+**Do not build a native Windows backend until there is a WHP-capable VMM to build it on, and
+treat finding or building one as the entire question.** Everything else — the shim, the
+snapshotter, the workspace mapping, the netstack, the proxy, the policy engine — is either
+already portable or a known, bounded piece of work. Section 8 assesses the candidates.
+
+### And there is an answer for Windows users today
+
+**Run Boks inside WSL2.** It needs no new code: Boks is then an ordinary Linux program on an
+ordinary Linux kernel, using `/dev/kvm` and its existing netstack, with none of the problems
+above. Nested virtualisation is on by default on Windows 11 x64, and the inbox WSL kernel
+carries both KVM and EROFS.
+
+It also **preserves the exact-path workspace invariant**, which a native port would have to
+abandon (section 4) — inside WSL2 a workspace is already a Linux path.
+
+This is not a Windows port and must not be described as one, and nobody here has run it. But it
+is a real answer to "can I use Boks on my Windows machine", it is available now, and it should
+be offered rather than buried. **Section 9** has the requirements, the costs and the one
+experiment most worth running.
 
 What has *not* changed is the honesty requirement. None of this has been run. "Docker does it,
 so it is possible" is a strong existence proof and a weak implementation plan.

@@ -285,7 +285,9 @@ enforces — what matters most is watching it work against a real guest.
 9. Windows — **investigated; the obstacle is a VMM, not the platform.** Windows exposes a
    user-mode hypervisor API (the Windows Hypervisor Platform) that supports Boks' design, and
    the reference product ships on it. What Boks lacks is a VMM that speaks it: libkrun targets
-   KVM and Hypervisor.framework only. See [docs/windows.md](docs/windows.md)
+   KVM and Hypervisor.framework only. In the meantime Boks should run **inside WSL2** with
+   nested virtualisation, unchanged and with workspace paths preserved exactly — untested, but
+   every ingredient is there. See [docs/windows.md](docs/windows.md)
 
 ## Development
 

@@ -455,6 +455,11 @@ impossible, because `C:\Users\dag\src\foo` is not a Linux path (both Boks and th
 product would map it to `/c/Users/dag/src/foo`), and the `unixgram` link would need a different
 socket type, because Windows' AF_UNIX is stream-only.
 
+Until a VMM exists, the Windows answer is **WSL2 with nested virtualisation**, where Boks is
+just a Linux program: `/dev/kvm` and EROFS are both in the inbox kernel, the link is a normal
+`unixgram` socket inside the distro, and workspace paths are Linux paths so exact-path mounting
+holds unchanged. Untested, and not a port.
+
 Code that touches platform specifics is kept behind build tags and interfaces, and `doctor`
 is structured as a list of checks each of which knows whether it applies to the current
 platform, rather than as a Linux script.
