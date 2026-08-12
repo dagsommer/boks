@@ -464,18 +464,25 @@ answer and the compatible answer are the same one.
 
 ---
 
-## 5. Can the guest get a NIC our netstack can terminate?
+## 5. Can an *LCOW* guest get a NIC our netstack can terminate?
 
-**Answer: no. There is no supported mechanism, and this is the finding that decides the
-verdict.**
+**Answer: no — and this is the finding that made the first pass of this document reach the
+wrong verdict.**
+
+> **Scope.** Everything in this section is about the Host Compute Service, the API that drives
+> Hyper-V containers and LCOW. It is accurate. It is **not** a statement about Windows: a
+> user-mode VMM on the Windows Hypervisor Platform emulates its own NIC and never asks HCS for
+> one, which is what the reference product does (section 7). The section is kept in full
+> because `NetworkAdapter{EndpointId, MacAddress, IovSettings}` is exactly the artefact that
+> produces a confident wrong answer, and the next person to look will find it too.
 
 Boks enforces by owning the far end of the guest's NIC. The VMM writes the guest's Ethernet
 frames to a host socket; a gvisor netstack in a Boks process terminates them and judges every
 flow before dialling. That is why a guest which ignores `HTTP_PROXY` is still contained — it is
 stated as the central property in `docs/architecture.md` and `docs/security-model.md`.
 
-That shape requires a hypervisor that can back a virtual NIC with a host socket. **Hyper-V
-cannot.**
+That shape requires something that can hand a userspace process the guest's frames. **HCS
+cannot**, and if HCS is how you create the VM, there is no way to arrange it.
 
 ### The evidence
 
@@ -594,21 +601,17 @@ It is not proposed, for four reasons:
   from **any** partition on the host. For a per-sandbox stack that is a cross-sandbox concern
   that would have to be closed by scoping to the UVM's VM ID.
 
-**If Boks ever wants network policy on Windows, the change has to happen upstream:** Hyper-V
-would need a socket- or userspace-backed NIC in the HCS device schema, in the way vfkit and
-QEMU have one. Nothing Boks can write substitutes for it.
+### The conclusion this supports, and the one it does not
 
-### What this means for `boks run` on Windows
+**Supported:** if Boks were to create its VMs through HCS, it could not enforce network policy
+on them, and a port built that way should ship `-net none` only. Every route out of that is
+either a kernel-mode driver or a guest-side agent in a UVM image Boks would have to own.
 
-- `-net nat` — the default, and the mode policy is enforced in — **cannot be honestly
-  supported.**
-- `-net none` — a VM with no endpoint attached — **is achievable and would be genuinely
-  contained**, since with no HNS endpoint there is no path to the network at all. It is
-  already the strongest containment Boks offers.
+**Not supported, though the first pass of this document claimed it:** that Windows cannot do
+this. The premise "if HCS is how you create the VM" is a choice, not a constraint, and it is
+one the reference product declines to make. Do not create the VM through HCS.
 
-A Windows port that shipped `-net none` only, and refused `-net nat` with the reason, would be
-truthful. Whether a sandbox with no network is worth shipping is a product question, not a
-technical one.
+That is the whole reason this section is now a cul-de-sac rather than a verdict.
 
 ---
 
