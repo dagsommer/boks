@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // gateway on Windows exists only so the package compiles there.
@@ -14,7 +16,7 @@ import (
 // says so beats failing later with "unsupported scheme".
 type gateway struct{}
 
-func (g *gateway) start(context.Context, Plan, io.Writer) error {
+func (g *gateway) start(context.Context, Plan, *policy.Engine, io.Writer) error {
 	return errors.New("network: sandbox networking is not available on Windows; " +
 		"the VM runtime does not support Windows yet")
 }
