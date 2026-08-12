@@ -670,6 +670,62 @@ func TestRawFlowToAnAllowedAddressIsCarriedAndLogged(t *testing.T) {
 	}
 }
 
+// TestCloseTearsDownAFlowInProgress: "this sandbox no longer has a network" has to be true
+// of the connection the guest opened a moment ago, not only of the next one it tries.
+//
+// A spliced flow holds two sockets and three goroutines on the host. If Close left them
+// alive, a guest would keep a working connection to a destination Boks believes it has taken
+// away, for as long as the far end kept it open — and the goroutines would accumulate one
+// set per sandbox the process ever served.
+func TestCloseTearsDownAFlowInProgress(t *testing.T) {
+	origin, originHost := originTheGuestCouldAddress(t, "hello from the origin")
+	defer origin.Close()
+
+	before := boksGoroutines(t)
+
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
+	spec.Allow = []string{originHost}
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	guest := attachGuest(t, spec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := guest.Dial(ctx, originHost)
+	if err != nil {
+		t.Fatalf("dialling an allowed destination: %v", err)
+	}
+	defer conn.Close()
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	guest.Close()
+
+	// The guest's end of the flow is gone: a read returns rather than blocking on a
+	// connection Boks no longer carries.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Error("a flow that was open when the network was closed is still carrying data")
+	} else if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "timed out") {
+		t.Errorf("the flow was left hanging rather than torn down: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for boksGoroutines(t) > before && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if after := boksGoroutines(t); after > before {
+		t.Errorf("goroutines running Boks code went from %d to %d after tearing down a live flow:\n%s",
+			before, after, goroutineDump())
+	}
+}
+
 // TestTheGuestCannotAddressTheHostsLoopback is the property the verification run on a real
 // VM saw as `curl rc=7`, pinned here so it cannot regress quietly.
 //
