@@ -670,6 +670,40 @@ func TestRawFlowToAnAllowedAddressIsCarriedAndLogged(t *testing.T) {
 	}
 }
 
+// TestTheMetadataEndpointIsRefusedEvenWhenAllowed: 169.254.169.254 is the cloud instance
+// metadata service, and on a hosted machine it is the most reliable credential source there
+// is. gvisor-tap-vsock's forwarder refused link-local unless its EC2 flag was set; Boks
+// asserts that flag off and now owns the forwarder, so the refusal has to be reimplemented
+// here or the assertion becomes decorative.
+//
+// The test permits the address explicitly, which is the point: this one is not a policy
+// question, and `-allow 169.254.169.254` must not buy it.
+func TestTheMetadataEndpointIsRefusedEvenWhenAllowed(t *testing.T) {
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
+	spec.Allow = []string{"169.254.169.254:80"}
+	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer session.Close()
+
+	guest := attachGuest(t, spec)
+	defer guest.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if conn, err := guest.Dial(ctx, "169.254.169.254:80"); err == nil {
+		conn.Close()
+		t.Fatal("the guest reached the instance metadata endpoint")
+	}
+	if d, ok := findDecision(t, spec.LogPath, "169.254.169.254"); ok && d.Allowed {
+		t.Errorf("the metadata endpoint was allowed by the policy engine: %+v", d)
+	}
+}
+
 // TestCloseTearsDownAFlowInProgress: "this sandbox no longer has a network" has to be true
 // of the connection the guest opened a moment ago, not only of the next one it tries.
 //
