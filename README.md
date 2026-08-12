@@ -282,10 +282,10 @@ enforces — what matters most is watching it work against a real guest.
 5. Docker daemon inside the guest
 6. Port publishing, and the `PORTS` column that has nothing to show without it
 8. Kits / declarative configuration
-9. ~~Windows, once the runtime supports it~~ — **investigated and not planned.** The runtime
-   is not the obstacle; Hyper-V exposes no socket-backed NIC, so no host process can terminate
-   a guest's traffic and a native Windows sandbox could not enforce network policy. See
-   [docs/windows.md](docs/windows.md)
+9. Windows — **investigated; the obstacle is a VMM, not the platform.** Windows exposes a
+   user-mode hypervisor API (the Windows Hypervisor Platform) that supports Boks' design, and
+   the reference product ships on it. What Boks lacks is a VMM that speaks it: libkrun targets
+   KVM and Hypervisor.framework only. See [docs/windows.md](docs/windows.md)
 
 ## Development
 
