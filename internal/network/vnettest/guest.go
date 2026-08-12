@@ -175,29 +175,33 @@ func Attach(cfg Config) (*Guest, error) {
 // RST, and that is a final answer about a policy, not a symptom of a link that is still
 // coming up — retrying it would turn a fast, exact refusal into a timeout.
 func (g *Guest) Dial(ctx context.Context, addr string) (net.Conn, error) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(10 * time.Second)
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 	}
 	var lastErr error
 	for {
-		conn, err := g.dialOnce(addr)
+		conn, err := g.dialOnce(ctx, addr)
 		if err == nil {
 			return conn, nil
 		}
 		lastErr = err
-		if Refused(err) || time.Now().After(deadline) {
+		// A destination that is silently dropped rather than refused holds the handshake
+		// open until the context expires, which is the answer in that case: nothing is
+		// coming. Returning the last error rather than the context's keeps the reason.
+		if Refused(err) || ctx.Err() != nil {
 			return nil, fmt.Errorf("vnettest: dialling %s from the fake guest: %w", addr, lastErr)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("vnettest: dialling %s from the fake guest: %w", addr, lastErr)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
 
-func (g *Guest) dialOnce(addr string) (net.Conn, error) {
+func (g *Guest) dialOnce(ctx context.Context, addr string) (net.Conn, error) {
 	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -213,7 +217,7 @@ func (g *Guest) dialOnce(addr string) (net.Conn, error) {
 		// machine's DNS.
 		return nil, fmt.Errorf("vnettest: %q is not an IPv4 address", host)
 	}
-	return gonet.DialTCP(g.stack, tcpip.FullAddress{
+	return gonet.DialContextTCP(ctx, g.stack, tcpip.FullAddress{
 		NIC:  1,
 		Addr: tcpip.AddrFrom4Slice(ip.To4()),
 		Port: uint16(port),
