@@ -364,6 +364,13 @@ Windows.** No amount of runtime work changes that; it is a statement about two p
 
 So something must translate, and the only question is what.
 
+**Scope, and it is narrower than it looks.** This applies to a *native* Windows port, where the
+host path is a Windows path. It does **not** apply to Boks running inside WSL2 (section 9),
+where the host is Linux and the workspace path is already a Linux path — `/home/dag/src/foo`
+mounts at `/home/dag/src/foo`, and even a Windows drive reached as `/mnt/c/Users/dag/src/foo`
+is a valid Linux path preserved verbatim. **The invariant holds completely on that route**,
+which is a genuine argument in its favour and not merely a convenience.
+
 ### What the runtime permits
 
 Everything. As established in section 3, the guest mount destination is free-form. The
