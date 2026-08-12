@@ -309,7 +309,7 @@ func TestDescribeNamesTheScopeOfEveryRule(t *testing.T) {
 	}
 	out := res.Describe()
 	for _, want := range []string{
-		"deny (always wins, in every scope):",
+		"deny (always wins):",
 		"bad.test",
 		"global",
 		"good.test:443",

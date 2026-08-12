@@ -181,7 +181,7 @@ func (req Request) Resolve() (Resolution, error) {
 				Count:  len(scoped),
 			})
 			if len(scoped) > 0 {
-				names = append(names, "sandbox")
+				names = append(names, "sandbox:"+req.Sandbox)
 			}
 		}
 	}
@@ -314,7 +314,7 @@ func (r Resolution) Describe() string {
 		}
 		allows = append(allows, rule)
 	}
-	writeRuleSection(&b, "deny (always wins, in every scope):", denies)
+	writeRuleSection(&b, "deny (always wins):", denies)
 	writeRuleSection(&b, "allow:", allows)
 	return b.String()
 }
@@ -340,11 +340,11 @@ func writeRuleSection(b *strings.Builder, title string, rules []RuleSpec) {
 		}
 	}
 	for _, r := range sorted {
-		fmt.Fprintf(b, "  %-*s  %-*s", specWidth, r.Spec, scopeWidth, r.Scope)
-		if r.Note != "" {
-			fmt.Fprintf(b, "  %s", r.Note)
+		if r.Note == "" {
+			fmt.Fprintf(b, "  %-*s  %s\n", specWidth, r.Spec, r.Scope)
+			continue
 		}
-		fmt.Fprintln(b)
+		fmt.Fprintf(b, "  %-*s  %-*s  %s\n", specWidth, r.Spec, scopeWidth, r.Scope, r.Note)
 	}
 }
 
