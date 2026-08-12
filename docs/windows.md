@@ -1164,35 +1164,61 @@ and the most likely outcome is stopping at step 9.
    Also worth timing here: `git status` on a large repository, host versus guest, to quantify
    the 9p cost.
 
-### Does the network half work? (Expected: no)
+10. **Confirm the LCOW network dead end** — the step that makes this path a cul-de-sac rather
+    than an option.
 
-8. **Establish that the guest's traffic cannot be terminated by a host process.** This is the
-   decisive step and the reason for the whole document.
+    ```powershell
+    ctr run --rm --snapshotter windows-lcow --runtime io.containerd.runhcs.v1 `
+        docker.io/library/alpine:latest lcownet sh -c "ip addr; ip route; ls -l /dev/net/tun"
+    ```
 
-   ```powershell
-   ctr run --rm --snapshotter windows-lcow --runtime io.containerd.runhcs.v1 `
-       docker.io/library/alpine:latest lcownet sh -c "ip addr; ip route; cat /sys/class/net/*/address"
-   ```
+    Expected: a NIC backed by an HNS endpoint with a route out, and **no** `/dev/net/tun`.
+    That confirms the frames are on the Windows vSwitch with no userspace process in the path,
+    and that the guest-agent construction in section 5 is not available either.
 
-   Evidence, and what each outcome means:
+    A Boks port built on this could offer `-net none` and nothing else. That is why section 7
+    exists.
 
-   - A NIC named `eth0` backed by an HNS endpoint, with a route out — **the expected result**,
-     and it confirms the finding: the frames are on the Windows vSwitch and no userspace
-     process is in the path.
-   - Check whether TUN exists, which decides unknown #2:
-     `ls -l /dev/net/tun; zcat /proc/config.gz 2>/dev/null | grep -i config_tun` — **absence is
-     expected.**
-   - Then the containment control, which is the Windows analogue of the probe that exposed TSI
-     on macOS: run a listener on the host's loopback and try to reach it from the guest. Record
-     the result either way; it establishes the baseline posture a Windows sandbox would have.
+### Part D — Boks inside WSL2 (section 9)
 
-9. **Confirm the honest fallback.** Create a UVM with no HNS endpoint attached and verify the
-   guest has `lo` and nothing else, and that the host loopback probe from step 8 now fails.
-   That is `-net none`, and it is the only mode Boks could ship truthfully on Windows.
+The cheapest and highest-value experiment in this document, and the only one that could produce
+a working Boks sandbox on a Windows machine.
+
+11. **Confirm `/dev/kvm`.** In a WSL2 distro on Windows 11:
+
+    ```bash
+    cat /proc/sys/kernel/osrelease      # identifies the WSL kernel
+    ls -l /dev/kvm                      # exists? owner, group, mode?
+    lsmod | grep kvm
+    ```
+
+    **Run this on an AMD machine specifically.** Nested virtualisation is documented as
+    vendor-agnostic on Windows 11, but the empirical record is thinner for AMD than for Intel,
+    and it decides how many users this answer actually covers. Record the CPU vendor either way.
+
+12. **Run `boks doctor`, then a sandbox.** Every check should pass exactly as on any Linux host.
+    Then boot a sandbox and apply the evidence criteria in [verification.md](verification.md) —
+    `boot_id`, uptime, `nproc` — which are unchanged, because this *is* Linux.
+
+    Evidence: a sandbox whose `boot_id` differs from the WSL2 distro's. Note that there are now
+    two nested boundaries, so record the WSL2 distro's own `boot_id` as well as the host's.
+
+13. **Confirm the workspace invariant survives.** With a workspace in the WSL2 filesystem:
+
+    ```bash
+    boks run shell ~/src/foo -- pwd
+    ```
+
+    Expected: `/home/<you>/src/foo`, exactly. **Section 4 does not apply here**, and confirming
+    that is the point — it is the concrete advantage of this route over a native port.
+
+    Then repeat with a workspace under `/mnt/c` and time `git status` on a large repository
+    both ways, to quantify the 9p cost that makes "keep workspaces in the WSL2 filesystem" the
+    standing advice.
 
 ### Corroborate the Docker Sandboxes findings
 
-10. If Docker Sandboxes is installed, one command corroborates section 4 and section 7 at once:
+14. If Docker Sandboxes is installed, one command corroborates section 4 and section 7 at once:
 
     ```
     sbx run --workspace C:\Users\<you>\src\foo <agent> -- sh -c "pwd; mount; ls /sys/bus; ip -o addr"
