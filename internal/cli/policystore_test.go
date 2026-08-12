@@ -77,7 +77,7 @@ func TestPolicyLsShowsScopes(t *testing.T) {
 		"github.com:443",
 		"global",
 		"flagged.test:443",
-		"flag -allow",
+		"flag --allow",
 		"layers",
 	} {
 		if !strings.Contains(out, want) {

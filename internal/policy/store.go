@@ -4,11 +4,11 @@ package policy
 //
 // # Why this exists at all
 //
-// Boks began with policy in the command line — `-policy`, `-allow`, `-deny` — which made a
+// Boks began with policy in the command line — `--policy`, `--allow`, `--deny` — which made a
 // sandbox's containment a property of the *invocation* rather than of the sandbox. That is
 // not merely a parity gap with Docker Sandboxes, whose `sbx policy allow/deny/rm` write
 // durable rules; it was a bug. `boks start` and `boks exec` had no flags to carry, so a
-// sandbox created under `-policy locked` came back up under the default preset. A
+// sandbox created under `--policy locked` came back up under the default preset. A
 // containment that silently widens when you restart a sandbox is worse than one that is
 // merely narrow.
 //
@@ -147,7 +147,7 @@ func (r RuleSpec) SameDestination(spec string) bool {
 //
 // A profile is not a new concept — it is a policy with a name — and it is kept that way
 // deliberately. It exists so that "the posture we use for CI" or "the posture for untrusted
-// pull requests" can be written once and selected with `boks run -profile ci`, rather than
+// pull requests" can be written once and selected with `boks run --profile ci`, rather than
 // retyped as a wall of flags that nobody will get right twice.
 type Profile struct {
 	Description string     `json:"description,omitempty"`
@@ -159,7 +159,7 @@ type Profile struct {
 // rules, and the profiles.
 type Store struct {
 	Version int `json:"version"`
-	// Preset is the base posture every run starts from unless a profile or a -policy flag
+	// Preset is the base posture every run starts from unless a profile or a --policy flag
 	// replaces it. Empty means DefaultPreset.
 	Preset string `json:"preset,omitempty"`
 	// Global holds rules that apply to every sandbox.
@@ -317,13 +317,13 @@ func (s ScopeRef) String() string {
 	return "global"
 }
 
-// ParseScope builds a scope reference from the -sandbox and -profile flags, refusing the
+// ParseScope builds a scope reference from the --sandbox and --profile flags, refusing the
 // combination that would be ambiguous.
 func ParseScope(sandbox, profile string) (ScopeRef, error) {
 	sandbox, profile = strings.TrimSpace(sandbox), strings.TrimSpace(profile)
 	switch {
 	case sandbox != "" && profile != "":
-		return ScopeRef{}, errors.New("-sandbox and -profile name two different scopes; give one")
+		return ScopeRef{}, errors.New("--sandbox and --profile name two different scopes; give one")
 	case sandbox != "":
 		return SandboxScope(sandbox), nil
 	case profile != "":
