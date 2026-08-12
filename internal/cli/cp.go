@@ -1,55 +1,40 @@
 package cli
 
 import (
-	"context"
-	"flag"
 	"fmt"
 	"path/filepath"
 	"strings"
 
+	"github.com/spf13/cobra"
+
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
-func cpCommand(ctx context.Context, env Env) error {
-	fs := flag.NewFlagSet("boks cp", flag.ContinueOnError)
-	fs.SetOutput(env.Stderr)
-	address := addressFlag(fs)
-
-	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks cp [flags] <src> <dst>
-
-Copies files and directories between the host and a running sandbox. Exactly one of the two
+func newCpCommand(env Env, dev *devFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "cp [flags] SRC DST",
+		Short: "Copy files between the host and a sandbox",
+		Long: `Copies files and directories between the host and a running sandbox. Exactly one of the two
 paths carries a SANDBOX: prefix; copying between two sandboxes is not supported.
 
-The sandbox must be running, and its image must contain 'tar'.
-
-Examples:
-  boks cp ./config.yaml web:/etc/app/config.yaml
-  boks cp web:/var/log/app ./logs
-
-Flags:
-`)
-		fs.PrintDefaults()
+The sandbox must be running, and its image must contain 'tar'.`,
+		Example: `  boks cp ./config.yaml web:/etc/app/config.yaml
+  boks cp web:/var/log/app ./logs`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 2 {
+				return usagef("cp takes exactly two paths, a source and a destination")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := parseCopyArgs(args[0], args[1])
+			if err != nil {
+				return err
+			}
+			cfg.Address = dev.address
+			return sandbox.Copy(cmd.Context(), cfg)
+		},
 	}
-
-	paths, err := parseInterspersed(fs, env.Args)
-	if err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
-		}
-		return err
-	}
-	if len(paths) != 2 {
-		fs.Usage()
-		return fmt.Errorf("cp takes exactly two paths, a source and a destination")
-	}
-
-	cfg, err := parseCopyArgs(paths[0], paths[1])
-	if err != nil {
-		return err
-	}
-	cfg.Address = *address
-	return sandbox.Copy(ctx, cfg)
 }
 
 // copyEnd is one side of a cp argument: a host path, or a path inside a named sandbox.
