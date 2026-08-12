@@ -509,8 +509,8 @@ upstream in hcsshim.
 It is not an LCOW problem though; it is an NTFS one. **Any** route from a Linux guest to a
 directory on a Windows volume inherits it — a native WHP port sharing a Windows directory over
 virtiofs, and `/mnt/c` under WSL2, both included. The only route that avoids it entirely is a
-workspace living in a Linux filesystem, which is one more reason the WSL2 section recommends keeping
-workspaces inside the WSL2 distro rather than on the Windows drive.
+workspace living in a Linux filesystem, which is one more reason the WSL2 section above
+recommends keeping workspaces inside the distribution rather than on the Windows drive.
 
 ---
 
@@ -530,8 +530,8 @@ Windows.** No amount of runtime work changes that; it is a statement about two p
 So something must translate, and the only question is what.
 
 **Scope, and it is narrower than it looks.** This applies to a *native* Windows port, where the
-host path is a Windows path. It does **not** apply to Boks running inside WSL2 (the WSL2 section),
-where the host is Linux and the workspace path is already a Linux path — `/home/dag/src/foo`
+host path is a Windows path. It does **not** apply to Boks running inside WSL2, where the host
+is Linux and the workspace path is already a Linux path — `/home/dag/src/foo`
 mounts at `/home/dag/src/foo`, and even a Windows drive reached as `/mnt/c/Users/dag/src/foo`
 is a valid Linux path preserved verbatim. **The invariant holds completely on that route**,
 which is a genuine argument in its favour and not merely a convenience.
@@ -1459,9 +1459,9 @@ and kernel, the containerd version, and the verbatim output of each step.
 **A step that fails is a result, not a blocked task.** The three most useful outcomes this
 checklist can produce, in order:
 
-1. **Step 11 on an AMD machine** — either result. If `/dev/kvm` is there, the WSL2 section covers
-   most Windows developers and Boks has a Windows answer today. If it is not, the WSL2 section covers
-   Intel only and should say so.
+1. **Step 11 on an AMD machine** — either result. If `/dev/kvm` is usable there, the WSL2
+   route covers most Windows developers and Boks has a Windows answer today. If it is not, that
+   route covers Intel only and the document should say so.
 2. **Step 1** — `sbx` running with the Hyper-V role disabled. That single observation converts
    section 7 from static analysis into fact and retires sections 1–5 for good.
 3. **Step 6** — a candidate VMM either does or does not expose a virtio-net backend Boks can
