@@ -180,6 +180,11 @@ and the host-side stack discards it at the IP layer — before the forwarder, be
 is consulted. A test gives a simulated guest a policy that *permits* the host's loopback and
 a real listener to reach, and it still cannot get there.
 
+Link-local (`169.254.0.0/16`, which contains the `169.254.169.254` instance metadata
+endpoint) is refused the same way: in the forwarder, before the policy is asked, so that an
+explicit `-allow 169.254.169.254` does not buy it either. Every preset also denies it, but
+that is the weaker of the two statements.
+
 Three things that verification changed, all of them reflected in the code:
 
 - **Deny-by-default must be asserted, not inherited.** The host being unreachable was a
