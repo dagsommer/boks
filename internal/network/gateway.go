@@ -39,6 +39,15 @@ import (
 // metadata service. Boks asserts all four closed here rather than trusting a default, so
 // that a version bump that changes a default cannot quietly open the host, and so that a
 // test can read the intent back.
+//
+// Since Boks assembles the stack itself (stack_unix.go) this value no longer reaches a
+// library constructor that could act on those four fields: nothing in Boks implements NAT,
+// port forwarding, virtual gateway addresses or a metadata proxy at all, so they are closed
+// by construction as well as by declaration. What the configuration is still *used* for is
+// the addressing, and the two services the gateway runs inside the stack — the resolver and
+// the address server. It is kept in this shape because it remains the one place a reader can
+// see the whole posture, and because the assertion is cheap to keep and expensive to
+// rediscover.
 func gatewayConfig(plan Plan) *types.Configuration {
 	return &types.Configuration{
 		MTU:               plan.MTU,
