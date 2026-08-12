@@ -271,18 +271,23 @@ and a typed resource, leaving formatting and aggregation to the display layer.
 
 ## 4. Networking
 
-**Where Boks stands (2026-08-11).** The policy engine, the host forward proxy, the credential
-injection and the host-side stack are now **applied to every sandbox `boks run` creates**: the
+**Where Boks stands (2026-08-12).** The policy engine, the host forward proxy, the credential
+injection and the host-side stack are **applied to every sandbox `boks run` creates**: the
 container is wired to a virtual NIC whose far end is a userspace stack in a per-sandbox Boks
-process, with the proxy listening inside that virtual network. The transport underneath was
-verified on real hardware. The enforcement built on it has been exercised **only against a
-simulated guest** on the real link socket — no VM has ever been refused a destination by
-Boks, because the machine this was built on has no hypervisor. See
-[security-model.md](security-model.md#network).
+process, which judges every TCP connection the guest opens before dialling it, drops UDP and
+ICMP, and has the proxy listening inside that virtual network for clients that cooperate.
+
+The transport underneath was verified on real hardware. The enforcement built on it was
+verified *broken* on real hardware — a guest with the proxy variables unset reached denied
+destinations, because the stack was the library's and its forwarder dialled anything —
+and the fix has since been exercised **only against a simulated guest** on the real link
+socket. No VM has ever been refused a destination by Boks. See
+[security-model.md](security-model.md#network) and
+[verification.md](verification.md#re-run-check-6).
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
-| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor-tap-vsock, embedded as a library) | P0 | partial | Wired into `run`, `exec`, `create` and `start`. Transport verified on hardware; the enforcement on top of it only against a simulated guest |
+| Enforcement point | Outside the guest — raw TCP/UDP/ICMP blocked at the network layer | Host-side userspace netstack (gvisor's, driven through gvisor-tap-vsock's link layer, embedded as a library) | P0 | partial | Wired into `run`, `exec`, `create` and `start`. Every TCP connection is judged in the stack before it is dialled; UDP and ICMP are dropped at the link. gvisor-tap-vsock's own forwarder dialled anything the guest asked for, so Boks assembles the stack itself. Transport verified on hardware; **the enforcement on top of it only against a simulated guest** |
 | No-network mode | Not offered as such | `-net none`: NIC on the VM, container not wired to it | P0 | done | End to end: VM NIC annotation only, no stack, no proxy, no listener, no proxy environment. Strongest containment available |
 | Egress via proxy | All outbound HTTP/HTTPS routed through a host proxy | Same | P0 | partial | The proxy listens *inside* the sandbox's virtual network — nothing is bound on the host — and the guest is pointed at it. `boks proxy` still runs standalone |
 | Default deny | Deny-by-default with an allowlist | Same | P0 | partial | Default preset `standard` is deny-by-default, applied to every run; asserted explicitly in the netstack config too |
@@ -293,16 +298,16 @@ Boks, because the machine this was built on has no hypervisor. See
 | Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | Decisions recorded as JSON lines under the state dir; local only |
 | Per-run allow flags | Policy configured per sandbox/host | `-allow`/`-deny` repeatable, `-policy <preset>`, `-net <mode>` | P0 | partial | Applied to the sandbox. **Not persisted**: the rules belong to the process serving that sandbox's network, so `boks start` and `boks exec` on a stopped sandbox use the default preset and say so |
 | TLS interception | Used for credential injection, not for filtering: a "Docker Sandboxes Proxy CA" sits in the guest trust store and is also exposed as `PROXY_CA_CERT_B64` | Terminate **only** for hosts with a credential rule; local CA, certificate handed over as a file and as `BOKS_CA_CERT_B64` | P0 | done | Demonstrated end to end: the intercepted host presents a Boks-issued certificate, an unconfigured host presents the origin's own chain |
-| Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | partial | `forward` and `forward-bypass` are produced, now attributed to the sandbox they came from; `transparent` needs judgements taken in the netstack itself, which is not built |
+| Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | done | All three are produced and attributed to the sandbox they came from. `transparent` comes from the netstack's own decisions, taken on address and port for flows that never touched the proxy |
 | Structured decisions | Blocked rows read `no applicable policies for op(action=net:connect:tcp, resource=net:domain:<host>:<port>)` | Same action/resource vocabulary on every decision | P1 | done | Recorded as fields rather than formatted prose, so the display layer can group, filter and aggregate |
 | Aggregated log display | Rows deduplicated per destination with `LAST SEEN` and `COUNT`, split into blocked and allowed | Same | P1 | done | One dependency install produces hundreds of identical allows; `-raw` still prints every decision |
 | SNI cross-check | Not documented | Deny a tunnel whose ClientHello names a forbidden host | P1 | done | Only possible after the `200`, so the client sees a broken handshake; the reason is in the log |
 | Resolved-address recheck | Not documented | Deny rules re-applied to the address a permitted name resolved to | P1 | done | Stops `allowed.test A 127.0.0.1` from becoming a path to host services |
-| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same initially | P1 | partial | The netstack is in the datapath and NATs nothing by default, so nothing routes out except through the proxy. Never observed against a real guest, and no policy decision is *recorded* for a dropped raw flow |
+| Non-HTTP protocols | UDP and ICMP blocked and cannot be re-enabled by policy | Same | P1 | partial | UDP and ICMP are dropped at the link, with DNS to the sandbox's own gateway the single exception; no policy re-enables them. Non-HTTP **TCP** is carried when an address rule permits it, and refused otherwise. Never observed against a real guest, and a dropped datagram produces a note in the stack's log rather than a policy decision — the guest chooses that volume |
 | Hostname rules for non-HTTP | Don't work; IP addresses required | Same limitation, documented | P1 | done | Address and CIDR rules exist for exactly this |
 | IPv6 | Not documented | Covered by the rule language from the start | P1 | partial | TSI had no v6; a real NIC does. No routable v6 is handed to the guest |
-| DNS mediation | Not documented | Guest resolver pointed at the host-side gateway | P1 | partial | `io.containerd.nerdbox.ctr.dns`; the hook for name policy, not yet a closed channel |
-| Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | partial | Every sandbox `run` creates is wired to the stack instead of TSI, and every preset denies the host's loopback outright. Sandboxes created *before* this wiring existed are still on TSI, and Boks warns when it meets one |
+| DNS mediation | Not documented | Guest resolver pointed at the host-side gateway | P1 | partial | `io.containerd.nerdbox.ctr.dns`, and UDP to any other resolver is dropped, so it is the only one reachable. Still the hook for name policy rather than name policy: the gateway resolves whatever it is asked |
+| Host-local services | `127.0.0.1` and LAN services may be unreachable | Must become unreachable by default | P0 | partial | Every sandbox `run` creates is wired to the stack instead of TSI. Host loopback is closed twice: every preset denies it, and the stack discards a packet addressed to `127.0.0.0/8` at the IP layer before any rule is consulted. Sandboxes created *before* this wiring existed are still on TSI, and Boks warns when it meets one |
 | Upstream proxy | Honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`; `DOCKER_SANDBOXES_PROXY` supports http/https/socks5/socks5h | Support an upstream proxy env var | P2 | none | socks5h delegates DNS to the proxy |
 | Port publishing | `--publish` at creation; `sbx ports SANDBOX --publish/--unpublish/--json` later; ignored when re-attaching | `boks ports` equivalent | P1 | none | The netstack can forward, and Boks explicitly asserts it does not. Spec `[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]`; omitting HOST_PORT allocates an ephemeral one |
 | Port binding defaults | Binds **loopback** by default, expanded per address family: `tcp`/`udp` bind both `127.0.0.1` and `::1`, or v4 only for a v4-only sandbox; `tcp4`/`udp4` v4 only; `tcp6`/`udp6` v6 only. Protocols: tcp, tcp4, tcp6, udp, udp4, udp6 | Same | P1 | none | Defaulting to loopback rather than all interfaces is the safe choice and should be copied exactly |
@@ -415,8 +420,9 @@ hosts and no others — see
 ## Open questions
 
 1. **Enforcement mechanics.** Docker states raw TCP/UDP/ICMP are blocked at the network
-   layer, but not how. A host userspace netstack is the natural fit and what Boks plans;
-   this is inference, not documented fact.
+   layer, but not how. A host userspace netstack is the natural fit and what Boks now does —
+   TCP judged in a forwarder that consults the policy, UDP and ICMP dropped at the link.
+   Whether Docker does it the same way is inference, not documented fact.
 2. **Exact-path mounting for non-existent guest parents.** Whether the guest runtime creates
    `/home/alice/src` implicitly for the mount point, or whether Boks must pre-create it, is
    unverified pending a working VM.
@@ -436,11 +442,12 @@ hosts and no others — see
    symlinked workspace resolves to its target before naming, so two paths to the same
    directory share one sandbox.
 4. **Kit schema.** Deliberately unanswered until real runtime features exist to configure.
-5. **`transparent` flows.** Docker's log has a third proxy mode for flows judged at the
-   network layer without the proxy — SSH on port 22 appeared under it. Boks reserves the
-   value but cannot produce it: nothing terminates the guest's NIC in the datapath yet, so
-   there is no network-layer decision point to record. When there is, hostname rules will
-   not apply to those flows and IP/port rules will be all there is.
+5. ~~**`transparent` flows.**~~ **Answered.** Docker's log has a third proxy mode for flows
+   judged at the network layer without the proxy — SSH on port 22 appeared under it. Boks
+   now produces it: the host-side stack judges every TCP connection the guest opens and
+   records the decision under that mode. As predicted, hostname rules cannot apply to those
+   flows and IP/port rules are all there is — which means a policy written only in hostnames
+   denies them.
 6. **Kit loading.** The credential model now matches the v2 `credentials[]` shape — one
    service, many injection rules — so a loader can be added without reworking it. Nothing
    parses YAML today, and `oauth` is modelled only to the extent of not designing it out.
@@ -448,5 +455,8 @@ hosts and no others — see
    displaces TSI: with it attached the guest has `eth0` and a host loopback probe that TSI
    answered is refused. Two annotations are needed (`io.containerd.nerdbox.network.N` for
    the VM, `io.containerd.nerdbox.ctr.network.N` keyed by `vmmac` for the container), `addr`
-   must be CIDR whatever nerdbox's docs show, and one stack serves exactly one VM. What
-   remains open is the enforcement built on top: no policy has been applied to a real guest.
+   must be CIDR whatever nerdbox's docs show, and one stack serves exactly one VM. A
+   follow-up worth recording: attaching the provider is *not* enforcement. Its default stack
+   forwards whatever the guest sends, which a real VM demonstrated on 2026-08-12; the policy
+   had to be put into the stack's own TCP forwarder. What remains open is whether that holds
+   against a real guest — no policy decision has been applied to one.
