@@ -407,8 +407,8 @@ Rules that follow, and should be decided up front rather than discovered:
 - **Absolute paths generated inside the sandbox stop being valid on the host.** This is the
   concrete user-visible loss and it is the whole reason the property exists. A binary compiled
   in the sandbox with embedded debug paths, a `compile_commands.json`, a `.pyc`, a generated
-  lockfile with absolute paths, an IDE index — all refer to `/mnt/c/...`, which no Windows tool
-  can open. On Linux and macOS these are portable across the boundary in both directions; on
+  lockfile with absolute paths, an IDE index — all refer to `/c/...`, which no Windows tool can
+  open. On Linux and macOS these are portable across the boundary in both directions; on
   Windows they are not. The argument for exact-path mounting is precisely that "build output,
   stack traces and tool config keep working", and on Windows they keep working *inside* the
   sandbox only.
@@ -420,16 +420,13 @@ translation of* its host path, not at its host path. That is a real deviation fr
 promises everywhere else, and it should be documented as a platform difference in the parity
 matrix rather than quietly implemented.
 
-### What Docker Sandboxes does
+### One thing this does *not* deviate on
 
-Docker Sandboxes' documentation makes the same exact-path claim Boks does, and it supports
-Windows 11, so it must resolve this the same way — by translating. What it translates *to* was
-not established by this spike with enough confidence to state as fact; see *What is unknown*.
-The candidate is the WSL spelling, both because Docker Desktop on Windows is built on WSL2 and
-because it is the convention Docker's own tooling already uses for host mounts. **Treat this as
-unconfirmed.** It should be settled by running one command inside a Windows-hosted sandbox
-(see the checklist), and it is worth settling before Boks commits, because matching the
-reference product costs nothing here and diverging from it costs user surprise.
+The reference product makes the same compromise. Docker Sandboxes' documentation makes the same
+exact-path claim Boks does, and on Windows it translates — to `/c/...`, as established above.
+So the deviation here is from *Boks' own stated invariant*, not from parity: on this point Boks
+and `sbx` would still agree. That is worth stating because it is the rare case where the honest
+answer and the compatible answer are the same one.
 
 ---
 
@@ -684,18 +681,16 @@ Ranked by how much it would change the conclusion.
    becomes a flat no.
 2. **Whether the LCOW guest kernel has TUN support.** Decides whether the guest-agent
    construction in section 5 is even theoretically available.
-3. **What path a workspace actually appears at inside a Windows-hosted Docker Sandboxes
-   sandbox.** One command settles it, and it should be settled before Boks commits to `/mnt/c`.
-4. **What Docker Sandboxes on Windows uses as its VM backend** — a bespoke Hyper-V VM, or
-   nesting inside the Docker Desktop WSL2 VM. If it is WSL2, the whole comparison shifts: WSL2
-   is a different substrate with different network options, and "target WSL2" would become a
-   serious alternative to LCOW that this spike did not evaluate.
-5. **How Docker Sandboxes enforces network policy on Windows**, given the same HCS constraint
-   applies to it. If it manages host-side enforcement, it knows something this spike did not
-   find. If it degrades on Windows, that is worth knowing too.
-6. Whether LCOW works at all at current `hcsshim`/`containerd` versions, given neither project
+3. Whether LCOW works at all at current `hcsshim`/`containerd` versions, given neither project
    exercises it in CI.
-7. The maximum number of concurrent 9p shares per UVM.
+4. Whether the LCOW v2 shim's stated **Windows Server 2025** requirement extends to the
+   **Windows 11** client SKU that shares its build number.
+5. The maximum number of concurrent 9p shares per UVM.
+
+Two questions that were open when this document was first written have since been answered and
+moved into the sections above: what path a workspace appears at inside a Windows-hosted `sbx`
+sandbox (section 4 — `/c/...`, verified), and how Docker Sandboxes enforces policy on Windows
+(section 7).
 
 ---
 
@@ -780,16 +775,19 @@ expected to fail.
    mkdir C:\boksprobe\deep\a\b\c\project
    echo hello > C:\boksprobe\deep\a\b\c\project\marker.txt
    ctr run --rm --snapshotter windows-lcow --runtime io.containerd.runhcs.v1 `
-       --mount type=bind,src=C:\boksprobe\deep\a\b\c\project,dst=/mnt/c/boksprobe/deep/a/b/c/project,options=rbind:rw `
-       docker.io/library/alpine:latest lcowmnt sh -c "pwd; ls -la /mnt/c/boksprobe/deep/a/b/c/project; mount | grep 9p"
+       --mount type=bind,src=C:\boksprobe\deep\a\b\c\project,dst=/c/boksprobe/deep/a/b/c/project,options=rbind:rw `
+       docker.io/library/alpine:latest lcowmnt sh -c "pwd; ls -la /c/boksprobe/deep/a/b/c/project; mount | grep 9p"
    ```
 
-   Evidence: `marker.txt` visible, and a `9p` line in `mount` confirming the transport. Then
-   the three questions that decide section 3 and 4:
+   The destination spelling here is the `/c/...` convention section 4 recommends; the point of
+   the step is partly to confirm the runtime accepts an arbitrary guest path at all.
 
-   - **Are intermediate directories created automatically?** `ls /mnt/c/boksprobe/deep` should
+   Evidence: `marker.txt` visible, and a `9p` line in `mount` confirming the transport. Then
+   the three questions that decide sections 3 and 4:
+
+   - **Are intermediate directories created automatically?** `ls /c/boksprobe/deep` should
      contain only the next component, as on Linux and macOS.
-   - **Is the share case-insensitive?** `ls /mnt/c/BOKSPROBE/...` succeeding is the answer, and
+   - **Is the share case-insensitive?** `ls /c/BOKSPROBE/...` succeeding is the answer, and
      it is expected to succeed. Then, inside the workspace:
      `touch Makefile makefile; ls` — one file rather than two confirms the problem is real for
      a Linux toolchain.
@@ -825,18 +823,19 @@ expected to fail.
    guest has `lo` and nothing else, and that the host loopback probe from step 8 now fails.
    That is `-net none`, and it is the only mode Boks could ship truthfully on Windows.
 
-### Settle the Docker Sandboxes questions
+### Corroborate the Docker Sandboxes findings
 
-10. If Docker Sandboxes is installed, one command answers unknowns #3 and #4:
+10. If Docker Sandboxes is installed, one command corroborates section 4 and section 7 at once:
 
     ```
-    sbx run --workspace C:\Users\<you>\src\foo <agent> -- sh -c "pwd; mount; ls /proc/1/comm; cat /proc/version"
+    sbx run --workspace C:\Users\<you>\src\foo <agent> -- sh -c "pwd; mount; cat /proc/version; ip -o addr"
     ```
 
-    Evidence: the path `pwd` reports is the convention Boks should match or consciously
-    diverge from. The `mount` output says whether the transport is 9p (Hyper-V/LCOW) or
-    virtiofs (something else, most likely WSL2). `/proc/version` identifies the kernel, and a
-    `-microsoft-standard-WSL2` suffix would settle unknown #4 immediately.
+    Expected, from the evidence in those sections: `pwd` prints `/c/Users/<you>/src/foo`;
+    `/proc/version` carries a `-microsoft-standard-WSL2` suffix or otherwise identifies a
+    Linux-hosted microVM rather than an LCOW UVM; and `mount` shows virtiofs rather than 9p.
+    **A 9p mount here would contradict section 7 and should be reported**, since it would mean
+    `sbx` is on LCOW after all and is solving the network problem some way this spike missed.
 
 ### Recording results
 
