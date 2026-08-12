@@ -13,7 +13,7 @@ descriptions are written from reading the public documentation and testing behav
 **Status key** — `done` implemented and locally tested · `partial` implemented, incompletely
 verified · `planned` designed, not built · `none` not started.
 
-Last reviewed against Docker's docs: 2026-08-11.
+Last reviewed against Docker's docs: 2026-08-12.
 
 ---
 
@@ -70,7 +70,8 @@ output, plus a live `sbx ls`.
 | Detached run | `-d, --detached` prints the sandbox and exits without an interactive session | Same | P1 | done |
 | Interactive by default | `sbx run` attaches an interactive session | Boks allocates a pty when stdin *and* stdout are terminals, and none when either is a pipe. There is no `-t` for it: `-t` is the template flag | P1 | done |
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
-| `--clone`, `--kit`, `--profile`, `-p/--publish` | Run flags for clone mode, kits, profiles and port publishing | Not implemented; nothing in the current design blocks them | P1 | none |
+| `--clone`, `--kit`, `-p/--publish` | Run flags for clone mode, kits and port publishing | Not implemented; nothing in the current design blocks them | P1 | none |
+| `--profile` | "Governance profile to assign to the sandbox" | `-profile NAME` on `run` and `create`, selecting a stored profile — a named preset plus rules. Local rules still apply on top of it, and a deny in any scope still wins | P1 | done |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
 | Boks-only commands | — | `boks start`, `boks inspect`, `boks run --rm`, `boks doctor`, `boks proxy`, `boks secret`, `boks policy` have no sbx equivalent at that spelling. Kept deliberately; none of them contradicts sbx's shape | — | done |
@@ -118,7 +119,7 @@ website documents.
 | `rm` | Remove sandboxes | `rm` |
 | `cp` | Copy between sandbox and host | `cp` |
 | `ports` | Manage port publishing | none |
-| `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | `policy ls`, `policy log` only |
+| `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | all ten, same spellings; rules are durable and scoped global or per-sandbox |
 | `secret` | Manage stored secrets | `secret set/ls/rm` |
 | `kit` | (Experimental) Manage kit artifacts | none |
 | `template` | Manage sandbox templates (the image an agent runs in) | none; `-t, --template` flag only |
@@ -169,11 +170,32 @@ sbx is therefore narrower than it was — Boks does have a background process no
 blast radius is one sandbox and the lifetime is one VM. `boks net ls` and `boks net stop`
 make it visible and stoppable, and there is still no `boks daemon start`.
 
-**Persistent, scoped policy is a bigger gap than it looked.** `sbx policy allow/deny/rm` write
-rules that survive the invocation, and rules are either global or scoped to a single sandbox.
-Boks only has per-run flags. `policy check` — asking whether a given access *would* be
-permitted, without making the request — is a genuinely good idea worth copying: it makes a
-policy testable instead of something you discover by being blocked.
+**Persistent, scoped policy was a bigger gap than it looked, and it is now closed.**
+`sbx policy allow/deny/rm` write rules that survive the invocation, global or scoped to a
+single sandbox. Boks had per-run flags only — which was not merely a parity gap but a bug:
+`boks start` and `boks exec` carry no flags, so a sandbox created under `--policy locked` came
+back up under the default preset, and a sandbox's containment silently widened when you
+restarted it.
+
+Boks now has a durable store (`<state>/policy/policy.json`, versioned JSON), the same ten
+subcommands under the same names, and three scopes: **global**, **per-sandbox** and
+**profile**. A sandbox records the selection it was created with in a container label
+(`dev.boks.policy`), so every command that brings its network up serves the same policy. The
+per-run flags remain as explicit overrides — a Boks addition, documented as such.
+
+Precedence is one rule, and it holds across every scope: **a deny in any scope beats an allow
+in any scope**, and only the base preset decides what happens to a destination no rule
+mentions. A narrower scope can add access the wider one tolerates and can take access away; it
+can never widen past a deny. `--deny` on a run is therefore *added* to what the sandbox already
+denies rather than replacing it.
+
+`policy check` — asking whether a given access *would* be permitted, without making the
+request — was worth copying outright: it makes a policy testable instead of something you
+discover by being blocked. Boks' version reports the verdict, the deciding rule, the scope that
+wrote it and the flow mode (`forward` / `forward-bypass` / `transparent`), answering from the
+same engine the sandbox's network stack consults. A test drives the command over a table of
+destinations and scopes and compares each answer with what `policy.Engine` decides, because a
+`check` that could disagree with the enforcement point would be worse than no check at all.
 
 **Resource defaults differ, and ours are worse.** sbx defaults to all host CPUs, and to half
 of host memory capped at 32 GiB, with memory given in binary units (`8g`). Boks hardcodes
@@ -314,8 +336,15 @@ socket. No VM has ever been refused a destination by Boks. See
 | Exact + wildcard hosts | Allowlist includes broad wildcards such as `*.googleapis.com` | Exact and wildcard, plus ports, IPs and CIDR | P0 | done | No multi-tenant wildcards in any preset — they allow every tenant's bucket |
 | Host pattern forms | v2 grammar: exact, host with port, single-label wildcard, multi-label wildcard, port ranges, port wildcard, CIDR | Exact, host with port, one wildcard form, port ranges and wildcard, CIDR | P1 | partial | **Gap:** Boks' `*.example.com` matches any subdomain depth, so "exactly one label" cannot be expressed. Not yet worth a second syntax |
 | Deny precedence | Local deny rules still apply under org governance | Deny always wins over allow | P0 | done | Order- and specificity-independent; tested |
-| Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | Decisions recorded as JSON lines under the state dir; local only |
-| Per-run allow flags | Policy configured per sandbox/host | `--allow`/`--deny` repeatable, `--policy <preset>`, `--net <mode>` | P0 | partial | Applied to the sandbox. **Not persisted**: the rules belong to the process serving that sandbox's network, so `boks start` and `boks exec` on a stopped sandbox use the default preset and say so |
+| Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | `ls` shows the stored rules by scope *and* what they resolve to, each rule labelled with the scope that wrote it. Decisions recorded as JSON lines under the state dir; local only |
+| Durable policy | `policy allow/deny/rm` write rules that outlive the invocation | Same, in `<state>/policy/policy.json` — versioned JSON, owner-only, written atomically | P0 | done | A missing store is the uninitialised state and still denies by default. A corrupt, unreadable or future-versioned one is an error every caller stops at: no sandbox starts |
+| Policy scoping | "Local rules can apply globally across all sandboxes or be scoped to one sandbox" | Global, per-sandbox and profile scopes | P0 | done | Deny in any scope beats allow in any scope; only the base preset decides the default action. Tested over every ordered pair of scopes |
+| Policy profiles | `sbx policy profile`; `sbx run --profile` | `boks policy profile ls/show/create/rm`, `boks run --profile` | P1 | done | A profile is a named policy, not a new concept: a preset plus rules. It cannot unsay a deny written elsewhere |
+| `policy check` | "Check whether policy allows an access request" | `boks policy check DESTINATION` | P1 | done | Reports verdict, rule, scope and flow mode without contacting anything, from the engine the stack uses. A test asserts the equivalence directly |
+| `policy init` / `reset` | Initialise the global policy; reset to defaults with a `y/N` prompt | Same, with the prompt and `-f` | P1 | done | `reset` can clear one scope or everything; an empty or non-`y` answer cancels |
+| `policy inspect` | "Inspect policy or rule details" | Same, for a scope or a single destination | P2 | done | For a destination it lists every rule that *covers* it, from every scope, then what the engine decides |
+| Policy survives restart | Policy is state, so restarting changes nothing | A sandbox records its selection in `dev.boks.policy` | P0 | done | The bug this fixed: `start`/`exec` used to serve the default preset. Integration-tested through create → start → stop → start. The label is refused rather than truncated if it would exceed containerd's 4 KiB limit |
+| Per-run allow flags | **Not offered** — `sbx run` has no allow/deny/policy flags at all | `--allow`/`--deny` repeatable, `--policy PRESET`, `--net MODE` | P0 | done | A deliberate **Boks addition**, not parity: one-off overrides of the stored policy. `--policy`/`--allow` replace the posture and the allow list; `--deny` is added to the sandbox's own denies, so a run cannot drop a prohibition. A sandbox created with them records them, so a restart serves the same rules |
 | TLS interception | Used for credential injection, not for filtering: a "Docker Sandboxes Proxy CA" sits in the guest trust store and is also exposed as `PROXY_CA_CERT_B64` | Terminate **only** for hosts with a credential rule; local CA, certificate handed over as a file and as `BOKS_CA_CERT_B64` | P0 | done | Demonstrated end to end: the intercepted host presents a Boks-issued certificate, an unconfigured host presents the origin's own chain |
 | Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | done | All three are produced and attributed to the sandbox they came from. `transparent` comes from the netstack's own decisions, taken on address and port for flows that never touched the proxy |
 | Structured decisions | Blocked rows read `no applicable policies for op(action=net:connect:tcp, resource=net:domain:<host>:<port>)` | Same action/resource vocabulary on every decision | P1 | done | Recorded as fields rather than formatted prose, so the display layer can group, filter and aggregate |

@@ -36,11 +36,15 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 		allow:  []string{"example.com:443"},
 		inject: []string{"anthropic@api.anthropic.com=x-api-key"},
 	}
+	resolution, err := flags.resolution("boks-test", nil)
+	if err != nil {
+		t.Fatalf("resolving: %v", err)
+	}
 	spec := enforce.Spec{
-		Sandbox:   "boks-test",
-		Allow:     flags.allow,
-		Inject:    flags.inject,
-		Intercept: true,
+		Sandbox:    "boks-test",
+		Resolution: &resolution,
+		Inject:     flags.inject,
+		Intercept:  true,
 	}
 	var errOut bytes.Buffer
 	if err := describeNetwork(flags, spec, network.ModeNAT, &errOut); err != nil {

@@ -23,12 +23,28 @@ func newPolicyCommand(env Env) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "policy",
 		Short: "Show network policy rules and recent decisions",
-		Long: `A network policy is what a sandbox may reach. These commands show what a policy resolves
-to before anything runs, and what it decided afterwards.`,
+		Long: `A network policy is what a sandbox may reach. It is durable state, not an argument to a
+run: rules written here survive the command that wrote them and are what 'boks run',
+'boks start' and 'boks exec' all serve a sandbox. A rule applies to every sandbox, or is
+scoped to one with --sandbox.
+
+Precedence, in one sentence: a deny in any scope beats an allow in any scope, and only the
+base preset — chosen by 'policy init', a profile, or a --policy flag — decides what happens
+to a destination no rule mentions.`,
 	}
+	// Registered here and nowhere else. The names are sbx's, in sbx's order, wherever the
+	// semantics match.
 	cmd.AddCommand(
-		newPolicyLsCommand(env),
+		newPolicyAllowCommand(env),
+		newPolicyCheckCommand(env),
+		newPolicyDenyCommand(env),
+		newPolicyInitCommand(env),
+		newPolicyInspectCommand(env),
 		newPolicyLogCommand(env),
+		newPolicyLsCommand(env),
+		newPolicyProfileCommand(env),
+		newPolicyResetCommand(env),
+		newPolicyRmCommand(env),
 	)
 	return cmd
 }
@@ -42,28 +58,59 @@ func newPolicyLsCommand(env Env) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ls [flags]",
 		Short: "Show the rules a policy resolves to",
-		Long: `Resolves a preset plus any --allow/--deny rules and prints the result, deny rules first
+		Long: `Two things, because they are two halves of one question. First what is written down —
+the stored rules, by scope — and then what they resolve to for a run, deny rules first
 because they always win. Nothing here contacts the network or a sandbox.
+
+The --policy, --allow, --deny and --profile flags resolve a hypothetical: they show what a
+run given those flags would get, on top of what is stored.
 
 Presets:
 ` + presets.String(),
 		Args: noArgs,
 	}
-	var flags policyFlags
+	var (
+		flags   policyFlags
+		sandbox string
+		stored  bool
+	)
 	flags.register(cmd.Flags())
+	cmd.Flags().StringVar(&sandbox, "sandbox", "",
+		"resolve as this sandbox, including rules scoped to it")
+	cmd.Flags().BoolVar(&stored, "stored", false,
+		"print only the stored rules, without resolving them")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		return policyLs(env, &flags)
+		return policyLs(env, &flags, sandbox, stored)
 	}
 	return cmd
 }
 
-func policyLs(env Env, flags *policyFlags) error {
-	p, err := flags.resolve()
+func policyLs(env Env, flags *policyFlags, sandbox string, stored bool) error {
+	store, err := openPolicyStore()
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(env.Stdout, p.Describe())
+	writeStoredPolicy(env.Stdout, store)
+	if stored {
+		return nil
+	}
+
+	resolution, err := flags.resolution(sandbox, nil)
+	if err != nil {
+		return err
+	}
+	if sandbox == "" {
+		fmt.Fprint(env.Stdout, "effective policy (for a sandbox with no rules of its own; "+
+			"pass --sandbox NAME for one that has):\n\n")
+	} else {
+		fmt.Fprintf(env.Stdout, "effective policy for sandbox %s:\n\n", sandbox)
+	}
+	fmt.Fprint(env.Stdout, resolution.Describe())
+	p, err := resolution.Policy()
+	if err != nil {
+		return err
+	}
 
 	// The network mode decides whether there is a network for the policy to apply to at
 	// all, so show it alongside the rules rather than in a separate command.
@@ -110,6 +157,65 @@ func policyLs(env Env, flags *policyFlags) error {
 	}
 	fmt.Fprintf(env.Stdout, "\n%s\n", enforcementNote)
 	return nil
+}
+
+// writeStoredPolicy prints what is written down, scope by scope.
+//
+// It comes before the resolved policy because it answers a different question — "what did I
+// configure" rather than "what will happen" — and because it is the part a user edits. An
+// uninitialised machine says so rather than printing an empty list, since "no rules" and "no
+// policy store" look identical otherwise and only one of them is worth acting on.
+func writeStoredPolicy(w io.Writer, store *policy.Store) {
+	fmt.Fprintf(w, "stored policy: %s\n", store.Path())
+	if !store.Exists() {
+		fmt.Fprint(w, "  not initialised — the built-in defaults apply. 'boks policy init' creates it.\n\n")
+		return
+	}
+	base := store.Preset
+	if base == "" {
+		base = policy.DefaultPreset + " (built-in default)"
+	}
+	fmt.Fprintf(w, "  base preset: %s\n", base)
+	if store.Count() == 0 && len(store.ProfileNames()) == 0 {
+		fmt.Fprint(w, "  no rules stored. 'boks policy allow DESTINATION' writes one.\n\n")
+		return
+	}
+
+	if len(store.Global) > 0 {
+		fmt.Fprint(w, "\n  global (every sandbox):\n")
+		writeIndentedRules(w, store.Global)
+	}
+	for _, name := range store.SandboxNames() {
+		rules, _ := store.Rules(policy.SandboxScope(name))
+		fmt.Fprintf(w, "\n  sandbox %s:\n", name)
+		writeIndentedRules(w, rules)
+	}
+	for _, name := range store.ProfileNames() {
+		p := store.Profiles[name]
+		preset := p.Preset
+		if preset == "" {
+			preset = policy.DefaultPreset
+		}
+		fmt.Fprintf(w, "\n  profile %s (preset %s)", name, preset)
+		if p.Description != "" {
+			fmt.Fprintf(w, " — %s", p.Description)
+		}
+		fmt.Fprintln(w, ":")
+		writeIndentedRules(w, p.Rules)
+	}
+	fmt.Fprintln(w)
+}
+
+func writeIndentedRules(w io.Writer, rules []policy.RuleSpec) {
+	if len(rules) == 0 {
+		fmt.Fprint(w, "    (none)\n")
+		return
+	}
+	var b strings.Builder
+	writeStoredRules(&b, rules)
+	for _, line := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
+		fmt.Fprintf(w, "  %s\n", line)
+	}
 }
 
 func newPolicyLogCommand(env Env) *cobra.Command {

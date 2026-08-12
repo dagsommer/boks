@@ -352,7 +352,7 @@ func TestIPv6IsCoveredFromTheStart(t *testing.T) {
 	}
 
 	// A local rule can name a v6 prefix with ports, in the same syntax as v4.
-	p, err := Resolve(PresetLocked, []string{"[2001:db8::/32]:443"}, nil)
+	p, err := resolvePolicy(PresetLocked, []string{"[2001:db8::/32]:443"}, nil)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -365,7 +365,7 @@ func TestIPv6IsCoveredFromTheStart(t *testing.T) {
 }
 
 func TestResolveAppliesLocalRules(t *testing.T) {
-	p, err := Resolve(PresetLocked, []string{"example.com:443"}, nil)
+	p, err := resolvePolicy(PresetLocked, []string{"example.com:443"}, nil)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestResolveAppliesLocalRules(t *testing.T) {
 	}
 
 	// A local allow cannot undo a preset deny.
-	p, err = Resolve(PresetOpen, []string{"127.0.0.1:5432"}, nil)
+	p, err = resolvePolicy(PresetOpen, []string{"127.0.0.1:5432"}, nil)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -383,7 +383,7 @@ func TestResolveAppliesLocalRules(t *testing.T) {
 	}
 
 	// A local deny narrows a preset allow.
-	p, err = Resolve(PresetStandard, nil, []string{"github.com"})
+	p, err = resolvePolicy(PresetStandard, nil, []string{"github.com"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -391,10 +391,10 @@ func TestResolveAppliesLocalRules(t *testing.T) {
 		t.Error("-deny did not override the preset allow")
 	}
 
-	if _, err := Resolve(PresetLocked, []string{"not a host"}, nil); err == nil {
+	if _, err := resolvePolicy(PresetLocked, []string{"not a host"}, nil); err == nil {
 		t.Error("Resolve accepted an invalid -allow value")
 	}
-	if _, err := Resolve(PresetLocked, nil, []string{"*.*.x"}); err == nil {
+	if _, err := resolvePolicy(PresetLocked, nil, []string{"*.*.x"}); err == nil {
 		t.Error("Resolve accepted an invalid -deny value")
 	}
 }
@@ -550,4 +550,15 @@ func TestAggregatedCollapsesRepeats(t *testing.T) {
 	if bypass.Destination() != "a.test:443" {
 		t.Errorf("destination = %q", bypass.Destination())
 	}
+}
+
+// resolvePolicy is the old preset-plus-flags resolution, expressed through the one
+// resolution path there now is. It keeps these tests exercising the layering the CLI
+// actually uses rather than a second implementation kept alive for them.
+func resolvePolicy(preset string, allow, deny []string) (Policy, error) {
+	res, err := (Request{Preset: preset, Allow: allow, Deny: deny}).Resolve()
+	if err != nil {
+		return Policy{}, err
+	}
+	return res.Policy()
 }
