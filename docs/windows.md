@@ -1057,30 +1057,119 @@ restrictive DACL is the idiomatic alternative and keeps the stream shape.
 
 ### The candidates
 
-Assessed against requirement 2, which is where they are decided. **This assessment is the least
-settled part of the document** — it is the live question, and it should be treated as a
-starting point for the Part B checklist rather than a conclusion.
+Assessed against requirement 2, which is where they are decided.
 
-| Candidate | Runs on Windows/WHP | virtio-net backend Boks could own |
+| Candidate | Windows via WHP | virtio-net backend Boks could own |
 |---|---|---|
-| **libkrun** — what Boks uses today | **No.** KVM and Hypervisor.framework only | n/a |
-| **cloud-hypervisor** | No. Its `mshv` backend is for Linux running on Microsoft Hypervisor, not Windows userland | n/a |
-| **Firecracker** | No. Linux/KVM only | n/a |
-| **QEMU** with the WHPX accelerator | Yes in principle — `-accel whpx` is upstream | **Yes** — `-netdev socket` / `-netdev stream` with `virtio-net-pci`, which is exactly the integration gvisor-tap-vsock documents |
-| **crosvm** | Has a Windows port | unassessed |
-| **OpenVMM** (Microsoft, Rust, open source) | Targets Windows via WHP | unassessed |
+| **libkrun** — what Boks uses today | **In progress, in tree** — see below | **The one device not yet ported.** Everything else was. |
+| **OpenVMM** (Microsoft, MIT) | **Yes, first-class** — x64 and arm64 | No socket backend, but `net_backend::{Endpoint, Queue}` is a documented pluggable trait with five implementations |
+| **QEMU** + WHPX | Yes, documented and maintained | Exists (`-netdev socket`/`stream` + `virtio-net-pci`) — **but whether it works on a Windows build is unverified** |
+| **crosvm** | Compile-tested upstream, "not tested upstream" at runtime, x86_64 only | **No.** There is no `--net` flag on Windows at all; the datapath is built-in libslirp |
+| **cloud-hypervisor** | No — `mshv` is Linux as a root partition on Microsoft Hypervisor | n/a |
+| **Firecracker** | No — Linux/KVM only, no hypervisor abstraction | n/a |
+| **Hyperlight** (Microsoft) | Yes, but no kernel, no OS, no virtio, no networking | Wrong tool entirely |
+| **Intel HAXM** | Archived 2023 | n/a |
 
-**QEMU + WHPX is the obvious first thing to try**, because it is the only candidate where
-requirement 2 is already known to be satisfied *and* already known to work with the exact
-library Boks uses. Its weaknesses are equally obvious and should be checked before anyone
-invests: WHPX's maintenance status and performance, whether a full QEMU is an acceptable
-dependency for a tool that currently embeds its VMM, and the absence of a containerd shim
-driving QEMU in the shape Boks wants — requirement 4, where libkrun-plus-nerdbox is doing a
-lot of work for Boks today that QEMU alone would not.
+### libkrun is being ported to WHP right now, and virtio-net is the only gap
 
-**OpenVMM is the most interesting unknown.** A Microsoft-authored, open-source, Rust VMM
-targeting WHP is on paper the closest thing to an open `sailor.dll`. If it satisfies
-requirement 2 it is likely the right answer; if it does not, that is worth knowing early.
+**This is the finding that should change what Boks does, and it invalidates a claim made
+earlier in this document and in the README.**
+
+libkrun's README still says KVM and Hypervisor.framework only. Its source says otherwise. Merged
+upstream between May and July 2026, almost all by one Red Hat engineer:
+
+| In tree | What |
+|---|---|
+| `src/whp/` (crate `krun-whp`) | safe Rust wrappers over WHP — `WhpVm`, `WhpVcpu`, `WhpEmulator` |
+| `src/arch/src/x86_64/windows/` | register, MSR and arch support |
+| `src/utils/src/windows/` | epoll emulated over I/O Completion Ports; eventfd over Windows Events |
+| `src/devices/src/legacy/ioapic_whp.rs` | IOAPIC for WHP |
+| virtio-fs, -blk, -console, -balloon, -rng | all ported to Windows |
+| `libkrunfw` | builds a `libkrunfw.dll` guest kernel bundle for WHP |
+
+**virtio-net is the exception.** `src/devices/src/virtio/net/backend.rs` is still built on
+`nix::Error` and `RawFd`. Every other device Boks needs got a Windows port; the one carrying the
+guest's packets did not.
+
+The maintainer's own status, from `containers/libkrun#798` (2026-07-28):
+
+> "Windows support is still on progress, **planned to be part of libkrun 2.0, which should be
+> released at the end of the year**. It lacks documentation because it still misses many pieces
+> and **it is not buildable yet**."
+
+Corroborating both halves: there is no Windows CI in libkrun, and `krun-cpuid` still imports
+`kvm_bindings` unconditionally — but a third-party MIT fork, `A3S-Lab/Box`, already ships a
+prebuilt `krun.dll` and `libkrunfw.dll` for `x86_64-pc-windows-msvc` and reports Alpine OCI
+workloads running on real hardware in mid-2026, with virtio-fs, bind mounts and snapshots — and
+explicitly **no networking**. That is simultaneously an existence proof that the WHP path boots
+Linux and a confirmation of exactly where the hole is.
+
+### And nerdbox already supports Windows, upstream
+
+The other half of the assumed gap is also smaller than assumed. `containerd/nerdbox`:
+
+- **builds the shim for `windows/amd64` and `windows/arm64`** in its own CI workflow, with
+  Windows-specific sources (`internal/shim/task/*_windows.go`, named-pipe retry logic, a longer
+  VM start timeout on Windows);
+- **on Windows, dynamically loads a DLL named `krun.dll`** — `internal/vm/libkrun/instance.go`
+  selects it by `runtime.GOOS`, via `LoadLibrary`/`GetProcAddress`.
+
+That last point explains Docker's arrangement precisely: **anything exporting libkrun's C ABI as
+`krun.dll` drops into upstream nerdbox on Windows**, which is what `sailor.dll` must be doing.
+So Docker's Windows product is upstream nerdbox plus a proprietary VMM behind a documented ABI —
+not a fork.
+
+And the VMM is pluggable at a second, higher seam: `pkg/vm/vm.go` is documented as "the
+hypervisor-agnostic interface", with a `nerdbox.vm-manager.v1` plugin type and libkrun registered
+as merely one implementation. Its `AddNIC` takes an endpoint path and a `NetworkMode` of
+`unixgram` or **`unixstream`**, the latter described as for "gvproxy and vfkit-compatible helpers
+that frame L2 packets over a stream connection".
+
+### The pieces line up better than anyone expected
+
+Three independent facts meet at the same place:
+
+1. libkrun's `krun_add_net_unixstream` frames each Ethernet frame with **a 4-byte big-endian
+   length prefix**.
+2. That is byte-for-byte gvisor-tap-vsock's **`qemu` protocol**, which Boks already links —
+   verified above by reading `pkg/tap/protocols.go`.
+3. Windows AF_UNIX supports **`SOCK_STREAM`**, which is exactly what `unixstream` needs — and the
+   absence of `SOCK_DGRAM`, which looked like a blocker in section 6, stops mattering because
+   `unixgram` is simply not the mode to use there.
+
+So the Windows link would be: nerdbox `NetworkModeUnixstream` → libkrun `krun_add_net_unixstream`
+→ an AF_UNIX stream socket → Boks' existing stack with `types.QemuProtocol` in place of
+`types.VfkitProtocol`. **One constant and a listener**, as measured above. A named pipe or
+loopback TCP would work equally well if AF_UNIX proves awkward, since the protocol only needs a
+stream.
+
+### What this means for what Boks should do
+
+**Wait, and optionally accelerate exactly one thing.** The structural work Boks would otherwise
+have faced — a WHP VMM, a Windows shim, a guest kernel bundle — is being done upstream by people
+already doing it, for a release due around the end of 2026. Boks needs to change nothing
+architectural.
+
+The highest-leverage contribution, if the project wants Windows sooner, is narrow and specific:
+**port `net/backend.rs` and `unixstream.rs` in libkrun from `nix`/`RawFd` to WinSock.** That is
+the single thing standing between the existing work and a Boks sandbox with enforced network
+policy on Windows, and it is squarely in Boks' area of expertise.
+
+Second-best, if libkrun 2.0 slips: **OpenVMM behind a nerdbox `vm-manager.v1` plugin**, writing a
+socket `Endpoint` against its pluggable `net_backend` trait. MIT, boots Linux directly on Windows
+x64 and arm64, the best-maintained WHP code that exists — at the cost of vendoring unpublished
+crates and accepting its own warning of "no API or feature-set stability guarantees whatsoever"
+on a host VMM its maintainers describe as not ready for end-user workloads.
+
+**And one cheap experiment could short-circuit both.** QEMU's WHPX accelerator is documented and
+maintained, and `-netdev socket,connect=127.0.0.1:PORT` with `virtio-net-pci` is precisely the
+gvisor-tap-vsock integration. What is **unverified** is whether that netdev works on a *Windows*
+build — gvisor-tap-vsock's README heads that section "Run with QEMU (Linux or macOS)", and QEMU
+netdevs have historically been POSIX-only in practice even when the option parses. The inference
+is favourable (`net/stream.c` goes through `QIOChannelSocket`, which is Winsock-backed) but no
+documentation affirms it. **That is a twenty-minute test on a Windows machine and it is worth
+more than any further reading**, because a positive result means Boks could have a working — if
+inelegant — Windows path today rather than at the end of the year.
 
 ---
 
