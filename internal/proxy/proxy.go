@@ -1,20 +1,23 @@
 // Package proxy is the host-side forward proxy that applies a network policy to a
 // sandbox's HTTP and HTTPS traffic and attaches credentials the guest never sees.
 //
-// # This is not an enforcement boundary yet
+// # This is a feature layered on the boundary, not the boundary
 //
-// A forward proxy only sees traffic a client chooses to send it. Boks' current VM runtime
-// uses libkrun's TSI, which rewrites the guest's socket calls and performs the connection
-// on the host, so a guest that ignores HTTP_PROXY and opens a raw socket bypasses every
-// decision in this package. **An environment variable is not a security boundary.** Real
-// enforcement needs the guest's virtio-net link terminated by a host-side network stack
-// that can drop packets; until that exists, this proxy is a cooperating-client mechanism —
-// useful for shaping and observing what well-behaved tooling does, worthless against
-// tooling that does not want to be shaped.
+// A forward proxy only sees traffic a client chooses to send it, and **an environment
+// variable is not a security boundary**. That has not changed and never will. What changed
+// is what lies underneath: inside a sandbox this proxy listens in a virtual network whose
+// host-side stack (internal/network) judges every TCP connection the guest opens, by address
+// and port, before it dials anything. A guest that ignores HTTP_PROXY no longer walks past
+// the policy — it is judged on addresses instead of names, and loses the things only a
+// cooperating client can be given:
 //
-// Nothing in this package is wired into `boks run`'s datapath. It runs standalone, under
-// `boks proxy`, so the policy engine and credential path can be built and tested while the
-// netstack question is settled.
+//   - hostname rules, and with them any rule about a destination whose address is not
+//     known in advance;
+//   - credential injection, which requires reading the request;
+//   - a refusal that says why, in a body a human can read, instead of a refused socket.
+//
+// Run standalone under `boks proxy`, with no sandbox and no stack behind it, this package is
+// exactly what it always was: a cooperating-client mechanism. The command says so.
 //
 // # Two kinds of flow, and the difference is user-visible
 //
@@ -31,8 +34,8 @@
 //     the proxy terminated and re-originated, presenting a leaf signed by the local Boks
 //     CA (internal/ca) and verifying the origin's real certificate itself.
 //
-// (A third mode, **transparent**, belongs to flows judged at the network layer without
-// using the proxy at all. Boks cannot produce it yet; see policy.ModeTransparent.)
+// (A third mode, **transparent**, belongs to flows judged at the network layer without using
+// the proxy at all. Those decisions are taken and logged by internal/network, not here.)
 //
 // An HTTPS flow is terminated **only if the destination host has a credential rule
 // configured for it** (internal/secret). There is no flag, preset or default that
@@ -59,10 +62,13 @@
 //     cross-check on the CONNECT target, not an independent guarantee. Encrypted Client
 //     Hello removes it entirely.
 //   - Hostname rules mean nothing for a raw socket. Only address and port rules apply
-//     there, and only once something can see raw sockets at all.
+//     there — which is what the network stack applies, and why a policy written entirely
+//     in hostnames denies raw flows rather than permitting them.
 //   - DNS is a covert channel unless resolution is mediated too. Traffic through this
-//     proxy carries names rather than resolving them in the guest, which helps; a guest
-//     that can send its own UDP does not have to cooperate.
+//     proxy carries names rather than resolving them in the guest, and inside a sandbox
+//     the only resolver the guest can reach is the gateway's own: UDP to anything else is
+//     dropped at the link. What that does not do is filter the names themselves, which is
+//     still unbuilt.
 package proxy
 
 import (
