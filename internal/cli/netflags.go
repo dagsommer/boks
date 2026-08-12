@@ -14,12 +14,13 @@ import (
 // `boks policy ls`, so that all three resolve a policy the same way and a rule that is
 // valid for one is valid for the others.
 type policyFlags struct {
-	preset string
-	mode   string
-	allow  stringList
-	deny   stringList
-	inject stringList
-	guest  stringList
+	preset  string
+	profile string
+	mode    string
+	allow   stringList
+	deny    stringList
+	inject  stringList
+	guest   stringList
 }
 
 // register adds the flags to a flag set. The preset default is empty rather than
@@ -28,6 +29,7 @@ type policyFlags struct {
 func (f *policyFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.preset, "policy", "", "network policy preset: "+strings.Join(policy.PresetNames(), ", ")+
 		" (default "+policy.DefaultPreset+")")
+	fs.StringVar(&f.profile, "profile", "", "stored policy profile to apply ('boks policy profile ls')")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
 	fs.Var(&f.allow, "allow", "allow a destination, host[:ports] (repeatable)")
@@ -38,8 +40,13 @@ func (f *policyFlags) register(fs *flag.FlagSet) {
 
 // specified reports whether the user set any of them.
 func (f *policyFlags) specified() bool {
-	return f.preset != "" || f.mode != "" || len(f.allow) > 0 || len(f.deny) > 0 ||
-		len(f.inject) > 0 || len(f.guest) > 0
+	return f.policySpecified() || f.mode != "" || len(f.inject) > 0 || len(f.guest) > 0
+}
+
+// policySpecified reports whether this run asked for a policy of its own, as opposed to the
+// one its sandbox and the store already decide.
+func (f *policyFlags) policySpecified() bool {
+	return f.preset != "" || f.profile != "" || len(f.allow) > 0 || len(f.deny) > 0
 }
 
 // sandboxNameFor supplies a placeholder when the real name has not been generated yet, so
@@ -77,13 +84,64 @@ func (f *policyFlags) planFor(sandbox string, mode network.Mode) (network.Plan, 
 	})
 }
 
-// resolve builds the effective policy.
+// resolve builds the effective policy for no particular sandbox. It is what `boks proxy`
+// runs under and what `boks run` uses to reject a malformed rule before it creates anything.
 func (f *policyFlags) resolve() (policy.Policy, error) {
-	preset := f.preset
-	if preset == "" {
-		preset = policy.DefaultPreset
+	res, err := f.resolution("", nil)
+	if err != nil {
+		return policy.Policy{}, err
 	}
-	return policy.Resolve(preset, f.allow, f.deny)
+	return res.Policy()
+}
+
+// resolution assembles a sandbox's policy from the three things that decide it: the durable
+// store, what the sandbox recorded when it was created, and this run's flags.
+//
+// The merge rule between the record and the flags is deliberately asymmetric, and it is the
+// same principle the scopes follow — nothing may quietly widen:
+//
+//   - the preset and the profile are *replaced* by a flag that names one, because choosing a
+//     posture for one run is what those flags are for;
+//   - `-allow` *replaces* the sandbox's recorded allow list, so a one-off run can narrow;
+//   - `-deny` is *added to* the recorded denies. A prohibition a sandbox was created with
+//     does not disappear because this invocation typed a different one.
+//
+// A run that names no policy flags at all gets exactly what the sandbox was created with,
+// which is the whole point: `boks start` and `boks exec` no longer serve a sandbox the
+// default preset in place of its own policy.
+func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (policy.Resolution, error) {
+	store, err := policy.LoadStore(policy.DefaultStorePath())
+	if err != nil {
+		return policy.Resolution{}, err
+	}
+	req := record.Request(store, sandbox)
+	if f.preset != "" {
+		req.Preset = f.preset
+	}
+	if f.profile != "" {
+		req.Profile = f.profile
+	}
+	if len(f.allow) > 0 {
+		req.Allow = f.allow
+	}
+	req.Deny = append(append([]string(nil), req.Deny...), f.deny...)
+	return req.Resolve()
+}
+
+// sandboxRecord is what this invocation's flags say a new sandbox should remember. It holds
+// the selection only — presets, profiles and destinations — and never a credential: a
+// credential rule names a service, and its value lives in the encrypted store.
+func (f *policyFlags) sandboxRecord() *policy.SandboxPolicy {
+	if !f.policySpecified() {
+		return nil
+	}
+	return &policy.SandboxPolicy{
+		V:       policy.SandboxPolicyVersion,
+		Profile: f.profile,
+		Preset:  f.preset,
+		Allow:   append([]string(nil), f.allow...),
+		Deny:    append([]string(nil), f.deny...),
+	}
 }
 
 // credentialRules assembles the credentials from the flags. Values are not touched here: a

@@ -207,7 +207,23 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 		return false, nil
 	}
 
-	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode)
+	// A sandbox that exists carries its own policy selection; a new one is about to be
+	// created with this run's. Either way the record travels with the container, so that
+	// `start` and `exec` — which have no policy flags — serve the same containment.
+	record := flags.sandboxRecord()
+	if inv.exists {
+		record = inv.info.Policy
+		if flags.policySpecified() {
+			fmt.Fprintf(env.Stderr,
+				"note: sandbox %q was created with %s. The policy flags on this run apply to\n"+
+					"      the stack it is about to get, and are not recorded on the sandbox:\n"+
+					"      a later 'boks start' will serve it what it was created with.\n",
+				inv.name, record.String())
+			record = flags.sandboxRecord()
+		}
+	}
+
+	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode, record)
 	if err != nil {
 		return false, err
 	}
@@ -217,6 +233,9 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 	guest, err := spec.Prepare()
 	if err != nil {
 		return false, err
+	}
+	if !inv.exists {
+		cfg.Policy = record
 	}
 	cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
 	cfg.Env = append(cfg.Env, guest.Env...)
@@ -275,8 +294,17 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 // Credential *values* are resolved here, in the foreground process that has the passphrase,
 // and handed to the stack on a pipe. The stack therefore never learns the passphrase and
 // can attach only the credentials this sandbox was configured with.
-func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mode network.Mode) (enforce.Spec, error) {
+// The record is what the sandbox remembers about its own policy, or nil for a sandbox that
+// does not exist yet. Passing it here rather than reading it inside is what makes `start`,
+// `exec` and `run` produce the same policy for the same sandbox.
+func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mode network.Mode,
+	record *policy.SandboxPolicy) (enforce.Spec, error) {
+
 	plan, err := f.planFor(name, mode)
+	if err != nil {
+		return enforce.Spec{}, err
+	}
+	resolution, err := f.resolution(name, record)
 	if err != nil {
 		return enforce.Spec{}, err
 	}
@@ -303,9 +331,7 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 	return enforce.Spec{
 		Sandbox:          name,
 		Plan:             plan,
-		Preset:           f.preset,
-		Allow:            f.allow,
-		Deny:             f.deny,
+		Resolution:       &resolution,
 		Inject:           f.inject,
 		GuestCredentials: f.guest,
 		Secrets:          secrets,
@@ -346,12 +372,16 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stder
 	notice := interceptionNotice(credentials)
 
 	if !f.specified() && notice == "" {
-		fmt.Fprintf(stderr, "network: %s, policy %s — 'boks policy ls' for the rules, "+
-			"'boks policy log' for what they decided.\n", mode, pol.Name)
+		fmt.Fprintf(stderr, "network: %s, policy %s — 'boks policy ls -sandbox %s' for the rules, "+
+			"'boks policy log' for what they decided.\n", mode, pol.Name, spec.Sandbox)
 		return nil
 	}
 
-	fmt.Fprint(stderr, pol.Describe())
+	if spec.Resolution != nil {
+		fmt.Fprint(stderr, spec.Resolution.Describe())
+	} else {
+		fmt.Fprint(stderr, pol.Describe())
+	}
 	if notice != "" {
 		fmt.Fprintf(stderr, "\n%s", notice)
 	}

@@ -117,8 +117,12 @@ Flags:
 // about to be started by a command with no policy flags of its own — `boks start`, and
 // `boks exec` on a stopped sandbox.
 //
-// The mode is read back from the container: it was fixed when the sandbox was created, and
-// a stack that disagrees with the container's wiring is worse than none.
+// Both the mode and the policy are read back from the container. The mode was fixed when the
+// sandbox was created and a stack that disagrees with the container's wiring is worse than
+// none; the policy used to be *not* read back at all, which was a real bug rather than a
+// missing feature — a sandbox created under `-policy locked` came back up under the default
+// preset, so restarting a sandbox silently widened its containment. The sandbox now carries
+// its own selection, and the durable store supplies the rest.
 func ensureNetworkForExisting(ctx context.Context, name, address string, stderr io.Writer) error {
 	info, exists, err := sandbox.Find(ctx, address, name)
 	if err != nil || !exists {
@@ -136,14 +140,17 @@ func ensureNetworkForExisting(ctx context.Context, name, address string, stderr 
 	}
 
 	var flags policyFlags
-	spec, err := flags.enforceSpec(ctx, name, address, mode)
+	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy)
 	if err != nil {
 		return err
 	}
 	if mode != network.ModeNone {
-		fmt.Fprintf(stderr, "network: starting a %s stack for %s with the default policy (%s); "+
-			"per-run rules are not recorded, so 'boks run -allow ...' is where they belong.\n",
-			mode, name, policy.DefaultPreset)
+		pol, err := spec.Policy()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "network: starting a %s stack for %s under policy %s (%s).\n",
+			mode, name, pol.Name, info.Policy.String())
 	}
 	_, _, err = attachNetwork(ctx, spec, info.Status == sandbox.StatusRunning, stderr)
 	return err
