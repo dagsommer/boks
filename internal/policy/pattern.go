@@ -121,6 +121,17 @@ func (p Pattern) Match(t Target) bool {
 // accept a catch-all — credential injection, above all — check this.
 func (p Pattern) IsAny() bool { return p.kind == patternAny }
 
+// MatchesNameOnly reports whether this pattern can only ever match a hostname, and so can
+// never permit a connection made straight to an address.
+//
+// The distinction matters to anyone writing rules: a raw socket carries no name, so a policy
+// built only from hostnames denies every direct-by-IP flow — including flows to the very host
+// it names. That is the safe direction, but it is not what `-allow example.com` looks like it
+// promises, so the CLI says so rather than leaving it to be discovered.
+func (p Pattern) MatchesNameOnly() bool {
+	return p.kind == patternExact || p.kind == patternSuffix
+}
+
 func (p Pattern) String() string { return p.text }
 
 // PortSet is the set of ports a rule applies to. The zero value means every port.
