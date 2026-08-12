@@ -180,14 +180,14 @@ func platformCheck() Check {
 				}
 				return Result{Status: StatusOK, Detail: detail}
 			case "windows":
-				// Not "blocked on runtime support": the runtime half exists. See
-				// virt_windows.go and docs/windows.md for what actually blocks it.
+				// Not "blocked on runtime support", and not a platform limitation
+				// either — Windows supports this design and the reference product
+				// ships on it. See virt_windows.go and docs/windows.md.
 				return Result{
 					Status: StatusFail, Detail: detail,
-					Remedy: "Boks does not run sandboxes on Windows. A Linux VM can be booted there\n" +
-						"through containerd and the runhcs shim, but the guest's network cannot be\n" +
-						"terminated by a host process, so no policy could be enforced on it.\n" +
-						"See docs/windows.md.",
+					Remedy: "Boks does not run sandboxes on Windows yet. The platform can host them —\n" +
+						"the Windows Hypervisor Platform is a user-mode hypervisor API that supports\n" +
+						"this design — but Boks has no VMM that speaks it. See docs/windows.md.",
 				}
 			default:
 				return Result{
