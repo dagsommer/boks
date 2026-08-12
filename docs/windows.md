@@ -1282,6 +1282,53 @@ depends on, read out of the local module cache rather than quoted from a summary
 - [Lima](https://github.com/lima-vm/lima) `mountPoint` defaulting to the host `location` — the
   exact-path approach, and its absence of a Windows convention
 
+### What the reference product does (section 7)
+
+The strongest evidence in this document, because it is what a working implementation actually
+links against rather than what anyone says about it.
+
+- `DockerSandboxes.msi` **v0.38.0**, from
+  [docker/sbx-releases releases](https://github.com/docker/sbx-releases/releases) — unpacked;
+  MSI `File` table, absence of `ServiceInstall`/`ServiceControl`/driver tables, per-user
+  `%LOCALAPPDATA%` install root, and the import tables and strings of `sailor.dll` and
+  `sbx.exe`
+- [Windows SBOM](https://github.com/docker/sbx-releases/releases/download/v0.38.0/DockerSandboxes-windows-amd64.sbom.json)
+  and [macOS SBOM](https://github.com/docker/sbx-releases/releases/download/v0.38.0/DockerSandboxes-darwin-arm64.sbom.json) —
+  identical `gvisor` and `goproxy` versions across the two platforms
+- [Docker Sandboxes prerequisites](https://docs.docker.com/ai/sandboxes/get-started/) —
+  Windows 11 + `HypervisorPlatform`, Docker Desktop **not** required, WSL2 not listed
+- [Docker Sandboxes architecture](https://docs.docker.com/ai/sandboxes/architecture/) and
+  [local policy](https://docs.docker.com/ai/sandboxes/security/policy/) — enforcement model,
+  UDP/ICMP blocked at the network layer, no Windows caveat
+- [Why MicroVMs: the architecture behind Docker Sandboxes](https://www.docker.com/blog/why-microvms-the-architecture-behind-docker-sandboxes/) —
+  "each OS's native hypervisor: Apple's Hypervisor.framework, Windows Hypervisor Platform, and
+  Linux KVM… a single codebase for three platforms"
+- [sbx-releases#397](https://github.com/docker/sbx-releases/issues/397) — Docker's maintainer:
+  the native Windows build is preferred; the Linux build in WSL is "best-effort"
+- [Windows Hypervisor Platform API](https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/hypervisor-platform) —
+  a user-mode API for third-party virtualization stacks; guest physical memory is "populated
+  using memory allocated in the user-mode process of the virtualization stack"; it exposes no
+  networking device of any kind
+
+### Boks inside WSL2 (section 9)
+
+- [microsoft/WSL releases](https://github.com/microsoft/WSL/releases) — kernel versions;
+  note that Learn's [kernel release notes](https://learn.microsoft.com/en-us/windows/wsl/kernel-release-notes)
+  are **stale** (newest entry 5.15.57.1, 2022) and should not be cited
+- WSL kernel config: `arch/x86/configs/config-wsl` on the `linux-msft-wsl-6.18.y` branch of
+  [microsoft/WSL2-Linux-Kernel](https://github.com/microsoft/WSL2-Linux-Kernel) — `CONFIG_KVM=m`,
+  `CONFIG_EROFS_FS=m`, `CONFIG_UNIX=y`. Note `master` is still the legacy 4.19 branch, and on
+  6.x the old `Microsoft/config-wsl` path is a symlink that naive raw fetches return literally
+- [microsoft/WSL#7257](https://github.com/microsoft/WSL/issues/7257) — the request that got
+  EROFS enabled (Microsoft, 2022)
+- [microsoft/wsl#40573](https://github.com/microsoft/wsl/issues/40573) — a custom kernel
+  without a matching modules VHD loses every `=m` symbol
+- [microsoft/WSL#5272](https://github.com/microsoft/WSL/issues/5272) — Windows' native AF_UNIX
+  has no `SOCK_DGRAM`, open since 2020
+- [rancher-desktop#9708](https://github.com/rancher-sandbox/rancher-desktop/issues/9708) —
+  containerd-in-WSL startup failure while dockerd works; the containerd path there is less
+  trodden
+
 ### The supervisor (section 6)
 
 - [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex) —
