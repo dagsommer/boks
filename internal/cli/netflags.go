@@ -1,9 +1,10 @@
 package cli
 
 import (
-	"flag"
 	"path/filepath"
 	"strings"
+
+	"github.com/spf13/pflag"
 
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
@@ -16,24 +17,30 @@ import (
 type policyFlags struct {
 	preset string
 	mode   string
-	allow  stringList
-	deny   stringList
-	inject stringList
-	guest  stringList
+	allow  []string
+	deny   []string
+	inject []string
+	guest  []string
 }
 
 // register adds the flags to a flag set. The preset default is empty rather than
 // "standard" so that a caller can tell "the user asked for the default" apart from "the
 // user said nothing", which matters while the policy is not enforced.
-func (f *policyFlags) register(fs *flag.FlagSet) {
+//
+// Every repeatable flag is a StringArray rather than a StringSlice: a StringSlice splits its
+// value on commas, and an -inject rule naming two hosts contains one. Splitting there would
+// turn a valid rule into two invalid ones.
+func (f *policyFlags) register(fs *pflag.FlagSet) {
 	fs.StringVar(&f.preset, "policy", "", "network policy preset: "+strings.Join(policy.PresetNames(), ", ")+
 		" (default "+policy.DefaultPreset+")")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
-	fs.Var(&f.allow, "allow", "allow a destination, host[:ports] (repeatable)")
-	fs.Var(&f.deny, "deny", "deny a destination, host[:ports] (repeatable); deny always wins")
-	fs.Var(&f.inject, "inject", "attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
-	fs.Var(&f.guest, "guest-credential", "what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
+	fs.StringArrayVar(&f.allow, "allow", nil, "allow a destination, host[:ports] (repeatable)")
+	fs.StringArrayVar(&f.deny, "deny", nil, "deny a destination, host[:ports] (repeatable); deny always wins")
+	fs.StringArrayVar(&f.inject, "inject", nil,
+		"attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
+	fs.StringArrayVar(&f.guest, "guest-credential", nil,
+		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
 }
 
 // specified reports whether the user set any of them.
