@@ -833,14 +833,25 @@ expected to fail.
 10. If Docker Sandboxes is installed, one command corroborates section 4 and section 7 at once:
 
     ```
-    sbx run --workspace C:\Users\<you>\src\foo <agent> -- sh -c "pwd; mount; cat /proc/version; ip -o addr"
+    sbx run --workspace C:\Users\<you>\src\foo <agent> -- sh -c "pwd; mount; ls /sys/bus; ip -o addr"
     ```
 
-    Expected, from the evidence in those sections: `pwd` prints `/c/Users/<you>/src/foo`;
-    `/proc/version` carries a `-microsoft-standard-WSL2` suffix or otherwise identifies a
-    Linux-hosted microVM rather than an LCOW UVM; and `mount` shows virtiofs rather than 9p.
+    Expected, from the evidence in those sections: `pwd` prints `/c/Users/<you>/src/foo`, and
+    the workspace arrives over **virtiofs**, not 9p.
+
+    Note what `/proc/version` does *and does not* tell you here. Inside the sandbox it reports
+    the **microVM's own kernel**, so it identifies neither the host nor the substrate — a
+    nested-in-WSL2 design and a native Hyper-V design both show a kernel Docker chose. The
+    discriminator is the **device topology**: `ls /sys/bus` showing a `virtio` bus means a
+    Linux-hosted microVM, while `vmbus` synthetic devices and a 9p mount would mean an LCOW
+    utility VM.
+
     **A 9p mount here would contradict section 7 and should be reported**, since it would mean
     `sbx` is on LCOW after all and is solving the network problem some way this spike missed.
+
+    To identify the substrate rather than the guest, look from the Windows side instead:
+    `wsl -l -v` for the distributions in play, and Task Manager / `Get-VM` for whether a
+    separate Hyper-V VM exists per sandbox.
 
 ### Recording results
 
