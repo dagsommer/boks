@@ -79,6 +79,23 @@ func runtimeEntitlementCheck() Check {
 			// codesign writes the entitlement plist to stdout and its commentary to
 			// stderr, so both are captured.
 			out, err := exec.CommandContext(ctx, "codesign", "-d", "--entitlements", "-", path).CombinedOutput()
+
+			// codesign exits non-zero both for an unsigned binary and for a genuine
+			// inspection failure, so the exit status alone cannot tell them apart. They
+			// are not the same thing: an unsigned shim definitely cannot boot a VM.
+			// Treating it as ambiguity let doctor conclude a host was ready when it was
+			// not, which is the one thing this command must never do.
+			if unsignedBinary(string(out)) {
+				return Result{
+					Status: StatusFail,
+					Detail: "shim is not signed at all",
+					Remedy: fmt.Sprintf("%s carries no code signature, so it has no %s\n"+
+						"entitlement and cannot use Hypervisor.framework. A sandbox will die inside\n"+
+						"libkrun with 'krun_start_enter failed: -22', which names nothing.\n"+
+						"nerdbox's build:shim task signs it; a plain image build does not.",
+						path, hypervisorEntitlement),
+				}
+			}
 			if err != nil {
 				return Result{
 					Status: StatusWarn,
@@ -105,6 +122,17 @@ func runtimeEntitlementCheck() Check {
 			return Result{Status: StatusOK, Detail: hypervisorEntitlement}
 		},
 	}
+}
+
+// unsignedBinary reports whether codesign's output says the file carries no signature at
+// all, as opposed to codesign having failed to run.
+//
+// The exact wording has varied across macOS releases, so this matches the stable part of
+// the phrase rather than a whole sentence.
+func unsignedBinary(out string) bool {
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "not signed at all") ||
+		strings.Contains(lower, "code object is not signed")
 }
 
 func hypervisorLibraryNames() []string {

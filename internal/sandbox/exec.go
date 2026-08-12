@@ -133,11 +133,17 @@ func execProcess(ctx context.Context, container client.Container, task client.Ta
 	defer stdin.closeGuestStdin(ctx, proc)()
 
 	restore := attachTerminal(ctx, proc, cfg.TTY, cfg.Stdin)
-	forwardSignals(ctx, proc)
+	interrupted := forwardSignals(ctx, proc)
 
 	status := <-statusC
 	restore()
 	code, _, statusErr := status.Result()
+
+	// An interrupted command reports 128+signal and prints nothing; the status error in
+	// that case is the cancelled RPC, which reads like a malfunction rather than a Ctrl-C.
+	if exit := interruptedExit(interrupted); exit != 0 {
+		return exit, nil
+	}
 	if statusErr != nil {
 		return 1, fmt.Errorf("the command in sandbox %q failed: %w", cfg.Name, statusErr)
 	}
