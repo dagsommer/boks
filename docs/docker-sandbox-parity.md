@@ -394,7 +394,8 @@ hosts and no others — see
 |---|---|---|---|---|---|
 | macOS | Sonoma 14+, Apple silicon only | Supported; **the verified platform** | P1 | done | Needs the shim codesigned with `com.apple.security.hypervisor` and a user-owned `/var/run/containerd` |
 | Linux | Ubuntu 24.04+, x86_64/aarch64, KVM required, user in `kvm` group, nested virt if in a VM | Supported, same requirements | P0 | partial | `doctor` checks these, but no VM has been booted on Linux yet |
-| Windows | Windows 11 x86_64, Hypervisor Platform enabled | Blocked on nerdbox | P2 | none | nerdbox lists Windows as future work |
+| Windows | Windows 11 x86_64, Hypervisor Platform enabled | **Not blocked on nerdbox — blocked on Hyper-V.** No native port planned | P2 | none | The runtime half exists (containerd's `windows-lcow` snapshotter + `io.containerd.runhcs.v1`); the enforcement half does not, because HCS attaches a VM NIC only as an HNS endpoint. See [windows.md](windows.md) |
+| Windows: workspace path | `C:\Users\dag\src\foo` → `/c/Users/dag/src/foo` (verified) | Same convention if ever implemented | P2 | none | Exact-path preservation is impossible on Windows; both products translate, and they would translate identically |
 | Docker Desktop | Not required | Not required | — | done | |
 
 ---
