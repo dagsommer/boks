@@ -807,8 +807,8 @@ underneath.
 
 ## The architecture as it would be
 
-If the network problem were solved upstream, this is the shape. Recorded so the plan exists,
-**not** as a claim that it works.
+The shape that follows from section 7, i.e. the one the reference product demonstrates.
+Recorded so the plan exists, **not** as a claim that it works.
 
 ```
 boks CLI
@@ -816,37 +816,45 @@ boks CLI
     v
 containerd (Windows, named pipe \\.\pipe\containerd-containerd)
     |
-    +-- snapshotter: windows-lcow      -- OCI layers -> ext4 layer.vhd + sandbox.vhdx
+    +-- snapshotter producing a guest-mountable rootfs (erofs, as today)
     |
     v
-containerd-shim-runhcs-v1.exe          -- one shim per sandbox
+containerd-shim-nerdbox-v1.exe         -- one shim per sandbox
     |
     v
-Host Compute Service -> Hyper-V utility VM
-    +-- kernel + initrd from %ProgramFiles%\Linux Containers
-    +-- guest init: GCS (Microsoft's, not ours)
-    +-- workspace via Plan 9 over hvsock port 564
-    +-- rootfs: layer VHDs over SCSI/VPMem, overlayfs in the guest
-    +-- network: HNS endpoint  <-- the part Boks cannot terminate
+a VMM on the Windows Hypervisor Platform    <-- THE GAP: Boks has none
+    +-- guest memory mapped into the VMM's own process (WHvMapGpaRange)
+    +-- devices emulated in user mode (WHvEmulatorTry{Mmio,Io}Emulation)
+    +-- workspace via virtiofs
+    +-- virtio-net, backend owned in user space
+              |
+              v
+    Boks' gvisor netstack + policy engine + proxy   (unchanged from Linux/macOS)
 ```
 
-What changes in Boks, by package:
+Every box except one is either already built or a known port. What changes in Boks, by package:
 
 | Package | Change | Size |
 |---|---|---|
-| `internal/runtimecfg` | `Runtime` and `Snapshotter` become platform-specific | trivial |
-| `internal/workspace` | Windows host path → `/mnt/<drive>/…`; refuse UNC | small, and the type already separates `HostPath` from `GuestPath`, so nothing downstream changes |
-| `internal/sandbox` | resource annotations change vocabulary (`io.microsoft.virtualmachine.computetopology.*` instead of `io.containerd.nerdbox.resources.*`) | small |
-| `internal/doctor` | Windows prerequisite checks: Hyper-V / Windows Hypervisor Platform, containerd, the shim, and above all the **boot files** | small |
-| `internal/network`, `internal/enforce` | **blocked** — no host-terminated link exists | — |
-| `internal/proxy`, `internal/policy`, `internal/secret`, `internal/ca` | unchanged, and already portable | none |
+| **the VMM** | **does not exist for Windows** — see section 8 | the entire question |
+| `internal/network` gateway | a Windows link: the VMM's virtio-net backend, whatever form it takes. Note Windows AF_UNIX is stream-only, so the `unixgram` transport cannot be reused as-is | small once a VMM exists, and shaped by which one |
+| `internal/enforce` | `LockFileEx` with a retry, and `CREATE_NEW_PROCESS_GROUP` in place of `setsid` | small (section 6) |
+| `internal/workspace` | Windows host path → `/c/…`; refuse UNC | small — the type already separates `HostPath` from `GuestPath`, so nothing downstream changes |
+| `internal/runtimecfg` | containerd's Windows named-pipe address is already handled; the runtime handler stays `io.containerd.nerdbox.v1` if the shim is the same family | trivial |
+| `internal/doctor` | Windows prerequisite checks: the Hypervisor Platform feature, containerd, the shim, the VMM | small |
+| `internal/network` stack, `internal/proxy`, `internal/policy`, `internal/secret`, `internal/ca` | **unchanged** | none |
 
-One encouraging measurement: **the netstack itself is portable.** `internal/network/stack_unix.go`
-imports no platform-specific package and makes no syscall; it is `!windows` only because the
-gateway that feeds it is. Removing the build tag and compiling the package for `windows/amd64`
-succeeds — gvisor's netstack, the tap switch and the DHCP and DNS services all build. The
-enforcement engine is not the obstacle. The link is. (Demonstrated during this spike and then
-reverted; it changes nothing about whether a guest could reach it.)
+Two measurements support that last row, and both were taken during this spike:
+
+- **The netstack is already portable.** `internal/network/stack_unix.go` imports no
+  platform-specific package and makes no syscall; it carries `!windows` only because the gateway
+  that feeds it does. Removing the build tag and compiling the package for `windows/amd64`
+  succeeds — gvisor's netstack, the tap switch, and the DHCP and DNS services all build. The
+  enforcement engine is not the obstacle. (Demonstrated, then reverted; it says nothing about
+  whether a guest could reach it.)
+- **The reference product reaches the same conclusion independently.** Its Windows build links
+  the same `gvisor` and `goproxy` versions as its macOS build, and carries all three proxy
+  modes. The policy layer is genuinely platform-independent in practice, not just in principle.
 
 ---
 
