@@ -655,7 +655,7 @@ func TestRawFlowToAnAllowedAddressIsCarriedAndLogged(t *testing.T) {
 	host, _, _ := net.SplitHostPort(originHost)
 	d, ok := findDecision(t, spec.LogPath, host)
 	if !ok {
-		t.Fatalf("the allowed raw flow was carried but not recorded; the log must show what a "+
+		t.Fatalf("the allowed raw flow was carried but not recorded; the log must show what a " +
 			"sandbox reached, not only what it was refused")
 	}
 	if !d.Allowed {
@@ -667,6 +667,55 @@ func TestRawFlowToAnAllowedAddressIsCarriedAndLogged(t *testing.T) {
 	if !strings.Contains(d.Resource, "net:ip:") {
 		t.Errorf("resource = %q; a raw flow carries no hostname and must be recorded as an address",
 			d.Resource)
+	}
+}
+
+// TestTheGuestCannotAddressTheHostsLoopback is the property the verification run on a real
+// VM saw as `curl rc=7`, pinned here so it cannot regress quietly.
+//
+// A packet addressed to 127.0.0.0/8 arriving on a NIC that is not the loopback interface is
+// a martian: the host-side stack drops it at the IP layer, before the forwarder is reached
+// and before any policy is consulted. That is stronger than a deny rule, and this test says
+// so by giving the guest a policy that *permits* the address it is trying to reach and a
+// real listener to reach. It still cannot get there.
+//
+// If this ever fails, every unauthenticated dev server, database and debug endpoint on the
+// developer's machine is inside the sandbox's reach.
+func TestTheGuestCannotAddressTheHostsLoopback(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "this must never reach a sandbox")
+	}))
+	defer origin.Close()
+	originHost := strings.TrimPrefix(origin.URL, "http://")
+
+	spec := testSpec(t, network.ModeNAT)
+	spec.Preset = policy.PresetLocked
+	spec.Allow = []string{originHost} // deliberately permitted, and still unreachable
+	spec.LogPath = filepath.Join(spec.StateDir, "decisions.jsonl")
+
+	session, err := Open(context.Background(), spec, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer session.Close()
+
+	guest := attachGuest(t, spec)
+	defer guest.Close()
+
+	// Long enough for a handshake that was going to work, short enough not to pad the
+	// suite: the SYN is dropped, so this is a wait for silence.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := guest.Dial(ctx, originHost)
+	if err == nil {
+		conn.Close()
+		t.Fatalf("the guest reached the host's loopback at %s", originHost)
+	}
+
+	// And nothing was decided about it, because the packet never got as far as a decision.
+	// This is the one case where an empty log is the correct outcome.
+	if d, ok := findDecision(t, spec.LogPath, "127.0.0.1"); ok {
+		t.Errorf("a loopback destination reached the policy engine: %+v", d)
 	}
 }
 
