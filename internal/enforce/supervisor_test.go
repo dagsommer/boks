@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dagsommer/boks/internal/network"
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // The supervisor is a *process*, and the things most likely to go wrong about it — that it
@@ -61,7 +62,7 @@ func TestSupervisorServesAndIsReusedAndStops(t *testing.T) {
 	spec := testSpec(t, network.ModeNAT)
 	// A rule to observe from the other end of the link: the point is that the policy
 	// reached the process that enforces it, not merely that something answered.
-	spec.Deny = []string{"denied.example.com"}
+	setPolicy(t, &spec, policy.PresetOpen, nil, []string{"denied.example.com"})
 
 	state, err := Ensure(context.Background(), spec, io.Discard)
 	if err != nil {
