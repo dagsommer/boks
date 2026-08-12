@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -479,7 +480,7 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 	defer stdin.closeGuestStdin(ctx, task)()
 
 	restore := attachTerminal(ctx, task, cfg.TTY, cfg.Stdin)
-	forwardSignals(ctx, task)
+	interrupted := forwardSignals(ctx, task)
 
 	status := <-statusC
 	restore()
@@ -487,6 +488,11 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 
 	cleanupTask(ctx, task)
 
+	// See interruptedExit: Ctrl-C is not a failure, and the status error here would be
+	// the cancelled RPC rather than anything the user did.
+	if exit := interruptedExit(interrupted); exit != 0 {
+		return exit, nil
+	}
 	if statusErr != nil {
 		return 1, fmt.Errorf("sandbox process failed: %w", statusErr)
 	}
@@ -503,7 +509,13 @@ func ioCreator(tty bool, stdin io.Reader, stdout, stderr io.Writer) cio.Creator 
 
 // forwardSignals relays interrupt and termination to the guest process so that Ctrl-C
 // behaves as it would for a local command, and so cleanup still runs.
-func forwardSignals(ctx context.Context, p client.Process) {
+//
+// The returned value holds the signal that was delivered, or zero if the run was never
+// interrupted, so the caller can report the conventional 128+signal exit status instead of
+// surfacing the transport-level cancellation that tearing the process down produces.
+func forwardSignals(ctx context.Context, p client.Process) *atomic.Int32 {
+	var received atomic.Int32
+
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -511,11 +523,31 @@ func forwardSignals(ctx context.Context, p client.Process) {
 		select {
 		case sig := <-sigC:
 			if s, ok := sig.(syscall.Signal); ok {
-				_ = p.Kill(ctx, s)
+				received.Store(int32(s))
+				// Kill on a context detached from cancellation: the process-wide
+				// handler has very likely cancelled ctx already, which would make
+				// this a no-op and leave the guest running until cleanup forces it.
+				killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
+				defer cancel()
+				_ = p.Kill(killCtx, s)
 			}
 		case <-ctx.Done():
 		}
 	}()
+
+	return &received
+}
+
+// interruptedExit reports the exit code for a run cut short by a signal, following the
+// shell convention of 128 plus the signal number. It returns 0 if no signal arrived.
+//
+// An interrupted run is not a failure, so the caller reports this code and says nothing —
+// rather than printing the "context canceled" error that tearing the process down produces.
+func interruptedExit(received *atomic.Int32) int {
+	if sig := received.Load(); sig != 0 {
+		return 128 + int(sig)
+	}
+	return 0
 }
 
 // cleanupTask removes the task, killing it first if it is still running. Errors are

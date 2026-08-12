@@ -4,6 +4,8 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/dagsommer/boks/internal/workspace"
@@ -131,5 +133,29 @@ func TestDescribeTaskErrorNamesTheMissingGuestCommand(t *testing.T) {
 	got := describeTaskError(cfg, underlying).Error()
 	if !strings.Contains(got, "nosuchcommand") || !strings.Contains(got, "docker.io/library/alpine:latest") {
 		t.Errorf("a missing guest command was not explained:\n%s", got)
+	}
+}
+
+// An interrupted run reports the shell's 128+signal convention rather than a generic
+// failure. This regressed once already: a refactor routed `run` through Exec and the
+// mapping did not follow, so Ctrl-C started printing a raw gRPC cancellation again.
+func TestInterruptedExit(t *testing.T) {
+	var none atomic.Int32
+	if got := interruptedExit(&none); got != 0 {
+		t.Errorf("interruptedExit(no signal) = %d, want 0 so the real exit code is used", got)
+	}
+
+	for _, tt := range []struct {
+		sig  syscall.Signal
+		want int
+	}{
+		{syscall.SIGINT, 130},
+		{syscall.SIGTERM, 143},
+	} {
+		var received atomic.Int32
+		received.Store(int32(tt.sig))
+		if got := interruptedExit(&received); got != tt.want {
+			t.Errorf("interruptedExit(%v) = %d, want %d", tt.sig, got, tt.want)
+		}
 	}
 }
