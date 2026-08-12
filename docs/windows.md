@@ -8,9 +8,15 @@ the CI configuration those projects ship, and — for the section that matters m
 shipped Windows binaries of the reference product. Every claim is labelled **verified** (traced
 to a primary source), **inferred** (reasoned from one), or **unknown**.
 
-The one thing that *was* demonstrated is that `GOOS=windows GOARCH=amd64 go build ./...`
-succeeds. That demonstrates nothing about whether a sandbox would run, and it is not offered
-as if it did.
+The only things that *were* demonstrated are that `GOOS=windows GOARCH=amd64 go build ./...`
+succeeds, and that the netstack compiles for Windows once its build tag is removed. Neither
+demonstrates anything about whether a sandbox would run, and neither is offered as if it did.
+
+**This document changed its mind once, and the reversal is left visible on purpose.** Sections
+1–6 conclude that Windows structurally cannot support Boks' network enforcement; section 7
+shows that conclusion was drawn from the wrong API and is wrong. Both are kept, because the
+wrong answer is well-evidenced, is the one a careful reader will reach independently, and is
+therefore worth refuting explicitly rather than deleting.
 
 > **Reading order.** This document was written in the order the spike happened, and the spike
 > changed its mind. If you are reading it to make a decision rather than to follow the
