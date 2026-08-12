@@ -12,12 +12,20 @@ The one thing that *was* demonstrated is that `GOOS=windows GOARCH=amd64 go buil
 succeeds. That demonstrates nothing about whether a sandbox would run, and it is not offered
 as if it did.
 
-> **Read section 7 first.** Sections 1–6 investigate LCOW — Linux containers in a Hyper-V
-> utility VM — which was the assumed path when this spike started and turned out to be the
-> wrong target entirely. That analysis is kept because it is correct, because it disposes of
-> an option someone will otherwise propose again, and because its workspace and supervisor
-> findings hold whatever the VM backend is. But the answer to "how does this work on Windows"
-> is in section 7.
+> **Reading order.** This document was written in the order the spike happened, and the spike
+> changed its mind. If you are reading it to make a decision rather than to follow the
+> reasoning:
+>
+> - **Section 7** — what the reference product actually does on Windows. This is the finding
+>   that matters, and it overturned the rest.
+> - **Section 8** — the VMM candidates, which is the only remaining question for a native port.
+> - **Section 9** — what a Windows user can do today.
+> - **Section 4** — the workspace-path decision, which is true regardless of backend.
+>
+> Sections 1–3, 5 and 6 investigate **LCOW** — Linux containers in a Hyper-V utility VM — which
+> was the assumed path at the start and turned out to be the wrong target. That analysis is
+> kept because it is correct, because it disposes of an option someone will otherwise propose
+> again, and because the supervisor findings in section 6 hold whatever the backend is.
 
 ## The verdict
 
