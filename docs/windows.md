@@ -1142,6 +1142,20 @@ Two measurements support that last row, and both were taken during this spike:
   not load-bearing* so they are not rediscovered as blockers, and carry the `LockFileEx` design
   for whoever implements it.
 
+**Built** — one real capability, on the Linux path, because the WSL2 route is the one users can
+actually take:
+
+- `internal/doctor/wsl_linux.go` and the WSL branches in `virt_linux.go`: `doctor` detects WSL
+  via `/bin/wslinfo` and splits a KVM failure into the three causes that are distinguishable
+  from inside a distribution — nested virtualisation genuinely off, the module merely not
+  loaded, or the device node left `root:root 0600` because WSL runs no udev. Each gets its own
+  remedy. This replaces a generic message whose first suggestion — enable nested
+  virtualisation — is, on Windows 11, usually the *wrong* one.
+- Tested: the CPU-flag discriminator against synthetic `/proc/cpuinfo`, and assertions that the
+  remedies keep the two warnings most easily lost in an edit (that `chmod 666` is dangerous, and
+  that nested virtualisation is already on by default). **The logic is tested; the values it
+  reads have never been read on a real WSL system.**
+
 Each of these was written once against the LCOW conclusion and rewritten when section 7
 overturned it. That is worth noting because the first version would have been a confidently
 worded, well-sourced, wrong error message — the exact failure mode this project's documentation
@@ -1556,6 +1570,13 @@ links against rather than what anyone says about it.
   without a matching modules VHD loses every `=m` symbol
 - [microsoft/WSL#5272](https://github.com/microsoft/WSL/issues/5272) — Windows' native AF_UNIX
   has no `SOCK_DGRAM`, open since 2020
+- [microsoft/WSL#7149](https://github.com/microsoft/WSL/issues/7149) — a Microsoft engineer
+  confirming WSL runs no udev, which is why `/dev/kvm` stays `root:root 0600`
+- WSL source, `WslCoreConfig.h` — `"wsl2.nestedVirtualization"` and
+  `"wsl2.loadKernelModules"` as config keys, and
+  `EnableNestedVirtualization = !shared::Arm64 && IsWindows11OrAbove()`, i.e. **on by default**
+- [WSL configuration settings](https://learn.microsoft.com/en-us/windows/wsl/wsl-config) —
+  `.wslconfig` is global-only; `loadKernelModules` is **not** documented there
 - [rancher-desktop#9708](https://github.com/rancher-sandbox/rancher-desktop/issues/9708) —
   containerd-in-WSL startup failure while dockerd works; the containerd path there is less
   trodden
