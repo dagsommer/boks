@@ -167,7 +167,7 @@ func newHostStack(ctx context.Context, plan Plan, engine *policy.Engine, logger 
 	if err != nil {
 		return nil, fmt.Errorf("network: building the link endpoint: %w", err)
 	}
-	filtered := &filteredLink{LinkEndpoint: link, gateway: plan.Gateway, onDrop: h.noteDrop}
+	filtered := &filteredLink{LinkEndpoint: link, gateway: plan.Gateway, onDrop: h.noteLinkDrop}
 
 	// The switch is the library's Ethernet fabric between the link socket and the stack.
 	// Both directions have to be connected: the endpoint writes to the switch, and the
@@ -472,6 +472,34 @@ func (h *hostStack) noteDrop(what string) {
 	logf(h.logger, "network: dropped %s", what)
 }
 
+// noteDroppedFlow records a link-level drop in the decision log as well as the operational
+// one, so `boks policy log` shows it.
+//
+// UDP and ICMP are refused categorically rather than by a rule, so there is no policy check
+// to record — Note exists for exactly that, carrying the reason instead of a verdict. Without
+// this a guest could probe UDP or ICMP all day and leave no trace anywhere the user looks,
+// which is the difference between containment and containment you can see.
+//
+// Rate limiting is the same as noteDrop's: once per distinct destination, capped, because the
+// guest chooses how many packets to send and must not choose how large the log gets.
+func (h *hostStack) noteDroppedFlow(target policy.Target, reason, operational string) {
+	h.mu.Lock()
+	_, seen := h.noticed[operational]
+	full := len(h.noticed) >= maxNoticedDestinations
+	if !seen && !full {
+		h.noticed[operational] = struct{}{}
+	}
+	h.mu.Unlock()
+	if seen || full {
+		return
+	}
+
+	logf(h.logger, "network: dropped %s", operational)
+	if h.engine != nil {
+		h.engine.NoteRefused(policy.StageNetwork, target, policy.ModeTransparent, reason)
+	}
+}
+
 // listen returns a listener inside the virtual network.
 func (h *hostStack) listen(addr string) (net.Listener, error) {
 	ip, port, err := splitIPPort(addr)
@@ -566,19 +594,32 @@ func splitIPPort(addr string) (net.IP, uint16, error) {
 type filteredLink struct {
 	*tap.LinkEndpoint
 	gateway netip.Addr
-	onDrop  func(string)
+	onDrop  func(dropReason)
 }
 
 // DeliverNetworkPacket is the guest's entire inbound path. Everything the sandbox emits
 // arrives here first.
 func (e *filteredLink) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	if why, drop := e.classify(protocol, pkt); drop {
-		if e.onDrop != nil && why != "" {
+		if e.onDrop != nil && why.operational != "" {
 			e.onDrop(why)
 		}
 		return
 	}
 	e.LinkEndpoint.DeliverNetworkPacket(protocol, pkt)
+}
+
+// dropReason describes a frame the link refused, in the two forms the two logs want.
+//
+// A frame with no addressable destination — a truncated packet, a non-IPv4 ethertype — has
+// no target, and `addressed` says so. Those still reach the operational log, because
+// something the guest sent was thrown away and an operator may need to know, but they cannot
+// become a policy decision about a destination that was never legible.
+type dropReason struct {
+	operational string
+	reason      string
+	target      policy.Target
+	addressed   bool
 }
 
 // classify decides whether a frame from the guest may reach the stack at all.
@@ -592,20 +633,21 @@ func (e *filteredLink) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber
 // re-enablable by policy. This matches that, and for the same reason: neither carries a
 // connection that could be judged, and DNS to an arbitrary server is a channel around every
 // hostname rule.
-func (e *filteredLink) classify(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) (why string, drop bool) {
+func (e *filteredLink) classify(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) (why dropReason, drop bool) {
 	switch protocol {
 	case header.ARPProtocolNumber:
-		return "", false
+		return dropReason{}, false
 	case header.IPv4ProtocolNumber:
 	default:
 		// IPv6 above all: a guest brings up link-local v6 by itself, and nothing here
 		// routes it. Dropping it is what keeps "this stack is IPv4-only" true.
-		return fmt.Sprintf("a frame of ethertype 0x%04x, which this stack does not carry", uint16(protocol)), true
+		return dropReason{operational: fmt.Sprintf(
+			"a frame of ethertype 0x%04x, which this stack does not carry", uint16(protocol))}, true
 	}
 
 	hdr, ok := pkt.Data().PullUp(header.IPv4MinimumSize)
 	if !ok {
-		return "a truncated IPv4 packet", true
+		return dropReason{operational: "a truncated IPv4 packet"}, true
 	}
 	ip := header.IPv4(hdr)
 	dstAddr := ip.DestinationAddress()
@@ -616,28 +658,45 @@ func (e *filteredLink) classify(protocol tcpip.NetworkProtocolNumber, pkt *stack
 	case header.TCPProtocolNumber:
 		// Passed on to the forwarder, which is where the policy decision is taken and
 		// logged. Nothing is decided here.
-		return "", false
+		return dropReason{}, false
 	case header.UDPProtocolNumber:
 		port, ok := udpDestinationPort(ip, pkt)
 		if !ok {
-			return fmt.Sprintf("a truncated or fragmented UDP datagram to %s", dst), true
+			return dropReason{operational: fmt.Sprintf(
+				"a truncated or fragmented UDP datagram to %s", dst)}, true
 		}
 		// The resolver, on the gateway's own address only: DNS anywhere else is the
 		// covert channel this is here to close.
 		if port == dnsPort && dst == e.gateway {
-			return "", false
+			return dropReason{}, false
 		}
 		// DHCP is broadcast before the guest has an address, so its destination cannot
 		// be checked. The server binds inside this stack and hands out an address in the
 		// sandbox's own subnet; there is nothing to forward and nowhere to reach.
 		if port == dhcpPort {
-			return "", false
+			return dropReason{}, false
 		}
-		return fmt.Sprintf("udp to %s:%d (only DNS to the gateway is carried)", dst, port), true
+		return dropReason{
+			operational: fmt.Sprintf("udp to %s:%d (only DNS to the gateway is carried)", dst, port),
+			reason:      "udp is not carried; only DNS to the sandbox's own resolver is",
+			target:      policy.TargetFromAddr(netip.AddrPortFrom(dst, port)),
+			addressed:   true,
+		}, true
 	case header.ICMPv4ProtocolNumber:
-		return fmt.Sprintf("icmp to %s (icmp is not carried)", dst), true
+		return dropReason{
+			operational: fmt.Sprintf("icmp to %s (icmp is not carried)", dst),
+			reason:      "icmp is not carried, and no rule can permit it",
+			target:      policy.TargetFromAddr(netip.AddrPortFrom(dst, 0)),
+			addressed:   true,
+		}, true
 	default:
-		return fmt.Sprintf("ip protocol %d to %s (only tcp is carried)", ip.TransportProtocol(), dst), true
+		proto := ip.TransportProtocol()
+		return dropReason{
+			operational: fmt.Sprintf("ip protocol %d to %s (only tcp is carried)", proto, dst),
+			reason:      fmt.Sprintf("ip protocol %d is not carried; only tcp is", proto),
+			target:      policy.TargetFromAddr(netip.AddrPortFrom(dst, 0)),
+			addressed:   true,
+		}, true
 	}
 }
 
@@ -658,4 +717,14 @@ func udpDestinationPort(ip header.IPv4, pkt *stack.PacketBuffer) (uint16, bool) 
 		return 0, false
 	}
 	return header.UDP(b[ihl:]).DestinationPort(), true
+}
+
+// noteLinkDrop records a frame the link refused. A drop with a legible destination becomes a
+// decision as well as an operational line; one without stays operational only.
+func (h *hostStack) noteLinkDrop(why dropReason) {
+	if !why.addressed {
+		h.noteDrop(why.operational)
+		return
+	}
+	h.noteDroppedFlow(why.target, why.reason, why.operational)
 }

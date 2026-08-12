@@ -55,18 +55,24 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 	}
 	got := errOut.String()
 	for _, want := range []string{
-		"example.com",            // the policy it resolved to
-		"TLS INTERCEPTION",       // the notice that had no call site before
-		"api.anthropic.com",      // and the host it applies to
-		"terminated on the host", // where enforcement actually happens
-		"Not yet demonstrated",   // and what has not been shown
+		"example.com",                   // the policy it resolved to
+		"TLS INTERCEPTION",              // the notice that had no call site before
+		"api.anthropic.com",             // and the host it applies to
+		"terminated on the host",        // where enforcement actually happens
+		"Measured against a real guest", // and the evidence for it
+		"Linux is not covered",          // and the limit of that evidence
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the description does not mention %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "NOT enforced") {
-		t.Errorf("the obsolete unenforced-policy warning is still printed:\n%s", got)
+	for _, stale := range []string{
+		"NOT enforced",         // the obsolete unenforced-policy warning
+		"Not yet demonstrated", // superseded once a real guest was refused
+	} {
+		if strings.Contains(got, stale) {
+			t.Errorf("obsolete wording %q is still printed:\n%s", stale, got)
+		}
 	}
 }
 

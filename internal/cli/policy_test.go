@@ -44,11 +44,16 @@ func TestPolicyLsShowsResolvedRules(t *testing.T) {
 		}
 	}
 	// The user must be able to read this output and know exactly how far the protection
-	// goes: what enforces it, and what has never been demonstrated.
-	for _, want := range []string{"terminated on the host", "Not yet demonstrated"} {
+	// goes: what enforces it, what has been measured, and where that measurement stops.
+	for _, want := range []string{"terminated on the host", "Measured against a real guest", "Linux is not covered"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not say %q:\n%s", want, out)
 		}
+	}
+	// A policy written only in hostnames cannot match a raw connection, which surprised a
+	// tester badly enough to be worth saying where the rules are shown.
+	if !strings.Contains(out, "Every allow rule here names a host") {
+		t.Errorf("a hostname-only policy did not warn that raw flows are denied:\n%s", out)
 	}
 }
 
