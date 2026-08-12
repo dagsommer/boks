@@ -440,7 +440,26 @@ authoritative, and deleting them while the sandbox is stopped costs the sandbox 
 
 Linux first (KVM). macOS second — libkrun and nerdbox both support it via
 Hypervisor.framework, and containerd 2.2+ runs natively there, so nothing in the design is
-Linux-only by construction. Windows waits for nerdbox support.
+Linux-only by construction.
+
+**Windows does not wait for nerdbox**, which is what this document used to say, and it is not
+blocked by anything about Windows either. A spike ([windows.md](windows.md)) found that the
+reference product runs this exact architecture there — containerd, a nerdbox shim, a Linux
+microVM, virtio-net terminated by a userspace stack — on top of the **Windows Hypervisor
+Platform**, a user-mode hypervisor API. nerdbox already builds a Windows shim upstream, and
+libkrun's WHP backend has been landing upstream through 2026 for libkrun 2.0. **The one device
+not yet ported is virtio-net** — precisely the one Boks' enforcement depends on. That is the
+whole gap, and it is narrow.
+
+Two things are true there regardless of how it is closed: the exact-path workspace property is
+impossible, because `C:\Users\dag\src\foo` is not a Linux path (both Boks and the reference
+product would map it to `/c/Users/dag/src/foo`), and the `unixgram` link would need a different
+socket type, because Windows' AF_UNIX is stream-only.
+
+Until a VMM exists, the Windows answer is **WSL2 with nested virtualisation**, where Boks is
+just a Linux program: `/dev/kvm` and EROFS are both in the inbox kernel, the link is a normal
+`unixgram` socket inside the distro, and workspace paths are Linux paths so exact-path mounting
+holds unchanged. Untested, and not a port.
 
 Code that touches platform specifics is kept behind build tags and interfaces, and `doctor`
 is structured as a list of checks each of which knows whether it applies to the current
