@@ -895,34 +895,75 @@ are the two most useful outcomes this checklist can have.
 
 ## Sources
 
-Primary, read directly:
+### Source trees read directly
 
-- `github.com/Microsoft/hcsshim` v0.14.1 — `internal/uvm/{plan9,share,network,create_lcow,hvsocket}.go`,
+These are the strongest evidence in the document: the exact module versions Boks already
+depends on, read out of the local module cache rather than quoted from a summary.
+
+- `github.com/Microsoft/hcsshim` **v0.14.1** — `internal/uvm/{plan9,share,network,create_lcow,hvsocket}.go`,
   `internal/hcs/schema2/{devices,network_adapter}.go`, `internal/hcsoci/resources_lcow.go`,
-  `internal/layers/lcow.go`, `internal/guest/`, `pkg/annotations/`, `Makefile.bootfiles`,
-  `.github/workflows/ci.yml`
-- `github.com/containerd/containerd/v2` v2.2.6 — `plugins/snapshots/lcow/`, `plugins/diff/lcow/`,
-  `defaults/defaults_windows.go`, `cmd/ctr/commands/run/run_windows.go`,
-  `.github/workflows/windows-hyperv-periodic.yml`
-- `github.com/containers/gvisor-tap-vsock` v0.8.9 — `pkg/transport/{listen_windows,unixgram_windows}.go`,
+  `internal/layers/lcow.go`, `internal/guest/`, `pkg/annotations/`, `internal/annotations/`,
+  `Makefile.bootfiles`, `README.md`, `.github/workflows/ci.yml`
+- `github.com/containerd/containerd/v2` **v2.2.6** — `plugins/snapshots/lcow/`,
+  `plugins/diff/lcow/`, `defaults/defaults_windows.go`, `plugins/types.go`,
+  `cmd/ctr/commands/run/run_windows.go`, `.github/workflows/windows-hyperv-periodic.yml`,
+  and the absence of any `lcow` reference under `.github/`
+- `github.com/containers/gvisor-tap-vsock` **v0.8.9** — `pkg/transport/{listen,listen_windows,unixgram_windows}.go`,
   `cmd/vm/main_linux.go`, `README.md`
-- `github.com/linuxkit/virtsock` — `pkg/hvsock/`
+- `github.com/linuxkit/virtsock` — `pkg/hvsock/{hvsock.go,hvsock_windows.go}`
 
-Documentation:
+### LCOW status (section 1)
 
-- [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex) —
-  the release-on-death promptness caveat
-- [CreateMutexW](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexw) —
-  recommends a locked file in the user profile instead
+- [LCOW deprecated on Windows Server](https://learn.microsoft.com/en-us/virtualization/windowscontainers/deploy-containers/linux-containers)
+  (Microsoft Learn, updated 2026-02-12)
+- [Set up Linux containers on Windows](https://learn.microsoft.com/en-us/virtualization/windowscontainers/quick-start/quick-start-windows-10-linux) —
+  Microsoft's recommended path is Docker Desktop on WSL2
+- [Docker deprecated features](https://docs.docker.com/engine/deprecated/) — LCOW deprecated
+  v20.10, removed v23.0; [moby/moby#42451](https://github.com/moby/moby/pull/42451) removed it
+- [containerd#6313](https://github.com/containerd/containerd/issues/6313) — "Unable to run linux
+  container on windows using ctr and lcow", closed as **not planned**
+- [containerd#9822](https://github.com/containerd/containerd/issues/9822) — Windows snapshotters
+  undocumented, open for years
+- [hcsshim#2667](https://github.com/microsoft/hcsshim/issues/2667) — the 2026 shim split, LCOW
+  implemented first
+- [Parma: confidential containers via attested execution policies](https://arxiv.org/abs/2302.03976) —
+  Microsoft Research; `pkg/securitypolicy` is what powers Confidential Azure Container Instances
+- [linuxkit/lcow](https://github.com/linuxkit/lcow) — archived March 2020, last release
+  v4.14.35-v0.3.9 (November 2018)
+
+### Storage and networking mechanics (sections 3 and 5)
+
 - [Hyper-V Extensible Switch](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/overview-of-the-hyper-v-extensible-switch)
   and [Filtering Extensions](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/filtering-extensions) —
-  interposition is kernel-mode only
+  interposition on the vSwitch is kernel-mode only
 - [AF_UNIX comes to Windows](https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/) —
   `SOCK_STREAM` only, no `SOCK_DGRAM`
 - [Make an integration service](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/user-guide/make-integration-service) —
   hvsock service registration
-- Go: `cmd/go/internal/lockedfile` — the `LockFileEx` reference implementation and its
-  documented warning about locks outliving a crashed process
-- [hcsshim#464](https://github.com/microsoft/hcsshim/issues/464) — 9p cache coherency
+- [hcsshim#464](https://github.com/microsoft/hcsshim/issues/464) — 9p cache coherency between
+  two shares of one directory
 - [containers/podman](https://github.com/containers/podman) `pkg/machine/hyperv/` — the working
   `gvforwarder`-in-guest deployment on Hyper-V
+
+### The workspace path convention (section 4)
+
+- [docker/sbx-releases#215](https://github.com/docker/sbx-releases/issues/215) and
+  [#31](https://github.com/docker/sbx-releases/issues/31) — `sbx` maps `C:\…` to `/c/…`
+- [Docker Desktop volume documentation](https://docs.docker.com/desktop/troubleshoot-and-support/troubleshoot/topics/) —
+  `-v /c/Users/user/work:/work` as documented CLI input
+- [Compose `COMPOSE_CONVERT_WINDOWS_PATHS`](https://docs.docker.com/compose/how-tos/environment-variables/envvars/)
+- `docker/machine` `drivers/virtualbox` — the `s!^([a-z]+):[/\\]+!\1/!` conversion, and
+  boot2docker mounting each share at `/$name`
+- [rancher-desktop#6630](https://github.com/rancher-sandbox/rancher-desktop/issues/6630) — the
+  `/c/` versus `/mnt/c/` confusion and the symlink workaround
+- [Lima](https://github.com/lima-vm/lima) `mountPoint` defaulting to the host `location` — the
+  exact-path approach, and its absence of a Windows convention
+
+### The supervisor (section 6)
+
+- [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex) —
+  the release-on-death promptness caveat, quoted in section 6
+- [CreateMutexW](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexw) —
+  recommends a locked file in the user profile instead of a named mutex
+- Go `cmd/go/internal/lockedfile/internal/filelock` — the `LockFileEx` reference
+  implementation, and `github.com/gofrs/flock` for the error-code handling
