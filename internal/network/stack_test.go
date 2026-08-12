@@ -98,10 +98,15 @@ func TestTheLinkCarriesOnlyWhatCanBeJudged(t *testing.T) {
 			defer pkt.DecRef()
 			why, drop := link.classify(tc.proto, pkt)
 			if drop != tc.drop {
-				t.Fatalf("drop = %v, want %v (%s)", drop, tc.drop, why)
+				t.Fatalf("drop = %v, want %v (%s)", drop, tc.drop, why.operational)
 			}
-			if drop && why == "" {
+			if drop && why.operational == "" {
 				t.Error("a dropped frame must say what it was, or nobody can debug the silence")
+			}
+			// A drop with a legible destination must also be reportable as a decision,
+			// otherwise it is refused where nobody looking at the policy log can see it.
+			if drop && why.addressed && why.reason == "" {
+				t.Error("an addressed drop carries no reason for the decision log")
 			}
 		})
 	}
@@ -199,4 +204,48 @@ func TestTheStackStopsCleanly(t *testing.T) {
 	}
 	h.stop()
 	h.stop()
+}
+
+// A UDP or ICMP frame is refused categorically rather than by a rule, so there is no policy
+// check to record — and before this it left no trace in the decision log at all. A guest
+// could probe UDP all day and `boks policy log` would show nothing, which is the difference
+// between containment and containment anyone can see.
+func TestAnAddressedLinkDropIsRecordedAsADecision(t *testing.T) {
+	log := policy.NewLog(16)
+	p, err := policy.Preset(policy.PresetLocked)
+	if err != nil {
+		t.Fatalf("policy.Preset: %v", err)
+	}
+	engine := policy.NewEngine(p, log)
+	h := &hostStack{engine: engine, logger: io.Discard, noticed: map[string]struct{}{}}
+
+	h.noteLinkDrop(dropReason{
+		operational: "udp to 8.8.8.8:53 (only DNS to the gateway is carried)",
+		reason:      "udp is not carried",
+		target:      policy.TargetFromAddr(netip.AddrPortFrom(netip.MustParseAddr("8.8.8.8"), 53)),
+		addressed:   true,
+	})
+
+	recent := log.Recent(10)
+	if len(recent) != 1 {
+		t.Fatalf("got %d decisions, want 1: an addressed drop must be visible in the policy log", len(recent))
+	}
+	if recent[0].Allowed {
+		t.Error("a dropped datagram was recorded as allowed")
+	}
+	if recent[0].Mode != policy.ModeTransparent {
+		t.Errorf("mode = %q, want %q: nothing proxied this flow", recent[0].Mode, policy.ModeTransparent)
+	}
+
+	// The guest chooses how many datagrams to send, so it must not choose how large the
+	// log grows: the same destination is recorded once.
+	h.noteLinkDrop(dropReason{
+		operational: "udp to 8.8.8.8:53 (only DNS to the gateway is carried)",
+		reason:      "udp is not carried",
+		target:      policy.TargetFromAddr(netip.AddrPortFrom(netip.MustParseAddr("8.8.8.8"), 53)),
+		addressed:   true,
+	})
+	if got := len(log.Recent(10)); got != 1 {
+		t.Errorf("got %d decisions after a repeat, want 1: a repeated drop is a log-flooding primitive", got)
+	}
 }

@@ -21,9 +21,10 @@ import (
 // gvisor-tap-vsock's virtualnetwork.New — that constructor installs a TCP forwarder which
 // dials whatever the guest asks for, with no policy in the path.
 //
-// The transport is a SOCK_DGRAM UNIX socket, which is why this file is Unix-only:
-// gvisor-tap-vsock has no unixgram transport on Windows, and nerdbox does not support
-// Windows either, so there is nothing to lose by saying so plainly.
+// The transport is a SOCK_DGRAM UNIX socket, which is why this file is Unix-only: Windows
+// has never supported SOCK_DGRAM on AF_UNIX, so gvisor-tap-vsock's unixgram transport is a
+// stub there. That is a property of the datagram socket, not of Windows — the stream
+// transport works, and a Windows gateway would use it. See gateway_windows.go.
 type gateway struct {
 	mu    sync.Mutex
 	conn  *net.UnixConn

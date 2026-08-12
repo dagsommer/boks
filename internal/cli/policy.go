@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -13,125 +11,106 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 )
 
-// policySubcommands is the command table. The names are sbx's, in sbx's order, wherever the
-// semantics match; each entry is a plain function with its own flag set so that a move to a
-// different dispatcher touches this table and nothing else.
-func policySubcommands() []command {
-	return []command{
-		{name: "allow", summary: "Add an allow rule, globally or scoped to one sandbox", run: policyAllow},
-		{name: "check", summary: "Report whether a destination would be permitted, without contacting it", run: policyCheck},
-		{name: "deny", summary: "Add a deny rule; deny always wins", run: policyDeny},
-		{name: "init", summary: "Create the durable policy store", run: policyInit},
-		{name: "inspect", summary: "Show a scope or a single rule in detail", run: policyInspect},
-		{name: "log", summary: "Show recent policy decisions", run: policyLog},
-		{name: "ls", alias: "list", summary: "List stored rules and what they resolve to", run: policyLs},
-		{name: "profile", summary: "Manage named policies a run can select", run: policyProfile},
-		{name: "reset", summary: "Restore the defaults, destroying stored rules", run: policyReset},
-		{name: "rm", summary: "Remove a stored rule", run: policyRm},
-	}
-}
+// newPolicyCommand groups the commands that answer "what may this sandbox reach, and what
+// did it try to reach". Subcommands are registered here and nowhere else.
+func newPolicyCommand(env Env) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "policy",
+		Short: "Show network policy rules and recent decisions",
+		Long: `A network policy is what a sandbox may reach. It is durable state, not an argument to a
+run: rules written here survive the command that wrote them and are what 'boks run',
+'boks start' and 'boks exec' all serve a sandbox. A rule applies to every sandbox, or is
+scoped to one with --sandbox.
 
-func policyCommand(ctx context.Context, env Env) error {
-	if len(env.Args) == 0 {
-		policyUsage(env.Stderr)
-		return errors.New("a subcommand is required")
-	}
-	sub := Env{Args: env.Args[1:], Stdin: env.Stdin, Stdout: env.Stdout, Stderr: env.Stderr}
-	switch env.Args[0] {
-	case "-h", "--help", "help":
-		policyUsage(env.Stdout)
-		return nil
-	}
-	for _, cmd := range policySubcommands() {
-		if cmd.matches(env.Args[0]) {
-			return cmd.run(ctx, sub)
-		}
-	}
-	policyUsage(env.Stderr)
-	return fmt.Errorf("unknown policy subcommand %q", env.Args[0])
-}
-
-func policyUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: boks policy <subcommand> [flags]
-
-Network policy is durable state, not an argument to a run: rules written here survive the
-command that wrote them and are what 'boks run', 'boks start' and 'boks exec' all serve a
-sandbox. Rules apply to every sandbox, or are scoped to one with -sandbox.
-
-Subcommands:
-`)
-	for _, cmd := range policySubcommands() {
-		name := cmd.name
-		if cmd.alias != "" {
-			name += ", " + cmd.alias
-		}
-		fmt.Fprintf(w, "  %-9s %s\n", name, cmd.summary)
-	}
-	fmt.Fprint(w, `
 Precedence, in one sentence: a deny in any scope beats an allow in any scope, and only the
-base preset — chosen by 'policy init', a profile, or a -policy flag — decides what happens to
-a destination no rule mentions.
-
-Run 'boks policy <subcommand> -h' for flags.
-`)
+base preset — chosen by 'policy init', a profile, or a --policy flag — decides what happens
+to a destination no rule mentions.`,
+	}
+	// Registered here and nowhere else. The names are sbx's, in sbx's order, wherever the
+	// semantics match.
+	cmd.AddCommand(
+		newPolicyAllowCommand(env),
+		newPolicyCheckCommand(env),
+		newPolicyDenyCommand(env),
+		newPolicyInitCommand(env),
+		newPolicyInspectCommand(env),
+		newPolicyLogCommand(env),
+		newPolicyLsCommand(env),
+		newPolicyProfileCommand(env),
+		newPolicyResetCommand(env),
+		newPolicyRmCommand(env),
+	)
+	return cmd
 }
 
-func policyLs(_ context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks policy ls", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	sandbox := fset.String("sandbox", "", "resolve as this sandbox, including rules scoped to it")
-	stored := fset.Bool("stored", false, "print only the stored rules, without resolving them")
-	var flags policyFlags
-	flags.register(fset)
-	fset.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks policy ls [flags]
+func newPolicyLsCommand(env Env) *cobra.Command {
+	presets := &strings.Builder{}
+	for _, name := range policy.PresetNames() {
+		fmt.Fprintf(presets, "  %-9s %s\n", name, policy.PresetDescription(name))
+	}
 
-Two things, because they are two halves of one question. First what is written down — the
-stored rules, by scope — and then what they resolve to for a run, deny rules first because
-they always win. Nothing here contacts the network or a sandbox.
+	cmd := &cobra.Command{
+		Use:   "ls [flags]",
+		Short: "Show the rules a policy resolves to",
+		Long: `Two things, because they are two halves of one question. First what is written down —
+the stored rules, by scope — and then what they resolve to for a run, deny rules first
+because they always win. Nothing here contacts the network or a sandbox.
 
-The -policy, -allow, -deny and -profile flags resolve a hypothetical: they show what a run
-given those flags would get, on top of what is stored.
+The --policy, --allow, --deny and --profile flags resolve a hypothetical: they show what a
+run given those flags would get, on top of what is stored.
 
 Presets:
-`)
-		for _, name := range policy.PresetNames() {
-			fmt.Fprintf(env.Stderr, "  %-9s %s\n", name, policy.PresetDescription(name))
-		}
-		fmt.Fprint(env.Stderr, "\nFlags:\n")
-		fset.PrintDefaults()
+` + presets.String(),
+		Args: noArgs,
 	}
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
-		}
-		return err
-	}
+	var (
+		flags   policyFlags
+		sandbox string
+		stored  bool
+	)
+	flags.register(cmd.Flags())
+	cmd.Flags().StringVar(&sandbox, "sandbox", "",
+		"resolve as this sandbox, including rules scoped to it")
+	cmd.Flags().BoolVar(&stored, "stored", false,
+		"print only the stored rules, without resolving them")
 
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		return policyLs(env, &flags, sandbox, stored)
+	}
+	return cmd
+}
+
+func policyLs(env Env, flags *policyFlags, sandbox string, stored bool) error {
 	store, err := openPolicyStore()
 	if err != nil {
 		return err
 	}
 	writeStoredPolicy(env.Stdout, store)
-	if *stored {
+	if stored {
 		return nil
 	}
 
-	resolution, err := flags.resolution(*sandbox, nil)
+	resolution, err := flags.resolution(sandbox, nil)
 	if err != nil {
 		return err
 	}
-	if *sandbox == "" {
+	if sandbox == "" {
 		fmt.Fprint(env.Stdout, "effective policy (for a sandbox with no rules of its own; "+
-			"pass -sandbox <name> for one that has):\n\n")
+			"pass --sandbox NAME for one that has):\n\n")
 	} else {
-		fmt.Fprintf(env.Stdout, "effective policy for sandbox %s:\n\n", *sandbox)
+		fmt.Fprintf(env.Stdout, "effective policy for sandbox %s:\n\n", sandbox)
 	}
 	fmt.Fprint(env.Stdout, resolution.Describe())
+	p, err := resolution.Policy()
+	if err != nil {
+		return err
+	}
 
 	// The network mode decides whether there is a network for the policy to apply to at
 	// all, so show it alongside the rules rather than in a separate command.
@@ -145,6 +124,7 @@ Presets:
 	} else {
 		fmt.Fprintf(env.Stdout, "  guest %s via gateway %s, resolver %s\n",
 			plan.GuestAddr, plan.Gateway, plan.Gateway)
+		fmt.Fprint(env.Stdout, hostnameRuleCaveat(p))
 	}
 	keys := make([]string, 0, len(plan.Annotations()))
 	for k := range plan.Annotations() {
@@ -197,7 +177,7 @@ func writeStoredPolicy(w io.Writer, store *policy.Store) {
 	}
 	fmt.Fprintf(w, "  base preset: %s\n", base)
 	if store.Count() == 0 && len(store.ProfileNames()) == 0 {
-		fmt.Fprint(w, "  no rules stored. 'boks policy allow <destination>' writes one.\n\n")
+		fmt.Fprint(w, "  no rules stored. 'boks policy allow DESTINATION' writes one.\n\n")
 		return
 	}
 
@@ -238,24 +218,17 @@ func writeIndentedRules(w io.Writer, rules []policy.RuleSpec) {
 	}
 }
 
-func policyLog(_ context.Context, env Env) error {
-	fset := flag.NewFlagSet("boks policy log", flag.ContinueOnError)
-	fset.SetOutput(env.Stderr)
-	var (
-		limit = fset.Int("n", 500, "read at most this many decisions (0 for all)")
-		path  = fset.String("file", policy.DefaultLogPath(), "decision log file")
-		raw   = fset.Bool("raw", false, "one line per decision instead of one per destination")
-	)
-	fset.Usage = func() {
-		fmt.Fprint(env.Stderr, `Usage: boks policy log [flags]
-
-Shows recent network policy decisions: what was allowed or denied, how the flow was
+func newPolicyLogCommand(env Env) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "log [flags]",
+		Short: "Show recent policy decisions",
+		Long: `Shows recent network policy decisions: what was allowed or denied, how the flow was
 carried, and why. Decisions are written by the sandbox's network stack and by the proxy
 inside it. The log stays on this machine and is never uploaded anywhere.
 
 Identical decisions are collapsed into one row with a count, because a single dependency
 install produces hundreds of them and the one denial that explains a failure should not be
-buried. Use -raw for the unaggregated form.
+buried. Use --raw for the unaggregated form.
 
 The PROXY column is the part to read when you care about confidentiality:
 
@@ -264,46 +237,48 @@ The PROXY column is the part to read when you care about confidentiality:
   forward-bypass   tunnelled untouched; end-to-end TLS, boks saw ciphertext only
   transparent      judged in the network stack, by address and port, without the proxy
                    being involved at all — what a raw socket or a non-HTTP protocol
-                   produces. boks saw a destination, and nothing else.
-
-Flags:
-`)
-		fset.PrintDefaults()
+                   produces. boks saw a destination, and nothing else.`,
+		Args: noArgs,
 	}
-	if err := fset.Parse(env.Args); err != nil {
-		if err == flag.ErrHelp {
-			return flagErrHelp
+	var (
+		limit int
+		path  string
+		raw   bool
+	)
+	cmd.Flags().IntVarP(&limit, "limit", "n", 500, "read at most this many decisions (0 for all)")
+	cmd.Flags().StringVar(&path, "file", policy.DefaultLogPath(), "decision log file")
+	cmd.Flags().BoolVar(&raw, "raw", false, "one line per decision instead of one per destination")
+
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		f, err := os.Open(path)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				fmt.Fprintf(env.Stdout, "no decisions recorded yet (%s does not exist)\n", path)
+				fmt.Fprint(env.Stdout, "Decisions appear once traffic passes through 'boks proxy'.\n")
+				return nil
+			}
+			return fmt.Errorf("opening decision log: %w", err)
 		}
-		return err
-	}
+		defer f.Close()
 
-	f, err := os.Open(*path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			fmt.Fprintf(env.Stdout, "no decisions recorded yet (%s does not exist)\n", *path)
-			fmt.Fprint(env.Stdout, "Decisions appear once traffic passes through 'boks proxy'.\n")
+		decisions, err := policy.ReadDecisions(f, limit)
+		if err != nil {
+			return err
+		}
+		if len(decisions) == 0 {
+			fmt.Fprintf(env.Stdout, "no decisions recorded in %s\n", path)
 			return nil
 		}
-		return fmt.Errorf("opening decision log: %w", err)
-	}
-	defer f.Close()
-
-	decisions, err := policy.ReadDecisions(f, *limit)
-	if err != nil {
-		return err
-	}
-	if len(decisions) == 0 {
-		fmt.Fprintf(env.Stdout, "no decisions recorded in %s\n", *path)
-		return nil
-	}
-	if *raw {
-		for _, d := range decisions {
-			fmt.Fprintln(env.Stdout, d)
+		if raw {
+			for _, d := range decisions {
+				fmt.Fprintln(env.Stdout, d)
+			}
+			return nil
 		}
+		writeDecisionTable(env.Stdout, policy.Aggregated(decisions), time.Now())
 		return nil
 	}
-	writeDecisionTable(env.Stdout, policy.Aggregated(decisions), time.Now())
-	return nil
+	return cmd
 }
 
 // writeDecisionTable prints aggregated decisions, blocked first.

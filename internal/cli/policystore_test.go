@@ -29,17 +29,17 @@ func mustPolicy(t *testing.T, args ...string) string {
 func TestPolicyAllowAndDenyAreDurable(t *testing.T) {
 	policyState(t)
 
-	out := mustPolicy(t, "allow", "github.com:443", "-note", "git over HTTPS")
+	out := mustPolicy(t, "allow", "github.com:443", "--note", "git over HTTPS")
 	if !strings.Contains(out, "added: allow github.com:443 to global") {
 		t.Errorf("adding a global rule said:\n%s", out)
 	}
-	out = mustPolicy(t, "allow", "-sandbox", "web", "api.example.com:443")
+	out = mustPolicy(t, "allow", "--sandbox", "web", "api.example.com:443")
 	if !strings.Contains(out, "added: allow api.example.com:443 to sandbox web") {
 		t.Errorf("adding a sandbox rule said:\n%s", out)
 	}
 
 	// A second process — which is what a second command is — must see both.
-	out = mustPolicy(t, "ls", "-stored")
+	out = mustPolicy(t, "ls", "--stored")
 	for _, want := range []string{"global (every sandbox):", "github.com:443", "git over HTTPS", "sandbox web:", "api.example.com:443"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("policy ls -stored is missing %q:\n%s", want, out)
@@ -55,7 +55,7 @@ func TestPolicyAllowAndDenyAreDurable(t *testing.T) {
 	if !strings.Contains(out, "removed: allow github.com:443 from global") {
 		t.Errorf("removing said:\n%s", out)
 	}
-	if out := mustPolicy(t, "ls", "-stored"); strings.Contains(out, "github.com") {
+	if out := mustPolicy(t, "ls", "--stored"); strings.Contains(out, "github.com") {
 		t.Errorf("a removed rule is still listed:\n%s", out)
 	}
 }
@@ -64,11 +64,11 @@ func TestPolicyAllowAndDenyAreDurable(t *testing.T) {
 // the code, so every rule is displayed with the scope that would have to change to remove it.
 func TestPolicyLsShowsScopes(t *testing.T) {
 	policyState(t)
-	mustPolicy(t, "init", "-preset", "locked")
+	mustPolicy(t, "init", "--preset", "locked")
 	mustPolicy(t, "allow", "github.com:443")
-	mustPolicy(t, "deny", "-sandbox", "web", "evil.test")
+	mustPolicy(t, "deny", "--sandbox", "web", "evil.test")
 
-	out := mustPolicy(t, "ls", "-sandbox", "web", "-allow", "flagged.test:443")
+	out := mustPolicy(t, "ls", "--sandbox", "web", "--allow", "flagged.test:443")
 	for _, want := range []string{
 		"effective policy for sandbox web",
 		"deny (always wins):",
@@ -92,7 +92,7 @@ func TestPolicyAllowWarnsWhenADenyStillWins(t *testing.T) {
 	policyState(t)
 	mustPolicy(t, "deny", "blocked.test")
 
-	_, errOut, err := runCLI(t, "", "policy", "allow", "-sandbox", "web", "blocked.test:443")
+	_, errOut, err := runCLI(t, "", "policy", "allow", "--sandbox", "web", "blocked.test:443")
 	if err != nil {
 		t.Fatalf("allow: %v", err)
 	}
@@ -106,12 +106,12 @@ func TestPolicyAllowWarnsWhenADenyStillWins(t *testing.T) {
 // re-derive verdicts — it asks the engine and compares, destination by destination.
 func TestPolicyCheckAgreesWithTheEngine(t *testing.T) {
 	policyState(t)
-	mustPolicy(t, "init", "-preset", "locked")
+	mustPolicy(t, "init", "--preset", "locked")
 	mustPolicy(t, "allow", "global.test:443")
 	mustPolicy(t, "deny", "blocked.test")
-	mustPolicy(t, "allow", "-sandbox", "web", "scoped.test:443")
-	mustPolicy(t, "allow", "-sandbox", "web", "blocked.test:443") // covered by the global deny
-	mustPolicy(t, "allow", "-sandbox", "web", "10.0.0.0/8:5432")
+	mustPolicy(t, "allow", "--sandbox", "web", "scoped.test:443")
+	mustPolicy(t, "allow", "--sandbox", "web", "blocked.test:443") // covered by the global deny
+	mustPolicy(t, "allow", "--sandbox", "web", "10.0.0.0/8:5432")
 
 	store, err := policy.LoadStore(policy.DefaultStorePath())
 	if err != nil {
@@ -143,7 +143,7 @@ func TestPolicyCheckAgreesWithTheEngine(t *testing.T) {
 
 			args := []string{"check", destination}
 			if sandbox != "" {
-				args = append(args, "-sandbox", sandbox)
+				args = append(args, "--sandbox", sandbox)
 			}
 			out := mustPolicy(t, args...)
 
@@ -177,8 +177,8 @@ func TestPolicyCheckReportsTheFlowMode(t *testing.T) {
 		{[]string{"check", "example.test:443"}, "forward-bypass"},
 		{[]string{"check", "example.test:80"}, "forward"},
 		{[]string{"check", "example.test:22"}, "transparent"},
-		{[]string{"check", "example.test:443", "-inject", "svc@example.test=bearer"}, "forward —"},
-		{[]string{"check", "example.test:443", "-net", "none"}, "no network at all"},
+		{[]string{"check", "example.test:443", "--inject", "svc@example.test=bearer"}, "forward —"},
+		{[]string{"check", "example.test:443", "--net", "none"}, "no network at all"},
 	}
 	for _, tc := range cases {
 		out := mustPolicy(t, tc.args...)
@@ -192,7 +192,7 @@ func TestPolicyCheckReportsTheFlowMode(t *testing.T) {
 // the one way to keep that promise honest is to notice if it starts needing a sandbox.
 func TestPolicyCheckIsHermetic(t *testing.T) {
 	policyState(t)
-	out := mustPolicy(t, "check", "-sandbox", "a-sandbox-that-does-not-exist", "example.test:443")
+	out := mustPolicy(t, "check", "--sandbox", "a-sandbox-that-does-not-exist", "example.test:443")
 	if !strings.HasPrefix(out, "DENY ") {
 		t.Errorf("check against an unknown sandbox said:\n%s", out)
 	}
@@ -212,7 +212,7 @@ func TestPolicyStoreFailsClosedAtTheCLI(t *testing.T) {
 		{"deny", "example.test:443"},
 		{"rm", "example.test:443"},
 		{"inspect"},
-		{"reset", "-f"},
+		{"reset", "--force"},
 		{"profile", "ls"},
 	} {
 		_, _, err := runCLI(t, "", append([]string{"policy"}, args...)...)
@@ -253,7 +253,7 @@ func corruptStore(t *testing.T) {
 func TestPolicyInitAndReset(t *testing.T) {
 	policyState(t)
 
-	out := mustPolicy(t, "init", "-preset", "locked")
+	out := mustPolicy(t, "init", "--preset", "locked")
 	if !strings.Contains(out, "locked preset") {
 		t.Errorf("init said:\n%s", out)
 	}
@@ -273,7 +273,7 @@ func TestPolicyInitAndReset(t *testing.T) {
 	if !strings.Contains(out, "cancelled") {
 		t.Errorf("a declined reset said:\n%s", out)
 	}
-	if out := mustPolicy(t, "ls", "-stored"); !strings.Contains(out, "example.test:443") {
+	if out := mustPolicy(t, "ls", "--stored"); !strings.Contains(out, "example.test:443") {
 		t.Errorf("a declined reset destroyed rules anyway:\n%s", out)
 	}
 
@@ -282,24 +282,24 @@ func TestPolicyInitAndReset(t *testing.T) {
 		t.Errorf("reset with no answer: %v\n%s", err, out)
 	}
 
-	out = mustPolicy(t, "reset", "-f")
+	out = mustPolicy(t, "reset", "--force")
 	if !strings.Contains(out, "1 rule(s) removed") {
 		t.Errorf("forced reset said:\n%s", out)
 	}
-	if out := mustPolicy(t, "ls", "-stored"); strings.Contains(out, "example.test") {
+	if out := mustPolicy(t, "ls", "--stored"); strings.Contains(out, "example.test") {
 		t.Errorf("reset left rules behind:\n%s", out)
 	}
 }
 
 func TestPolicyProfiles(t *testing.T) {
 	policyState(t)
-	mustPolicy(t, "profile", "create", "ci", "-preset", "locked",
-		"-allow", "proxy.golang.org:443", "-description", "dependency fetch only")
+	mustPolicy(t, "profile", "create", "ci", "--preset", "locked",
+		"--allow", "proxy.golang.org:443", "--description", "dependency fetch only")
 
 	if out := mustPolicy(t, "profile", "ls"); !strings.Contains(out, "ci") || !strings.Contains(out, "dependency fetch only") {
 		t.Errorf("profile ls said:\n%s", out)
 	}
-	mustPolicy(t, "allow", "-profile", "ci", "sum.golang.org:443")
+	mustPolicy(t, "allow", "--profile", "ci", "sum.golang.org:443")
 	out := mustPolicy(t, "profile", "show", "ci")
 	for _, want := range []string{"proxy.golang.org:443", "sum.golang.org:443", "profile ci"} {
 		if !strings.Contains(out, want) {
@@ -308,29 +308,29 @@ func TestPolicyProfiles(t *testing.T) {
 	}
 
 	// A profile is selected by name, and what it resolves to is what a run would get.
-	out = mustPolicy(t, "check", "-profile", "ci", "proxy.golang.org:443")
+	out = mustPolicy(t, "check", "--profile", "ci", "proxy.golang.org:443")
 	if !strings.HasPrefix(out, "ALLOW") || !strings.Contains(out, "profile ci") {
 		t.Errorf("checking through a profile said:\n%s", out)
 	}
 	// And it still cannot unsay a deny written elsewhere.
 	mustPolicy(t, "deny", "proxy.golang.org")
-	out = mustPolicy(t, "check", "-profile", "ci", "proxy.golang.org:443")
+	out = mustPolicy(t, "check", "--profile", "ci", "proxy.golang.org:443")
 	if !strings.HasPrefix(out, "DENY") {
 		t.Errorf("a profile allow defeated a global deny:\n%s", out)
 	}
 
 	mustPolicy(t, "profile", "rm", "ci")
-	if _, _, err := runCLI(t, "", "policy", "check", "-profile", "ci", "example.test:443"); err == nil {
+	if _, _, err := runCLI(t, "", "policy", "check", "--profile", "ci", "example.test:443"); err == nil {
 		t.Error("a run selected a profile that does not exist")
 	}
 }
 
 func TestPolicyInspect(t *testing.T) {
 	policyState(t)
-	mustPolicy(t, "allow", "github.com:443", "-note", "git")
-	mustPolicy(t, "deny", "-sandbox", "web", "github.com")
+	mustPolicy(t, "allow", "github.com:443", "--note", "git")
+	mustPolicy(t, "deny", "--sandbox", "web", "github.com")
 
-	out := mustPolicy(t, "inspect", "github.com:443", "-sandbox", "web")
+	out := mustPolicy(t, "inspect", "github.com:443", "--sandbox", "web")
 	for _, want := range []string{"allow github.com:443 in global", "deny github.com in sandbox web", "is denied"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect is missing %q:\n%s", want, out)
@@ -346,7 +346,7 @@ func TestPolicyInspect(t *testing.T) {
 // guessing which one was meant is how a rule ends up somewhere nobody looks.
 func TestPolicyRejectsAmbiguousScope(t *testing.T) {
 	policyState(t)
-	if _, _, err := runCLI(t, "", "policy", "allow", "-sandbox", "web", "-profile", "ci", "a.test"); err == nil {
+	if _, _, err := runCLI(t, "", "policy", "allow", "--sandbox", "web", "--profile", "ci", "a.test"); err == nil {
 		t.Fatal("-sandbox and -profile together were accepted")
 	}
 }
@@ -356,7 +356,7 @@ func TestPolicyRejectsAmbiguousScope(t *testing.T) {
 // the sandbox recorded, not the default preset.
 func TestRecordedPolicyIsWhatARestartServes(t *testing.T) {
 	policyState(t)
-	mustPolicy(t, "allow", "-sandbox", "web", "stored.test:443")
+	mustPolicy(t, "allow", "--sandbox", "web", "stored.test:443")
 
 	record := &policy.SandboxPolicy{
 		V:      policy.SandboxPolicyVersion,
@@ -405,8 +405,8 @@ func TestPerRunFlagsOverrideARecordWithoutLoosening(t *testing.T) {
 		Deny:   []string{"blocked.test"},
 	}
 	flags := policyFlags{
-		allow: stringList{"oneoff.test:443"},
-		deny:  stringList{"blocked.test", "alsoblocked.test"},
+		allow: []string{"oneoff.test:443"},
+		deny:  []string{"blocked.test", "alsoblocked.test"},
 	}
 	res, err := flags.resolution("web", record)
 	if err != nil {
