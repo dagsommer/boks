@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/workspace"
 )
 
@@ -39,7 +40,25 @@ const (
 	// sandbox's identity the container record cannot express, and `ls` has a column for
 	// it; it is also what lets `boks run -name x` work without naming an agent.
 	LabelAgent = "dev.boks.agent"
+	// LabelPolicy is how the sandbox's network policy was chosen: the profile, the
+	// preset, and the per-run allow and deny rules it was created with, as JSON.
+	//
+	// Without it, `boks start` and `boks exec` had nothing to go on and served a sandbox
+	// the default preset instead of the policy it was created under — a containment that
+	// silently widened on restart. The stored global and per-sandbox rules are
+	// deliberately *not* copied here: they are re-read from the policy store, so a rule
+	// added after a sandbox was created still reaches it.
+	//
+	// It holds destinations and preset names. It holds no credential and no secret.
+	LabelPolicy = "dev.boks.policy"
 )
+
+// maxLabelBytes is containerd's limit on the size of one label's key and value together.
+// Nothing here is normally near it — a policy record is a few dozen bytes — but a run with
+// a hundred `-allow` flags would be, and a sandbox that failed to record its policy would be
+// a sandbox that quietly forgot it. The limit is met with an error rather than with
+// truncation, which would be the same failure with the evidence removed.
+const maxLabelBytes = 4096
 
 // containerdName is containerd's own identifier grammar: alphanumeric runs joined by single
 // '.', '_' or '-' separators. Rejecting a bad name here gives a better message than
@@ -319,4 +338,39 @@ func decodeCommand(labels map[string]string) []string {
 		_ = json.Unmarshal([]byte(raw), &cmd)
 	}
 	return cmd
+}
+
+// encodePolicyLabel serialises a sandbox's policy record, refusing to write one containerd
+// would reject. See maxLabelBytes for why this is an error rather than a truncation.
+func encodePolicyLabel(p *policy.SandboxPolicy) (string, error) {
+	if p.IsZero() {
+		return "", nil
+	}
+	raw, err := encodeLabel(p)
+	if err != nil {
+		return "", err
+	}
+	if len(raw)+len(LabelPolicy) > maxLabelBytes {
+		return "", fmt.Errorf("this sandbox's policy is too large to record on it (%d bytes, limit %d).\n"+
+			"Rules a sandbox cannot remember would be lost the next time it starts, so boks refuses\n"+
+			"rather than create it. Put them in the policy store instead, where there is no limit:\n"+
+			"  boks policy allow -sandbox <name> <destination>", len(raw), maxLabelBytes-len(LabelPolicy))
+	}
+	return raw, nil
+}
+
+// decodePolicy reads the policy record back. A sandbox whose label is absent or unreadable
+// is not broken — it predates the record, or was made by something else — and it gets the
+// same treatment it got before the record existed: the default policy, plus whatever the
+// store says about it.
+func decodePolicy(labels map[string]string) *policy.SandboxPolicy {
+	raw := labels[LabelPolicy]
+	if raw == "" {
+		return nil
+	}
+	var p policy.SandboxPolicy
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return nil
+	}
+	return &p
 }
