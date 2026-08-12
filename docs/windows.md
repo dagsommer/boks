@@ -1009,14 +1009,19 @@ For someone with a Windows 11 machine and hardware virtualisation. Written in th
 [verification.md](verification.md): each step says what would count as evidence, and none of it
 has been run.
 
-**Nothing below produces a working Boks sandbox** — Boks has no Windows backend. What these
-steps do is (A) corroborate section 7, which was reached by static analysis and deserves a
-runtime check, and (B) establish whether a candidate VMM can actually give Boks what it needs.
-Part C is the LCOW path, kept only for anyone who wants to confirm the cul-de-sac is one.
+Four parts, in descending order of value:
 
-Part A is the highest-value work here. Section 7 reverses this document's original verdict on
-the strength of an import table; one afternoon on a Windows machine would turn that into an
-observation.
+- **Part D (steps 11–13) — Boks inside WSL2.** The only steps here that could produce a
+  *working* Boks sandbox on a Windows machine, and the cheapest to run. Start here.
+- **Part A (steps 1–4) — corroborate section 7.** That section reverses this document's
+  original verdict on the strength of an import table; an afternoon would make it an
+  observation.
+- **Part B (steps 5–7) — evaluate a candidate VMM.** The native-port question.
+- **Part C (steps 8–10) — LCOW.** Kept only for anyone who wants to confirm the cul-de-sac is
+  one.
+
+Parts A, B and C **will not produce a working Boks sandbox**; Boks has no native Windows
+backend, and none of these steps give it one. They establish whether one is worth building.
 
 ### Part A — corroborate what the reference product does
 
