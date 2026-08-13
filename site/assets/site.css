@@ -185,8 +185,8 @@ a:hover { text-decoration-thickness: 2px; }
 .nav-item > a:hover { background: var(--bg-raised); text-decoration: underline; }
 .nav-item.current > a { font-weight: 600; color: var(--accent); background: var(--bg-raised); }
 
-/* Fourteen documents in one list is a wall. The groups say what kind of page each is:
-   what you do, what you look up, and the evidence behind both. */
+/* A dozen documents in one list is a wall. The groups say what kind of page each is:
+   what you do first, what you look up, and where the project is going. */
 .nav-section {
   margin: 1.1rem 0 0.3rem;
   padding: 0 0.5rem;
@@ -440,8 +440,9 @@ a:hover { text-decoration-thickness: 2px; }
   --state-yes-bg: #edf7f1;
   --state-maybe: #8a5a00;
   --state-maybe-bg: #fdf6e7;
-  --state-no: #b3352c;
-  --state-no-bg: #fdf0ef;
+  --state-soon: #1f5fa8;
+  --state-soon-bg: #eef4fb;
+  --shadow: 0 1px 2px rgba(22, 25, 29, 0.05), 0 8px 24px -18px rgba(22, 25, 29, 0.25);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -454,8 +455,9 @@ a:hover { text-decoration-thickness: 2px; }
     --state-yes-bg: #16261e;
     --state-maybe: #d9b26a;
     --state-maybe-bg: #262013;
-    --state-no: #f0918a;
-    --state-no-bg: #2c1917;
+    --state-soon: #79b0ec;
+    --state-soon-bg: #16212e;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -18px rgba(0, 0, 0, 0.6);
   }
 }
 
@@ -468,8 +470,9 @@ a:hover { text-decoration-thickness: 2px; }
   --state-yes-bg: #16261e;
   --state-maybe: #d9b26a;
   --state-maybe-bg: #262013;
-  --state-no: #f0918a;
-  --state-no-bg: #2c1917;
+  --state-soon: #79b0ec;
+  --state-soon-bg: #16212e;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -18px rgba(0, 0, 0, 0.6);
 }
 
 .home .wrap { max-width: 68rem; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 2rem); }
@@ -606,9 +609,10 @@ a:hover { text-decoration-thickness: 2px; }
 }
 .platform {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--bg-raised);
   padding: 1.1rem 1.2rem 1.3rem;
+  box-shadow: var(--shadow);
 }
 .platform h3 { margin: 0.5rem 0 0.4rem; font-size: 1.05rem; }
 .platform p:last-child { margin: 0; color: var(--fg-muted); font-size: 0.92rem; }
@@ -627,7 +631,7 @@ a:hover { text-decoration-thickness: 2px; }
 .platform.yes { border-color: var(--state-yes); }
 .platform.yes .platform-state { color: var(--state-yes); background: var(--state-yes-bg); }
 .platform.maybe .platform-state { color: var(--state-maybe); background: var(--state-maybe-bg); }
-.platform.no .platform-state { color: var(--state-no); background: var(--state-no-bg); }
+.platform.soon .platform-state { color: var(--state-soon); background: var(--state-soon-bg); }
 
 /* Split: prose beside a terminal ---------------------------------------- */
 
@@ -641,11 +645,12 @@ a:hover { text-decoration-thickness: 2px; }
   background: var(--code-bg);
   color: var(--code-fg);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 1.1rem 1.2rem;
   overflow-x: auto;
   font-size: 0.86rem;
   line-height: 1.65;
+  box-shadow: var(--shadow);
 }
 .split-code .c { color: var(--fg-faint); }
 
@@ -743,18 +748,38 @@ a:hover { text-decoration-thickness: 2px; }
   50% { opacity: 0.9; }
 }
 
-/* Tenets ----------------------------------------------------------------- */
+/* Features ---------------------------------------------------------------
 
-.tenets {
+   What a user gets, one card per property. The cards carry the same restraint as the rest
+   of the page: no icons to invent meaning for, an accent rule instead of an illustration. */
+
+.features {
   display: grid;
-  gap: 1.25rem 2rem;
+  gap: 1rem;
   margin-top: 2rem;
   grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
 }
-.tenet { border-top: 2px solid var(--accent-2); padding-top: 0.9rem; }
-.tenet h3 { margin: 0 0 0.5rem; font-size: 1.02rem; }
-.tenet p { margin: 0 0 0.6rem; color: var(--fg-muted); font-size: 0.94rem; }
-.tenet p:last-child { margin: 0; }
+.feature {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-raised);
+  padding: 1.15rem 1.25rem 1.2rem;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.feature::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  opacity: 0.7;
+}
+.feature h3 { margin: 0 0 0.5rem; font-size: 1.02rem; letter-spacing: -0.01em; }
+.feature p { margin: 0 0 0.6rem; color: var(--fg-muted); font-size: 0.92rem; }
+.feature p:last-child { margin: 0; }
+.feature code { font-size: 0.88em; background: var(--code-bg); padding: 0.05em 0.3em; border-radius: 4px; }
 
 /* Documentation cards ---------------------------------------------------- */
 
@@ -766,9 +791,10 @@ a:hover { text-decoration-thickness: 2px; }
 }
 .card {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 1rem 1.1rem 1.1rem;
   background: var(--bg-raised);
+  box-shadow: var(--shadow);
 }
 .card-section {
   margin: 0 0 0.6rem;
