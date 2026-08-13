@@ -3,7 +3,9 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ site.title }} — {{ site.description | strip_newlines }}</title>
+    <!-- The CLI's own one-line description of itself, which is short enough to survive a
+         browser tab. site.description is the README's fuller sentence and is the meta one. -->
+    <title>{{ site.title }} — run untrusted developer tooling in isolated microVMs</title>
     <meta name="description" content="{{ site.description | strip_newlines }}">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
@@ -65,9 +67,9 @@
     <footer class="site-footer">
       <p>
         <a href="{{ site.repo }}">github.com/dagsommer/boks</a> · Apache-2.0 ·
-        the words on this page are
+        the description and the warning above are
         <a href="{{ site.repo }}/blob/{{ site.repo_branch }}/{{ site.home.source }}">{{ site.home.source }}</a>'s
-        own, quoted at build time.
+        own words, quoted at build time rather than copied.
       </p>
       <p>No analytics, no trackers, no third-party requests. Nothing on this page is loaded
         from anywhere but this origin.</p>
