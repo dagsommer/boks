@@ -1,0 +1,245 @@
+From 154bc9681f44fe428d1714aaf3f7708fe9891a23 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:28:21 +0200
+Subject: [PATCH 8/8] windows: write the AP idle trampoline, and stop reading
+ HLT as shutdown
+
+Two bugs that would have shown up the moment a Windows guest was given more
+than one vCPU.
+
+`AP_TRAMPOLINE_START` was documented in the x86_64 layout as "the address of
+the AP idle trampoline (`cli; hlt; jmp` loop)" and `setup_regs` already parked
+every non-boot vCPU's RIP there -- but nothing ever wrote those instructions.
+An AP would have started executing zeroed guest memory (a run of
+`add [bx+si], al`) and wandered into a triple fault. `setup_ap_trampoline`
+writes the four bytes, and `configure_x86_64` calls it before pointing any AP
+at them. KVM needs no counterpart because it starts x86 APs in the
+wait-for-SIPI state; WHP starts every virtual processor runnable, so the wait
+has to exist as code.
+
+The halt handling then had to change to match. It had followed the KVM
+backend in treating a HLT with interrupts masked as a guest shutdown, which is
+safe on KVM only because an in-kernel LAPIC means HLT never reaches userspace
+at all. On WHP the AP trampoline *is* a `cli; hlt` loop, so that reading would
+have torn the whole VM down as soon as a second vCPU started. HLT now always
+parks. Shutdown continues to arrive through the i8042 reset port and
+`exit_evt`, or as an unrecoverable exception.
+
+x86_64-pc-windows-msvc: still 0 errors (also with --features blk).
+x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu, --all-targets,
+krun-vmm + libkrun: 0 errors. `cargo test -p krun-vmm --lib` is unchanged at
+13 passed / 10 failed, the failures being pre-existing and all from /dev/kvm
+being unavailable in this environment.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/arch/src/x86_64/regs.rs         |  3 ++
+ src/arch/src/x86_64/windows/regs.rs | 36 ++++++++++++++-
+ src/vmm/src/windows/vstate.rs       | 69 ++++++++++++-----------------
+ 3 files changed, 67 insertions(+), 41 deletions(-)
+
+diff --git a/src/arch/src/x86_64/regs.rs b/src/arch/src/x86_64/regs.rs
+index f5f69e9..554ab5f 100644
+--- a/src/arch/src/x86_64/regs.rs
++++ b/src/arch/src/x86_64/regs.rs
+@@ -37,6 +37,9 @@ pub enum Error {
+     #[cfg(target_os = "windows")]
+     /// Failed to set WHP registers.
+     SetWhpRegisters(whp::Error),
++    /// Writing the AP idle trampoline to RAM failed.
++    #[cfg(target_os = "windows")]
++    WriteApTrampoline,
+     /// Writing the GDT to RAM failed.
+     WriteGDT,
+     /// Writing the IDT to RAM failed.
+diff --git a/src/arch/src/x86_64/windows/regs.rs b/src/arch/src/x86_64/windows/regs.rs
+index 19ae8a8..44826d2 100644
+--- a/src/arch/src/x86_64/windows/regs.rs
++++ b/src/arch/src/x86_64/windows/regs.rs
+@@ -1,7 +1,7 @@
+ // Copyright 2026 Red Hat, Inc.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-use vm_memory::GuestMemoryMmap;
++use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+ 
+ use super::super::gdt::SegmentDescriptor;
+ use super::super::layout::{
+@@ -114,6 +114,40 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
+     .map_err(Error::SetWhpRegisters)
+ }
+ 
++/// The idle loop APs execute until the BSP starts them.
++///
++/// ```text
++///   0x1000:  fa        cli
++///   0x1001:  f4        hlt
++///   0x1002:  eb fc     jmp 0x1000
++/// ```
++///
++/// The `jmp` displacement is relative to the address of the *next* instruction
++/// (0x1004), so -4 lands back on the `cli`.
++///
++/// `cli` before `hlt` is deliberate. An AP must not act on device interrupts
++/// before the BSP has started it; the events that legitimately wake it here are
++/// INIT and SIPI, which wake a halted processor regardless of RFLAGS.IF. The
++/// `jmp` back exists for the spurious-wakeup case, and to re-arm the halt if
++/// the processor is resumed without having been sent a SIPI.
++const AP_TRAMPOLINE_CODE: [u8; 4] = [0xfa, 0xf4, 0xeb, 0xfc];
++
++/// Writes the AP idle trampoline into guest memory.
++///
++/// [`setup_regs`] parks every non-boot vCPU at [`AP_TRAMPOLINE_START`], so
++/// something has to put instructions there. Without this the APs would execute
++/// whatever happens to be at guest physical 0x1000 — zeroed memory, i.e. a run
++/// of `add [bx+si], al` — and wander off into a triple fault.
++///
++/// The KVM path needs no counterpart: `KVM_ARM_VCPU_POWER_OFF` has no x86
++/// equivalent, but KVM starts x86 APs in the INIT-received (wait-for-SIPI)
++/// state, so they never execute anything until the BSP starts them. WHP starts
++/// every virtual processor runnable, so the wait has to be expressed as code.
++pub fn setup_ap_trampoline(mem: &GuestMemoryMmap) -> Result<()> {
++    mem.write_slice(&AP_TRAMPOLINE_CODE, GuestAddress(AP_TRAMPOLINE_START))
++        .map_err(|_| Error::WriteApTrampoline)
++}
++
+ /// Reset CS.base to 0 for an AP vCPU so that RIP addresses land in low
+ /// memory rather than at the default reset CS.base of 0xFFFF_0000.
+ /// All other segment registers and control registers stay at their
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+index 4d76292..52077df 100644
+--- a/src/vmm/src/windows/vstate.rs
++++ b/src/vmm/src/windows/vstate.rs
+@@ -48,9 +48,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
+ 
+ use crossbeam_channel::{Receiver, Sender, unbounded};
+ use utils::eventfd::EventFd;
+-use vm_memory::{
+-    Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+-};
++use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+ use whp::{VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
+ 
+ /// How long a vCPU parks after a `HLT` it can still be woken from, before
+@@ -58,18 +56,11 @@ use whp::{VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
+ /// poll rather than a wait, and for the uncertainty it hedges against.
+ const HALT_POLL_INTERVAL: Duration = Duration::from_micros(500);
+ 
+-/// RFLAGS.IF — set when the guest can still take an external interrupt.
+-const RFLAGS_IF: u64 = 1 << 9;
+-
+ /// Errors associated with the wrappers over the WHP API.
+ #[derive(Debug)]
+ pub enum Error {
+     /// A CPU template was requested, which WHP cannot honour.
+     CpuTemplateUnsupported(CpuFeaturesTemplate),
+-    /// Error configuring the floating point related registers.
+-    FPUConfiguration(arch::x86_64::regs::Error),
+-    /// Invalid guest memory configuration.
+-    GuestMemoryMmap(GuestMemoryError),
+     /// The Windows Hypervisor Platform is unavailable on this host.
+     HypervisorUnavailable(whp::Error),
+     /// Cannot create the instruction emulator.
+@@ -82,8 +73,6 @@ pub enum Error {
+     SREGSConfiguration(arch::x86_64::regs::Error),
+     /// Cannot set the memory regions.
+     SetUserMemoryRegion(whp::Error),
+-    /// The vCPU event channel was closed (the vCPU thread has exited).
+-    VcpuChannelClosed,
+     /// Cannot create the virtual processor.
+     VcpuCreate(whp::Error),
+     /// vCPU count is not initialized.
+@@ -112,11 +101,6 @@ impl Display for Error {
+                 "CPU template {t:?} cannot be applied on WHP: the partition does not take CPUID \
+                  exits, so the template's CPUID entries could not be delivered to the guest"
+             ),
+-            FPUConfiguration(e) => write!(
+-                f,
+-                "Error configuring the floating point related registers: {e:?}"
+-            ),
+-            GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
+             HypervisorUnavailable(e) => {
+                 write!(f, "The Windows Hypervisor Platform is unavailable: {e}")
+             }
+@@ -127,7 +111,6 @@ impl Display for Error {
+             }
+             SREGSConfiguration(e) => write!(f, "Error configuring the special registers: {e:?}"),
+             SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e}"),
+-            VcpuChannelClosed => write!(f, "vCPU response channel closed"),
+             VcpuCreate(e) => write!(f, "Cannot create the virtual processor: {e}"),
+             VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
+             VcpuRun(e) => write!(f, "Cannot run the VCPUs: {e}"),
+@@ -338,6 +321,15 @@ impl Vcpu {
+             .expect("vCPU was already moved to its thread");
+ 
+         if kernel_boot {
++            // Must precede `setup_regs`, which parks every AP at
++            // `AP_TRAMPOLINE_START`. WHP, unlike KVM, starts every virtual
++            // processor runnable rather than in the wait-for-SIPI state, so the
++            // "wait for the BSP" has to exist as instructions in guest memory.
++            if self.id != 0 {
++                arch::x86_64::regs::setup_ap_trampoline(guest_mem)
++                    .map_err(Error::REGSConfiguration)?;
++            }
++
+             arch::x86_64::msr::setup_msrs(whp_vcpu).map_err(Error::MSRSConfiguration)?;
+             arch::x86_64::regs::setup_regs(whp_vcpu, kernel_start_addr.raw_value())
+                 .map_err(Error::REGSConfiguration)?;
+@@ -430,7 +422,25 @@ impl Vcpu {
+                 .map_err(Error::VcpuEmulation)?;
+                 Ok(VcpuEmulation::Handled)
+             }
+-            VcpuExitReason::Halt => Ok(self.handle_halt(whp_vcpu)),
++            VcpuExitReason::Halt => {
++                // Deliberately *not* a shutdown, unlike the KVM backend's
++                // `KVM_EXIT_HLT` arm. That arm is safe on KVM only because an
++                // in-kernel LAPIC means HLT never reaches userspace at all;
++                // here HLT is routine. In particular every AP spends the whole
++                // pre-SMP-boot window in the `cli; hlt; jmp` trampoline that
++                // `arch::x86_64::regs::setup_ap_trampoline` writes, so reading
++                // a halt -- even one with interrupts masked -- as "the guest is
++                // finished" would tear the VM down the moment a second vCPU
++                // started. Shutdown arrives through the i8042 reset port and
++                // `exit_evt`, or as an unrecoverable exception below.
++                trace!(
++                    "vCPU {} halted at rip=0x{:x} (rflags=0x{:x})",
++                    self.id,
++                    whp_vcpu.exit_rip(),
++                    whp_vcpu.exit_rflags()
++                );
++                Ok(VcpuEmulation::Halted)
++            }
+             // Someone called `WHvCancelRunVirtualProcessor`. Nothing to do:
+             // whatever prompted the cancellation is observed by the caller on
+             // the next trip round the loop.
+@@ -516,27 +526,6 @@ impl Vcpu {
+         }
+     }
+ 
+-    /// Decides what a `HLT` exit means.
+-    ///
+-    /// The distinction is RFLAGS.IF as it stood when the guest halted. With
+-    /// interrupts masked (`cli; hlt`) nothing can ever wake the processor, so
+-    /// the guest has stopped for good — this is the case the KVM backend sees
+-    /// as `KVM_EXIT_HLT` and treats as a shutdown. With interrupts enabled
+-    /// (`sti; hlt`) this is an ordinary idle and the guest must be resumed once
+-    /// an interrupt arrives.
+-    fn handle_halt(&self, whp_vcpu: &WhpVcpu) -> VcpuEmulation {
+-        if whp_vcpu.exit_rflags() & RFLAGS_IF == 0 {
+-            info!(
+-                "vCPU {} halted with interrupts disabled at rip=0x{:x}; treating as shutdown",
+-                self.id,
+-                whp_vcpu.exit_rip()
+-            );
+-            VcpuEmulation::Stopped
+-        } else {
+-            VcpuEmulation::Halted
+-        }
+-    }
+-
+     /// Parks an idle vCPU before re-entering the guest.
+     ///
+     /// UNVERIFIED AGAINST HARDWARE. Two readings of the WHP contract are
+-- 
+2.53.0
+

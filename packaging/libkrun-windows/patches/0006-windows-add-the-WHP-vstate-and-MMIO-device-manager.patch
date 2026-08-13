@@ -1,0 +1,1460 @@
+From 96ea8a432dc32d963ffa2336e67a5a544fe91851 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:16:05 +0200
+Subject: [PATCH 6/8] windows: add the WHP vstate and MMIO device manager
+
+Adds the two modules whose absence accounted for essentially all of the
+krun-vmm Windows build failures: `src/vmm/src/windows/` (Vm, Vcpu, the run
+loop and the instruction-emulator callbacks) and
+`src/vmm/src/device_manager/whp/`.
+
+Both are modelled on the HVF backend rather than the KVM one, because WHP is
+the same shape of API: user-mode, explicit per-vCPU run loop, no in-hypervisor
+device emulation, no ioeventfd and no irqfd. Devices raise interrupts through
+the IrqChip (the WHP IOAPIC backend added earlier), not through an eventfd the
+kernel picks up. Register and boot setup follows the x86_64 KVM path, since
+that is where the architecture, rather than the hypervisor, decides.
+
+The one thing with no counterpart in either existing backend is the
+instruction emulator. A WHP I/O or MMIO exit carries only an address -- no
+width, no direction, no data -- so the access has to be reconstructed by
+`WHvEmulatorTry{Io,Mmio}Emulation`, which calls back into the VMM for the I/O
+itself, for register access and for GVA translation. Those callbacks live in
+`windows/emulator.rs`.
+
+Places where WHP has no equivalent are named in comments rather than
+approximated: CPUID filtering (a requested CPU template is refused, not
+silently dropped), exception injection for unhandled MSRs, and pause/resume.
+The HLT exit is the one place the WHP contract is genuinely ambiguous; the
+handling is correct under both readings and says so.
+
+Also extends krun-whp with the slice-based register accessors and
+WHvTranslateGva that the emulator callbacks need.
+
+krun-vmm on x86_64-pc-windows-msvc: 58 errors -> 48.
+Host Linux (`cargo check -p krun-vmm -p libkrun`): 0 errors.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Cargo.lock                             |   1 +
+ src/vmm/Cargo.toml                     |   2 +
+ src/vmm/src/device_manager/mod.rs      |   4 +
+ src/vmm/src/device_manager/whp/mmio.rs | 201 +++++++
+ src/vmm/src/device_manager/whp/mod.rs  |   1 +
+ src/vmm/src/lib.rs                     |   4 +
+ src/vmm/src/windows/emulator.rs        | 281 ++++++++++
+ src/vmm/src/windows/mod.rs             |   2 +
+ src/vmm/src/windows/vstate.rs          | 693 +++++++++++++++++++++++++
+ src/whp/src/lib.rs                     |  82 ++-
+ 10 files changed, 1269 insertions(+), 2 deletions(-)
+ create mode 100644 src/vmm/src/device_manager/whp/mmio.rs
+ create mode 100644 src/vmm/src/device_manager/whp/mod.rs
+ create mode 100644 src/vmm/src/windows/emulator.rs
+ create mode 100644 src/vmm/src/windows/mod.rs
+ create mode 100644 src/vmm/src/windows/vstate.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 7a80bae..ae03132 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -886,6 +886,7 @@ dependencies = [
+  "krun-kernel",
+  "krun-polly",
+  "krun-utils",
++ "krun-whp",
+  "kvm-bindings",
+  "kvm-ioctls",
+  "libc",
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 6b318ae..6e6ad75 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -74,9 +74,11 @@ kvm-ioctls = "0.24"
+ hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
++whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
+ windows-sys = { version = "0.61.2", features = [
+     "Win32_Foundation",
+     "Win32_System_Console",
++    "Win32_System_Hypervisor",
+ ] }
+ 
+ [dev-dependencies]
+diff --git a/src/vmm/src/device_manager/mod.rs b/src/vmm/src/device_manager/mod.rs
+index b73c8ef..9447111 100644
+--- a/src/vmm/src/device_manager/mod.rs
++++ b/src/vmm/src/device_manager/mod.rs
+@@ -20,3 +20,7 @@ pub use self::kvm::mmio;
+ pub mod hvf;
+ #[cfg(target_os = "macos")]
+ pub use self::hvf::mmio;
++#[cfg(target_os = "windows")]
++pub mod whp;
++#[cfg(target_os = "windows")]
++pub use self::whp::mmio;
+diff --git a/src/vmm/src/device_manager/whp/mmio.rs b/src/vmm/src/device_manager/whp/mmio.rs
+new file mode 100644
+index 0000000..2e8c771
+--- /dev/null
++++ b/src/vmm/src/device_manager/whp/mmio.rs
+@@ -0,0 +1,201 @@
++// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++// SPDX-License-Identifier: Apache-2.0
++//
++// Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the THIRD-PARTY file.
++
++//! MMIO device manager for the WHP backend.
++//!
++//! Follows the HVF manager rather than the KVM one. The KVM version registers
++//! an ioeventfd per virtqueue and an irqfd per device, so that the kernel can
++//! service a queue notification and raise an interrupt without ever returning
++//! to the VMM. WHP has neither primitive: a queue notification arrives as an
++//! ordinary MMIO write that the vCPU thread dispatches on this bus, and an
++//! interrupt goes out through the `IrqChip` (the WHP IOAPIC backend), which
++//! turns it into `WHvRequestInterrupt`. Registration is correspondingly plain —
++//! insert on the bus, hand the device its IRQ line, done.
++//!
++//! What it keeps from the KVM x86_64 version is the pieces the architecture
++//! needs regardless of hypervisor: the IOAPIC's own MMIO window, and appending
++//! `virtio_mmio.device=` to the kernel command line, which is how the guest
++//! discovers devices in the absence of a device tree.
++
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++use std::{fmt, io};
++
++use devices::{BusDevice, DeviceType};
++use kernel::cmdline as kernel_cmdline;
++
++/// Errors for MMIO device manager.
++#[allow(clippy::enum_variant_names)]
++#[derive(Debug)]
++pub enum Error {
++    /// Failed to create MmioTransport
++    CreateMmioTransport(devices::virtio::CreateMmioTransportError),
++    /// Failed to perform an operation on the bus.
++    BusError(devices::BusError),
++    /// Appending to kernel command line failed.
++    Cmdline(kernel_cmdline::Error),
++    /// Failure in creating or cloning an event fd.
++    EventFd(io::Error),
++    /// No more IRQs are available.
++    IrqsExhausted,
++    /// The device couldn't be found
++    DeviceNotFound,
++    /// Failed to update the mmio device.
++    UpdateFailed,
++}
++
++impl fmt::Display for Error {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        match *self {
++            Error::CreateMmioTransport(ref e) => {
++                write!(f, "failed to create mmio transport for the device {e}")
++            }
++            Error::BusError(ref e) => write!(f, "failed to perform bus operation: {e}"),
++            Error::Cmdline(ref e) => {
++                write!(f, "unable to add device to kernel command line: {e}")
++            }
++            Error::EventFd(ref e) => write!(f, "failed to create or clone event descriptor: {e}"),
++            Error::IrqsExhausted => write!(f, "no more IRQs are available"),
++            Error::DeviceNotFound => write!(f, "the device couldn't be found"),
++            Error::UpdateFailed => write!(f, "failed to update the mmio device"),
++        }
++    }
++}
++
++impl From<devices::virtio::CreateMmioTransportError> for Error {
++    fn from(e: devices::virtio::CreateMmioTransportError) -> Self {
++        Self::CreateMmioTransport(e)
++    }
++}
++
++type Result<T> = ::std::result::Result<T, Error>;
++
++/// This represents the size of the mmio device specified to the kernel as a cmdline option
++/// It has to be larger than 0x100 (the offset where the configuration space starts from
++/// the beginning of the memory mapped device registers) + the size of the configuration space
++/// Currently hardcoded to 4K.
++const MMIO_LEN: u64 = 0x1000;
++
++/// Manages the complexities of registering a MMIO device.
++pub struct MMIODeviceManager {
++    pub bus: devices::Bus,
++    mmio_base: u64,
++    irq: u32,
++    last_irq: u32,
++    id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
++}
++
++impl MMIODeviceManager {
++    /// Create a new DeviceManager handling mmio devices (virtio block, fs, console, ...).
++    pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
++        MMIODeviceManager {
++            mmio_base: *mmio_base,
++            irq: irq_interval.0,
++            last_irq: irq_interval.1,
++            bus: devices::Bus::new(),
++            id_to_dev_info: HashMap::new(),
++        }
++    }
++
++    /// Register the IOAPIC's own MMIO window.
++    ///
++    /// Unlike KVM, WHP has no in-hypervisor IOAPIC — it emulates the LAPIC only
++    /// — so the IOAPIC is always a userspace device and its register window
++    /// always has to appear on this bus for the guest to program it.
++    pub fn register_mmio_ioapic(
++        &mut self,
++        intc: Option<Arc<Mutex<devices::legacy::IrqChipDevice>>>,
++    ) -> Result<()> {
++        if let Some(intc) = intc {
++            let (addr, size) = {
++                let intc = intc.lock().unwrap();
++                (intc.get_mmio_addr(), intc.get_mmio_size())
++            };
++            self.bus.insert(intc, addr, size).map_err(Error::BusError)?;
++        }
++
++        Ok(())
++    }
++
++    /// Register an already created MMIO device to be used via MMIO transport.
++    pub fn register_mmio_device(
++        &mut self,
++        mut mmio_device: devices::virtio::MmioTransport,
++        type_id: u32,
++        device_id: String,
++    ) -> Result<(u64, u32)> {
++        if self.irq > self.last_irq {
++            return Err(Error::IrqsExhausted);
++        }
++
++        // The device raises this line through the IrqChip it was built with;
++        // there is no irqfd to register it against.
++        mmio_device.set_irq_line(self.irq);
++
++        self.bus
++            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
++            .map_err(Error::BusError)?;
++        let ret = (self.mmio_base, self.irq);
++        self.id_to_dev_info.insert(
++            (DeviceType::Virtio(type_id), device_id),
++            MMIODeviceInfo {
++                addr: self.mmio_base,
++                _len: MMIO_LEN,
++                _irq: self.irq,
++            },
++        );
++        self.mmio_base += MMIO_LEN;
++        self.irq += 1;
++
++        Ok(ret)
++    }
++
++    /// Append a registered MMIO device to the kernel cmdline.
++    pub fn add_device_to_cmdline(
++        &mut self,
++        cmdline: &mut kernel_cmdline::Cmdline,
++        mmio_base: u64,
++        irq: u32,
++    ) -> Result<()> {
++        // as per doc, [virtio_mmio.]device=<size>@<baseaddr>:<irq> needs to be appended
++        // to kernel commandline for virtio mmio devices to get recognized
++        // the size parameter has to be transformed to KiB, so dividing hexadecimal value in
++        // bytes to 1024; further, the '{}' formatting rust construct will automatically
++        // transform it to decimal
++        cmdline
++            .insert(
++                "virtio_mmio.device",
++                &format!("{}K@0x{:08x}:{}", MMIO_LEN / 1024, mmio_base, irq),
++            )
++            .map_err(Error::Cmdline)
++    }
++
++    /// Gets the specified device.
++    pub fn get_device(
++        &self,
++        device_type: DeviceType,
++        device_id: &str,
++    ) -> Option<&Mutex<dyn BusDevice>> {
++        if let Some(dev_info) = self
++            .id_to_dev_info
++            .get(&(device_type, device_id.to_string()))
++            && let Some((_, device)) = self.bus.get_device(dev_info.addr)
++        {
++            return Some(device);
++        }
++        None
++    }
++}
++
++/// Private structure for storing information about the MMIO device registered at some address on
++/// the bus.
++#[derive(Clone, Debug)]
++pub struct MMIODeviceInfo {
++    addr: u64,
++    _irq: u32,
++    _len: u64,
++}
+diff --git a/src/vmm/src/device_manager/whp/mod.rs b/src/vmm/src/device_manager/whp/mod.rs
+new file mode 100644
+index 0000000..a17106e
+--- /dev/null
++++ b/src/vmm/src/device_manager/whp/mod.rs
+@@ -0,0 +1 @@
++pub mod mmio;
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 299b4b9..262fd18 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -31,10 +31,14 @@ use crate::linux::vstate;
+ #[cfg(target_os = "macos")]
+ mod macos;
+ mod terminal;
++#[cfg(target_os = "windows")]
++mod windows;
+ pub mod worker;
+ 
+ #[cfg(target_os = "macos")]
+ use macos::vstate;
++#[cfg(target_os = "windows")]
++use windows::vstate;
+ 
+ use std::fmt::{Display, Formatter};
+ use std::io;
+diff --git a/src/vmm/src/windows/emulator.rs b/src/vmm/src/windows/emulator.rs
+new file mode 100644
+index 0000000..14740b8
+--- /dev/null
++++ b/src/vmm/src/windows/emulator.rs
+@@ -0,0 +1,281 @@
++// Copyright 2026 Red Hat, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++//! Callbacks for the Windows Hypervisor Platform instruction emulator.
++//!
++//! WHP reports an I/O port or MMIO intercept as a bare "the guest touched this
++//! address" event: unlike KVM, it does not decode the faulting instruction for
++//! us, so the exit context carries no access size, no direction and no data.
++//! What it offers instead is `WHvEmulatorTry{Io,Mmio}Emulation`, an x86
++//! decoder that walks the instruction and calls back into us for every piece it
++//! cannot resolve on its own — the actual I/O, the register reads and writes,
++//! and any guest-virtual-to-guest-physical translation. It also advances RIP
++//! and commits the register side effects, which is why nothing in this file
++//! touches RIP.
++//!
++//! The HVF backend has no equivalent: on aarch64 `hv_vcpu_run` hands back a
++//! fully decoded ESR (address, width, direction, register) and the MMIO
++//! dispatch is a direct `mmio_bus.read()/write()`. Everything here exists
++//! purely because the x86 exit does not carry that information.
++//!
++//! # Lifetime and threading contract
++//!
++//! WHP invokes these callbacks *synchronously*, on the calling thread, before
++//! `WHvEmulatorTry{Io,Mmio}Emulation` returns. The `context` pointer we hand it
++//! is therefore allowed to point at a stack local of the caller, and the
++//! borrows inside [`EmulatorContext`] stay live for exactly as long as the
++//! emulation call. Nothing here may stash the pointer.
++
++use std::ffi::c_void;
++use std::slice;
++
++use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
++use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
++use windows_sys::Win32::System::Hypervisor::{
++    WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
++    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT_CODE,
++};
++use windows_sys::core::HRESULT;
++
++/// Direction field shared by `WHV_EMULATOR_IO_ACCESS_INFO` and
++/// `WHV_EMULATOR_MEMORY_ACCESS_INFO`: 0 means the guest is reading (`IN` /
++/// load), 1 means it is writing (`OUT` / store).
++const ACCESS_DIRECTION_READ: u8 = 0;
++
++/// Everything the callbacks need to service one emulation call.
++///
++/// Borrowed rather than owned so that constructing it costs nothing on the
++/// per-exit path; see the module-level note on why the borrows are sound.
++pub(crate) struct EmulatorContext<'a> {
++    /// The vCPU that took the intercept. Used for the register and
++    /// address-translation callbacks, which WHP routes back through us rather
++    /// than servicing internally.
++    pub vcpu: &'a whp::WhpVcpu,
++    /// vCPU index, passed to the bus so devices can tell callers apart.
++    pub vcpu_id: u64,
++    /// Port I/O bus (COM ports, i8042, CMOS).
++    pub io_bus: &'a devices::Bus,
++    /// MMIO bus (virtio-mmio transports, IOAPIC). `None` before
++    /// [`crate::vstate::Vcpu::set_mmio_bus`] has run, which cannot happen once
++    /// the guest is executing, but the field is an `Option` to match the
++    /// existing backends.
++    pub mmio_bus: Option<&'a devices::Bus>,
++    /// Guest RAM, for the case described in [`memory_callback`].
++    pub guest_memory: &'a GuestMemoryMmap,
++}
++
++impl EmulatorContext<'_> {
++    /// Pointer to hand to `WHvEmulatorTry*Emulation` as its `context` argument.
++    pub fn as_ptr(&self) -> *const c_void {
++        self as *const Self as *const c_void
++    }
++}
++
++/// Reconstitute the context from the opaque pointer WHP passes back.
++///
++/// # Safety
++///
++/// `context` must be the pointer produced by [`EmulatorContext::as_ptr`] for a
++/// still-live `EmulatorContext`, which holds for every callback WHP makes from
++/// inside the emulation call that pointer was handed to.
++unsafe fn context<'a>(context: *const c_void) -> &'a EmulatorContext<'a> {
++    unsafe { &*(context as *const EmulatorContext) }
++}
++
++/// Services `IN`/`OUT` by routing to the port I/O bus.
++///
++/// `AccessSize` is 1, 2 or 4 bytes; `Data` carries the value as a native-endian
++/// `u32`, so it is the low `AccessSize` bytes of its little-endian encoding
++/// that the device sees. Getting that wrong would silently transpose bytes for
++/// every 2- and 4-byte port access, so the conversion is explicit.
++unsafe extern "system" fn io_port_callback(
++    ctx: *const c_void,
++    io_access: *mut WHV_EMULATOR_IO_ACCESS_INFO,
++) -> HRESULT {
++    let ctx = unsafe { context(ctx) };
++    let access = unsafe { &mut *io_access };
++
++    let size = access.AccessSize as usize;
++    if size == 0 || size > 4 {
++        error!(
++            "WHP emulator asked for a {}-byte port access on port 0x{:x}; only 1/2/4 are valid",
++            size, access.Port
++        );
++        return E_INVALIDARG;
++    }
++
++    let port = u64::from(access.Port);
++    if access.Direction == ACCESS_DIRECTION_READ {
++        let mut data = [0u8; 4];
++        ctx.io_bus.read(ctx.vcpu_id, port, &mut data[..size]);
++        access.Data = u32::from_le_bytes(data);
++    } else {
++        let data = access.Data.to_le_bytes();
++        ctx.io_bus.write(ctx.vcpu_id, port, &data[..size]);
++    }
++
++    S_OK
++}
++
++/// Services the memory operands of the faulting instruction.
++///
++/// The emulator calls this for *every* memory access the instruction makes,
++/// not just the one that caused the intercept. A `MOVS` from RAM into a virtio
++/// register, for instance, produces one read against ordinary guest RAM and one
++/// write against the MMIO bus. So this tries the MMIO bus first — a hit there
++/// is the device access we exited for — and falls back to guest RAM, which is
++/// the right answer for the operand that did not fault. Guest RAM cannot
++/// overlap the MMIO window (`arch::MMIO_MEM_START` sits in the 32-bit hole
++/// above the last RAM region), so the two cases cannot both match.
++///
++/// An address that is neither is a genuine fault, and is reported as such
++/// rather than quietly returning zeroes: a silent zero here would look to the
++/// guest like a successful read of a device that does not exist.
++unsafe extern "system" fn memory_callback(
++    ctx: *const c_void,
++    memory_access: *mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
++) -> HRESULT {
++    let ctx = unsafe { context(ctx) };
++    let access = unsafe { &mut *memory_access };
++
++    let size = access.AccessSize as usize;
++    if size == 0 || size > access.Data.len() {
++        error!(
++            "WHP emulator asked for a {}-byte memory access at gpa 0x{:x}; the ABI allows at most {}",
++            size,
++            access.GpaAddress,
++            access.Data.len()
++        );
++        return E_INVALIDARG;
++    }
++
++    let gpa = access.GpaAddress;
++    let reading = access.Direction == ACCESS_DIRECTION_READ;
++
++    if let Some(mmio_bus) = ctx.mmio_bus {
++        let handled = if reading {
++            mmio_bus.read(ctx.vcpu_id, gpa, &mut access.Data[..size])
++        } else {
++            mmio_bus.write(ctx.vcpu_id, gpa, &access.Data[..size])
++        };
++        if handled {
++            return S_OK;
++        }
++    }
++
++    let result = if reading {
++        ctx.guest_memory
++            .read_slice(&mut access.Data[..size], GuestAddress(gpa))
++    } else {
++        ctx.guest_memory
++            .write_slice(&access.Data[..size], GuestAddress(gpa))
++    };
++
++    match result {
++        Ok(()) => S_OK,
++        Err(e) => {
++            error!(
++                "WHP emulator {} of {size} bytes at gpa 0x{gpa:x} hit neither a device nor guest \
++                 RAM: {e}",
++                if reading { "read" } else { "write" }
++            );
++            E_FAIL
++        }
++    }
++}
++
++/// Reads guest registers on the emulator's behalf.
++///
++/// WHP could read these itself; routing them through the VMM is what lets a
++/// VMM that caches register state stay authoritative. We do not cache, so this
++/// is a straight pass-through to `WHvGetVirtualProcessorRegisters`.
++unsafe extern "system" fn get_registers_callback(
++    ctx: *const c_void,
++    register_names: *const WHV_REGISTER_NAME,
++    register_count: u32,
++    register_values: *mut WHV_REGISTER_VALUE,
++) -> HRESULT {
++    let ctx = unsafe { context(ctx) };
++    let count = register_count as usize;
++    let names = unsafe { slice::from_raw_parts(register_names, count) };
++    let values = unsafe { slice::from_raw_parts_mut(register_values, count) };
++
++    match ctx.vcpu.get_whp_registers(names, values) {
++        Ok(()) => S_OK,
++        Err(e) => {
++            error!("WHP emulator register read failed: {e}");
++            E_FAIL
++        }
++    }
++}
++
++/// Writes guest registers on the emulator's behalf. This is how the decoded
++/// instruction's result — the destination register of an `IN`, the updated
++/// RIP, the flags — actually reaches the guest.
++unsafe extern "system" fn set_registers_callback(
++    ctx: *const c_void,
++    register_names: *const WHV_REGISTER_NAME,
++    register_count: u32,
++    register_values: *const WHV_REGISTER_VALUE,
++) -> HRESULT {
++    let ctx = unsafe { context(ctx) };
++    let count = register_count as usize;
++    let names = unsafe { slice::from_raw_parts(register_names, count) };
++    let values = unsafe { slice::from_raw_parts(register_values, count) };
++
++    match ctx.vcpu.set_whp_registers(names, values) {
++        Ok(()) => S_OK,
++        Err(e) => {
++            error!("WHP emulator register write failed: {e}");
++            E_FAIL
++        }
++    }
++}
++
++/// Translates a guest virtual address for the emulator, e.g. to find where a
++/// string instruction's source operand lives.
++///
++/// A failed *translation* (page not present, privilege violation, ...) is not
++/// a failed *call*: it is reported through `translation_result` with `S_OK`, and
++/// the emulator turns it into the page fault the guest should see. Only an
++/// error from WHP itself is an `E_FAIL`.
++unsafe extern "system" fn translate_gva_callback(
++    ctx: *const c_void,
++    gva: u64,
++    translate_flags: WHV_TRANSLATE_GVA_FLAGS,
++    translation_result: *mut WHV_TRANSLATE_GVA_RESULT_CODE,
++    gpa: *mut u64,
++) -> HRESULT {
++    let ctx = unsafe { context(ctx) };
++
++    match ctx.vcpu.translate_gva(gva, translate_flags) {
++        Ok((result_code, translated)) => {
++            unsafe {
++                *translation_result = result_code;
++                *gpa = translated;
++            }
++            S_OK
++        }
++        Err(e) => {
++            error!("WHP emulator GVA translation of 0x{gva:x} failed: {e}");
++            E_FAIL
++        }
++    }
++}
++
++/// The callback table handed to `WHvEmulatorCreateEmulator`.
++///
++/// `Size` is a versioning field: WHP rejects a table whose size it does not
++/// recognise, so it must describe the struct we were compiled against rather
++/// than a hardcoded number.
++pub(crate) fn callbacks() -> WHV_EMULATOR_CALLBACKS {
++    WHV_EMULATOR_CALLBACKS {
++        Size: std::mem::size_of::<WHV_EMULATOR_CALLBACKS>() as u32,
++        Reserved: 0,
++        WHvEmulatorIoPortCallback: Some(io_port_callback),
++        WHvEmulatorMemoryCallback: Some(memory_callback),
++        WHvEmulatorGetVirtualProcessorRegisters: Some(get_registers_callback),
++        WHvEmulatorSetVirtualProcessorRegisters: Some(set_registers_callback),
++        WHvEmulatorTranslateGvaPage: Some(translate_gva_callback),
++    }
++}
+diff --git a/src/vmm/src/windows/mod.rs b/src/vmm/src/windows/mod.rs
+new file mode 100644
+index 0000000..e153110
+--- /dev/null
++++ b/src/vmm/src/windows/mod.rs
+@@ -0,0 +1,2 @@
++mod emulator;
++pub mod vstate;
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+new file mode 100644
+index 0000000..4d76292
+--- /dev/null
++++ b/src/vmm/src/windows/vstate.rs
+@@ -0,0 +1,693 @@
++// Copyright 2026 Red Hat, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++//! Windows Hypervisor Platform (WHP) backend.
++//!
++//! Structurally this follows the HVF backend rather than the KVM one: WHP is a
++//! user-mode hypervisor API with an explicit per-vCPU run loop, no in-kernel
++//! device emulation, no ioeventfd and no irqfd. Devices therefore raise
++//! interrupts by calling into the IOAPIC model in `krun-devices`, which turns
++//! them into `WHvRequestInterrupt` calls, rather than by writing an eventfd
++//! that the kernel picks up.
++//!
++//! The architecture is x86_64, so the register and boot setup follows the KVM
++//! x86_64 path (`arch::x86_64::regs` / `arch::x86_64::msr`, whose WHP variants
++//! live in `src/arch/src/x86_64/windows/`) rather than HVF's aarch64 one.
++//!
++//! ## What WHP has no equivalent for
++//!
++//! * **ioeventfd / irqfd.** No equivalent at all. `Vm` exposes no registration
++//!   for them and `device_manager::whp::mmio` does not try; devices signal
++//!   through the `IrqChip` instead, exactly as the HVF backend does.
++//! * **CPUID filtering.** KVM lets the VMM install a complete CPUID table with
++//!   `KVM_SET_CPUID2`, which is how `krun-cpuid` normalises topology and
++//!   applies the T2/C3 templates. WHP's `CpuidResultList` only *overrides*
++//!   individual leaves, and taking a full exit per CPUID needs
++//!   `WHvPartitionPropertyCodeCpuidExitList`, which the partition setup does not
++//!   request. CPU templates are therefore rejected rather than ignored — see
++//!   [`Vcpu::configure_x86_64`].
++//! * **Exception injection.** `WHvRequestInterrupt` delivers external
++//!   interrupts only. Injecting a `#GP` (which is what KVM does for an
++//!   unhandled MSR by default) would need `WHvX64RegisterPendingEvent`; see
++//!   [`Vcpu::handle_msr_access`] for the policy that is implemented instead.
++//! * **Pause / resume.** Not implemented. Unlike HVF there is no vtimer offset
++//!   to advance, but the guest TSC would still jump by the pause duration, and
++//!   nothing in the Windows path requests a pause today. `WhpVm::cancel_vcpu`
++//!   is the primitive a future implementation would build on.
++
++use std::fmt::{Display, Formatter};
++use std::io;
++use std::result;
++use std::sync::Arc;
++use std::thread;
++use std::time::Duration;
++
++use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
++use super::emulator::{self, EmulatorContext};
++use crate::vmm_config::machine_config::CpuFeaturesTemplate;
++
++use crossbeam_channel::{Receiver, Sender, unbounded};
++use utils::eventfd::EventFd;
++use vm_memory::{
++    Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
++};
++use whp::{VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
++
++/// How long a vCPU parks after a `HLT` it can still be woken from, before
++/// re-entering the guest. See [`Vcpu::wait_for_interrupt`] for why this is a
++/// poll rather than a wait, and for the uncertainty it hedges against.
++const HALT_POLL_INTERVAL: Duration = Duration::from_micros(500);
++
++/// RFLAGS.IF — set when the guest can still take an external interrupt.
++const RFLAGS_IF: u64 = 1 << 9;
++
++/// Errors associated with the wrappers over the WHP API.
++#[derive(Debug)]
++pub enum Error {
++    /// A CPU template was requested, which WHP cannot honour.
++    CpuTemplateUnsupported(CpuFeaturesTemplate),
++    /// Error configuring the floating point related registers.
++    FPUConfiguration(arch::x86_64::regs::Error),
++    /// Invalid guest memory configuration.
++    GuestMemoryMmap(GuestMemoryError),
++    /// The Windows Hypervisor Platform is unavailable on this host.
++    HypervisorUnavailable(whp::Error),
++    /// Cannot create the instruction emulator.
++    CreateEmulator(whp::Error),
++    /// Error configuring the MSR registers.
++    MSRSConfiguration(arch::x86_64::msr::Error),
++    /// Error configuring the general purpose registers.
++    REGSConfiguration(arch::x86_64::regs::Error),
++    /// Error configuring the special registers.
++    SREGSConfiguration(arch::x86_64::regs::Error),
++    /// Cannot set the memory regions.
++    SetUserMemoryRegion(whp::Error),
++    /// The vCPU event channel was closed (the vCPU thread has exited).
++    VcpuChannelClosed,
++    /// Cannot create the virtual processor.
++    VcpuCreate(whp::Error),
++    /// vCPU count is not initialized.
++    VcpuCountNotInitialized,
++    /// Cannot run the VCPUs.
++    VcpuRun(whp::Error),
++    /// Cannot spawn a new vCPU thread.
++    VcpuSpawn(io::Error),
++    /// The emulator could not emulate the intercepted instruction.
++    VcpuEmulation(whp::Error),
++    /// An exit we have no handling for.
++    VcpuUnhandledWhpExit(u32),
++    /// Cannot access a vCPU register.
++    VcpuRegisterAccess(whp::Error),
++    /// Cannot configure the microvm.
++    VmSetup(whp::Error),
++}
++
++impl Display for Error {
++    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
++        use self::Error::*;
++
++        match self {
++            CpuTemplateUnsupported(t) => write!(
++                f,
++                "CPU template {t:?} cannot be applied on WHP: the partition does not take CPUID \
++                 exits, so the template's CPUID entries could not be delivered to the guest"
++            ),
++            FPUConfiguration(e) => write!(
++                f,
++                "Error configuring the floating point related registers: {e:?}"
++            ),
++            GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
++            HypervisorUnavailable(e) => {
++                write!(f, "The Windows Hypervisor Platform is unavailable: {e}")
++            }
++            CreateEmulator(e) => write!(f, "Cannot create the instruction emulator: {e}"),
++            MSRSConfiguration(e) => write!(f, "Error configuring the MSR registers: {e:?}"),
++            REGSConfiguration(e) => {
++                write!(f, "Error configuring the general purpose registers: {e:?}")
++            }
++            SREGSConfiguration(e) => write!(f, "Error configuring the special registers: {e:?}"),
++            SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e}"),
++            VcpuChannelClosed => write!(f, "vCPU response channel closed"),
++            VcpuCreate(e) => write!(f, "Cannot create the virtual processor: {e}"),
++            VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
++            VcpuRun(e) => write!(f, "Cannot run the VCPUs: {e}"),
++            VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
++            VcpuEmulation(e) => write!(f, "Cannot emulate the intercepted instruction: {e}"),
++            VcpuUnhandledWhpExit(reason) => {
++                write!(f, "Unexpected WHvRunVirtualProcessor exit reason: {reason}")
++            }
++            VcpuRegisterAccess(e) => write!(f, "Cannot access a vCPU register: {e}"),
++            VmSetup(e) => write!(f, "Cannot configure the microvm: {e}"),
++        }
++    }
++}
++
++pub type Result<T> = result::Result<T, Error>;
++
++/// A wrapper around creating and using a WHP partition.
++pub struct Vm {
++    whp_vm: Arc<WhpVm>,
++
++    // Keeping the guest memory alive here is load-bearing, not bookkeeping.
++    // `WHvMapGpaRange` records raw host pointers into these mappings, and the
++    // partition keeps dereferencing them for as long as it exists. `Vmm` stores
++    // `guest_memory` before `vm`, and Rust drops struct fields in declaration
++    // order, so without this clone the backing pages would be unmapped while
++    // the partition still referenced them.
++    guest_memory: Option<GuestMemoryMmap>,
++}
++
++impl Vm {
++    /// Creates and finalises a WHP partition sized for `vcpu_count` processors.
++    ///
++    /// Unlike `KVM_CREATE_VM` and `hv_vm_create`, WHP needs the processor count
++    /// *before* the partition is usable: `WHvSetupPartition` locks the
++    /// configuration in, and vCPUs cannot be created before it nor the count
++    /// changed after it. That is why this takes an argument the other two
++    /// backends' `Vm::new` does not.
++    pub fn new(vcpu_count: u8) -> Result<Self> {
++        // Fail with "no hypervisor" rather than an opaque HRESULT from
++        // WHvCreatePartition when the feature is simply not enabled.
++        whp::check_hypervisor().map_err(Error::HypervisorUnavailable)?;
++
++        let whp_vm = WhpVm::new(u32::from(vcpu_count)).map_err(Error::VmSetup)?;
++
++        Ok(Vm {
++            whp_vm: Arc::new(whp_vm),
++            guest_memory: None,
++        })
++    }
++
++    /// The partition, for the pieces that talk to WHP directly — currently the
++    /// IOAPIC backend, which needs it to issue `WHvRequestInterrupt`.
++    pub fn whp_vm(&self) -> &Arc<WhpVm> {
++        &self.whp_vm
++    }
++
++    /// Maps every guest memory region into the partition's physical address
++    /// space.
++    pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
++        for region in guest_mem.iter() {
++            // Safe to unwrap: the address comes from the region itself.
++            let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
++            debug!(
++                "Guest memory host_addr={:x?} guest_addr={:x?} len={:x?}",
++                host_addr,
++                region.start_addr().raw_value(),
++                region.len()
++            );
++
++            // SAFETY: `host_addr` points into a live mapping owned by
++            // `guest_mem`, of at least `region.len()` bytes, and the clone
++            // stored below keeps that mapping alive for as long as the
++            // partition can reach it.
++            unsafe {
++                self.whp_vm
++                    .map_memory(
++                        host_addr as *mut std::ffi::c_void,
++                        region.start_addr().raw_value(),
++                        region.len(),
++                    )
++                    .map_err(Error::SetUserMemoryRegion)?;
++            }
++        }
++
++        self.guest_memory = Some(guest_mem.clone());
++
++        Ok(())
++    }
++}
++
++/// Encapsulates configuration parameters for the guest vCPUS.
++#[derive(Debug, Eq, PartialEq)]
++pub struct VcpuConfig {
++    /// Number of guest VCPUs.
++    pub vcpu_count: u8,
++    /// Enable hyperthreading in the CPUID configuration.
++    pub ht_enabled: bool,
++    /// CPUID template to use.
++    pub cpu_template: Option<CpuFeaturesTemplate>,
++}
++
++/// A wrapper around creating and using a WHP-based vCPU.
++pub struct Vcpu {
++    id: u8,
++
++    // Created eagerly in `new_x86_64` so that `configure_x86_64` can write the
++    // boot register state before the guest starts, then moved onto the vCPU
++    // thread by `run`. WHP allows a virtual processor to be created on one
++    // thread and run on another; what it does not allow is two threads running
++    // the same processor at once, which the `Option`-take enforces structurally.
++    whp_vcpu: Option<WhpVcpu>,
++
++    mmio_bus: Option<devices::Bus>,
++    io_bus: devices::Bus,
++
++    // The emulator's memory callback needs to reach guest RAM for the operands
++    // of an intercepted instruction that do not themselves fault; see
++    // `windows::emulator::memory_callback`.
++    guest_memory: GuestMemoryMmap,
++
++    exit_evt: EventFd,
++
++    // The receiving end of the responses channel which will be given to the handler.
++    response_receiver: Option<Receiver<VcpuResponse>>,
++    // The transmitting end of the responses channel owned by the vcpu side.
++    response_sender: Sender<VcpuResponse>,
++}
++
++impl Vcpu {
++    /// Registers a signal handler to kick a running vCPU.
++    ///
++    /// Nothing to do on Windows: there are no signals, and the equivalent
++    /// "break this vCPU out of the hypervisor" primitive is
++    /// `WHvCancelRunVirtualProcessor`, which is called directly on the
++    /// partition rather than through a handler. Kept so that the cross-platform
++    /// call in `Vmm::start_vcpus` stays uniform.
++    pub fn register_kick_signal_handler() {}
++
++    /// Constructs a new vCPU within `vm`.
++    ///
++    /// # Arguments
++    ///
++    /// * `id` - Represents the CPU number between [0, max vcpus).
++    /// * `vm` - The partition this vCPU will belong to.
++    /// * `io_bus` - The io-bus used to access port-io devices.
++    /// * `guest_memory` - Guest RAM, for the instruction emulator's memory callback.
++    /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
++    pub fn new_x86_64(
++        id: u8,
++        vm: &Vm,
++        io_bus: devices::Bus,
++        guest_memory: GuestMemoryMmap,
++        exit_evt: EventFd,
++    ) -> Result<Self> {
++        let whp_vcpu =
++            WhpVcpu::new(vm.whp_vm().clone(), u32::from(id)).map_err(Error::VcpuCreate)?;
++        let (response_sender, response_receiver) = unbounded();
++
++        Ok(Vcpu {
++            id,
++            whp_vcpu: Some(whp_vcpu),
++            mmio_bus: None,
++            io_bus,
++            guest_memory,
++            exit_evt,
++            response_receiver: Some(response_receiver),
++            response_sender,
++        })
++    }
++
++    /// Returns the cpu index as seen by the guest OS.
++    pub fn cpu_index(&self) -> u8 {
++        self.id
++    }
++
++    /// Sets a MMIO bus for this vcpu.
++    pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
++        self.mmio_bus = Some(mmio_bus);
++    }
++
++    /// Configures a x86_64 specific vcpu and should be called once per vcpu.
++    ///
++    /// # Arguments
++    ///
++    /// * `guest_mem` - The guest memory used by this microvm.
++    /// * `kernel_start_addr` - Offset from `guest_mem` at which the kernel starts.
++    /// * `vcpu_config` - The machine configuration of this microvm.
++    /// * `kernel_boot` - Whether we are booting a kernel directly (as opposed to firmware).
++    pub fn configure_x86_64(
++        &mut self,
++        guest_mem: &GuestMemoryMmap,
++        kernel_start_addr: GuestAddress,
++        vcpu_config: &VcpuConfig,
++        kernel_boot: bool,
++    ) -> Result<()> {
++        // The KVM path calls `filter_cpuid` here to normalise the CPUID
++        // topology (and apply T2/C3). WHP gives us no way to do that — see the
++        // module-level notes — so an explicitly requested template is refused
++        // rather than silently dropped, which would hand the guest a CPU that
++        // does not match what the caller asked for.
++        if let Some(template) = vcpu_config.cpu_template {
++            return Err(Error::CpuTemplateUnsupported(template));
++        }
++
++        let whp_vcpu = self
++            .whp_vcpu
++            .as_ref()
++            .expect("vCPU was already moved to its thread");
++
++        if kernel_boot {
++            arch::x86_64::msr::setup_msrs(whp_vcpu).map_err(Error::MSRSConfiguration)?;
++            arch::x86_64::regs::setup_regs(whp_vcpu, kernel_start_addr.raw_value())
++                .map_err(Error::REGSConfiguration)?;
++            arch::x86_64::regs::setup_sregs(guest_mem, whp_vcpu)
++                .map_err(Error::SREGSConfiguration)?;
++
++            // Two steps the KVM path takes that are deliberately absent:
++            //
++            // * `setup_fpu`. Firecracker loads the post-`FNINIT` x87 state
++            //   (FCW=0x037f, MXCSR=0x1f80) because KVM's initial FPU state is
++            //   not guaranteed to be the architectural reset state. A WHP
++            //   virtual processor starts at architectural reset, and the Linux
++            //   boot path runs `fninit` itself before using the FPU, so there is
++            //   nothing to correct. Writing it anyway would mean composing
++            //   `WHV_X64_FP_CONTROL_STATUS_REGISTER` by hand for no benefit.
++            //
++            // * `interrupts::set_lint`, which programs LAPIC LVT0 as ExtINT and
++            //   LVT1 as NMI for virtual-wire mode with an 8259 PIC. WHP emulates
++            //   the LAPIC itself and libkrun routes device interrupts through
++            //   the IOAPIC, so there is no PIC to chain to. If a guest ever
++            //   needs the LVT entries programmed, the way in is
++            //   `WHvGetVirtualProcessorInterruptControllerState`, which is not
++            //   currently bound.
++        }
++
++        Ok(())
++    }
++
++    /// Moves the vcpu to its own thread and constructs a VcpuHandle.
++    /// The handle can be used to control the remote vcpu.
++    pub fn start_threaded(mut self) -> Result<VcpuHandle> {
++        let response_receiver = self.response_receiver.take().unwrap();
++        let (init_sender, init_receiver) = unbounded();
++
++        let vcpu_thread = thread::Builder::new()
++            .name(format!("fc_vcpu {}", self.cpu_index()))
++            .spawn(move || {
++                self.run(init_sender);
++            })
++            .map_err(Error::VcpuSpawn)?;
++
++        // Block until the thread has taken ownership of the virtual processor
++        // and built its emulator, so that a failure there surfaces here rather
++        // than as a guest that never starts.
++        init_receiver
++            .recv()
++            .expect("vCPU thread exited before reporting readiness")?;
++
++        Ok(VcpuHandle::new(response_receiver, vcpu_thread))
++    }
++
++    /// Runs the guest until the next exit and services it.
++    fn run_emulation(
++        &self,
++        whp_vcpu: &mut WhpVcpu,
++        emulator: &WhpEmulator,
++    ) -> Result<VcpuEmulation> {
++        let exit = whp_vcpu.run().map_err(Error::VcpuRun)?;
++
++        match exit {
++            // The guest touched an I/O port or an unmapped physical address.
++            // Both are handed to the instruction emulator, which decodes the
++            // access, calls back into `windows::emulator` to perform it, writes
++            // the result into the guest's registers and advances RIP.
++            VcpuExitReason::IoPortAccess => {
++                let ctx = self.emulator_context(whp_vcpu);
++                // SAFETY: all three pointers are valid for the duration of the
++                // call — `ctx` is a live local, and the two exit contexts point
++                // into `whp_vcpu`, which outlives this statement.
++                unsafe {
++                    emulator.try_io_emulation(
++                        ctx.as_ptr(),
++                        whp_vcpu.vp_exit_context(),
++                        whp_vcpu.io_port_access_context(),
++                    )
++                }
++                .map_err(Error::VcpuEmulation)?;
++                Ok(VcpuEmulation::Handled)
++            }
++            VcpuExitReason::MemoryAccess => {
++                let ctx = self.emulator_context(whp_vcpu);
++                // SAFETY: as above.
++                unsafe {
++                    emulator.try_mmio_emulation(
++                        ctx.as_ptr(),
++                        whp_vcpu.vp_exit_context(),
++                        whp_vcpu.memory_access_context(),
++                    )
++                }
++                .map_err(Error::VcpuEmulation)?;
++                Ok(VcpuEmulation::Handled)
++            }
++            VcpuExitReason::Halt => Ok(self.handle_halt(whp_vcpu)),
++            // Someone called `WHvCancelRunVirtualProcessor`. Nothing to do:
++            // whatever prompted the cancellation is observed by the caller on
++            // the next trip round the loop.
++            VcpuExitReason::Canceled => {
++                debug!("vCPU {} run canceled", self.id);
++                Ok(VcpuEmulation::Handled)
++            }
++            VcpuExitReason::CpuidAccess => {
++                // Unreachable as the partition stands: without
++                // `WHvPartitionPropertyCodeCpuidExitList`, WHP answers CPUID
++                // itself from its defaults plus the `CpuidResultList` installed
++                // in `WhpVm::configure_partition`. Handled anyway, by replaying
++                // the default result WHP computed, so that adding an exit list
++                // later cannot turn into a hang.
++                let info = whp_vcpu.cpuid_exit_info();
++                debug!(
++                    "vCPU {} CPUID leaf 0x{:x} subleaf 0x{:x}",
++                    self.id, info.leaf, info.subleaf
++                );
++                whp_vcpu
++                    .complete_cpuid(
++                        info.default_eax,
++                        info.default_ebx,
++                        info.default_ecx,
++                        info.default_edx,
++                    )
++                    .map_err(Error::VcpuRegisterAccess)?;
++                Ok(VcpuEmulation::Handled)
++            }
++            VcpuExitReason::MsrAccess => self.handle_msr_access(whp_vcpu),
++            VcpuExitReason::InterruptWindow => {
++                // We asked to be told when the guest could next take an
++                // interrupt. We do not queue interrupts ourselves — the IOAPIC
++                // backend hands them straight to `WHvRequestInterrupt`, which
++                // queues them in the emulated LAPIC — so there is nothing to
++                // deliver here; clearing the request stops WHP exiting on every
++                // subsequent `STI`.
++                whp_vcpu
++                    .clear_interrupt_window()
++                    .map_err(Error::VcpuRegisterAccess)?;
++                Ok(VcpuEmulation::Handled)
++            }
++            // The x86 equivalent of KVM_EXIT_SHUTDOWN: a triple fault, or an
++            // exception the guest cannot handle. The guest is not recoverable.
++            VcpuExitReason::UnrecoverableException => {
++                error!(
++                    "vCPU {} took an unrecoverable exception at rip=0x{:x}",
++                    self.id,
++                    whp_vcpu.exit_rip()
++                );
++                Ok(VcpuEmulation::Stopped)
++            }
++            VcpuExitReason::InvalidVpRegisterValue => {
++                error!(
++                    "vCPU {} has an invalid register state at rip=0x{:x}",
++                    self.id,
++                    whp_vcpu.exit_rip()
++                );
++                Err(Error::VcpuUnhandledWhpExit(0))
++            }
++            VcpuExitReason::UnsupportedFeature => {
++                error!(
++                    "vCPU {} used a feature the partition does not support, at rip=0x{:x}",
++                    self.id,
++                    whp_vcpu.exit_rip()
++                );
++                Err(Error::VcpuUnhandledWhpExit(0))
++            }
++            VcpuExitReason::Unknown(reason) => {
++                error!("vCPU {} unexpected exit reason {reason}", self.id);
++                Err(Error::VcpuUnhandledWhpExit(reason))
++            }
++        }
++    }
++
++    fn emulator_context<'a>(&'a self, whp_vcpu: &'a WhpVcpu) -> EmulatorContext<'a> {
++        EmulatorContext {
++            vcpu: whp_vcpu,
++            vcpu_id: u64::from(self.id),
++            io_bus: &self.io_bus,
++            mmio_bus: self.mmio_bus.as_ref(),
++            guest_memory: &self.guest_memory,
++        }
++    }
++
++    /// Decides what a `HLT` exit means.
++    ///
++    /// The distinction is RFLAGS.IF as it stood when the guest halted. With
++    /// interrupts masked (`cli; hlt`) nothing can ever wake the processor, so
++    /// the guest has stopped for good — this is the case the KVM backend sees
++    /// as `KVM_EXIT_HLT` and treats as a shutdown. With interrupts enabled
++    /// (`sti; hlt`) this is an ordinary idle and the guest must be resumed once
++    /// an interrupt arrives.
++    fn handle_halt(&self, whp_vcpu: &WhpVcpu) -> VcpuEmulation {
++        if whp_vcpu.exit_rflags() & RFLAGS_IF == 0 {
++            info!(
++                "vCPU {} halted with interrupts disabled at rip=0x{:x}; treating as shutdown",
++                self.id,
++                whp_vcpu.exit_rip()
++            );
++            VcpuEmulation::Stopped
++        } else {
++            VcpuEmulation::Halted
++        }
++    }
++
++    /// Parks an idle vCPU before re-entering the guest.
++    ///
++    /// UNVERIFIED AGAINST HARDWARE. Two readings of the WHP contract are
++    /// possible and this code has never run:
++    ///
++    /// 1. `WHvRunVirtualProcessor` returns `X64Halt` and leaves the processor
++    ///    halted, so re-entering immediately would spin at 100% CPU.
++    /// 2. `WHvRunVirtualProcessor` blocks internally while the processor is
++    ///    halted and only returns once an interrupt lands or the call is
++    ///    cancelled — which is what the note on `WhpVm::cancel_vcpu` ("required
++    ///    to wake a vCPU that is blocked in HLT") suggests.
++    ///
++    /// A short sleep before re-entry is correct under both: under (2) it never
++    /// happens, and under (1) it turns a spin into a bounded-rate poll. What it
++    /// costs under (1) is up to `HALT_POLL_INTERVAL` of extra latency on a
++    /// device interrupt delivered to an idle guest.
++    ///
++    /// The event-driven version needs the injecting side to be able to wake
++    /// this thread. `WhpIoapicBackend` holds the partition and could call
++    /// `WhpVm::cancel_vcpu`, but it does not know which vCPUs are parked here;
++    /// closing that gap is follow-up work, deliberately not guessed at now.
++    fn wait_for_interrupt(&self) {
++        thread::sleep(HALT_POLL_INTERVAL);
++    }
++
++    /// Services an MSR the partition did not handle.
++    ///
++    /// `WhpVm::configure_partition` sets `X64MsrExitBitmap` bit 0
++    /// (`UnhandledMsrs`), so anything WHP does not model itself lands here
++    /// rather than failing inside the hypervisor.
++    ///
++    /// The policy is KVM's `ignore_msrs=1`: reads return zero, writes are
++    /// dropped, both advance past the instruction. The architecturally correct
++    /// answer is `#GP`, and KVM's default is to inject one — but WHP exposes no
++    /// exception-injection call in these bindings (`WHvRequestInterrupt` carries
++    /// external interrupts only; a `#GP` would have to be composed into
++    /// `WHvX64RegisterPendingEvent`). Faulting the guest is the more faithful
++    /// behaviour and should replace this once that register is bound; until
++    /// then, ignoring is the option that boots rather than the option that is
++    /// right, and it is logged so the difference is visible.
++    fn handle_msr_access(&self, whp_vcpu: &WhpVcpu) -> Result<VcpuEmulation> {
++        let info = whp_vcpu.msr_exit_info();
++
++        if info.is_write {
++            debug!(
++                "vCPU {} wrote unhandled MSR 0x{:x} (eax=0x{:x} edx=0x{:x}); ignoring",
++                self.id, info.msr_number, info.rax, info.rdx
++            );
++            whp_vcpu.advance_rip().map_err(Error::VcpuRegisterAccess)?;
++        } else {
++            debug!(
++                "vCPU {} read unhandled MSR 0x{:x}; returning 0",
++                self.id, info.msr_number
++            );
++            whp_vcpu
++                .complete_msr_read(0, 0)
++                .map_err(Error::VcpuRegisterAccess)?;
++        }
++
++        Ok(VcpuEmulation::Handled)
++    }
++
++    /// Main loop of the vCPU thread.
++    fn run(&mut self, init_sender: Sender<Result<()>>) {
++        let mut whp_vcpu = match self.whp_vcpu.take() {
++            Some(vcpu) => vcpu,
++            None => {
++                let _ = init_sender.send(Err(Error::VcpuCountNotInitialized));
++                return;
++            }
++        };
++
++        // One emulator per vCPU: the handle carries per-instruction decode
++        // state, so sharing one across threads would corrupt concurrent
++        // emulations.
++        let emulator = match WhpEmulator::new(emulator::callbacks()) {
++            Ok(emulator) => emulator,
++            Err(e) => {
++                let _ = init_sender.send(Err(Error::CreateEmulator(e)));
++                return;
++            }
++        };
++
++        if init_sender.send(Ok(())).is_err() {
++            // The spawning thread is gone; there is nobody left to run for.
++            return;
++        }
++
++        loop {
++            match self.run_emulation(&mut whp_vcpu, &emulator) {
++                // Emulation ran successfully, continue.
++                Ok(VcpuEmulation::Handled) => (),
++                // The guest is idle; park before re-entering.
++                Ok(VcpuEmulation::Halted) => self.wait_for_interrupt(),
++                // The guest was rebooted or halted for good.
++                Ok(VcpuEmulation::Stopped) => {
++                    self.exit(FC_EXIT_CODE_OK);
++                    break;
++                }
++                // Emulation errors lead to vCPU exit.
++                Err(e) => {
++                    error!("vCPU {} exiting: {e}", self.id);
++                    self.exit(FC_EXIT_CODE_GENERIC_ERROR);
++                    break;
++                }
++            }
++        }
++    }
++
++    fn exit(&mut self, exit_code: u8) {
++        self.response_sender
++            .send(VcpuResponse::Exited(exit_code))
++            .expect("failed to send Exited status");
++
++        if let Err(e) = self.exit_evt.write(1) {
++            error!("Failed signaling vcpu exit event: {e}");
++        }
++    }
++}
++
++#[derive(Debug, Eq, PartialEq)]
++/// List of responses that the Vcpu reports.
++pub enum VcpuResponse {
++    /// Vcpu is stopped.
++    Exited(u8),
++}
++
++/// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
++///
++/// Thinner than its KVM and HVF counterparts because there is no event channel:
++/// pause/resume is not implemented on WHP (see the module-level notes), so the
++/// only traffic is the vCPU reporting its own exit.
++pub struct VcpuHandle {
++    response_receiver: Receiver<VcpuResponse>,
++}
++
++impl VcpuHandle {
++    pub fn new(
++        response_receiver: Receiver<VcpuResponse>,
++        _vcpu_thread: thread::JoinHandle<()>,
++    ) -> Self {
++        Self { response_receiver }
++    }
++
++    pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
++        &self.response_receiver
++    }
++}
++
++enum VcpuEmulation {
++    Handled,
++    Halted,
++    Stopped,
++}
+diff --git a/src/whp/src/lib.rs b/src/whp/src/lib.rs
+index 735c290..d01bc5b 100644
+--- a/src/whp/src/lib.rs
++++ b/src/whp/src/lib.rs
+@@ -14,6 +14,7 @@ use windows_sys::Win32::System::Hypervisor::{
+     WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
+     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
+     WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
++    WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE,
+     WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
+     WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent,
+     WHvCapabilityCodeProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor,
+@@ -30,7 +31,7 @@ use windows_sys::Win32::System::Hypervisor::{
+     WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
+     WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
+     WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
+-    WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
++    WHvSetupPartition, WHvTranslateGva, WHvX64LocalApicEmulationModeXApic,
+     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
+     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+ };
+@@ -57,6 +58,7 @@ pub enum Error {
+     IoEmulation(i32),
+     MmioEmulation(i32),
+     EmulationFailed(u32),
++    TranslateGva(i32),
+ }
+ 
+ impl Display for Error {
+@@ -125,6 +127,7 @@ impl Display for Error {
+                     "Instruction emulation failed: {reason} (status 0x{status:08x})"
+                 )
+             }
++            TranslateGva(hr) => write!(f, "WHvTranslateGva failed: HRESULT 0x{hr:08x}"),
+         }
+     }
+ }
+@@ -893,6 +896,13 @@ impl WhpVcpu {
+         self.exit_context.VpContext.Rip
+     }
+ 
++    /// RFLAGS at the time of the VM exit. Callers use bit 9 (IF) to tell a HLT
++    /// the guest can still be woken from by an interrupt apart from one it can
++    /// never be woken from.
++    pub fn exit_rflags(&self) -> u64 {
++        self.exit_context.VpContext.Rflags
++    }
++
+     /// Instruction length from the exit context (lower 4 bits of the packed byte).
+     pub fn instruction_length(&self) -> u8 {
+         self.exit_context.VpContext._bitfield & 0x0F
+@@ -965,7 +975,38 @@ impl WhpVcpu {
+         Ok(values.map(|v| unsafe { v.Reg64 }))
+     }
+ 
+-    fn set_whp_registers(
++    /// Slice-based counterpart of [`WhpVcpu::get_registers`], for callers whose
++    /// register count is only known at runtime — notably the instruction
++    /// emulator's `GetVirtualProcessorRegisters` callback, which is handed a
++    /// (pointer, count) pair by WHP.
++    ///
++    /// `names` and `values` must have the same length.
++    pub fn get_whp_registers(
++        &self,
++        names: &[WHV_REGISTER_NAME],
++        values: &mut [WHV_REGISTER_VALUE],
++    ) -> Result<(), Error> {
++        assert_eq!(names.len(), values.len());
++
++        let hr = unsafe {
++            WHvGetVirtualProcessorRegisters(
++                self.vm.partition_handle(),
++                self.index,
++                names.as_ptr(),
++                names.len() as u32,
++                values.as_mut_ptr(),
++            )
++        };
++        if hr != S_OK {
++            Err(Error::GetRegisters(hr))
++        } else {
++            Ok(())
++        }
++    }
++
++    /// Slice-based counterpart of [`WhpVcpu::set_registers`]. See
++    /// [`WhpVcpu::get_whp_registers`] for why the slice form is needed.
++    pub fn set_whp_registers(
+         &self,
+         names: &[WHV_REGISTER_NAME],
+         values: &[WHV_REGISTER_VALUE],
+@@ -1019,6 +1060,43 @@ impl WhpVcpu {
+         self.set_whp_registers(&names, &values)
+     }
+ 
++    /// Walks the guest's page tables to translate a guest *virtual* address to
++    /// a guest *physical* one, returning the result code alongside the GPA.
++    ///
++    /// Note that a non-`WHvTranslateGvaResultSuccess` result code is *not* an
++    /// error at this level: a page fault or a missing page is a legitimate
++    /// answer that the caller has to report back to whoever asked (the
++    /// instruction emulator, in practice). Only a failing HRESULT — i.e. the
++    /// call itself could not be made — becomes an `Err`.
++    ///
++    /// The returned GPA is only meaningful when the result code is
++    /// `WHvTranslateGvaResultSuccess`.
++    // https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvtranslategva
++    pub fn translate_gva(
++        &self,
++        gva: u64,
++        flags: WHV_TRANSLATE_GVA_FLAGS,
++    ) -> Result<(WHV_TRANSLATE_GVA_RESULT_CODE, u64), Error> {
++        let mut result: WHV_TRANSLATE_GVA_RESULT = unsafe { mem::zeroed() };
++        let mut gpa: u64 = 0;
++
++        let hr = unsafe {
++            WHvTranslateGva(
++                self.vm.partition_handle(),
++                self.index,
++                gva,
++                flags,
++                &mut result,
++                &mut gpa,
++            )
++        };
++        if hr != S_OK {
++            return Err(Error::TranslateGva(hr));
++        }
++
++        Ok((result.ResultCode, gpa))
++    }
++
+     pub fn vm(&self) -> &Arc<WhpVm> {
+         &self.vm
+     }
+-- 
+2.53.0
+
