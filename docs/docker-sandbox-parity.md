@@ -122,7 +122,7 @@ website documents.
 | `cp` | Copy between sandbox and host | `cp` |
 | `ports` | Manage port publishing | none |
 | `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | all ten, same spellings; rules are durable and scoped global or per-sandbox |
-| `secret` | `set`, `import`, `ls`, `rm`, `set-custom`; **secrets are keyed by a known service name**, not a free-form label | `secret set/import/adopt/ls/services/rm/reset`; keyed by service name, free-form names still work | P0 | done | The registry landed — see 5a. `import` now means sbx's thing (host environment variables); reading a stored OAuth credential is `adopt`. `services` prints the registry, empty rows included |
+| `secret` | `set`, `import`, `ls`, `rm`, `set-custom`; **secrets are keyed by a known service name**, not a free-form label | `secret set/import/adopt/login/ls/services/rm/reset`; keyed by service name, free-form names still work | P0 | done | The registry landed — see 5a. `import` now means sbx's thing (host environment variables); reading a stored OAuth credential is `adopt`; `login` arms one for the agent to acquire inside a sandbox, which is sbx's `run … -- auth login` made explicit — see 5b. `services` prints the registry, empty rows included |
 | `kit` | (Experimental) Manage kit artifacts | none |
 | `template` | Manage sandbox templates (the image an agent runs in) | none; `-t, --template` flag only |
 | `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
@@ -387,8 +387,9 @@ hosts and no others — see
 | OAuth sentinels | `sentinels.{accessToken,refreshToken}` the guest holds | Same, derived per credential with the provider's real prefix and length | P0 | done | Shape is functional: Claude Code refuses a token that is not `sk-ant-oat01-…` before any request is made. Substitution is restricted to the credential's own headers, so an origin echoing an arbitrary header cannot leak the token back |
 | OAuth token endpoint | `tokenEndpoint.{host,path}` where tokens are refreshed | Same; the flow is terminated and the request **answered**, never forwarded | P0 | done | Boks refreshes on the host and replies with the sentinels the guest already holds. A guest-composed request never reaches the endpoint carrying the real refresh token, and no origin response body has to be buffered or rewritten |
 | OAuth credential file | `credentialFile.{path,template}`, a Go template rendered into the guest | Same, rendered on the host and shared read-only, as the CA is | P1 | done | The template is executed with a data struct that has no field a real token could occupy. Read-only is safe because a refresh answered by boks returns the same sentinels, so an agent rewriting the file writes back what is there |
-| OAuth response fields / passthrough | `responseFields` overrides, `passthrough` skips masking | `responseFields` equivalent; no `passthrough` | P2 | partial | Masking is unnecessary here: no response carrying a real token ever travels toward the guest, because the refresh is answered rather than relayed |
+| OAuth response fields / passthrough | `responseFields` overrides, `passthrough` skips masking | `responseFields` equivalent; masking on the acquisition path only, and no way to turn it off | P2 | done | `passthrough` is very likely this same distinction seen from the other side: a *relayed* response is the only kind that needs masking, and a *refresh* is composed from sentinels so there is nothing to mask. Boks masks by value rather than by field — a token echoed anywhere is replaced — and a body it cannot fully mask fails the exchange instead |
 | OAuth adoption | Not documented; sbx obtains it by logging in inside the sandbox | `boks secret adopt`, reading what the agent already wrote | P0 | partial | macOS Keychain via the `security` CLI, `~/.claude/.credentials.json` elsewhere, or a document on stdin. The Keychain read is **unexecuted** — written on Linux. Renamed from `import`, which now means what sbx's means |
+| OAuth acquisition in the sandbox | `sbx run claude … -- auth login`: the real client performs its own OAuth inside the sandbox and sbx ends up holding the token | `boks secret login SERVICE` arms a credential, `boks run claude -- auth login` fills it in | P0 | partial | The initial exchange is **relayed and captured** — the opposite of the refresh path, because the authorization code exists only inside the guest — and the response is rewritten to sentinels before the guest sees a byte. Verified against a local origin, with the exchange shape copied from the real Claude Code. **Not durable through a sandbox**: the network supervisor has no store passphrase, so the login lasts as long as the sandbox. Needs no port publishing — the flow is paste-a-code, confirmed on the real binary |
 | OAuth precedence | An OAuth credential beats an API key for the same service | Same, decided on destinations rather than names | P1 | done | A login adopted as `claude-code` and a key stored as `anthropic` both end at api.anthropic.com; the key is dropped and the run says so. A key with any host of its own is kept |
 | OAuth refresh durability | Not documented | Durable through `boks proxy`; in-sandbox rotation is not | P1 | partial | The network supervisor never learns the store passphrase, so a refresh it performs lasts as long as the sandbox. With a provider that rotates refresh tokens the stored copy then goes stale and must be re-imported |
 | HTTPS injection | Supported | Supported, by terminating TLS for the configured hosts only | P0 | done | Demonstrated: origin received the real secret, client had sent only a placeholder. Every other host stays a blind tunnel |
@@ -401,8 +402,9 @@ hosts and no others — see
 | Never logged | Not documented | Values redacted in every printed and serialised form | P1 | done | Enforced by the `Value` type and asserted by tests |
 ### 5a. Secrets are keyed by service, and that is the whole UX
 
-Read from real `sbx secret --help` and `sbx secret set/import --help`. **Done**, apart from
-`--oauth`; what follows is what was found and what was built from it.
+Read from real `sbx secret --help` and `sbx secret set/import --help`. **Done**, apart from the
+host-side `--oauth`, which is refused on purpose; the in-sandbox acquisition it exists beside
+is in §5b. What follows is what was found and what was built from it.
 
 sbx does not ask the user how to inject a credential. It has a **fixed list of known
 services** — anthropic, cursor, droid, github, google, groq, mistral, nebius, openai,
@@ -439,17 +441,18 @@ the header was the problem.
 
 Three further findings from the same output, and what each became:
 
-- **Two OAuth acquisition paths, neither of which is ours.** `sbx secret set -g openai --oauth`
-  runs the flow host-side; `sbx run claude … -- auth login` drives it through the agent inside
-  the sandbox. Boks adopts a credential the host already has, which sbx does not appear to do
-  at all. Ours works from an existing login; theirs works on a fresh machine. `--oauth` is
-  recognised by `boks secret set` and refused **with the reason**: every flow that could
-  acquire a token — authorization code with PKCE, or the device flow — begins by identifying
-  the program to the vendor with a client id issued to a registered application, and Boks is
-  registered with none of them. Of the nine configured services only GitHub and Google publish
-  a flow a third party could drive at all, and both start with that client id. Reusing another
-  product's client id would work and is not something Boks will do on a user's behalf. See the
-  row below.
+- **Two OAuth acquisition paths, and Boks now has both of the ones that matter.**
+  `sbx secret set -g openai --oauth` runs the flow host-side; `sbx run claude … -- auth login`
+  drives it through the agent inside the sandbox. The host-side one is refused here and stays
+  refused — every flow that could acquire a token begins by identifying the program to the
+  vendor with a client id issued to a registered application, and Boks is registered with none
+  — and it is worth noticing that sbx's is documented "openai/global only", which is what
+  holding exactly *one* registration looks like. **The in-sandbox one is not blocked by any of
+  that**, because the client id belongs to the agent, and Boks was already terminating TLS for
+  the endpoint it uses. So `boks secret login` arms a credential and `boks run claude -- auth
+  login` fills it in, with the initial exchange relayed and captured and the response rewritten
+  to sentinels; and `boks secret adopt`, which sbx does not appear to have at all, still covers
+  the machine you already logged in on. See §5b and the rows below.
 - **OAuth takes precedence over an API key** for the same service at runtime, and `secret
   import` deliberately skips a service that already has one rather than silently shadowing it.
   Both copied. `secret.PreferOAuth` decides precedence on *destinations* rather than names,
@@ -468,13 +471,66 @@ Three further findings from the same output, and what each became:
 | Global vs per-sandbox scope | `-g` stores globally; a sandbox-scoped variant exists | Global only: a stored credential applies to every sandbox | P2 | partial | Scoping a credential to one sandbox is not implemented. `--no-secrets` is the only narrowing, and it is all-or-nothing |
 | Registry secrets | `sbx secret set --registry ghcr.io --password-stdin`, with three scopes: host-only (template and kit pulls, never injected), global (injected by the proxy into every new sandbox's registry login), or one sandbox | None | P2 | none | A category Boks does not have at all. Note the property worth copying: the credential authenticates the pull **without entering the sandbox filesystem** |
 | `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set SERVICE` | P1 | done | Reads from stdin by default; `--value` documented as visible in the process list. A known service resolves to its rule and the command prints what the sandbox will do with it; a known service with no rule is refused by name, because storing it would leave a credential nothing ever attaches |
-| `secret set --oauth` | Runs an OAuth flow from the host | Refused, with the reason | P2 | none | Not a missing afternoon's work: every flow starts with a client id the vendor issues to a registered application, and Boks holds none. Only GitHub and Google publish a flow a third party could drive at all. Reusing another product's client id would work and is declined. `boks secret adopt` covers the case on a machine you have already logged in on, and nothing covers a fresh one |
+| `secret set --oauth` | Runs an OAuth flow from the host | Refused, with the reason, and the refusal now names two routes that work | P2 | none | Still not a missing afternoon's work: every host-side flow starts with a client id the vendor issues to a registered application, and Boks holds none. Note that sbx's `--oauth` is documented "openai/global only", which is what holding exactly one registered client id looks like. `boks secret adopt` covers a machine you have logged in on; `boks secret login` + `boks run claude -- auth login` covers a fresh one, by letting the agent use *its* client id |
+| `secret login` | Not a command; the equivalent is `sbx run claude … -- auth login` with no setup | `boks secret login SERVICE` arms the credential first | P1 | done | Boks makes the arming explicit rather than doing it for every run of an agent, because arming a credential is what decides that boks decrypts that host's traffic — the same bargain every credential rule makes, struck where the user can see it |
 | `secret import` | Walks host environment variables, Y/n each, last-4 preview, `--all`/`--force`/`--dry-run` | Same, built on the registry | P1 | done | Every configured service knows the variable its vendor's tooling reads. The last-4 preview is the only fragment of a credential Boks prints anywhere; a value under 12 characters gets none |
 | `secret ls` | Lists names | Name, kind and destination | P1 | done | Shows which credentials are logins and which are keys, and where each is attached. Never a value |
 | Lost passphrase | Not applicable: sbx keeps credentials in an account-backed store | `boks secret reset --force` deletes the store without decrypting it | P1 | done | Every other subcommand has to decrypt, `rm` included, so the remedy for a forgotten passphrase used to be the command that had just failed. The failure now names the file, the cost and this command. `secret ls` still needs the passphrase: the names are inside the envelope, and a plaintext index of which services you hold credentials for is worth denying an attacker |
 | Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | partial | The mechanism exists (basic auth with a username, over an intercepted flow); never exercised against a real Git host |
 | SSH agent forwarding | Supported; SSH key signing works, GPG/S-MIME do not | Host agent socket forwarding | P2 | none | |
-| OAuth device login | Agent login inside sandbox; session tokens stay on host | Out of scope near-term | P2 | none | |
+| OAuth device login | Agent login inside sandbox; session tokens stay on host | Implemented as acquisition, not as a device flow | P1 | partial | See §5b. No device flow is involved: the agent runs its own authorization-code-with-PKCE login and boks keeps the result |
+
+### 5b. Acquisition: the login happens in the sandbox, the token does not leave the host
+
+The gap `boks secret adopt` cannot close is a **fresh machine**, where there is no login to
+read. sbx closes it with `sbx run claude … -- auth login`, and the reason that works for a
+product with no Anthropic registration is that it is not the product logging in — it is the
+agent, with the agent's own client id, which is legitimate because it *is* that program. Boks
+does the same, and most of the machinery was already there.
+
+**What was determined first, because it decides whether this is possible at all.** Two login
+shapes are common and they behave very differently in a sandbox: paste-a-code works today,
+while a localhost redirect needs the browser on the host to reach a listener in the guest —
+which without port publishing never arrives. Claude Code 2.1.228 was driven headless to find
+out. It uses **paste-a-code**: `redirect_uri` is a vendor-hosted page, `code=true` selects the
+paste flow, and the binary contains no loopback callback at all. So this needs no ports, and
+the fact that sbx *has* `sbx ports` is not the reason its version of this works. See
+[verification.md](verification.md#the-real-claude-code-login-flow-observed).
+
+**The design, in one sentence:** an armed credential — sentinels, endpoint, destinations, no
+tokens — makes the proxy relay the *first* token exchange it sees for that endpoint, keep the
+pair out of the response, and hand the guest the same document with sentinels in it.
+
+The thing to keep straight is that this is the **opposite** of the refresh path, which was
+built earlier and stays as it was:
+
+| | refresh | acquisition |
+|---|---|---|
+| the guest's request | drained and discarded, never forwarded | relayed verbatim |
+| why | Boks can compose the request itself from the stored refresh token | the authorization code and PKCE verifier came from a redirect only the guest saw |
+| the response | composed by Boks from sentinels | the origin's, with the tokens replaced |
+| the body | never buffered | buffered, bounded, and refused if it cannot be masked |
+| how often | every time | once, and never again for that credential |
+
+Which one applies is read from the **stored record**, never from the request: a credential
+relays only while it holds no token, and the first token closes the door. A guest cannot ask
+for the relay path and cannot re-open it.
+
+Docker's v2 grammar documents `passthrough: boolean to skip sentinel masking` on its `oauth`
+block. That is very likely this same distinction from the other side — a relayed response is
+the only kind there is anything to mask *in* — and Boks deliberately has no equivalent switch.
+
+**Two things this does not do**, both worth stating rather than discovering:
+
+- **It is not durable through a sandbox.** The network supervisor never learns the store's
+  passphrase, so a login it captures lasts as long as that sandbox. This is the same
+  limitation `internal/secret/memory.go` already records for refresh, and for acquisition it
+  is the sharper one: it is exactly the fresh-machine story the feature exists for. The
+  writeback channel that would fix it is named there and is not built.
+- **It captures the exchange it can see.** A guest reaching a token endpoint Boks is not
+  intercepting keeps what it gets. That makes the recorded endpoint host load-bearing, which
+  is why it was read off the binary — and why the correction from `console.anthropic.com` to
+  `platform.claude.com` is a security fix rather than a tidy-up.
 
 ## 6. Docker inside the sandbox
 

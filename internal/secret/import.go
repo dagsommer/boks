@@ -205,8 +205,19 @@ var profiles = map[string]OAuthProfile{
 	"claude-code": {
 		Name:        "claude-code",
 		Description: "Claude Code's Claude.ai subscription login (OAuth), from the macOS Keychain or its own credential file",
+		// Observed, not assumed — and it moved. Claude Code 2.1.228's own binary contains
+		// `https://platform.claude.com/v1/oauth/token` and no occurrence of
+		// console.anthropic.com at all, and a login driven against a stand-in origin sent
+		// exactly `POST /v1/oauth/token` with `Host: platform.claude.com`. See
+		// docs/verification.md.
+		//
+		// Getting this host wrong is not a cosmetic error under the acquisition path in
+		// acquire.go: interception is decided per host, so a record naming a host the agent
+		// does not talk to leaves the real exchange in an untouched tunnel — the login
+		// succeeds and the **guest** ends up holding the token. An older Claude Code that
+		// still uses console.anthropic.com needs `--token-url` to say so.
 		TokenEndpoint: Endpoint{
-			Host: "console.anthropic.com",
+			Host: "platform.claude.com",
 			Path: "/v1/oauth/token",
 		},
 		ClientID:      claudeCodeClientID,
@@ -318,26 +329,18 @@ func Import(ctx context.Context, profile OAuthProfile, src CredentialSource, ser
 	return profile.Record(service, tokens)
 }
 
-// Record turns imported tokens into the record the store holds, minting the sentinels.
-func (p OAuthProfile) Record(service string, tokens ImportedTokens) (OAuthRecord, error) {
-	if service == "" {
-		service = p.Name
-	}
-	if tokens.Access == "" {
-		return OAuthRecord{}, errors.New("the credential has no access token")
-	}
+// shape builds everything about a record except the tokens: the destinations, the endpoint,
+// and the sentinels the guest will hold. It is shared by the two ways a credential arrives —
+// adopted from a login already on this machine, or armed for one that has not happened yet —
+// so the two cannot drift into producing differently shaped credentials for one provider.
+func (p OAuthProfile) shape(service string) OAuthRecord {
 	length := p.SentinelLength
 	if length == 0 {
 		length = 64
 	}
-	r := OAuthRecord{
+	return OAuthRecord{
 		V:               OAuthRecordVersion,
 		Service:         service,
-		AccessToken:     tokens.Access,
-		RefreshToken:    tokens.Refresh,
-		ExpiresAt:       tokens.ExpiresAt,
-		Scopes:          tokens.Scopes,
-		Subscription:    tokens.Subscription,
 		TokenHost:       p.TokenEndpoint.Host,
 		TokenPath:       p.TokenEndpoint.Path,
 		ClientID:        p.ClientID,
@@ -350,6 +353,45 @@ func (p OAuthProfile) Record(service string, tokens ImportedTokens) (OAuthRecord
 		FilePath:        p.FilePath,
 		FileTemplate:    p.FileTemplate,
 	}
+}
+
+// Arm builds the record for a credential that does not exist yet and will be acquired by the
+// agent's own login inside a sandbox.
+//
+// The sentinels are minted now rather than at capture time, and that is the point: they are
+// derived from the service name, so the credential file and the environment variable a
+// sandbox is prepared with are the same before the login as after it. Nothing has to be
+// re-rendered when the tokens arrive, and a sandbox already running when the login completes
+// keeps working with what it was given.
+//
+// The record it returns holds no token and is marked Pending, which is the only state in
+// which the proxy will relay a token request. See acquire.go.
+func (p OAuthProfile) Arm(service string) (OAuthRecord, error) {
+	if service == "" {
+		service = p.Name
+	}
+	r := p.shape(service)
+	r.Pending = true
+	if err := r.Validate(); err != nil {
+		return OAuthRecord{}, err
+	}
+	return r, nil
+}
+
+// Record turns imported tokens into the record the store holds, minting the sentinels.
+func (p OAuthProfile) Record(service string, tokens ImportedTokens) (OAuthRecord, error) {
+	if service == "" {
+		service = p.Name
+	}
+	if tokens.Access == "" {
+		return OAuthRecord{}, errors.New("the credential has no access token")
+	}
+	r := p.shape(service)
+	r.AccessToken = tokens.Access
+	r.RefreshToken = tokens.Refresh
+	r.ExpiresAt = tokens.ExpiresAt
+	r.Scopes = tokens.Scopes
+	r.Subscription = tokens.Subscription
 	if err := r.Validate(); err != nil {
 		return OAuthRecord{}, err
 	}

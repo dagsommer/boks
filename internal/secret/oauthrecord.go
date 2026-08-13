@@ -35,6 +35,17 @@ type OAuthRecord struct {
 	Scopes       []string `json:"scopes,omitempty"`
 	Subscription string   `json:"subscription_type,omitempty"`
 
+	// Pending marks a credential that has been *armed* and not yet acquired: the shape is
+	// known, the sentinels are minted, and there are no tokens behind them.
+	//
+	// It is a separate flag rather than "the access token is empty" because the two say
+	// different things to a reader. An empty token with no flag is a corrupt record; an empty
+	// token with the flag is the one state in which the proxy is permitted to *relay* a
+	// token request instead of answering it. See acquire.go — that permission is the whole
+	// security-relevant difference between the two paths, so it is written down rather than
+	// inferred.
+	Pending bool `json:"pending,omitempty"`
+
 	TokenHost string   `json:"token_host"`
 	TokenPath string   `json:"token_path"`
 	ClientID  string   `json:"client_id,omitempty"`
@@ -90,6 +101,9 @@ func (r OAuthRecord) Tokens() OAuthTokens {
 
 // WithTokens returns a copy carrying a rotated pair. Everything else is unchanged: a refresh
 // rotates values, never configuration.
+//
+// It also clears Pending, which is what makes acquisition a one-way door: the moment a record
+// holds a token, the proxy stops being allowed to relay a token request for it.
 func (r OAuthRecord) WithTokens(t OAuthTokens) OAuthRecord {
 	out := r
 	out.AccessToken = t.Access.Reveal()
@@ -97,6 +111,9 @@ func (r OAuthRecord) WithTokens(t OAuthTokens) OAuthRecord {
 	out.ExpiresAt = 0
 	if !t.Expiry.IsZero() {
 		out.ExpiresAt = t.Expiry.UnixMilli()
+	}
+	if out.AccessToken != "" {
+		out.Pending = false
 	}
 	return out
 }
@@ -157,8 +174,11 @@ func (r OAuthRecord) Credential() (Credential, error) {
 // Validate checks a record before it is stored, so that a credential that could never work
 // is refused at import time rather than inside a request an hour later.
 func (r OAuthRecord) Validate() error {
-	if r.AccessToken == "" {
+	if r.AccessToken == "" && !r.Pending {
 		return errors.New("the oauth credential has no access token")
+	}
+	if r.AccessToken != "" && r.Pending {
+		return errors.New("the oauth credential is marked pending but already holds a token")
 	}
 	if _, err := r.Credential(); err != nil {
 		return err
