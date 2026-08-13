@@ -202,7 +202,9 @@ func TestCloneCommandPassesPathsAsArguments(t *testing.T) {
 	if argv[4] != "1000:1000" {
 		t.Errorf("argv[4] = %q, want the owner", argv[4])
 	}
-	if strings.Contains(argv[2], "rm -rf") {
+	// The script must not contain the destination at all: if it did, the quote in it
+	// would end a string and the rest would be commands.
+	if strings.Contains(argv[2], "/home/a b/") {
 		t.Error("the destination was interpolated into the script")
 	}
 }
