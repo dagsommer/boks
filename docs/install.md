@@ -92,11 +92,12 @@ that needs a hypervisor, which the machine that built them does not have.
 `$(brew --prefix)/lib` is already on the shim's own search path on Apple silicon. Any
 directory on containerd's `PATH` or on `LIBKRUN_PATH` works too — the shim scans both.
 
-> [!WARNING]
-> **`boks doctor` does not check for these two files.** It checks the shim, its
-> entitlement, libkrun, containerd and `mkfs.erofs` — so a machine without them reports
-> ready and then fails at boot with `nerdbox-kernel not found in PATH or LIBKRUN_PATH`.
-> Until `doctor` grows a check for the guest assets, this paragraph is the check.
+> [!NOTE]
+> `boks doctor` checks for these two files, as `guest image`, and scans the same `PATH`
+> and `LIBKRUN_PATH` the shim does. It used to report ready on a machine that then failed
+> at boot with `nerdbox-kernel not found in PATH or LIBKRUN_PATH`; a `fail` on that line
+> now says so up front. One caveat remains: `doctor` scans *your* `PATH`, and what
+> matters is the containerd daemon's.
 
 ### What "installed" gets you
 
@@ -232,8 +233,9 @@ snapshotter          warn   could not list snapshotters
 snapshotter tools    ok     /usr/bin/mkfs.erofs
 vm runtime           fail   containerd-shim-nerdbox-v1 not found on PATH
 hypervisor library   warn   libkrun.so.1 not found
+guest image          fail   nerdbox-kernel-arm64 and nerdbox-rootfs.erofs not found
 
-Not ready: virtualization, containerd, vm runtime must be fixed before sandboxes can start.
+Not ready: virtualization, containerd, vm runtime, guest image must be fixed before sandboxes can start.
 ```
 
 ## Verifying what you downloaded
