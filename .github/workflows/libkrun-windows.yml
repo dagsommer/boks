@@ -169,7 +169,17 @@ jobs:
           dll=target/x86_64-pc-windows-msvc/release/krun.dll
           test -f "$dll" || { echo "no krun.dll was produced" >&2; exit 1; }
           echo "krun.dll: $(wc -c <"$dll") bytes"
-          for sym in krun_create_ctx krun_add_disk2 krun_add_net_unixstream krun_set_log_level; do
+          # ALL NINETEEN symbols nerdbox binds, not a sample. Its loader reflects over the
+          # whole binding table and resolves every one eagerly, so the DLL either satisfies
+          # all of them or fails to load — there is no partial success to sample for. This
+          # list is every `C:"krun_..."` tag on the libkrun struct in nerdbox's
+          # internal/vm/libkrun/krun.go; regenerate it from that file if nerdbox changes.
+          #
+          # Measured on a real Windows 11 machine on 2026-08-13: 18 of 19 resolved, and the
+          # missing one — krun_set_console_output, gated behind an unrelated `aws-nitro`
+          # feature — was enough on its own to stop nerdbox loading the DLL. A four-symbol
+          # sample had reported everything fine.
+          for sym in krun_add_disk krun_add_disk2 krun_add_net_unixgram krun_add_net_unixstream krun_add_virtiofs3 krun_add_vsock_port2 krun_create_ctx krun_free_ctx krun_get_shutdown_eventfd krun_init_log krun_set_console_output krun_set_exec krun_set_gpu_options krun_set_gvproxy_path krun_set_kernel krun_set_log_level krun_set_net_mac krun_set_vm_config krun_start_enter; do
             if grep -qa "$sym" "$dll"; then
               echo "  export present: $sym"
             else
