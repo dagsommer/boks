@@ -1,7 +1,7 @@
 From 8fe791569a4ec5268279d9b6e7fd2b2db25d8cf4 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:37:53 +0200
-Subject: [PATCH 10/29] windows: refuse krun_setuid/krun_setgid instead of
+Subject: [PATCH 10/30] windows: refuse krun_setuid/krun_setgid instead of
  recording a dead uid
 
 Windows has no setuid/setgid. Privilege reduction there means constructing a
