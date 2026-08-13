@@ -295,6 +295,77 @@ func ReadDecisions(r io.Reader, n int) ([]Decision, error) {
 	return out, nil
 }
 
+// Filter narrows a decision log to the part someone is asking about.
+//
+// The log is one file for the whole machine, which is right — decisions from a sandbox that
+// no longer exists are exactly what you want after a run fails — but it makes the unfiltered
+// view a firehose: every sandbox anyone has ever run, back to whenever the file was created.
+// Both fields are already on every decision, so this is a display concern rather than a
+// change to what is recorded.
+type Filter struct {
+	// Sandbox keeps only decisions from this sandbox. Empty keeps all of them.
+	Sandbox string
+	// Since keeps only decisions at or after this instant. The zero time keeps all.
+	Since time.Time
+}
+
+// Match reports whether a decision survives the filter.
+func (f Filter) Match(d Decision) bool {
+	if f.Sandbox != "" && d.Sandbox != f.Sandbox {
+		return false
+	}
+	if !f.Since.IsZero() && d.Time.Before(f.Since) {
+		return false
+	}
+	return true
+}
+
+// Empty reports whether the filter would keep everything.
+func (f Filter) Empty() bool { return f.Sandbox == "" && f.Since.IsZero() }
+
+// Apply returns the decisions the filter keeps, in order.
+func (f Filter) Apply(decisions []Decision) []Decision {
+	if f.Empty() {
+		return decisions
+	}
+	out := make([]Decision, 0, len(decisions))
+	for _, d := range decisions {
+		if f.Match(d) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// ParseSince reads the two spellings of "how far back": a duration before now ("2h", "90m",
+// "45s") and an absolute time (RFC 3339, or a plain date).
+//
+// A duration is what someone debugging a run reaches for, and an absolute time is what
+// someone comparing against another record has. Both are accepted because guessing which one
+// a string is meant to be is easy and refusing one of them is not.
+//
+// A negative duration is taken as its magnitude: "-2h" and "2h" both mean two hours ago,
+// since there is no sense in which a decision log has entries in the future.
+func ParseSince(s string, now time.Time) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		if d < 0 {
+			d = -d
+		}
+		return now.Add(-d), nil
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot read %q as a time: use a duration such as 30m or 2h, "+
+		"or a time such as 2026-08-13 or 2026-08-13T09:30:00Z", s)
+}
+
 // Aggregate is a set of decisions that were, for a reader's purposes, the same decision:
 // one destination, one mode, one outcome, one reason.
 type Aggregate struct {

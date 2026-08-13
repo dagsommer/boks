@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
@@ -223,6 +224,69 @@ func TestPolicyLogReadsDecisions(t *testing.T) {
 	}
 }
 
+// TestPolicyLogFilters: the log is a global firehose across every sandbox ever run, and it
+// had only --limit and --raw. A tester debugging one run was reading another sandbox's
+// traffic from four hours earlier.
+func TestPolicyLogFilters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	sink, err := policy.NewFileSink(path)
+	if err != nil {
+		t.Fatalf("NewFileSink: %v", err)
+	}
+	old := time.Now().Add(-4 * time.Hour)
+	for _, d := range []policy.Decision{
+		{Time: old, Type: policy.TypeNetwork, Host: "stale.test", Port: 443, Sandbox: "other", Reason: "denied"},
+		{Time: time.Now(), Type: policy.TypeNetwork, Host: "wanted.test", Port: 443, Sandbox: "web", Reason: "denied"},
+		{Time: time.Now(), Type: policy.TypeNetwork, Host: "noise.test", Port: 443, Sandbox: "other", Reason: "denied"},
+	} {
+		sink.Record(d)
+	}
+	sink.Close()
+
+	out, _, err := runCLI(t, "", "policy", "log", "--file", path, "--sandbox", "web")
+	if err != nil {
+		t.Fatalf("policy log --sandbox: %v", err)
+	}
+	if !strings.Contains(out, "wanted.test") || strings.Contains(out, "noise.test") || strings.Contains(out, "stale.test") {
+		t.Errorf("--sandbox did not narrow to one sandbox:\n%s", out)
+	}
+
+	out, _, err = runCLI(t, "", "policy", "log", "--file", path, "--since", "1h")
+	if err != nil {
+		t.Fatalf("policy log --since: %v", err)
+	}
+	if strings.Contains(out, "stale.test") {
+		t.Errorf("--since 1h kept a decision from four hours ago:\n%s", out)
+	}
+	if !strings.Contains(out, "wanted.test") || !strings.Contains(out, "noise.test") {
+		t.Errorf("--since 1h dropped decisions inside the window:\n%s", out)
+	}
+
+	// A filter that matches nothing has to say so as a filter result, or "no decisions"
+	// reads as "nothing was recorded" and sends the user looking for the wrong bug.
+	out, _, err = runCLI(t, "", "policy", "log", "--file", path, "--sandbox", "ghost")
+	if err != nil {
+		t.Fatalf("policy log --sandbox ghost: %v", err)
+	}
+	if !strings.Contains(out, "for sandbox ghost") || !strings.Contains(out, "the filter excluded") {
+		t.Errorf("an empty filter result does not say it was filtered:\n%s", out)
+	}
+
+	// The limit applies to what survived the filter, not to what was read: tailing first
+	// would throw away the decision the filter was looking for.
+	out, _, err = runCLI(t, "", "policy", "log", "--file", path, "--sandbox", "web", "--limit", "1")
+	if err != nil {
+		t.Fatalf("policy log --sandbox --limit: %v", err)
+	}
+	if !strings.Contains(out, "wanted.test") {
+		t.Errorf("--limit was applied before the filter:\n%s", out)
+	}
+
+	if _, _, code := mainExitCode(t, "policy", "log", "--file", path, "--since", "yesterday"); code != 2 {
+		t.Errorf("an unreadable --since exited %d, want 2", code)
+	}
+}
+
 func TestSecretRoundTripThroughCLI(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(secret.PassphraseEnv, "test-passphrase")
@@ -271,6 +335,48 @@ func TestSecretRequiresAPassphrase(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), secret.PassphraseEnv) {
 		t.Errorf("error %q should name the environment variable", err)
+	}
+}
+
+// `-t` means --template on run and --tty on exec, and that is not going to change: both
+// spellings are sbx's. What has to change is what happens when someone types Docker's `-it`
+// at `boks run`, which used to fail two different ways — `-it` with an unhelpful "unknown
+// shorthand flag: 'i'", and `-ti` not failing at all, because it set --template to "i" and
+// sent the user off to debug a missing image.
+func TestDockerTerminalFlagsOnRunAreExplained(t *testing.T) {
+	for _, arg := range []string{"-it", "-ti", "-i"} {
+		out, errOut, code := mainExitCode(t, "run", arg, ".")
+		if code != 2 {
+			t.Errorf("boks run %s . exited %d, want 2", arg, code)
+		}
+		// The answer has to name both halves of the confusion: what -t is here, and
+		// where a terminal actually comes from.
+		for _, want := range []string{"--template", "boks exec -it", "no -i or -t terminal flags"} {
+			if !strings.Contains(errOut, want) {
+				t.Errorf("boks run %s: the message does not say %q:\n%s", arg, want, errOut)
+			}
+		}
+		if strings.Contains(out, "\n") {
+			t.Errorf("boks run %s wrote to stdout: %q", arg, out)
+		}
+	}
+
+	// `create` takes the same flags as `run` and has the same trap.
+	if _, errOut, code := mainExitCode(t, "create", "-it", "."); code != 2 || !strings.Contains(errOut, "--template") {
+		t.Errorf("boks create -it exited %d:\n%s", code, errOut)
+	}
+
+	// The flags this guard is *not* about must be untouched: -t with a value is the
+	// template flag doing its job, and `exec -it` is the documented way to get a terminal.
+	if _, errOut, code := mainExitCode(t, "run", "-t", "example.com/img:1", "--help"); code != 0 {
+		t.Errorf("boks run -t IMAGE --help exited %d:\n%s", code, errOut)
+	}
+	if _, errOut, _ := mainExitCode(t, "exec", "-it", "web", "sh"); strings.Contains(errOut, "no -i or -t terminal flags") {
+		t.Errorf("the guard reached into 'exec', where -it is real:\n%s", errOut)
+	}
+	// And nothing after `--` is ours: an agent may have its own -i.
+	if _, errOut, _ := mainExitCode(t, "run", "shell", ".", "--", "-it"); strings.Contains(errOut, "no -i or -t terminal flags") {
+		t.Errorf("the guard reached past `--` into the agent's own arguments:\n%s", errOut)
 	}
 }
 
