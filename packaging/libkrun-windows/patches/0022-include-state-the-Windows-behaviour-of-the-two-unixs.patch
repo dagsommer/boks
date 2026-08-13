@@ -1,7 +1,7 @@
 From 522da4b8fa54b0ae2d682edf26c4e448cf024ebc Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:30:14 +0200
-Subject: [PATCH 22/31] include: state the Windows behaviour of the two
+Subject: [PATCH 22/32] include: state the Windows behaviour of the two
  unixstream/unixgram entries
 
 The header is the contract consumers compile against, and both functions now
