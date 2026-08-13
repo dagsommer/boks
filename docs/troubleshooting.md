@@ -115,6 +115,33 @@ rather than a surprise — see [Get started](get-started.md#which-platforms-work
 
 ---
 
+## Windows
+
+### `TestReferenceIsCurrent` fails but `docs/cli.md` is not stale
+
+The symptom is peculiar: the test says the reference is out of date, and comparing the two
+files shows **zero line-content differences** — only a length delta exactly equal to the
+number of lines.
+
+That delta is one byte per line, which is the tell. Git's `core.autocrlf=true`, the common
+Windows default, rewrote the file to CRLF on checkout; `cmd/gen-docs` emits LF; the test
+compares bytes. The file is correct and the test is right to fail, but the cause is the
+checkout rather than the content.
+
+A `.gitattributes` pins these files to LF, so a fresh clone does not have the problem. It
+cannot repair a tree that was checked out before it landed, because `git pull` does not
+convert files already on disk. Confirm and fix:
+
+```powershell
+git ls-files --eol docs/cli.md      # `w/crlf` is the problem; `w/lf` is correct
+git add --renormalize .             # rewrites the working tree to match
+```
+
+Reported from a real Windows machine on 2026-08-13, along with the detail that makes it
+worth writing down: the same rewriting applies to `packaging/libkrun-windows/patches/*.patch`,
+which are applied with no fuzz on purpose so that a drifted pin fails loudly. A CRLF rewrite
+there produces the same loud failure for an entirely unrelated reason.
+
 ## WSL2
 
 Boks inside WSL2 is the only route to Boks on a Windows machine today; a native Windows build
