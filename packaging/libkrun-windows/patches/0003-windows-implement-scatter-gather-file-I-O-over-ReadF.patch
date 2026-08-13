@@ -1,0 +1,217 @@
+From ca14949b24917755d5d1af660be5673af62a3f29 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 13:35:42 +0200
+Subject: [PATCH 3/3] windows: implement scatter-gather file I/O over
+ ReadFile/WriteFile
+
+---
+ src/devices/src/virtio/file_traits.rs | 181 ++++++++++++++++++++++++++
+ 1 file changed, 181 insertions(+)
+
+diff --git a/src/devices/src/virtio/file_traits.rs b/src/devices/src/virtio/file_traits.rs
+index e7d2ca1..d08ed81 100644
+--- a/src/devices/src/virtio/file_traits.rs
++++ b/src/devices/src/virtio/file_traits.rs
+@@ -4,14 +4,19 @@
+ 
+ use std::fs::File;
+ use std::io::{Error, ErrorKind, Result};
++#[cfg(unix)]
+ use std::os::unix::io::AsRawFd;
++#[cfg(windows)]
++use std::os::windows::io::AsRawHandle;
+ 
+ #[cfg(feature = "blk")]
+ use imago::io_buffers::{IoVector, IoVectorMut};
+ use vm_memory::VolatileSlice;
+ 
++#[cfg(unix)]
+ use libc::{c_int, c_void, read, readv, size_t, write, writev};
+ 
++#[cfg(unix)]
+ use super::bindings::{off64_t, pread64, preadv64, pwrite64, pwritev64};
+ #[cfg(feature = "blk")]
+ use super::block::device::DiskProperties;
+@@ -220,6 +225,182 @@ impl<T: FileReadWriteAtVolatile + ?Sized> FileReadWriteAtVolatile for &T {
+     }
+ }
+ 
++// Windows has no `iovec`, and its one scatter/gather call, `ReadFileScatter`, demands
++// page-aligned buffers of exactly one page each — the guest's descriptor chains are neither.
++// So the vectored forms loop over the buffers instead. The trait's contract is that a vectored
++// call behaves as a single call with the buffers concatenated, which a loop satisfies; the
++// property it gives up is atomicity against concurrent writers, which no caller here relies on.
++//
++// Offsets go through `OVERLAPPED` rather than a seek, because that is the only positioned read
++// Windows offers and it is what `pread`/`pwrite` mean. The raw pointer is handed to the OS
++// exactly as the Unix path hands it to `read`/`write`: fabricating a `&mut [u8]` over guest
++// memory would be a lie, since the guest may write to it while the call is in flight.
++#[cfg(windows)]
++mod win_io {
++    use std::io::{Error, Result};
++    use windows_sys::Win32::Foundation::HANDLE;
++    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
++    use windows_sys::Win32::System::IO::OVERLAPPED;
++
++    fn overlapped_at(offset: u64) -> OVERLAPPED {
++        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
++        ov.Anonymous.Anonymous.Offset = offset as u32;
++        ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
++        ov
++    }
++
++    /// # Safety
++    /// `buf` must point to at least `len` bytes that stay mapped for the call.
++    pub unsafe fn read_at(h: HANDLE, buf: *mut u8, len: usize, offset: Option<u64>) -> Result<usize> {
++        let len = len.min(u32::MAX as usize) as u32;
++        let mut done: u32 = 0;
++        let ok = match offset {
++            Some(off) => {
++                let mut ov = overlapped_at(off);
++                unsafe { ReadFile(h, buf.cast(), len, &mut done, &mut ov) }
++            }
++            None => unsafe { ReadFile(h, buf.cast(), len, &mut done, std::ptr::null_mut()) },
++        };
++        if ok == 0 {
++            return Err(Error::last_os_error());
++        }
++        Ok(done as usize)
++    }
++
++    /// # Safety
++    /// `buf` must point to at least `len` bytes that stay mapped for the call.
++    pub unsafe fn write_at(
++        h: HANDLE,
++        buf: *const u8,
++        len: usize,
++        offset: Option<u64>,
++    ) -> Result<usize> {
++        let len = len.min(u32::MAX as usize) as u32;
++        let mut done: u32 = 0;
++        let ok = match offset {
++            Some(off) => {
++                let mut ov = overlapped_at(off);
++                unsafe { WriteFile(h, buf.cast(), len, &mut done, &mut ov) }
++            }
++            None => unsafe { WriteFile(h, buf.cast(), len, &mut done, std::ptr::null_mut()) },
++        };
++        if ok == 0 {
++            return Err(Error::last_os_error());
++        }
++        Ok(done as usize)
++    }
++}
++
++#[cfg(windows)]
++macro_rules! volatile_impl {
++    ($ty:ty) => {
++        impl FileReadWriteVolatile for $ty {
++            fn read_volatile(&mut self, slice: VolatileSlice) -> Result<usize> {
++                unsafe {
++                    win_io::read_at(
++                        self.as_raw_handle() as _,
++                        slice.ptr_guard_mut().as_ptr(),
++                        slice.len(),
++                        None,
++                    )
++                }
++            }
++
++            fn read_vectored_volatile(&mut self, bufs: &[VolatileSlice]) -> Result<usize> {
++                let mut total = 0;
++                for b in bufs.iter().filter(|b| !b.is_empty()) {
++                    let n = self.read_volatile(*b)?;
++                    total += n;
++                    if n < b.len() {
++                        break;
++                    }
++                }
++                Ok(total)
++            }
++
++            fn write_volatile(&mut self, slice: VolatileSlice) -> Result<usize> {
++                unsafe {
++                    win_io::write_at(
++                        self.as_raw_handle() as _,
++                        slice.ptr_guard().as_ptr(),
++                        slice.len(),
++                        None,
++                    )
++                }
++            }
++
++            fn write_vectored_volatile(&mut self, bufs: &[VolatileSlice]) -> Result<usize> {
++                let mut total = 0;
++                for b in bufs.iter().filter(|b| !b.is_empty()) {
++                    let n = self.write_volatile(*b)?;
++                    total += n;
++                    if n < b.len() {
++                        break;
++                    }
++                }
++                Ok(total)
++            }
++        }
++
++        impl FileReadWriteAtVolatile for $ty {
++            fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
++                unsafe {
++                    win_io::read_at(
++                        self.as_raw_handle() as _,
++                        slice.ptr_guard_mut().as_ptr(),
++                        slice.len(),
++                        Some(offset),
++                    )
++                }
++            }
++
++            fn read_vectored_at_volatile(
++                &self,
++                bufs: &[VolatileSlice],
++                offset: u64,
++            ) -> Result<usize> {
++                let mut total = 0;
++                for b in bufs.iter().filter(|b| !b.is_empty()) {
++                    let n = self.read_at_volatile(*b, offset + total as u64)?;
++                    total += n;
++                    if n < b.len() {
++                        break;
++                    }
++                }
++                Ok(total)
++            }
++
++            fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
++                unsafe {
++                    win_io::write_at(
++                        self.as_raw_handle() as _,
++                        slice.ptr_guard().as_ptr(),
++                        slice.len(),
++                        Some(offset),
++                    )
++                }
++            }
++
++            fn write_vectored_at_volatile(
++                &self,
++                bufs: &[VolatileSlice],
++                offset: u64,
++            ) -> Result<usize> {
++                let mut total = 0;
++                for b in bufs.iter().filter(|b| !b.is_empty()) {
++                    let n = self.write_at_volatile(*b, offset + total as u64)?;
++                    total += n;
++                    if n < b.len() {
++                        break;
++                    }
++                }
++                Ok(total)
++            }
++        }
++    };
++}
++
++#[cfg(unix)]
+ macro_rules! volatile_impl {
+     ($ty:ty) => {
+         impl FileReadWriteVolatile for $ty {
