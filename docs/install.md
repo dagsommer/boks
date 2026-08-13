@@ -158,7 +158,7 @@ this page will carry the `signed-by` setup lines.
 **Native Windows support is being built, and no sandbox has ever booted on Windows.** Both
 halves of that sentence matter. The work is real and visible: a Windows Hypervisor Platform
 backend for libkrun is being developed in this repository's
-[patch series](../packaging/libkrun-windows/), most of the VMM now compiles for Windows in
+[patch series](../packaging/libkrun-windows/), every libkrun crate now compiles for Windows, and `krun.dll` links on a real Windows runner in
 CI, and upstream nerdbox already builds a Windows shim that loads the VMM as `krun.dll`.
 What remains is the `krun.dll` C API layer and `virtio-net` — the one device Boks'
 enforcement depends on — and until a VM boots there, no Windows binary is shipped: a binary

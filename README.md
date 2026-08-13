@@ -132,8 +132,6 @@ What is **not** done:
 - **No terminal dashboard** for bare `boks`, and no `--kit`. See the CLI surface section of
   the parity matrix. `--clone` exists, but has only been exercised against runc, so nothing
   about it has been measured behind a hypervisor.
-- **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather
-  than exiting 130 silently.
 - **A crashed network supervisor is unrecoverable without a restart.** The running VM does
   not re-attach to a fresh stack on the same socket — measured on 2026-08-12 — so the
   sandbox keeps running with no network at all. Boks now says exactly that when it meets
