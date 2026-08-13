@@ -1,7 +1,7 @@
 From ae42c27b5411ecb19a5145cec4e53e235910e624 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 21:52:18 +0200
-Subject: [PATCH 30/31] windows: stop telling the guest its APIC timer runs at
+Subject: [PATCH 30/32] windows: stop telling the guest its APIC timer runs at
  1 kHz
 
 The first Linux boot on WHP came out with every one of its 78 console

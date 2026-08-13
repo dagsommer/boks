@@ -1,0 +1,36 @@
+From 199295225778c4ca743d1dcf11ff32a76c8dd37a Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 22:15:26 +0200
+Subject: [PATCH 32/32] windows: record what the guest kernel's own config
+ settles about the clock
+
+---
+ src/vmm/src/windows/vstate.rs | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+index 885705c..2f4eb10 100644
+--- a/src/vmm/src/windows/vstate.rs
++++ b/src/vmm/src/windows/vstate.rs
+@@ -261,6 +261,18 @@ impl Vm {
+ /// bundled into an unrelated fix — not least because doing both at once would
+ /// make the next boot's result impossible to attribute.
+ ///
++/// Settled since, by extracting the effective config from the shipped guest
++/// kernel's own `IKCFG` blob rather than reading the config file (which is an
++/// arm64 fragment run through `olddefconfig`, so it says little about x86):
++/// `# CONFIG_HYPERV is not set`, and `CONFIG_HYPERV_TIMER` absent entirely. This
++/// guest has no Hyper-V clocksource to register, so the enlightenments we
++/// advertise reach nothing even if the bit were set — and the second
++/// frozen-clock mechanism feared above cannot fire on this kernel. The same dump
++/// confirms `CONFIG_HZ=250`, the divisor the crystal fix is sized against, and
++/// `CONFIG_HPET_TIMER=y` / `CONFIG_X86_PM_TIMER=y` — both compiled in and both
++/// useless here, since WHP emulates neither, which is why CPUID is the only
++/// channel that can carry a usable timer frequency.
++///
+ /// Everything else in leaf 1, including the APIC ID and topology fields in
+ /// EBX, is passed through. Rewriting those is a change to AP bring-up rather
+ /// than to timekeeping, and is left alone deliberately.
+-- 
+2.53.0
+
