@@ -1,7 +1,7 @@
 From 08bf1787cc9aba6b3cfd68f04d8d1b3e05e9a72e Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:12:02 +0200
-Subject: [PATCH 17/31] windows: implement the host end of a guest-IPC vsock
+Subject: [PATCH 17/32] windows: implement the host end of a guest-IPC vsock
  port over AF_UNIX
 
 `krun_add_vsock_port2()` is called on every nerdbox boot -- port 1025 for ttrpc
