@@ -1,5 +1,6 @@
 # Build artifacts
 /bin/
+/dist/
 *.exe
 
 # Test and coverage output
