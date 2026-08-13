@@ -163,6 +163,13 @@ func (n *Network) Start(ctx context.Context) error {
 	if n.stopped {
 		return errors.New("network: already stopped")
 	}
+	// Refuse early on a platform where nothing can attach a VM to this link, rather than
+	// binding a socket and waiting for a peer that cannot exist. This is the only place
+	// the platform is asked about: the link is a stream now, so the socket, the framing
+	// and the stack are the same code everywhere.
+	if err := vmmSupported(); err != nil {
+		return err
+	}
 
 	dir := filepath.Dir(n.plan.Socket)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -217,35 +224,70 @@ func (n *Network) Stop() error {
 // to be at the other end of the link or the VM's device has nowhere to write. Nothing is
 // wired to the NIC inside the container, so in practice almost nothing arrives; discarding
 // what does is both correct and the smallest possible amount of host code.
+//
+// It does not frame what it reads, and it deliberately does not care: there is no stack
+// behind this socket, so a length prefix is a byte like any other. That is the one place a
+// stream link is simpler than a datagram one.
 type blackhole struct {
-	conn *net.UnixConn
-	done chan struct{}
+	mu       sync.Mutex
+	listener net.Listener
+	conns    map[net.Conn]struct{}
+	stopped  bool
+	done     chan struct{}
 }
 
 func (b *blackhole) start(ctx context.Context, plan Plan, _ *policy.Engine, _ io.Writer) error {
-	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: plan.Socket, Net: "unixgram"})
+	listener, err := net.Listen("unix", plan.Socket)
 	if err != nil {
 		return fmt.Errorf("network: binding the link socket %s: %w", plan.Socket, err)
 	}
-	b.conn = conn
+	b.listener = listener
+	b.conns = map[net.Conn]struct{}{}
 	b.done = make(chan struct{})
 
 	go func() {
 		defer close(b.done)
-		buf := make([]byte, plan.MTU+64)
 		for {
-			if _, _, err := conn.ReadFrom(buf); err != nil {
+			conn, err := listener.Accept()
+			if err != nil {
 				return
 			}
-			// Deliberately dropped. A frame arriving here means the guest emitted
-			// something on an interface it was never wired to.
+			if !b.track(conn) {
+				_ = conn.Close()
+				continue
+			}
+			go func() {
+				defer b.untrack(conn)
+				// Deliberately discarded. A frame arriving here means the
+				// guest emitted something on an interface it was never wired
+				// to, and reading it is only what keeps the VM's device from
+				// blocking on a socket nobody drains.
+				_, _ = io.Copy(io.Discard, conn)
+			}()
 		}
 	}()
 	go func() {
 		<-ctx.Done()
-		_ = conn.Close()
+		_ = b.stop()
 	}()
 	return nil
+}
+
+func (b *blackhole) track(conn net.Conn) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stopped {
+		return false
+	}
+	b.conns[conn] = struct{}{}
+	return true
+}
+
+func (b *blackhole) untrack(conn net.Conn) {
+	b.mu.Lock()
+	delete(b.conns, conn)
+	b.mu.Unlock()
+	_ = conn.Close()
 }
 
 // listen and dial refuse: ModeNone has a link socket, so the VM's NIC has somewhere to
@@ -259,11 +301,26 @@ func (b *blackhole) dial(context.Context, string) (net.Conn, error) {
 	return nil, fmt.Errorf("%w: -net none attaches no stack, so there is nothing to dial", ErrNoNetwork)
 }
 
+// stop closes the socket and every connection on it. It is called both from Network.Stop and
+// from the context watcher, so it has to be safe twice and safe concurrently.
 func (b *blackhole) stop() error {
-	if b.conn == nil {
+	b.mu.Lock()
+	if b.listener == nil || b.stopped {
+		b.mu.Unlock()
 		return nil
 	}
-	err := b.conn.Close()
+	b.stopped = true
+	conns := make([]net.Conn, 0, len(b.conns))
+	for c := range b.conns {
+		conns = append(conns, c)
+	}
+	b.conns = map[net.Conn]struct{}{}
+	b.mu.Unlock()
+
+	err := b.listener.Close()
+	for _, c := range conns {
+		_ = c.Close()
+	}
 	<-b.done
 	if err != nil && !errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("network: closing the link socket: %w", err)
