@@ -123,6 +123,13 @@ contents are never shared.
 One caveat inherited from nerdbox: bind-mounting a *single file* shares its **parent
 directory** with the VM. Boks therefore only mounts directories for workspaces.
 
+The one host where "the host path verbatim" is not a path at all is Windows, since
+`C:\Users\dag\src\foo` has no Linux reading. There the workspace is mounted at a reversible
+translation of its host path instead — `/c/Users/dag/src/foo`, the convention Docker Sandboxes
+and the rest of the Docker family use. `internal/workspace/guestpath.go` is the only code that
+knows this, and `docs/windows.md` section 4 is the reasoning. Nothing about it has run on
+Windows; Boks has no VMM there.
+
 *(verified 2026-08-11: `boks run shell /private/tmp/boksprobe/deep/a/b/c/project -- pwd` printed
 that exact path inside the guest; the intermediate directories were created automatically
 and each contained only the next component of the path, nothing from the host.)*

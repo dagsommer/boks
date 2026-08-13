@@ -3,6 +3,7 @@ package policy
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -76,7 +77,7 @@ func TestStoreIsWrittenAsText(t *testing.T) {
 // TestStorePermissions: the store records which destinations this machine permits, and a
 // policy other users can rewrite is not a policy.
 func TestStorePermissions(t *testing.T) {
-	if os.Getenv("GOOS") == "windows" {
+	if runtime.GOOS == "windows" {
 		t.Skip("POSIX permissions")
 	}
 	s := tempStore(t)
