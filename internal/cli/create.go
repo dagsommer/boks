@@ -47,6 +47,9 @@ Agents:
 		if err := dev.requireIsolation(env.Stderr); err != nil {
 			return err
 		}
+		if err := netFlags.checkPublish(); err != nil {
+			return err
+		}
 
 		inv, err := flags.resolve(ctx, agents, positional, env)
 		if err != nil {
@@ -75,7 +78,11 @@ Agents:
 		// sandbox that did not carry its own would come up under the default preset
 		// instead of the one it was created with.
 		record := netFlags.sandboxRecord()
-		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record)
+		// `create` starts nothing, so nothing is bound here: the specifications are
+		// recorded on the container and honoured when `run`, `exec` or `start` brings
+		// the sandbox up. They are still validated, because a typo should cost a message
+		// rather than a sandbox that fails to start tomorrow.
+		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, netFlags.publish)
 		if err != nil {
 			return err
 		}
@@ -87,6 +94,7 @@ Agents:
 			return err
 		}
 		cfg.Policy = record
+		cfg.Ports = netFlags.publish
 		cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
 		cfg.Env = append(cfg.Env, guest.Env...)
 		cfg.Mounts = guest.Mounts
