@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% if page.is_home %}{{ site.title }} — documentation{% else %}{{ page.title }} — {{ site.title }}{% endif %}</title>
+    <meta name="description" content="{{ site.description | strip_newlines }}">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+    <link rel="icon" href="{{ '/assets/favicon.svg' | relative_url }}" type="image/svg+xml">
+    <!-- Applied before first paint so a reader who chose a theme does not get a flash of
+         the other one. localStorage only: nothing is sent anywhere. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("boks-theme");
+          if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <a class="skip" href="#content">Skip to content</a>
+
+    <header class="topbar">
+      <button class="menu-toggle" id="menu-toggle" aria-expanded="false" aria-controls="sidebar">
+        <span aria-hidden="true">☰</span> Menu
+      </button>
+      <a class="brand" href="{{ '/' | relative_url }}">{{ site.title }}</a>
+      <span class="brand-note">documentation</span>
+      <div class="topbar-right">
+        <a class="repo-link" href="{{ site.repo }}">GitHub</a>
+        <button class="theme-toggle" id="theme-toggle" title="Switch between light and dark">
+          <span class="theme-toggle-label">Theme</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="shell">
+      <nav class="sidebar" id="sidebar" aria-label="Documents">
+        <form class="search" role="search" onsubmit="return false;">
+          <label class="sr-only" for="search-input">Search the documentation</label>
+          <input id="search-input" type="search" placeholder="Search the documentation"
+                 autocomplete="off" spellcheck="false">
+        </form>
+        <div class="search-results" id="search-results" hidden></div>
+
+        <ul class="nav" id="nav">
+          {%- for item in site.nav %}
+          {%- assign current = false %}
+          {%- if item.url == page.url %}{% assign current = true %}{% endif %}
+          <li class="nav-item{% if current %} current{% endif %}">
+            <a href="{{ item.url | relative_url }}"{% if current %} aria-current="page"{% endif %}>{{ item.label }}</a>
+            {%- if current and item.toc.size > 0 %}
+            <ul class="toc">
+              {%- for h in item.toc %}
+              <li class="toc-h{{ h.level }}"><a href="#{{ h.id }}">{{ h.text }}</a></li>
+              {%- endfor %}
+            </ul>
+            {%- endif %}
+          </li>
+          {%- endfor %}
+        </ul>
+      </nav>
+
+      <main class="content" id="content">
+        <article class="doc">
+          {{ content }}
+        </article>
+        <footer class="doc-footer">
+          <p>
+            This page is
+            <a href="{{ site.repo }}/blob/{{ site.repo_branch }}/{{ page.source }}">{{ page.source }}</a>
+            in the repository, rendered. Edit it there.
+          </p>
+          <p>Apache-2.0. No analytics, no trackers, no third-party requests.</p>
+        </footer>
+      </main>
+    </div>
+
+    <script src="{{ '/assets/site.js' | relative_url }}" defer></script>
+    <script>window.BOKS_SEARCH_INDEX = "{{ '/search-index.json' | relative_url }}";</script>
+  </body>
+</html>
