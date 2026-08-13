@@ -15,6 +15,39 @@ Four flags for developing Boks itself are accepted by every command and hidden f
 hidden. The last one turns off the refusal to present a runtime with no VM boundary as a
 sandbox, and must never be used to run anything untrusted.
 
+## boks bundle
+
+Write a clone-mode sandbox's commits to a git bundle on the host
+
+```
+boks bundle [flags] SANDBOX
+```
+
+Writes the commits from a clone-mode sandbox to a git bundle on the host, then prints the
+'git fetch' that reads them into your repository.
+
+In clone mode the guest works on its own clone, so its commits are inside the VM and nothing
+on the host has seen them. Docker Sandboxes solves this by serving a git daemon from the
+sandbox and fetching over the network. Boks does not: a sandbox has no inbound network, and
+opening one so that work can leave would be a hole cut through the boundary the mode exists
+to provide. A bundle is a single file that 'git fetch' reads exactly like a remote, and it
+travels out over the same channel 'boks cp' uses, which needs no listener at all.
+
+A bundle carries commits. Whatever is uncommitted inside the sandbox is not in it, and this
+command says so rather than leaving it to be discovered later.
+
+The printed 'git fetch' writes the sandbox's branches under refs/sandboxes/&lt;sandbox&gt;/, so it
+cannot move any branch of yours.
+
+```
+boks bundle claude-myrepo
+  boks bundle claude-myrepo -o /tmp/work.bundle
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-o`, `--output string` |  | where to write the bundle (default: ./&lt;sandbox&gt;.bundle) |
+
 ## boks ca
 
 Inspect or replace the local CA used for TLS interception
@@ -281,6 +314,9 @@ The arguments are the same as 'boks run': the agent first, then the workspaces, 
 default to the current directory. Anything after '--' is recorded as the agent's arguments,
 and is what 'boks run' executes when it is given none of its own.
 
+\--clone belongs here too, and only here: the mode lives in the sandbox's mounts, so it is
+fixed when the sandbox is created and cannot be changed afterwards.
+
 ```
 Agents:
   shell          a plain shell in the Boks base image
@@ -304,6 +340,7 @@ boks create shell .
 |---|---|---|
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
 | `--annotation stringArray` |  | extra OCI annotation KEY=VALUE passed to the runtime (repeatable) |
+| `--clone` |  | keep guest writes off your disk: work on a git clone made inside the guest, with the host repository shared read-only at /run/sandbox/source |
 | `--cpus int` | `0` | vCPUs for the guest (0: all host CPUs) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--env stringArray` |  | extra environment variable KEY=VALUE (repeatable) |
@@ -372,7 +409,13 @@ boks inspect [flags] SANDBOX...
 ```
 
 Prints everything Boks knows about a sandbox, as JSON: status, image, runtime, snapshotter,
-creation time, workspaces, default command, environment and process id.
+creation time, workspaces, filesystem mode, default command, environment and process id.
+
+"filesystem" is the one to read first. In "direct" mode the workspace is shared read-write at
+its host path and guest writes land on your disk. In "clone" mode the host repository is
+shared read-only at "source" and the guest works on a clone at "clone"; the workspace entry
+still names the host directory the sandbox was created for, which in that mode is what was
+cloned rather than what the guest writes to.
 
 ## boks ls
 
@@ -931,6 +974,12 @@ workspace is shared into the guest at the same absolute path it has on the host,
 first one is the process's working directory. Nothing above them is exposed. A workspace
 may carry a ':ro' suffix for a read-only share.
 
+By default the guest writes straight to those directories. --clone changes that: the
+workspace must be a git repository, it is shared read-only at /run/sandbox/source, and the
+agent works on a clone made inside the guest, so nothing it writes reaches your disk. The
+clone carries committed history only, the mode is fixed when the sandbox is created, and
+'boks bundle' is how commits come back out.
+
 The sandbox is named &lt;agent&gt;-&lt;workspace directory&gt; and persists. Running the same agent in
 the same directory re-attaches to it, so packages installed and files written inside it are
 still there; remove it with 'boks rm'. Pass --rm for a sandbox destroyed when the command
@@ -957,6 +1006,7 @@ Agents:
 boks run                              # a shell in the current directory
   boks run shell . -- uname -a
   boks run shell ~/src/foo ~/src/lib:ro
+  boks run --clone claude ~/src/foo     # the agent works on a clone; your files are read-only
   boks run --name claude-boks           # re-attach by name, from anywhere
 ```
 
@@ -964,6 +1014,7 @@ boks run                              # a shell in the current directory
 |---|---|---|
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
 | `--annotation stringArray` |  | extra OCI annotation KEY=VALUE passed to the runtime (repeatable) |
+| `--clone` |  | keep guest writes off your disk: work on a git clone made inside the guest, with the host repository shared read-only at /run/sandbox/source |
 | `--cpus int` | `0` | vCPUs for the guest (0: all host CPUs) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `-d`, `--detached` |  | print the sandbox name and exit instead of attaching |

@@ -129,8 +129,14 @@ What is **not** done:
   `docker run`, which proves each CLI is installed and starts — and nothing about isolation.
   `kiro` has no image (see [images/README.md](images/README.md) for why), and there is still
   no way to define an agent in a file rather than in code.
+<<<<<<< HEAD
 - **No terminal dashboard** for bare `boks`, and no `--clone` or `--kit`. See the CLI surface
   section of the parity matrix.
+=======
+- **No terminal dashboard** for bare `boks`, no `--kit`, `--profile` or `--publish`. See the
+  CLI surface section of the parity matrix. `--clone` exists, but has only been exercised
+  against runc, so nothing about it has been measured behind a hypervisor.
+>>>>>>> worktree-agent-ae95ff2a9c8ada764
 - **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather
   than exiting 130 silently.
 - **A crashed network supervisor is unrecoverable without a restart.** The running VM does
@@ -424,7 +430,8 @@ enforces — what matters most is watching it work against a real guest.
 2. Policy over names for raw flows, so that `--allow example.com` can authorise a direct
    connection to the address it resolves to rather than denying it
 3. The interactive dashboard that bare `boks` should open
-4. Clone mode, so guest writes do not land on the host by default
+4. Clone mode measured behind a hypervisor — it is built and verified on runc, where the
+   read-only source share is a bind mount rather than virtiofs
 5. Docker daemon inside the guest
 6. UDP port publishing, which needs the link filter to carry a datagram's return path without
    becoming a general hole
