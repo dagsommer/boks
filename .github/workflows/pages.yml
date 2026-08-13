@@ -125,11 +125,9 @@ jobs:
         working-directory: site
         run: |
           set -euo pipefail
-          for page in index get-started/index usage/index agents/index cli/index \
-                      troubleshooting/index faq/index roadmap/index release-notes/index \
-                      verification/index security-model/index architecture/index \
-                      docker-sandbox-parity/index windows/index \
-                      upstream-libkrun-virtio-net/index; do
+          for page in index get-started/index install/index walkthrough/index usage/index \
+                      agents/index cli/index troubleshooting/index faq/index roadmap/index \
+                      release-notes/index security-model/index architecture/index; do
             test -s "_site/${page}.html" || { echo "missing _site/${page}.html" >&2; exit 1; }
           done
           test -s _site/search-index.json
@@ -137,10 +135,8 @@ jobs:
             || { echo "the README's warning is not rendered as one" >&2; exit 1; }
           grep -q 'Boks is experimental' _site/index.html \
             || { echo "the status warning is missing from the landing page" >&2; exit 1; }
-          grep -q 'alert alert-caution' _site/verification/index.html \
-            || { echo "verification.md's caution is not rendered as one" >&2; exit 1; }
-          grep -q 'table-wrap' _site/docker-sandbox-parity/index.html \
-            || { echo "the parity matrix tables are not wrapped for scrolling" >&2; exit 1; }
+          grep -q 'table-wrap' _site/agents/index.html \
+            || { echo "wide tables are not wrapped for scrolling" >&2; exit 1; }
           ! grep -rq '\[!WARNING\]\|\[!CAUTION\]\|\[!IMPORTANT\]' _site \
             || { echo "an alert marker was published as literal text" >&2; exit 1; }
 
@@ -163,7 +159,10 @@ jobs:
           # Platform support, stated on the landing page, where someone decides whether to
           # spend an hour on the setup. These are the facts a redesign is most tempted to
           # round off.
-          for phrase in 'macOS on Apple silicon' 'Not verified' 'Does not run'; do
+          # "In progress" is Windows: being built, and no sandbox has ever booted there.
+          # A redesign may reword the card, but the page must keep distinguishing the one
+          # verified platform from the ones that are not.
+          for phrase in 'macOS on Apple silicon' 'Not verified' 'In progress'; do
             grep -qF "$phrase" _site/index.html \
               || { echo "the landing page no longer states platform support: '$phrase'" >&2; exit 1; }
           done
