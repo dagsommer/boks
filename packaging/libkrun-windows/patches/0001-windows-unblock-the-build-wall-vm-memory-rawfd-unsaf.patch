@@ -1,0 +1,56 @@
+From 329f62433566287f73074ddc57485210a45bf231 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 13:25:16 +0200
+Subject: [PATCH 1/3] windows: unblock the build wall (vm-memory rawfd, unsafe
+ extern, Wdk features)
+
+---
+ src/devices/Cargo.toml            | 9 ++++++++-
+ src/utils/src/windows/bindings.rs | 2 +-
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index 8f70a33..227d174 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -33,7 +33,7 @@ thiserror = { version = "2.0", optional = true }
+ vhost = { version = "0.15", optional = true, features = ["vhost-user-frontend"] }
+ vmm-sys-util = { version = "0.15", optional = true }
+ virtio-bindings = "0.2.0"
+-vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap", "rawfd"] }
++vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
+ zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
+ krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
+ krun_input = { package = "krun-input", version = "0.1.0", path = "../input", features = ["bindgen_clang_runtime"], optional = true }
+@@ -45,6 +45,7 @@ rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-2.0.0-dev", pa
+ imago = { version = "0.2.3", features = ["sync-wrappers", "vm-memory"] }
+ 
+ [target.'cfg(unix)'.dependencies]
++vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap", "rawfd"] }
+ nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
+@@ -68,4 +69,10 @@ windows-sys = { version = "0.61.2", features = [
+     "Win32_System_Console",
+     "Win32_System_Memory",
+     "Win32_System_Threading",
++    "Win32_System_IO",
++    "Win32_System_WindowsProgramming",
++    "Win32_Security",
++    "Wdk",
++    "Wdk_Storage_FileSystem",
++    "Wdk_Foundation",
+ ] }
+diff --git a/src/utils/src/windows/bindings.rs b/src/utils/src/windows/bindings.rs
+index c61857a..965e88b 100644
+--- a/src/utils/src/windows/bindings.rs
++++ b/src/utils/src/windows/bindings.rs
+@@ -13,7 +13,7 @@ use windows_sys::Win32::Foundation::HANDLE;
+ pub type NTSTATUS = i32;
+ 
+ #[link(name = "ntdll")]
+-extern "system" {
++unsafe extern "system" {
+     pub fn NtCreateWaitCompletionPacket(
+         WaitCompletionPacketHandle: *mut HANDLE,
+         DesiredAccess: u32,

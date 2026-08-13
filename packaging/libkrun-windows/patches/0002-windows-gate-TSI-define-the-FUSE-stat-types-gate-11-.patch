@@ -1,0 +1,170 @@
+From f30dd89d6da6a674dd0da0d8e8218b284b2414b1 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 13:28:17 +0200
+Subject: [PATCH 2/3] windows: gate TSI, define the FUSE stat types, gate 11
+ absent errno arms
+
+---
+ src/devices/src/virtio/bindings.rs    | 47 +++++++++++++++++++++++++++
+ src/devices/src/virtio/linux_errno.rs | 22 +++++++++++++
+ src/devices/src/virtio/mod.rs         |  4 +++
+ 3 files changed, 73 insertions(+)
+
+diff --git a/src/devices/src/virtio/bindings.rs b/src/devices/src/virtio/bindings.rs
+index 3f04e7f..a3128d8 100644
+--- a/src/devices/src/virtio/bindings.rs
++++ b/src/devices/src/virtio/bindings.rs
+@@ -38,10 +38,55 @@ pub type stat64 = libc::stat;
+ #[cfg(target_os = "linux")]
+ pub use libc::stat64;
+ 
++// On Windows there is no host libc type to borrow. That is not a gap to paper over: these
++// structures describe the *guest's* Linux ABI, which FUSE serialises on the wire, so
++// aliasing them to a host type was always an accident of Unix hosts happening to agree.
++// The layouts below are Linux x86_64's, spelled out.
++#[cfg(target_os = "windows")]
++#[repr(C)]
++#[derive(Debug, Default, Clone, Copy)]
++pub struct stat64 {
++    pub st_dev: u64,
++    pub st_ino: u64,
++    pub st_nlink: u32,
++    pub st_mode: u32,
++    pub st_uid: u32,
++    pub st_gid: u32,
++    pub st_rdev: u64,
++    pub st_size: i64,
++    pub st_blksize: i64,
++    pub st_blocks: i64,
++    pub st_atime: i64,
++    pub st_atime_nsec: u32,
++    pub st_mtime: i64,
++    pub st_mtime_nsec: u32,
++    pub st_ctime: i64,
++    pub st_ctime_nsec: u32,
++}
++
++#[cfg(target_os = "windows")]
++#[repr(C)]
++#[derive(Debug, Default, Clone, Copy)]
++pub struct statvfs64 {
++    pub f_bsize: u64,
++    pub f_frsize: u64,
++    pub f_blocks: u64,
++    pub f_bfree: u64,
++    pub f_bavail: u64,
++    pub f_files: u64,
++    pub f_ffree: u64,
++    pub f_favail: u64,
++    pub f_fsid: u64,
++    pub f_flag: u64,
++    pub f_namemax: u64,
++}
++
+ #[cfg(target_os = "macos")]
+ pub type off64_t = libc::off_t;
+ #[cfg(target_os = "linux")]
+ pub use libc::off64_t;
++#[cfg(target_os = "windows")]
++pub type off64_t = i64;
+ 
+ #[cfg(target_os = "macos")]
+ pub type statvfs64 = libc::statvfs;
+@@ -52,6 +97,8 @@ pub use libc::statvfs64;
+ pub type ino64_t = libc::ino_t;
+ #[cfg(target_os = "linux")]
+ pub use libc::ino64_t;
++#[cfg(target_os = "windows")]
++pub type ino64_t = u64;
+ 
+ #[cfg(target_os = "linux")]
+ pub unsafe fn pread64(
+diff --git a/src/devices/src/virtio/linux_errno.rs b/src/devices/src/virtio/linux_errno.rs
+index 5291d38..6b142bd 100644
+--- a/src/devices/src/virtio/linux_errno.rs
++++ b/src/devices/src/virtio/linux_errno.rs
+@@ -106,6 +106,8 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
+         libc::ENOMEM => LINUX_ENOMEM,
+         libc::EACCES => LINUX_EACCES,
+         libc::EFAULT => LINUX_EFAULT,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::ENOTBLK => LINUX_ENOTBLK,
+         libc::EBUSY => LINUX_EBUSY,
+         libc::EEXIST => LINUX_EEXIST,
+@@ -134,7 +136,11 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
+         libc::EPROTOTYPE => LINUX_EPROTOTYPE,
+         libc::ENOPROTOOPT => LINUX_ENOPROTOOPT,
+         libc::EPROTONOSUPPORT => LINUX_EPROTONOSUPPORT,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::ESOCKTNOSUPPORT => LINUX_ESOCKTNOSUPPORT,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::EPFNOSUPPORT => LINUX_EPFNOSUPPORT,
+         libc::EAFNOSUPPORT => LINUX_EAFNOSUPPORT,
+         libc::EADDRINUSE => LINUX_EADDRINUSE,
+@@ -147,18 +153,32 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
+         libc::ENOBUFS => LINUX_ENOBUFS,
+         libc::EISCONN => LINUX_EISCONN,
+         libc::ENOTCONN => LINUX_ENOTCONN,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::ESHUTDOWN => LINUX_ESHUTDOWN,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::ETOOMANYREFS => LINUX_ETOOMANYREFS,
+         libc::ETIMEDOUT => LINUX_ETIMEDOUT,
+         libc::ECONNREFUSED => LINUX_ECONNREFUSED,
+         libc::ELOOP => LINUX_ELOOP,
+         libc::ENAMETOOLONG => LINUX_ENAMETOOLONG,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::EHOSTDOWN => LINUX_EHOSTDOWN,
+         libc::EHOSTUNREACH => LINUX_EHOSTUNREACH,
+         libc::ENOTEMPTY => LINUX_ENOTEMPTY,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::EUSERS => LINUX_EUSERS,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::EDQUOT => LINUX_EDQUOT,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::ESTALE => LINUX_ESTALE,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::EREMOTE => LINUX_EREMOTE,
+         libc::ENOLCK => LINUX_ENOLCK,
+         libc::ENOSYS => LINUX_ENOSYS,
+@@ -170,6 +190,8 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
+         #[cfg(target_os = "macos")]
+         libc::ENOATTR => LINUX_ENODATA,
+         libc::EBADMSG => LINUX_EBADMSG,
++        // Not defined by the Windows CRT; the guest constant stays, only the host arm goes.
++        #[cfg(unix)]
+         libc::EMULTIHOP => LINUX_EMULTIHOP,
+         libc::ENODATA => LINUX_ENODATA,
+         libc::ENOLINK => LINUX_ENOLINK,
+diff --git a/src/devices/src/virtio/mod.rs b/src/devices/src/virtio/mod.rs
+index ce3d0a0..8b22be7 100644
+--- a/src/devices/src/virtio/mod.rs
++++ b/src/devices/src/virtio/mod.rs
+@@ -36,6 +36,9 @@ mod queue;
+ pub mod rng;
+ #[cfg(feature = "vhost-user")]
+ pub mod vhost_user;
++// vsock carries libkrun's TSI networking, which is Unix-socket based end to end.
++// Boks displaces TSI with virtio-net, so Windows does not need it.
++#[cfg(unix)]
+ pub mod vsock;
+ 
+ #[cfg(not(feature = "tee"))]
+@@ -56,6 +59,7 @@ pub use self::queue::{Descriptor, DescriptorChain, Queue};
+ pub use self::rng::*;
+ #[cfg(feature = "vhost-user")]
+ pub use self::vhost_user::VhostUserDevice;
++#[cfg(unix)]
+ pub use self::vsock::*;
+ 
+ /// When the driver initializes the device, it lets the device know about the
