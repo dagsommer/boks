@@ -1,0 +1,42 @@
+From d5f65c9678913623fe6153e3216644f079db3cb2 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 22:52:25 +0200
+Subject: [PATCH] builtins: register the erofs snapshotter and differ on
+ Windows
+
+containerd's Windows build registers only the lcow and windows snapshotters and
+differs. The erofs plugins are already non-Linux-capable -- builtins_unix.go
+registers both for darwin, freebsd and solaris, and both packages compile for
+windows/amd64 and windows/arm64 unmodified -- they are simply never imported on
+Windows, so `ctr --snapshotter erofs` has nothing to bind to.
+
+nerdbox needs them. Its non-Linux mount handling (mount_other.go) forwards any
+mount type other than erofs, ext4 or overlay verbatim into the guest, where it
+fails, so an EROFS-backed snapshotter is the only one that produces mounts the
+guest can consume.
+
+The erofs differ gates itself on `mkfs.erofs --help` reporting `--tar=` and
+returns ErrSkipPlugin when the binary is missing, so registering it on a host
+without mkfs.erofs.exe is inert rather than fatal.
+---
+ cmd/containerd/builtins/builtins_windows.go | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/cmd/containerd/builtins/builtins_windows.go b/cmd/containerd/builtins/builtins_windows.go
+index 5600624..91efa6a 100644
+--- a/cmd/containerd/builtins/builtins_windows.go
++++ b/cmd/containerd/builtins/builtins_windows.go
+@@ -17,8 +17,10 @@
+ package builtins
+ 
+ import (
++	_ "github.com/containerd/containerd/v2/plugins/diff/erofs/plugin"
+ 	_ "github.com/containerd/containerd/v2/plugins/diff/lcow"
+ 	_ "github.com/containerd/containerd/v2/plugins/diff/windows"
++	_ "github.com/containerd/containerd/v2/plugins/snapshots/erofs/plugin"
+ 	_ "github.com/containerd/containerd/v2/plugins/snapshots/lcow"
+ 	_ "github.com/containerd/containerd/v2/plugins/snapshots/windows"
+ )
+-- 
+2.53.0
+

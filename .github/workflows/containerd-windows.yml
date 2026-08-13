@@ -1,0 +1,449 @@
+# Build the two host binaries that stand between Boks and containerd on native Windows, and
+# publish them so the Windows tester needs no Docker, no mingw, and no Go.
+#
+# WHY THIS EXISTS. Boks' runtime is nerdbox, and nerdbox needs an EROFS snapshotter: its
+# non-Linux mount handling (mount_other.go) understands erofs, ext4 and overlay, and forwards
+# every other mount type verbatim into the guest, where it fails. containerd's Windows build
+# does not register the erofs snapshotter or differ — builtins_windows.go lists only lcow and
+# windows — so `ctr --snapshotter erofs` has nothing to bind to. And the erofs differ shells
+# out to `mkfs.erofs`, which has no Windows package anywhere.
+#
+# So two binaries, and they are useless apart: without mkfs.erofs.exe on PATH the erofs differ
+# returns ErrSkipPlugin at init and silently disappears from a containerd that otherwise looks
+# healthy. They are built by one workflow and shipped as one bundle for that reason.
+#
+# Read packaging/containerd-windows/README.md and packaging/mkfs-erofs-windows/README.md before
+# changing anything here. They explain the patch, the pins, what is known not to work on
+# Windows, and the exact commands to test the result.
+#
+# WHAT THIS WORKFLOW PROVES, AND WHAT IT DOES NOT. It proves the containerd patch still applies
+# to the pinned release, that the erofs plugin packages still cross-compile for Windows and are
+# genuinely linked into the binary, and that the go-erofs recipe still produces a PE32+
+# mkfs.erofs.exe whose help text advertises tar mode.
+#
+# It proves NOTHING about whether any of it runs. No Windows binary is executed here — this is a
+# Linux runner. The failure this whole effort most expects, the erofs differ skipping itself at
+# init, is invisible to a compiler by construction. Download the bundle and run the commands in
+# packaging/containerd-windows/README.md to learn anything at all about whether it works.
+name: containerd-windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/containerd-windows/**"
+      - "packaging/mkfs-erofs-windows/**"
+      - ".github/workflows/containerd-windows.yml"
+  pull_request:
+    paths:
+      - "packaging/containerd-windows/**"
+      - "packaging/mkfs-erofs-windows/**"
+      - ".github/workflows/containerd-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: containerd-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -----------------------------------------------------------------------------------------
+  # mkfs.erofs.exe — erofs-utils cross-compiled with mingw-w64, using erofs/go-erofs's recipe.
+  #
+  # `ubuntu-24.04`, pinned, NOT `ubuntu-latest`. This is load-bearing: on a newer mingw-w64
+  # (Debian trixie) the build dies with `implicit declaration of function 'asprintf'`, because
+  # newer headers no longer declare it under the feature-test macros erofs-utils sets. go-erofs
+  # runs this on `ubuntu-latest` and gets away with it only because that label still means 24.04
+  # today. Pinning the image means this breaks when we change it, not when GitHub does.
+  # -----------------------------------------------------------------------------------------
+  mkfs-erofs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - name: Read the pinned go-erofs revision
+        id: pin
+        run: |
+          set -euo pipefail
+          rev="$(grep -v '^[[:space:]]*#' boks/packaging/mkfs-erofs-windows/GO_EROFS_REV | tr -d '[:space:]')"
+          case "$rev" in
+            [0-9a-f]*) ;;
+            *) echo "GO_EROFS_REV does not contain a commit SHA: '$rev'" >&2; exit 1 ;;
+          esac
+          if [ "${#rev}" -ne 40 ]; then
+            echo "GO_EROFS_REV must be a full 40-character SHA, got ${#rev} characters" >&2
+            exit 1
+          fi
+          echo "rev=$rev" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: erofs/go-erofs
+          ref: ${{ steps.pin.outputs.rev }}
+          path: go-erofs
+          fetch-depth: 0
+
+      # The recipe's inputs are DERIVED from the pinned tree, never duplicated in this repo.
+      # go-erofs owns the patch series and picks the erofs-utils it targets; a copy here would
+      # be a second source of truth that rots the first time they fix a patch.
+      #
+      # Every derivation is asserted rather than defaulted. If upstream restructures the
+      # workflow, this must fail loudly — a silently empty patch list would build an unpatched
+      # erofs-utils, and the failure would surface much later as a mystery on Windows.
+      - name: Derive the recipe from the pinned go-erofs tree
+        id: recipe
+        working-directory: go-erofs
+        run: |
+          set -euo pipefail
+          ci=.github/workflows/ci.yml
+          test -f "$ci" || { echo "$ci is gone — upstream restructured, re-read the recipe" >&2; exit 1; }
+
+          grep -q 'cross-compile-mkfs-windows:' "$ci" \
+            || { echo "job 'cross-compile-mkfs-windows' is gone from $ci" >&2; exit 1; }
+
+          erofs="$(grep -oP '^\s*EROFS_UTILS_VERSION:\s*\K\S+' "$ci" | head -1)"
+          test -n "$erofs" || { echo "EROFS_UTILS_VERSION not found in $ci" >&2; exit 1; }
+
+          # [0-9]+(\.[0-9]+)+ and not [0-9.]+ — the latter also eats the dot of `.tar.gz`
+          # and yields "1.10.0.", which 404s at the download step much later on.
+          lz4="$(grep -oP 'lz4/archive/refs/tags/v\K[0-9]+(\.[0-9]+)+' "$ci" | head -1)"
+          test -n "$lz4" || { echo "lz4 version not found in $ci" >&2; exit 1; }
+
+          n_patches=$(find .github/workflows/patches/erofs-utils -name '*.patch' | wc -l)
+          test "$n_patches" -gt 0 || { echo "no erofs-utils patches found" >&2; exit 1; }
+
+          n_headers=$(find .github/workflows/mingw-compat-headers -type f | wc -l)
+          test "$n_headers" -gt 0 || { echo "no mingw compat headers found" >&2; exit 1; }
+
+          echo "erofs-utils $erofs, lz4 $lz4, $n_patches patches, $n_headers compat headers"
+          {
+            echo "erofs=$erofs"
+            echo "lz4=$lz4"
+            echo "patches=$n_patches"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Install the mingw-w64 toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config mingw-w64 make curl ca-certificates patch file
+          x86_64-w64-mingw32-gcc --version | head -1
+
+      # Static lz4. --enable-lz4 is the one compressor kept: EROFS layers containerd produces
+      # use it, and it cross-compiles cleanly. zlib, lzma and zstd are all configured out.
+      - name: Cross-compile lz4 for Windows
+        env:
+          MINGW_HOST: x86_64-w64-mingw32
+          LZ4_VERSION: ${{ steps.recipe.outputs.lz4 }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/lz4/lz4/archive/refs/tags/v${LZ4_VERSION}.tar.gz" | tar -xzf -
+          cd "lz4-${LZ4_VERSION}/lib"
+          make -j"$(nproc)" \
+            CC=${MINGW_HOST}-gcc AR=${MINGW_HOST}-ar WINDRES=${MINGW_HOST}-windres \
+            TARGET_OS=Windows BUILD_STATIC=yes BUILD_SHARED=no \
+            CFLAGS="-O3 -DXXH_NAMESPACE=LZ4_"
+          sudo make PREFIX=/usr/${MINGW_HOST} install
+
+      # The patches are SEQUENTIAL. 003-windows-pipe-lseek.patch does not apply to a pristine
+      # tree — it depends on 001. Hence the sorted loop and no --dry-run pre-flight.
+      - name: Cross-compile erofs-utils for Windows
+        env:
+          MINGW_HOST: x86_64-w64-mingw32
+          EROFS_UTILS_VERSION: ${{ steps.recipe.outputs.erofs }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/erofs/erofs-utils/archive/refs/tags/${EROFS_UTILS_VERSION}.tar.gz" | tar -xzf -
+          cd "erofs-utils-${EROFS_UTILS_VERSION#v}"
+
+          sudo cp -r "${GITHUB_WORKSPACE}/go-erofs/.github/workflows/mingw-compat-headers"/* \
+            /usr/${MINGW_HOST}/include/
+
+          for p in $(find "${GITHUB_WORKSPACE}/go-erofs/.github/workflows/patches/erofs-utils" -name '*.patch' | sort); do
+            echo "::group::$(basename "$p")"
+            patch -p1 <"$p"
+            echo "::endgroup::"
+          done
+
+          ./autogen.sh
+          PKG_CONFIG_PATH=/usr/${MINGW_HOST}/lib/pkgconfig \
+          ./configure \
+            --host=${MINGW_HOST} --disable-shared --enable-lz4 \
+            --without-zlib --disable-lzma --without-libzstd --without-selinux \
+            --without-uuid --without-openssl --disable-fuse --disable-debug \
+            --disable-dependency-tracking \
+            CFLAGS="-O2 -g -D_FILE_OFFSET_BITS=64" \
+            LDFLAGS="-Wl,-Bstatic -static-libgcc -L/usr/${MINGW_HOST}/lib" \
+            liblz4_LIBS="/usr/${MINGW_HOST}/lib/liblz4.a"
+
+          make -j"$(nproc)" -C lib  CPPFLAGS="-include posix_compat.h"
+          make -j"$(nproc)" -C mkfs CPPFLAGS="-include posix_compat.h" LIBS="-llz4"
+          ${MINGW_HOST}-strip mkfs/mkfs.erofs.exe
+
+          mkdir -p "${GITHUB_WORKSPACE}/out"
+          cp mkfs/mkfs.erofs.exe "${GITHUB_WORKSPACE}/out/"
+
+      # Two assertions, both earned.
+      #
+      # PE32+: a cross-build that silently fell back to the host compiler would produce a
+      # working-looking ELF named .exe, and nothing downstream would notice until Windows
+      # refused to load it.
+      #
+      # --tar=: containerd's differ decides whether to register itself by running
+      # `mkfs.erofs --help` and grepping the output for exactly this literal. A build that
+      # dropped tar support would produce a perfectly good mkfs.erofs.exe that makes the erofs
+      # differ vanish at init with no error anyone would connect to this job.
+      - name: Assert mkfs.erofs.exe is a PE32+ binary that supports tar mode
+        run: |
+          set -euo pipefail
+          f=out/mkfs.erofs.exe
+          magic="$(head -c 2 "$f")"
+          [ "$magic" = "MZ" ] || { echo "$f is not a PE image (magic '$magic')" >&2; exit 1; }
+          objdump -f "$f" | grep -q 'pei-x86-64' \
+            || { echo "$f is not PE32+ x86-64" >&2; objdump -f "$f" >&2; exit 1; }
+          strings "$f" | grep -q -- '--tar=' \
+            || { echo "$f help text has no '--tar=' — containerd's differ would skip itself" >&2; exit 1; }
+          echo "  PE32+ x86-64, $(wc -c <"$f") bytes, advertises --tar="
+          objdump -p "$f" | grep -i 'DLL Name'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mkfs-erofs-windows-amd64
+          path: out/mkfs.erofs.exe
+          if-no-files-found: error
+
+      - name: Record what was built
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## mkfs.erofs.exe"
+            echo
+            echo "erofs-utils \`${{ steps.recipe.outputs.erofs }}\`, lz4 \`${{ steps.recipe.outputs.lz4 }}\`,"
+            echo "${{ steps.recipe.outputs.patches }} patches from erofs/go-erofs \`${{ steps.pin.outputs.rev }}\`."
+            echo
+            echo '```'
+            sha256sum out/mkfs.erofs.exe 2>/dev/null | sed 's|out/||' || echo "(build failed)"
+            echo '```'
+            echo
+            echo "x86-64 only — go-erofs's recipe cross-compiles for no other Windows target."
+            echo "This binary has never been executed, on Windows or anywhere."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # -----------------------------------------------------------------------------------------
+  # containerd.exe + ctr.exe, with the erofs snapshotter and differ registered on Windows.
+  #
+  # ubuntu-latest is fine here: CGO_ENABLED=0, so Go cross-compiles to Windows with no C
+  # toolchain and produces exactly the PE a Windows runner would.
+  # -----------------------------------------------------------------------------------------
+  containerd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - name: Read the pinned containerd version
+        id: pin
+        run: |
+          set -euo pipefail
+          ver="$(grep -v '^[[:space:]]*#' boks/packaging/containerd-windows/CONTAINERD_VERSION | tr -d '[:space:]')"
+          case "$ver" in
+            v[0-9]*) ;;
+            *) echo "CONTAINERD_VERSION must be a vX.Y.Z tag, got '$ver'" >&2; exit 1 ;;
+          esac
+          echo "ver=$ver" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: containerd/containerd
+          ref: ${{ steps.pin.outputs.ver }}
+          path: containerd
+          fetch-depth: 0
+
+      # `git apply`, not `git am`: `am` writes a commit and needs a committer identity the
+      # runner does not have. No --3way and no fuzz — the version is pinned, so the patch
+      # applies exactly or the pin and the patch have drifted, and fuzzing would hide it.
+      - name: Apply the Boks erofs-on-Windows patch
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(../boks/packaging/containerd-windows/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "no patches found — packaging/containerd-windows/patches/ is empty" >&2
+            exit 1
+          fi
+          git apply --verbose "${patches[@]}"
+
+      # containerd's own go directive, so the toolchain moves with the pin.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: containerd/go.mod
+          cache: false
+
+      - name: Record the toolchain
+        run: go version
+
+      # amd64 is what ships in the bundle, because mkfs.erofs.exe exists only for x86-64 and
+      # without it the differ skips itself. arm64 is built anyway, and only to catch a
+      # compile-time break: the erofs packages' !linux fallbacks carry no architecture
+      # condition, so an arm64-only regression would otherwise go unseen.
+      - name: Build containerd and ctr for Windows
+        working-directory: containerd
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          ver="${{ steps.pin.outputs.ver }}"
+          rev="$(git rev-parse HEAD)"
+          ldflags="-s -w"
+          ldflags="$ldflags -X github.com/containerd/containerd/v2/version.Version=${ver#v}+boks-erofs"
+          ldflags="$ldflags -X github.com/containerd/containerd/v2/version.Revision=${rev}"
+          for arch in amd64 arm64; do
+            echo "::group::GOOS=windows GOARCH=$arch"
+            for cmd in containerd ctr; do
+              GOOS=windows GOARCH="$arch" go build -mod=readonly -ldflags "$ldflags" \
+                -o "_out/$arch/$cmd.exe" "./cmd/$cmd"
+            done
+            echo "::endgroup::"
+          done
+          ls -lR _out/
+
+      - name: Assert the artifacts are PE executables with the erofs plugins linked in
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            for cmd in containerd ctr; do
+              f="_out/$arch/$cmd.exe"
+              magic="$(head -c 2 "$f")"
+              [ "$magic" = "MZ" ] || { echo "$f is not a PE image (magic '$magic')" >&2; exit 1; }
+              echo "  $f: PE, $(wc -c <"$f") bytes"
+            done
+          done
+
+          # The point of the whole patch. `go build` cannot fail if an underscore import is
+          # missing — it just builds a containerd without the plugin, exactly like upstream's.
+          # Assert both packages are actually in the binary.
+          for pkg in plugins/diff/erofs/plugin plugins/snapshots/erofs/plugin; do
+            for arch in amd64 arm64; do
+              strings "_out/$arch/containerd.exe" | grep -q "containerd/v2/$pkg" \
+                || { echo "$pkg is NOT linked into containerd.exe ($arch)" >&2; exit 1; }
+            done
+            echo "  linked: $pkg"
+          done
+
+          # And that the patch did not displace what Windows already had.
+          strings _out/amd64/containerd.exe | grep -q 'plugins/snapshots/windows' \
+            || { echo "the windows snapshotter went missing" >&2; exit 1; }
+          echo "  linked: plugins/snapshots/windows (unchanged)"
+
+      # Two import lines cannot plausibly break Linux, which is exactly why it costs nothing
+      # to assert instead of assume.
+      - name: Build for Linux too, so the platform that works stays working
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          GOOS=linux GOARCH=amd64 go build -mod=readonly ./cmd/containerd ./cmd/ctr
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: containerd-windows
+          path: containerd/_out/**/*.exe
+          if-no-files-found: error
+
+      - name: Record what was built
+        if: always()
+        working-directory: containerd
+        run: |
+          set -uo pipefail
+          {
+            echo "## containerd.exe + ctr.exe"
+            echo
+            echo "containerd \`${{ steps.pin.outputs.ver }}\` + \`packaging/containerd-windows/patches/\`,"
+            echo "reporting version \`${{ steps.pin.outputs.ver }}+boks-erofs\`."
+            echo
+            echo '```'
+            (cd _out && sha256sum */*.exe) 2>/dev/null || echo "(build failed)"
+            echo '```'
+            echo
+            echo "The erofs snapshotter and differ are linked in, for both architectures."
+            echo "Only amd64 is usable: mkfs.erofs.exe exists for x86-64 only, and without it"
+            echo "the erofs differ returns ErrSkipPlugin at init and disappears."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # -----------------------------------------------------------------------------------------
+  # One artifact the tester downloads once. The three binaries are useless apart, and asking
+  # someone to collect them from two artifacts and get them into one directory on PATH is how
+  # you end up debugging a missing erofs differ instead of testing containerd.
+  # -----------------------------------------------------------------------------------------
+  bundle:
+    runs-on: ubuntu-latest
+    needs: [mkfs-erofs, containerd]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mkfs-erofs-windows-amd64
+          path: staging
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: containerd-windows
+          path: containerd-artifact
+
+      - name: Assemble the amd64 test bundle
+        run: |
+          set -euo pipefail
+          cp containerd-artifact/amd64/containerd.exe staging/
+          cp containerd-artifact/amd64/ctr.exe staging/
+          cp boks/packaging/containerd-windows/README.md staging/README.md
+          ls -l staging/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: containerd-windows-amd64-bundle
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Checksums and how to test
+        run: |
+          set -euo pipefail
+          {
+            echo "## Windows test bundle (amd64)"
+            echo
+            echo "Artifact \`containerd-windows-amd64-bundle\` — three binaries plus the README."
+            echo
+            echo '```'
+            (cd staging && sha256sum ./*.exe | sed 's|\./||')
+            echo '```'
+            echo
+            echo "Unzip all three into one directory and put that directory on \`PATH\` **before**"
+            echo "starting containerd. \`mkfs.erofs.exe\` must be resolvable when containerd"
+            echo "initialises, or the erofs differ returns \`ErrSkipPlugin\` and vanishes with no"
+            echo "error that mentions it."
+            echo
+            echo "Then, in order — full commands and what each proves are in \`README.md\` in the"
+            echo "artifact:"
+            echo
+            echo '```powershell'
+            echo 'mkfs.erofs -V                        # the exe runs at all'
+            echo 'containerd.exe --log-level debug     # leave running in its own console'
+            echo 'ctr.exe plugins ls | Select-String erofs   # both plugins must say ok, not skip'
+            echo 'ctr.exe -n test images pull --platform linux/amd64 --snapshotter erofs docker.io/library/alpine:latest'
+            echo '```'
+            echo
+            echo "**Nothing here has been run.** Every binary was cross-compiled and inspected on"
+            echo "a Linux runner. \`ctr plugins ls\` is in the list because the erofs differ"
+            echo "skipping itself is silent, and must be checked rather than assumed."
+          } >>"$GITHUB_STEP_SUMMARY"
