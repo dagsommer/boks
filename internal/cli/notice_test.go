@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/enforce"
 	"github.com/dagsommer/boks/internal/network"
 )
@@ -13,7 +14,7 @@ import (
 // directory the test has set up. It returns what the user would have seen on stderr.
 func describeRun(t *testing.T, sandbox string, quiet bool, allow, inject []string) string {
 	t.Helper()
-	flags := &policyFlags{allow: allow, inject: inject}
+	flags := (&policyFlags{allow: allow, inject: inject}).forAgent(mustAgent(t, "claude"))
 	resolution, err := flags.resolution(sandbox, nil)
 	if err != nil {
 		t.Fatalf("resolving: %v", err)
@@ -27,6 +28,15 @@ func describeRun(t *testing.T, sandbox string, quiet bool, allow, inject []strin
 }
 
 func lineCount(s string) int { return len(strings.Split(strings.TrimRight(s, "\n"), "\n")) }
+
+func mustAgent(t *testing.T, name string) agent.Agent {
+	t.Helper()
+	a, err := agent.Builtin().Resolve(name)
+	if err != nil {
+		t.Fatalf("agent %q: %v", name, err)
+	}
+	return a
+}
 
 // TestTheSecondRunIsQuiet is the whole of item 3: the first encounter is loud, and a run
 // that has nothing new to say says almost nothing. Fifty lines before every command is how
@@ -49,8 +59,10 @@ func TestTheSecondRunIsQuiet(t *testing.T) {
 	if !strings.Contains(second, "unchanged since this sandbox last ran") {
 		t.Errorf("the summary does not say why it is short:\n%s", second)
 	}
-	// The detail is one command away, and the summary has to say which command.
-	for _, want := range []string{"policy ls --sandbox boks-test", "policy log --sandbox boks-test"} {
+	// The detail is one command away, and the summary has to say which command —
+	// including the agent, or it would name a command that prints a *different* policy
+	// from the one this sandbox is running under.
+	for _, want := range []string{"policy ls --sandbox boks-test --agent claude", "policy log --sandbox boks-test"} {
 		if !strings.Contains(second, want) {
 			t.Errorf("the summary does not point at %q:\n%s", want, second)
 		}

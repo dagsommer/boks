@@ -421,7 +421,7 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, quiet
 		}
 		shown.Policy = digest(table)
 	default:
-		fmt.Fprint(stderr, steadyStateLine(pol, mode, spec.Sandbox, hosts))
+		fmt.Fprint(stderr, steadyStateLine(pol, mode, spec.Sandbox, f.agent.Name, hosts))
 	}
 
 	// The announced hosts are recorded whether or not this run was quiet, because they
@@ -437,7 +437,7 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, quiet
 // two of your flows" is not a thing to mention once and then leave out. The rules and the
 // decisions are one command away, and naming those commands is worth more than reprinting
 // what they would say.
-func steadyStateLine(pol policy.Policy, mode network.Mode, sandbox string, hosts []string) string {
+func steadyStateLine(pol policy.Policy, mode network.Mode, sandbox, agentName string, hosts []string) string {
 	allows, denies := 0, 0
 	for _, r := range pol.Rules {
 		if r.Action == policy.Deny {
@@ -450,10 +450,18 @@ func steadyStateLine(pol policy.Policy, mode network.Mode, sandbox string, hosts
 	if len(hosts) > 0 {
 		tls = fmt.Sprintf("TLS decrypted for %d host(s): %s", len(hosts), strings.Join(hosts, ", "))
 	}
+	// The `policy ls` invocation has to include the agent, or it would print a policy
+	// without the agent's own layer — a different policy from the one this sandbox is
+	// about to run under, offered as the way to inspect it. `policy ls` contacts nothing,
+	// containerd included, so it cannot look the agent up for itself.
+	ls := "boks policy ls --sandbox " + sandbox
+	if agentName != "" {
+		ls += " --agent " + agentName
+	}
 	return fmt.Sprintf("network: %s · policy %s · %d allow, %d deny · %s\n"+
-		"         unchanged since this sandbox last ran — 'boks policy ls --sandbox %s' for the\n"+
-		"         rules, 'boks policy log --sandbox %s' for what they decided.\n",
-		mode, pol.Name, allows, denies, tls, sandbox, sandbox)
+		"         unchanged since this sandbox last ran. The rules: %s\n"+
+		"         What they decided: boks policy log --sandbox %s\n",
+		mode, pol.Name, allows, denies, tls, ls, sandbox)
 }
 
 // stopNetworkQuietly and forgetNetworkQuietly are the cleanup paths. Failures are reported
