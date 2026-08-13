@@ -33,10 +33,10 @@ flags rather than the host's. A shared-kernel container cannot produce any of th
 
 ## Can I run it on Windows?
 
-Not natively. There is no Windows build, and the obstacle is one device driver rather than
-the platform: libkrun's Windows Hypervisor Platform backend is in progress upstream for
-libkrun 2.0 with every device ported except `virtio-net` — which is exactly the one Boks'
-enforcement depends on.
+Not yet, natively — it is in progress. A Windows Hypervisor Platform backend for libkrun is
+being built in this repository's patch series and most of the VMM now compiles for Windows
+in CI, but `virtio-net` — the one device Boks' enforcement depends on — is not ported yet,
+and no sandbox has ever booted on Windows.
 
 Inside WSL2 it should work unchanged, with workspace paths preserved exactly, and nobody has
 run it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2).
