@@ -101,11 +101,16 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
 USER agent
 WORKDIR /home/agent
 
-# tini first so it is PID 1 and reaps; the entrypoint installs the CA and then execs, so it
-# does not linger as a process of its own.
+# tini first so it reaps; the entrypoint installs the CA and then execs, so it does not
+# linger as a process of its own.
+#
+# `-s` registers tini as a child subreaper. Inside a microVM the guest's own init is PID 1,
+# so tini is not, and a tini that is neither PID 1 nor a subreaper reaps nothing — orphans go
+# past it to PID 1. It also said so, in three lines of warning before every run, which read
+# like a fault. `-s` is tini's own remedy for exactly that and makes the reaping real.
 #
 # Note that `boks run` replaces the whole argv (containerd's WithProcessArgs discards the
 # image entrypoint), which is why internal/agent carries this same prefix in Agent.Init.
 # The ENTRYPOINT here is what makes `docker run` and any other OCI runtime behave the same.
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/boks-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/boks-entrypoint"]
 CMD ["/bin/bash"]

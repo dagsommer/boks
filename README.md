@@ -117,6 +117,9 @@ procedure to confirm the VM boundary on capable hardware.
 Docker Desktop is not required. Docker Sandboxes is not required.
 
 Run `boks doctor` — it checks all of the above and tells you what to do about each gap.
+Nothing should be `fail`. On macOS one check warns on a perfectly good host and always will:
+`virtualization` cannot be probed without booting a VM, so it reports architecture support
+and says as much. On Linux that check reads `/dev/kvm` and is `ok` or `fail`.
 
 ## Quick start
 
