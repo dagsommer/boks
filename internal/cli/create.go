@@ -39,6 +39,9 @@ Agents:
 	// on the runtime's default transport, which is the one that reaches host loopback.
 	var netFlags policyFlags
 	netFlags.register(cmd.Flags())
+	var quiet bool
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false,
+		"suppress the network summary (a new TLS-interception host is still announced)")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
@@ -82,7 +85,7 @@ Agents:
 		if err != nil {
 			return err
 		}
-		if err := describeNetwork(&netFlags, spec, mode, env.Stderr); err != nil {
+		if err := describeNetwork(&netFlags, spec, mode, quiet, env.Stderr); err != nil {
 			return err
 		}
 		guest, err := spec.Prepare()
