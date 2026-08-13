@@ -3,6 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -323,6 +326,64 @@ func TestSecretRoundTripThroughCLI(t *testing.T) {
 	}
 	if !strings.Contains(out, "no secrets stored") {
 		t.Errorf("output = %q", out)
+	}
+}
+
+// A forgotten passphrase used to be a dead end reachable in one step: every subcommand has
+// to decrypt, `rm` included, so the remedy for "wrong passphrase" was the command that had
+// just failed, and `ls` failed the same way. There was no move left inside the CLI.
+func TestAForgottenPassphraseHasAWayOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BOKS_STATE_DIR", dir)
+
+	t.Setenv(secret.PassphraseEnv, "the-right-one")
+	if _, _, err := runCLI(t, "value\n", "secret", "set", "github"); err != nil {
+		t.Fatalf("secret set: %v", err)
+	}
+
+	t.Setenv(secret.PassphraseEnv, "not-the-right-one")
+	for _, args := range [][]string{{"secret", "ls"}, {"secret", "rm", "github"}, {"secret", "set", "other"}} {
+		_, _, err := runCLI(t, "value\n", args...)
+		if err == nil {
+			t.Fatalf("boks %v succeeded with the wrong passphrase", args)
+		}
+		// The remedy has to name the file, say what deleting it costs, and give the
+		// command — none of which the user can be expected to know otherwise.
+		for _, want := range []string{"secrets.json", "boks secret reset --force", "set again"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("boks %v: the error does not say %q:\n%v", args, want, err)
+			}
+		}
+	}
+
+	// The way out must not itself need the passphrase, or it is not a way out.
+	t.Setenv(secret.PassphraseEnv, "")
+	if _, _, err := runCLI(t, "", "secret", "reset"); err == nil {
+		t.Error("secret reset destroyed the store without --force")
+	}
+	out, _, err := runCLI(t, "", "secret", "reset", "--force")
+	if err != nil {
+		t.Fatalf("secret reset --force: %v", err)
+	}
+	if !strings.Contains(out, "deleted") {
+		t.Errorf("secret reset --force said %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "secrets.json")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the store is still there after a reset: %v", err)
+	}
+
+	// And afterwards the store is usable again, with whatever passphrase you now have.
+	t.Setenv(secret.PassphraseEnv, "a-new-one")
+	if _, _, err := runCLI(t, "value\n", "secret", "set", "github"); err != nil {
+		t.Fatalf("the store was not usable after a reset: %v", err)
+	}
+	// Resetting a store that is not there is a statement, not a failure.
+	if _, _, err := runCLI(t, "", "secret", "reset", "--force"); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = runCLI(t, "", "secret", "reset", "--force")
+	if err != nil || !strings.Contains(out, "nothing to reset") {
+		t.Errorf("resetting an absent store = %q, %v", out, err)
 	}
 }
 
