@@ -2,6 +2,7 @@ package sandbox_test
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/dagsommer/boks/internal/policy"
@@ -43,7 +44,7 @@ func TestIntegrationPolicySurvivesStopAndStart(t *testing.T) {
 	}
 	assertPolicyPreserved(t, cfg, "after Create")
 
-	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	assertPolicyPreserved(t, cfg, "after Start")
@@ -53,7 +54,7 @@ func TestIntegrationPolicySurvivesStopAndStart(t *testing.T) {
 	}
 	assertPolicyPreserved(t, cfg, "after Stop")
 
-	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start after Stop: %v", err)
 	}
 	assertPolicyPreserved(t, cfg, "after a stop and a start")

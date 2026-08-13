@@ -51,6 +51,15 @@ const (
 	//
 	// It holds destinations and preset names. It holds no credential and no secret.
 	LabelPolicy = "dev.boks.policy"
+	// LabelFilesystem is how the workspace reaches the guest: direct, or a clone of the
+	// host repository made inside the guest. It is a versioned JSON record; see
+	// Filesystem in clone.go.
+	//
+	// Absent means direct mode, which is what every sandbox created before clone mode
+	// existed is in, and is also the reading that claims the least. The mode is fixed
+	// when a sandbox is created because it lives in the OCI mounts, so this label is
+	// both what `boks ls` reports and what a re-attach checks a `--clone` against.
+	LabelFilesystem = "dev.boks.filesystem"
 )
 
 // maxLabelBytes is containerd's limit on the size of one label's key and value together.
