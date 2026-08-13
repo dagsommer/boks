@@ -1,0 +1,15 @@
+# The erofs/go-erofs commit whose CI recipe we reuse to cross-compile mkfs.erofs.exe.
+#
+# THIS IS THE ONLY PIN IN THIS DIRECTORY, ON PURPOSE. Everything else the build needs — the
+# erofs-utils version, the lz4 version, the five patches, the seven MinGW compatibility
+# headers — is read out of the tree at this SHA by the workflow rather than copied here.
+# go-erofs maintains that recipe; we are borrowing it, not forking it. A copy in this repo
+# would be a second source of truth that silently rots the first time upstream fixes a patch.
+#
+# A full SHA rather than a branch for the usual reason: the recipe has to be the one we
+# tested, and a moving ref turns "upstream changed the patch series" into a random Tuesday's
+# CI failure on a pull request that touched none of this.
+#
+# 52cc42c "Add RemoveAll for recursive removal", 2026-08-03, on erofs/go-erofs main.
+# At this SHA the recipe builds erofs-utils v1.9.1 against lz4 1.10.0.
+52cc42c5291c08ce1b29d1e78088d12cea4c00df
