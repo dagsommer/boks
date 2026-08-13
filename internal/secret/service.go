@@ -212,6 +212,26 @@ func (s Service) InjectSpecs() []string {
 	return out
 }
 
+// Describe renders the header this rule sets, with the credential's place in it marked. It
+// is printed where a user is choosing to store something, so that "which header does my key
+// ride in" is answered on the screen rather than in a vendor's documentation.
+func (r ServiceInject) Describe() string {
+	header := r.Header
+	if header == "" {
+		header = DefaultHeader
+	}
+	switch r.Scheme {
+	case SchemeBearer:
+		return header + ": Bearer <credential>"
+	case SchemeBasic:
+		return header + ": Basic base64(" + r.Username + ":<credential>)"
+	}
+	if r.Format == "" {
+		return header + ": <credential>"
+	}
+	return header + ": " + strings.Replace(r.Format, "%s", "<credential>", 1)
+}
+
 func (r ServiceInject) attachment() string {
 	switch r.Scheme {
 	case SchemeBearer:

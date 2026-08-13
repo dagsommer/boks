@@ -431,7 +431,8 @@ func describeStoredService(w io.Writer, name string) {
 	}
 	fmt.Fprintf(w, "\n  %s\n", service.Summary)
 	for _, rule := range service.Inject {
-		fmt.Fprintf(w, "  attached to:  %s  (%s)\n", strings.Join(rule.Hosts, ", "), rule.Why)
+		fmt.Fprintf(w, "  attached to:  %s\n", strings.Join(rule.Hosts, ", "))
+		fmt.Fprintf(w, "                %s — %s\n", rule.Describe(), rule.Why)
 	}
 	if service.EnvName != "" {
 		fmt.Fprintf(w, "  the guest gets a placeholder in $%s\n", service.EnvName)
