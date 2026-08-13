@@ -1,7 +1,7 @@
 From 91dd9235eda4c053e970d166667594229023c7d1 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 17:33:41 +0200
-Subject: [PATCH 28/28] windows: load an external ELF kernel instead of
+Subject: [PATCH 28/29] windows: load an external ELF kernel instead of
  refusing
 
 `krun_start_enter` on Windows failed with -EINVAL and

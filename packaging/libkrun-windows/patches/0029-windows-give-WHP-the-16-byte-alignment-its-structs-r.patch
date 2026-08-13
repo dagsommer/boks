@@ -1,0 +1,730 @@
+From c29bab61e667a070d3516325197fb5f7f9320d93 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 18:37:33 +0200
+Subject: [PATCH 29/29] windows: give WHP the 16-byte alignment its structs
+ require
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`WinHvPlatformDefs.h` declares `WHV_UINT128` as `DECLSPEC_ALIGN(16)`, and
+the alignment propagates to every type embedding it — `WHV_REGISTER_VALUE`
+through `Reg128`, and `WHV_RUN_VP_EXIT_CONTEXT` through the six
+`WHV_UINT128` XMM registers in `WHV_HYPERCALL_CONTEXT`.
+
+windows-sys 0.61.2 emits both as plain `#[repr(C)]`. Their largest
+primitive member is a `u64`, so Rust computes an alignment of 8. The sizes
+are right (16 and 224, matching the header's own C_ASSERTs); only the
+alignment is wrong, which is exactly the kind of mismatch that faults at
+runtime instead of failing to compile.
+
+`set_registers64` builds a `[WHV_REGISTER_VALUE; N]` on the stack and hands
+its address to `WHvSetVirtualProcessorRegisters`. At align 8 that array
+lands 8-mod-16 depending on the caller's frame layout, and WHP faults
+dereferencing it — deterministically for a given call site, which is why
+`setup_msrs` died on every boot while a standalone probe and the unit tests
+doing the same thing from different frames passed.
+
+Wrap both types in `#[repr(C, align(16))]` newtypes. A single-field newtype
+keeps the size and field offsets, so an array of wrappers has exactly the
+layout a C compiler gives the properly-aligned C type, and no copying or
+allocation is needed anywhere.
+
+The slice-taking `get_whp_registers`/`set_whp_registers` change their
+element type rather than copying into an aligned scratch buffer: they run
+on the emulator callback path, i.e. on every MMIO/PIO exit, where the
+count is only known at runtime and a copy would mean a heap allocation per
+exit. Making the alignment part of the type moves the requirement to where
+it can be enforced. The emulator callbacks reborrow WHP's own buffers with
+a checked cast, so a buffer that somehow was not aligned is reported as
+E_INVALIDARG rather than turned into a reference.
+
+Every `WHV_*` record windows-sys exposes was compared against the SDK
+headers compiled for x86_64-pc-windows-msvc. Nine differ, all alignment
+only, all descending from `WHV_UINT128`; the other seven are reachable
+only as members of the two types wrapped here. Everything else this crate
+passes across the FFI boundary matches the C layout exactly.
+
+`const _: () = assert!(...)` guards pin the sizes and alignments — of the
+wrappers and of the hand-rolled `WhvInterruptControl` — so a future
+windows-sys bump that changes a layout fails the build instead of
+producing another access violation months later.
+
+The missing `align(16)` is a windows-sys metadata bug and is worth
+reporting upstream.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/arch/src/x86_64/windows/regs.rs |  15 +-
+ src/vmm/src/windows/emulator.rs     |  22 +-
+ src/whp/src/aligned.rs              | 326 ++++++++++++++++++++++++++++
+ src/whp/src/lib.rs                  | 123 +++++++----
+ 4 files changed, 428 insertions(+), 58 deletions(-)
+ create mode 100644 src/whp/src/aligned.rs
+
+diff --git a/src/arch/src/x86_64/windows/regs.rs b/src/arch/src/x86_64/windows/regs.rs
+index 44826d2..98af78a 100644
+--- a/src/arch/src/x86_64/windows/regs.rs
++++ b/src/arch/src/x86_64/windows/regs.rs
+@@ -10,6 +10,7 @@ use super::super::layout::{
+ use super::super::regs::{
+     EFER_LMA, EFER_LME, Error, X86_CR0_PE, compute_page_tables, compute_segments,
+ };
++use whp::AlignedRegisterValue;
+ use windows_sys::Win32::System::Hypervisor::*;
+ 
+ type Result<T> = std::result::Result<T, Error>;
+@@ -62,8 +63,8 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
+     let segs = compute_segments(mem, false)?;
+     let pt = compute_page_tables(mem)?;
+ 
+-    let to_segment = |seg: &SegmentDescriptor| -> WHV_REGISTER_VALUE {
+-        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
++    let to_segment = |seg: &SegmentDescriptor| -> AlignedRegisterValue {
++        let mut v = AlignedRegisterValue::zeroed();
+         let s = unsafe { &mut v.Segment };
+         s.Base = seg.base;
+         s.Limit = seg.limit;
+@@ -79,19 +80,15 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
+         v
+     };
+ 
+-    let to_table = |base: u64, limit: u16| -> WHV_REGISTER_VALUE {
+-        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
++    let to_table = |base: u64, limit: u16| -> AlignedRegisterValue {
++        let mut v = AlignedRegisterValue::zeroed();
+         let t = unsafe { &mut v.Table };
+         t.Base = base;
+         t.Limit = limit;
+         v
+     };
+ 
+-    let to_reg64 = |val: u64| -> WHV_REGISTER_VALUE {
+-        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
+-        v.Reg64 = val;
+-        v
+-    };
++    let to_reg64 = AlignedRegisterValue::from_reg64;
+ 
+     let [cr0, cr4, efer] = vcpu
+         .get_registers64([WHvX64RegisterCr0, WHvX64RegisterCr4, WHvX64RegisterEfer])
+diff --git a/src/vmm/src/windows/emulator.rs b/src/vmm/src/windows/emulator.rs
+index 14740b8..ceb8663 100644
+--- a/src/vmm/src/windows/emulator.rs
++++ b/src/vmm/src/windows/emulator.rs
+@@ -30,6 +30,7 @@ use std::ffi::c_void;
+ use std::slice;
+ 
+ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
++use whp::AlignedRegisterValue;
+ use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
+ use windows_sys::Win32::System::Hypervisor::{
+     WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
+@@ -198,7 +199,16 @@ unsafe extern "system" fn get_registers_callback(
+     let ctx = unsafe { context(ctx) };
+     let count = register_count as usize;
+     let names = unsafe { slice::from_raw_parts(register_names, count) };
+-    let values = unsafe { slice::from_raw_parts_mut(register_values, count) };
++    // The buffer belongs to WHP, which compiled against the properly aligned C
++    // declaration, so this should always succeed; see `whp::aligned`.
++    let Some(values) =
++        (unsafe { AlignedRegisterValue::slice_from_raw_mut(register_values, count) })
++    else {
++        error!(
++            "WHP emulator handed us a null or misaligned register-value buffer ({register_values:p})"
++        );
++        return E_INVALIDARG;
++    };
+ 
+     match ctx.vcpu.get_whp_registers(names, values) {
+         Ok(()) => S_OK,
+@@ -221,7 +231,15 @@ unsafe extern "system" fn set_registers_callback(
+     let ctx = unsafe { context(ctx) };
+     let count = register_count as usize;
+     let names = unsafe { slice::from_raw_parts(register_names, count) };
+-    let values = unsafe { slice::from_raw_parts(register_values, count) };
++    // As in `get_registers_callback`: WHP's own buffer, checked rather than
++    // assumed.
++    let Some(values) = (unsafe { AlignedRegisterValue::slice_from_raw(register_values, count) })
++    else {
++        error!(
++            "WHP emulator handed us a null or misaligned register-value buffer ({register_values:p})"
++        );
++        return E_INVALIDARG;
++    };
+ 
+     match ctx.vcpu.set_whp_registers(names, values) {
+         Ok(()) => S_OK,
+diff --git a/src/whp/src/aligned.rs b/src/whp/src/aligned.rs
+new file mode 100644
+index 0000000..3e7bc46
+--- /dev/null
++++ b/src/whp/src/aligned.rs
+@@ -0,0 +1,326 @@
++// Copyright 2026 Red Hat, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++//! Alignment-correcting wrappers for the WHP types that `windows-sys` declares
++//! under-aligned.
++//!
++//! # The bug
++//!
++//! `WinHvPlatformDefs.h` (Windows SDK 10.0.26100) declares
++//!
++//! ```c
++//! typedef union DECLSPEC_ALIGN(16) WHV_UINT128 { ... } WHV_UINT128;
++//! ```
++//!
++//! and the alignment propagates to every type that embeds it — most
++//! importantly `WHV_REGISTER_VALUE` (whose `Reg128` member is a `WHV_UINT128`)
++//! and `WHV_RUN_VP_EXIT_CONTEXT` (whose exit-context union contains
++//! `WHV_HYPERCALL_CONTEXT`, an array of six `WHV_UINT128`).
++//!
++//! `windows-sys` 0.61.2 emits all of these as plain `#[repr(C)]` with no
++//! `align(16)`. Their largest primitive member is a `u64`, so Rust computes an
++//! alignment of 8. The *sizes* are right — 16 for `WHV_REGISTER_VALUE`, 224 for
++//! `WHV_RUN_VP_EXIT_CONTEXT`, verified against the header's own `C_ASSERT`s —
++//! only the alignment is wrong, which is exactly the kind of mismatch that
++//! produces a crash rather than a compile error.
++//!
++//! A `[WHV_REGISTER_VALUE; N]` built on the stack therefore lands on an
++//! 8-mod-16 address roughly half the time, depending on the caller's frame
++//! layout, and `WHvSetVirtualProcessorRegisters` faults when it dereferences it
++//! with an alignment-assuming (SSE) load. That is a deterministic,
++//! call-site-dependent access violation: the same helper works from one caller
++//! and dies from another.
++//!
++//! This is a `windows-sys` metadata bug and is worth reporting upstream; until
++//! it is fixed there, correcting it here is not optional.
++//!
++//! # The fix
++//!
++//! Wrap each affected type in a `#[repr(C, align(16))]` newtype. The wrapper
++//! has exactly one field, so it has the same size and field offsets as the
++//! inner type, and raising its alignment to 16 does not change its size (16 and
++//! 224 are both multiples of 16). An array of wrappers therefore has *exactly*
++//! the layout a C compiler gives an array of the properly-aligned C type, so
++//! `&[AlignedRegisterValue]` can be handed straight to WHP as a
++//! `const WHV_REGISTER_VALUE*`.
++//!
++//! The `const _: () = assert!(...)` guards below are the point of this module
++//! as much as the wrappers are: if a future `windows-sys` bump changes any of
++//! these layouts — including "fixing" the alignment, which the wrappers absorb
++//! harmlessly — the build fails with a readable message instead of regressing
++//! into another access violation months later.
++//!
++//! # Types checked
++//!
++//! Every `WHV_*` record `windows-sys` 0.61.2 exposes was compared against the
++//! SDK headers compiled for `x86_64-pc-windows-msvc`. Nine differ, all of them
++//! alignment-only, all of them rooted in the missing `align(16)` on
++//! `WHV_UINT128`:
++//!
++//! | type | C (size/align) | windows-sys |
++//! |---|---|---|
++//! | `WHV_UINT128` | 16/16 | 16/8 |
++//! | `WHV_REGISTER_VALUE` | 16/16 | 16/8 |
++//! | `WHV_RUN_VP_EXIT_CONTEXT` | 224/16 | 224/8 |
++//! | `WHV_HYPERCALL_CONTEXT` | 176/16 | 176/8 |
++//! | `WHV_X64_FP_REGISTER` | 16/16 | 16/8 |
++//! | `WHV_X64_FP_CONTROL_STATUS_REGISTER` | 16/16 | 16/8 |
++//! | `WHV_X64_XMM_CONTROL_STATUS_REGISTER` | 16/16 | 16/8 |
++//! | `WHV_X64_PENDING_EXCEPTION_EVENT` | 16/16 | 16/8 |
++//! | `WHV_X64_PENDING_EXT_INT_EVENT` | 16/16 | 16/8 |
++//!
++//! Of those, only two are ever handed to WHP by this crate as an object in
++//! their own right — `WHV_REGISTER_VALUE` and `WHV_RUN_VP_EXIT_CONTEXT` — and
++//! those are the two wrapped here. The other seven are only ever reached as
++//! members of a `WHV_REGISTER_VALUE` (the FP/XMM/pending-event registers) or of
++//! a `WHV_RUN_VP_EXIT_CONTEXT` (`WHV_HYPERCALL_CONTEXT`), so aligning the two
++//! containers aligns them too. Every other WHP type this crate passes across
++//! the FFI boundary — `WHV_CAPABILITY`, `WHV_PARTITION_PROPERTY`,
++//! `WHV_X64_CPUID_RESULT`, `WHV_INTERRUPT_CONTROL`, `WHV_EMULATOR_CALLBACKS`,
++//! `WHV_EMULATOR_STATUS`, `WHV_EMULATOR_IO_ACCESS_INFO`,
++//! `WHV_EMULATOR_MEMORY_ACCESS_INFO`, `WHV_TRANSLATE_GVA_RESULT`,
++//! `WHV_MEMORY_ACCESS_CONTEXT`, `WHV_X64_IO_PORT_ACCESS_CONTEXT`,
++//! `WHV_VP_EXIT_CONTEXT`, `WHV_PROCESSOR_FEATURES_BANKS` — matches the C
++//! layout exactly and needs no wrapper.
++
++use std::mem;
++use std::ops::{Deref, DerefMut};
++
++use windows_sys::Win32::System::Hypervisor::{WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT};
++
++/// The alignment `DECLSPEC_ALIGN(16)` imposes on `WHV_UINT128` and everything
++/// that embeds it.
++pub const WHP_ALIGN: usize = 16;
++
++/// A `WHV_REGISTER_VALUE` with the 16-byte alignment WHP actually requires.
++///
++/// See the [module docs](self) for why this exists. Use it anywhere a register
++/// value crosses the FFI boundary; the [`Deref`]/[`DerefMut`] impls make the
++/// union's fields directly reachable, so `value.Reg64` and `value.Segment.Base`
++/// work exactly as they did on the bare type.
++#[repr(C, align(16))]
++#[derive(Clone, Copy)]
++pub struct AlignedRegisterValue(pub WHV_REGISTER_VALUE);
++
++// Guards. Do not delete these when bumping `windows-sys`: they are what turns a
++// silently changed layout back into a build failure instead of a fault inside
++// WHP. `WinHvPlatformDefs.h` asserts `sizeof(WHV_REGISTER_VALUE) == 16` itself.
++const _: () = assert!(
++    mem::size_of::<WHV_REGISTER_VALUE>() == 16,
++    "windows-sys WHV_REGISTER_VALUE is no longer 16 bytes; the WHP ABI says it must be"
++);
++const _: () = assert!(
++    mem::size_of::<AlignedRegisterValue>() == mem::size_of::<WHV_REGISTER_VALUE>(),
++    "AlignedRegisterValue must not add padding: WHP indexes arrays of it"
++);
++const _: () = assert!(
++    mem::align_of::<AlignedRegisterValue>() == WHP_ALIGN,
++    "AlignedRegisterValue must be 16-byte aligned; WHP dereferences it with aligned loads"
++);
++
++impl AlignedRegisterValue {
++    /// An all-zero register value.
++    pub fn zeroed() -> Self {
++        // A union of integers and bitfields: all-zero is a valid value of every
++        // member.
++        Self(unsafe { mem::zeroed() })
++    }
++
++    /// A register value holding `value` in its 64-bit member.
++    pub fn from_reg64(value: u64) -> Self {
++        let mut v = Self::zeroed();
++        v.0.Reg64 = value;
++        v
++    }
++
++    /// Reads the 64-bit member.
++    ///
++    /// Every WHP register is at most 128 bits and the union is fully
++    /// initialised by construction, so reading `Reg64` out of a value produced
++    /// by this crate is always a defined (if possibly meaningless) read.
++    pub fn reg64(&self) -> u64 {
++        unsafe { self.0.Reg64 }
++    }
++
++    /// Borrows a WHP-owned buffer of register values as aligned wrappers.
++    ///
++    /// This is for the instruction emulator's register callbacks, which are
++    /// handed a `(pointer, count)` pair that WHP allocated. WHP compiles
++    /// against the properly-aligned C declaration, so its buffers *are* 16-byte
++    /// aligned — but rather than take that on faith and construct a reference
++    /// that would be UB if it were ever false, the alignment is checked and a
++    /// misaligned buffer is reported to the caller as `None`.
++    ///
++    /// # Safety
++    ///
++    /// `ptr` must point to `len` initialised, contiguous `WHV_REGISTER_VALUE`s
++    /// that stay valid and unaliased for `'a`.
++    pub unsafe fn slice_from_raw<'a>(
++        ptr: *const WHV_REGISTER_VALUE,
++        len: usize,
++    ) -> Option<&'a [Self]> {
++        if ptr.is_null() || (ptr as usize) % WHP_ALIGN != 0 {
++            return None;
++        }
++        // Same size and field offsets as the pointee; the alignment check above
++        // establishes the only property the cast adds.
++        Some(unsafe { std::slice::from_raw_parts(ptr.cast::<Self>(), len) })
++    }
++
++    /// Mutable counterpart of [`AlignedRegisterValue::slice_from_raw`].
++    ///
++    /// # Safety
++    ///
++    /// As [`AlignedRegisterValue::slice_from_raw`], and `ptr` must additionally
++    /// be unaliased for writes for `'a`.
++    pub unsafe fn slice_from_raw_mut<'a>(
++        ptr: *mut WHV_REGISTER_VALUE,
++        len: usize,
++    ) -> Option<&'a mut [Self]> {
++        if ptr.is_null() || (ptr as usize) % WHP_ALIGN != 0 {
++            return None;
++        }
++        Some(unsafe { std::slice::from_raw_parts_mut(ptr.cast::<Self>(), len) })
++    }
++}
++
++impl Deref for AlignedRegisterValue {
++    type Target = WHV_REGISTER_VALUE;
++
++    fn deref(&self) -> &Self::Target {
++        &self.0
++    }
++}
++
++impl DerefMut for AlignedRegisterValue {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        &mut self.0
++    }
++}
++
++impl From<WHV_REGISTER_VALUE> for AlignedRegisterValue {
++    fn from(value: WHV_REGISTER_VALUE) -> Self {
++        Self(value)
++    }
++}
++
++impl From<AlignedRegisterValue> for WHV_REGISTER_VALUE {
++    fn from(value: AlignedRegisterValue) -> Self {
++        value.0
++    }
++}
++
++/// A `WHV_RUN_VP_EXIT_CONTEXT` with the 16-byte alignment WHP requires.
++///
++/// `WHvRunVirtualProcessor` writes into this buffer, and the exit-context union
++/// includes `WHV_HYPERCALL_CONTEXT` with its six `WHV_UINT128` XMM registers,
++/// so the C declaration is 16-byte aligned and the buffer we hand it has to be
++/// too. Nothing in this crate reads the hypercall context — we never enable
++/// hypercall exits — but the alignment is a property of the *buffer* WHP
++/// writes, not of the member we happen to read afterwards.
++#[repr(C, align(16))]
++#[derive(Clone, Copy)]
++pub struct AlignedExitContext(pub WHV_RUN_VP_EXIT_CONTEXT);
++
++// Same rationale as the guards on `AlignedRegisterValue`.
++// `WinHvPlatformDefs.h` asserts `sizeof(WHV_RUN_VP_EXIT_CONTEXT) == 224` on
++// AMD64.
++const _: () = assert!(
++    mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() == 224,
++    "windows-sys WHV_RUN_VP_EXIT_CONTEXT is no longer 224 bytes; the WHP ABI says it must be"
++);
++const _: () = assert!(
++    mem::size_of::<AlignedExitContext>() == mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>(),
++    "AlignedExitContext must not add padding: its size is passed to WHvRunVirtualProcessor"
++);
++const _: () = assert!(
++    mem::align_of::<AlignedExitContext>() == WHP_ALIGN,
++    "AlignedExitContext must be 16-byte aligned; WHvRunVirtualProcessor writes it with aligned stores"
++);
++
++impl AlignedExitContext {
++    /// An all-zero exit context, matching the previous `mem::zeroed()`
++    /// initialisation of the field.
++    pub fn zeroed() -> Self {
++        Self(unsafe { mem::zeroed() })
++    }
++}
++
++impl Deref for AlignedExitContext {
++    type Target = WHV_RUN_VP_EXIT_CONTEXT;
++
++    fn deref(&self) -> &Self::Target {
++        &self.0
++    }
++}
++
++impl DerefMut for AlignedExitContext {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        &mut self.0
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The compile-time guards prove the *type* is 16-byte aligned; this proves
++    /// the property that actually mattered at the crash site, namely that an
++    /// array of them built on the stack lands on a 16-byte boundary regardless
++    /// of the caller's frame layout. `set_registers64` builds exactly such an
++    /// array and hands its address to WHP.
++    #[test]
++    fn stack_arrays_are_16_byte_aligned() {
++        fn check<const N: usize>() {
++            let values = [AlignedRegisterValue::zeroed(); N];
++            assert_eq!(
++                values.as_ptr() as usize % WHP_ALIGN,
++                0,
++                "[AlignedRegisterValue; {N}] must start on a 16-byte boundary"
++            );
++            // Stride has to match the C array too, not just the start.
++            assert_eq!(mem::size_of_val(&values), N * 16);
++        }
++
++        // A spread of lengths, and a misaligning local in between, so that the
++        // frame offsets differ from one another.
++        check::<1>();
++        let _pad: u64 = 0;
++        check::<2>();
++        let _pad2: [u8; 3] = [0; 3];
++        check::<5>();
++        check::<13>();
++
++        let ctx = AlignedExitContext::zeroed();
++        assert_eq!(&ctx as *const _ as usize % WHP_ALIGN, 0);
++    }
++
++    /// A misaligned buffer must be rejected rather than turned into a reference,
++    /// which would be UB.
++    #[test]
++    fn slice_from_raw_rejects_misaligned_and_null() {
++        let mut backing = [AlignedRegisterValue::zeroed(); 4];
++        let base = backing.as_mut_ptr().cast::<WHV_REGISTER_VALUE>();
++
++        assert!(unsafe { AlignedRegisterValue::slice_from_raw(base, 4) }.is_some());
++        assert!(unsafe { AlignedRegisterValue::slice_from_raw_mut(base, 4) }.is_some());
++
++        // 8 bytes into a 16-byte-aligned buffer: aligned for windows-sys,
++        // misaligned for WHP. This is the address `set_registers64` was handing
++        // over half the time.
++        let skewed = unsafe { base.cast::<u64>().add(1) }.cast::<WHV_REGISTER_VALUE>();
++        assert!(unsafe { AlignedRegisterValue::slice_from_raw(skewed, 3) }.is_none());
++        assert!(unsafe { AlignedRegisterValue::slice_from_raw_mut(skewed, 3) }.is_none());
++
++        assert!(unsafe { AlignedRegisterValue::slice_from_raw(std::ptr::null(), 0) }.is_none());
++    }
++
++    #[test]
++    fn reg64_round_trips() {
++        assert_eq!(
++            AlignedRegisterValue::from_reg64(0xdead_beef_1234_5678).reg64(),
++            0xdead_beef_1234_5678
++        );
++        assert_eq!(AlignedRegisterValue::zeroed().reg64(), 0);
++    }
++}
+diff --git a/src/whp/src/lib.rs b/src/whp/src/lib.rs
+index d01bc5b..69ec85d 100644
+--- a/src/whp/src/lib.rs
++++ b/src/whp/src/lib.rs
+@@ -3,6 +3,10 @@
+ 
+ #![cfg(target_os = "windows")]
+ 
++mod aligned;
++
++pub use aligned::{AlignedExitContext, AlignedRegisterValue, WHP_ALIGN};
++
+ use std::ffi::c_void;
+ use std::fmt::{Display, Formatter};
+ use std::mem::{self, MaybeUninit};
+@@ -11,19 +15,20 @@ use std::sync::Arc;
+ use log::{debug, error};
+ use windows_sys::Win32::Foundation::S_OK;
+ use windows_sys::Win32::System::Hypervisor::{
+-    WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
+-    WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
+-    WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
+-    WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE,
+-    WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
+-    WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent,
+-    WHvCapabilityCodeProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor,
+-    WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator,
+-    WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
+-    WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
+-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList,
+-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+-    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
++    WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_INTERRUPT_CONTROL,
++    WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY,
++    WHV_PARTITION_PROPERTY_CODE, WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME,
++    WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT,
++    WHV_TRANSLATE_GVA_RESULT_CODE, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT,
++    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
++    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorFeaturesBanks,
++    WHvCreatePartition, WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
++    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
++    WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
++    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
++    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExtendedVmExits,
++    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
++    WHvPartitionPropertyCodeProcessorFeaturesBanks,
+     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+     WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRequestInterrupt, WHvRunVirtualProcessor,
+     WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
+@@ -209,6 +214,22 @@ struct WhvInterruptControl {
+     vector: u32,
+ }
+ 
++// `WhvInterruptControl` is a hand-rolled mirror of the C
++// `WHV_INTERRUPT_CONTROL`, whose leading field is a bitfield that
++// `windows-sys` exposes only as an opaque `u64`. The header and `windows-sys`
++// agree on 16 bytes / 8-byte alignment and this struct must match, because its
++// size is what `WHvRequestInterrupt` is told the buffer is. Pinned here so a
++// layout drift on either side fails the build rather than misplacing the
++// destination and vector fields.
++const _: () = assert!(
++    mem::size_of::<WhvInterruptControl>() == mem::size_of::<WHV_INTERRUPT_CONTROL>(),
++    "WhvInterruptControl must have the same size as the WHP WHV_INTERRUPT_CONTROL"
++);
++const _: () = assert!(
++    mem::align_of::<WhvInterruptControl>() == mem::align_of::<WHV_INTERRUPT_CONTROL>(),
++    "WhvInterruptControl must have the same alignment as the WHP WHV_INTERRUPT_CONTROL"
++);
++
+ #[repr(u8)]
+ #[derive(Debug, Clone, Copy)]
+ pub enum InterruptType {
+@@ -815,7 +836,10 @@ pub enum VcpuExitReason {
+ pub struct WhpVcpu {
+     vm: Arc<WhpVm>,
+     index: u32,
+-    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
++    /// Buffer `WHvRunVirtualProcessor` writes the exit context into. Wrapped
++    /// because WHP requires it 16-byte aligned and `windows-sys` under-aligns
++    /// the raw type; see [`aligned`].
++    exit_context: AlignedExitContext,
+ }
+ 
+ impl WhpVcpu {
+@@ -830,7 +854,7 @@ impl WhpVcpu {
+         Ok(WhpVcpu {
+             vm,
+             index,
+-            exit_context: unsafe { mem::zeroed() },
++            exit_context: AlignedExitContext::zeroed(),
+         })
+     }
+ 
+@@ -844,6 +868,9 @@ impl WhpVcpu {
+             WHvRunVirtualProcessor(
+                 self.vm.partition_handle(),
+                 self.index,
++                // The wrapper has the same size and field offsets as the inner
++                // type, so WHP sees exactly the buffer it expects — only
++                // correctly aligned.
+                 &mut self.exit_context as *mut _ as *mut _,
+                 mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as u32,
+             )
+@@ -942,29 +969,21 @@ impl WhpVcpu {
+ 
+     /// Helper to get multiple registers at once.
+     /// Returns a stack-allocated array of results.
++    ///
++    /// The result array is `[AlignedRegisterValue; N]` rather than
++    /// `[WHV_REGISTER_VALUE; N]` because the latter is under-aligned by
++    /// `windows-sys` and WHP writes into it directly; see [`aligned`].
+     pub fn get_registers<const N: usize>(
+         &self,
+         names: [WHV_REGISTER_NAME; N],
+-    ) -> Result<[WHV_REGISTER_VALUE; N], Error> {
+-        // Create a zeroed array on the stack to hold the results
+-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+-
+-        let hr = unsafe {
+-            WHvGetVirtualProcessorRegisters(
+-                self.vm.partition_handle(),
+-                self.index,
+-                names.as_ptr(),
+-                N as u32,
+-                values.as_mut_ptr(),
+-            )
+-        };
+-
+-        if hr != S_OK {
+-            Err(Error::GetRegisters(hr))
+-        } else {
+-            // Return the array directly!
+-            Ok(values)
+-        }
++    ) -> Result<[AlignedRegisterValue; N], Error> {
++        // Create a zeroed array on the stack to hold the results. The element
++        // type carries `align(16)`, so the array as a whole is 16-byte aligned
++        // whatever the caller's frame looks like.
++        let mut values = [AlignedRegisterValue::zeroed(); N];
++
++        self.get_whp_registers(&names, &mut values)?;
++        Ok(values)
+     }
+ 
+     pub fn get_registers64<const N: usize>(
+@@ -972,7 +991,7 @@ impl WhpVcpu {
+         names: [WHV_REGISTER_NAME; N],
+     ) -> Result<[u64; N], Error> {
+         let values = self.get_registers(names)?;
+-        Ok(values.map(|v| unsafe { v.Reg64 }))
++        Ok(values.map(|v| v.reg64()))
+     }
+ 
+     /// Slice-based counterpart of [`WhpVcpu::get_registers`], for callers whose
+@@ -981,10 +1000,16 @@ impl WhpVcpu {
+     /// (pointer, count) pair by WHP.
+     ///
+     /// `names` and `values` must have the same length.
++    ///
++    /// `values` is a slice of [`AlignedRegisterValue`] rather than of the bare
++    /// `WHV_REGISTER_VALUE`: the alignment WHP requires is a property of the
++    /// buffer, and this is the only place it can be enforced rather than hoped
++    /// for. Callers holding a raw WHP buffer can reborrow it with
++    /// [`AlignedRegisterValue::slice_from_raw_mut`].
+     pub fn get_whp_registers(
+         &self,
+         names: &[WHV_REGISTER_NAME],
+-        values: &mut [WHV_REGISTER_VALUE],
++        values: &mut [AlignedRegisterValue],
+     ) -> Result<(), Error> {
+         assert_eq!(names.len(), values.len());
+ 
+@@ -994,7 +1019,10 @@ impl WhpVcpu {
+                 self.index,
+                 names.as_ptr(),
+                 names.len() as u32,
+-                values.as_mut_ptr(),
++                // `AlignedRegisterValue` is a `#[repr(C, align(16))]` newtype of
++                // exactly one `WHV_REGISTER_VALUE`, so this array has the same
++                // size and stride as the C array WHP expects.
++                values.as_mut_ptr().cast(),
+             )
+         };
+         if hr != S_OK {
+@@ -1005,11 +1033,12 @@ impl WhpVcpu {
+     }
+ 
+     /// Slice-based counterpart of [`WhpVcpu::set_registers`]. See
+-    /// [`WhpVcpu::get_whp_registers`] for why the slice form is needed.
++    /// [`WhpVcpu::get_whp_registers`] for why the slice form is needed and why
++    /// the element type is [`AlignedRegisterValue`].
+     pub fn set_whp_registers(
+         &self,
+         names: &[WHV_REGISTER_NAME],
+-        values: &[WHV_REGISTER_VALUE],
++        values: &[AlignedRegisterValue],
+     ) -> Result<(), Error> {
+         assert_eq!(names.len(), values.len());
+         let count = names.len() as u32;
+@@ -1020,7 +1049,7 @@ impl WhpVcpu {
+                 self.index,
+                 names.as_ptr(),
+                 count,
+-                values.as_ptr(),
++                values.as_ptr().cast(),
+             )
+         };
+         if hr != S_OK {
+@@ -1032,10 +1061,10 @@ impl WhpVcpu {
+ 
+     pub fn set_registers<const N: usize>(
+         &self,
+-        pairs: [(WHV_REGISTER_NAME, WHV_REGISTER_VALUE); N],
++        pairs: [(WHV_REGISTER_NAME, AlignedRegisterValue); N],
+     ) -> Result<(), Error> {
+-        let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
+-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
++        let mut names: [WHV_REGISTER_NAME; N] = [0; N];
++        let mut values = [AlignedRegisterValue::zeroed(); N];
+ 
+         for i in 0..N {
+             names[i] = pairs[i].0;
+@@ -1049,12 +1078,12 @@ impl WhpVcpu {
+         &self,
+         pairs: [(WHV_REGISTER_NAME, u64); N],
+     ) -> Result<(), Error> {
+-        let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
+-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
++        let mut names: [WHV_REGISTER_NAME; N] = [0; N];
++        let mut values = [AlignedRegisterValue::zeroed(); N];
+ 
+         for i in 0..N {
+             names[i] = pairs[i].0;
+-            values[i].Reg64 = pairs[i].1;
++            values[i] = AlignedRegisterValue::from_reg64(pairs[i].1);
+         }
+ 
+         self.set_whp_registers(&names, &values)
+-- 
+2.53.0
+
