@@ -24,6 +24,10 @@ type policyFlags struct {
 	inject  []string
 	guest   []string
 	oauth   []string
+	// noSecrets leaves the credential store out of this run entirely. A credential
+	// stored under a service's name applies without being named again — see
+	// credentialPlan — and this is how a sandbox is run without one.
+	noSecrets bool
 	// agent is the agent the sandbox runs. It is not a flag on `run` — the agent is a
 	// positional there — but it decides a layer of the policy, so it travels with the
 	// rest of what decides one. `boks policy ls` and `boks policy check` set it from
@@ -58,7 +62,9 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	fs.StringArrayVar(&f.guest, "guest-credential", nil,
 		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
 	fs.StringArrayVar(&f.oauth, "oauth", nil,
-		"use a stored OAuth credential by name, from 'boks secret import' (repeatable)")
+		"use a stored OAuth credential by name, from 'boks secret adopt' (repeatable)")
+	fs.BoolVar(&f.noSecrets, "no-secrets", false,
+		"do not attach credentials from the store; only what --inject names")
 }
 
 // specified reports whether the user set any of them.
