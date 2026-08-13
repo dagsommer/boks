@@ -68,7 +68,13 @@ What works, tested locally:
 - **Credential injection in a sandbox**, over HTTP and HTTPS. The guest holds a placeholder
   in the environment variable its tooling reads; the real secret stays on the host and is
   attached to requests for the hosts you named. Those hosts — and only those — have their
-  TLS terminated, which `boks run` says out loud when you configure it.
+  TLS terminated, which `boks run` says out loud the first time a sandbox meets each one.
+  A forgotten passphrase is not a dead end: `boks secret reset` deletes the store without
+  needing to decrypt it, and the failure that sends you there says what that costs.
+- **Each agent brings the destinations it cannot work without**, so `boks run claude` works
+  under the default deny-by-default preset without anyone reading a hostname out of a log.
+  They are an ordinary allow layer — a deny in any scope still beats them — and only
+  vendor-documented hosts are in them. Telemetry endpoints are not.
 
 What is **not** done:
 
@@ -93,8 +99,10 @@ What is **not** done:
 - **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather
   than exiting 130 silently.
 - **A crashed network supervisor is unrecoverable without a restart.** The running VM does
-  not re-attach to a fresh stack on the same socket, so the sandbox keeps running with no
-  network at all.
+  not re-attach to a fresh stack on the same socket — measured on 2026-08-12 — so the
+  sandbox keeps running with no network at all. Boks now says exactly that when it meets
+  one, and gives the `stop && start` that fixes it; it does not restart the sandbox itself,
+  because that kills whatever is running inside.
 - **Linux is untested in practice.** The boundary was verified on macOS/Apple silicon;
   the Linux/KVM path is designed for but has not been exercised end to end.
 
@@ -230,6 +238,21 @@ base preset — chosen by `policy init`, a profile, or a `--policy` flag — dec
 a destination no rule mentions. A sandbox-scoped rule can add access the machine's policy
 already tolerates and can take access away; it can never widen past a deny someone wrote down.
 
+**An agent brings its own destinations.** `boks run claude` needs `api.anthropic.com`, and
+that is a fact about the agent, like its image — so it lives in the agent's record and
+resolves as a layer of its own, visible in `boks policy ls --agent claude` beside the preset
+and the global scope. It is a set of allows and nothing more: a deny in any scope beats it,
+so `boks policy deny api.anthropic.com` denies it for the claude agent too, and `--policy
+locked` drops the layer entirely because "deny everything" has to keep meaning that. Only
+destinations a vendor documents as required go in one; telemetry endpoints do not, and
+agents with no vendor source have an empty list, which their user fills with one
+`boks policy allow` after seeing the denial in `boks policy log`.
+
+```bash
+./bin/boks policy ls --agent claude          # what running that agent would add, and why
+./bin/boks policy log --sandbox claude-myproject --since 30m   # narrow the decision log
+```
+
 The `--policy`, `--allow`, `--deny` and `--net` flags are a Boks addition rather than sbx parity:
 they override the stored policy for one run. `--policy` and `--allow` replace the posture and the
 allow list; `--deny` is *added* to what the sandbox already denies, because a prohibition must
@@ -275,6 +298,10 @@ Two things to understand before using Boks:
   address in the packet, so hostname rules do not authorise raw connections.
 - **Hosts you configure a credential for are decrypted by Boks**, by design, and `boks run`
   tells you which. Everything else is tunnelled with the origin's own certificate chain.
+  It says so the first time a sandbox meets a given host, and again for any host it has not
+  named before — including under `--quiet`, which suppresses the rest of the network summary
+  but never that. The steady-state run is two lines, because a notice printed fifty lines at
+  a time before every command is a notice people learn to skip.
 
 Boks will never mount the host's Docker or containerd socket into a guest.
 
