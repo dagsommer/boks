@@ -125,35 +125,39 @@ jobs:
         working-directory: libkrun
         run: |
           set -euo pipefail
-          for crate in krun-utils krun-polly krun-arch-gen krun-smbios krun-whp krun-kernel krun-arch; do
+          for crate in krun-utils krun-polly krun-arch-gen krun-smbios krun-whp krun-kernel krun-arch krun-devices; do
             echo "::group::cargo check -p $crate"
             cargo check --target x86_64-pc-windows-msvc -p "$crate"
             echo "::endgroup::"
           done
+          # Boks needs virtio-blk as well as the default device set, so the feature that
+          # carries it is checked rather than assumed to be harmless.
+          echo "::group::cargo check -p krun-devices --features blk"
+          cargo check --target x86_64-pc-windows-msvc -p krun-devices --features blk
+          echo "::endgroup::"
 
       # ---------------------------------------------------------------------------------
       # EXPECTED TO FAIL. These are the crates the port has not reached yet, and this step is
       # a progress report, not a gate. Each entry names what is blocking it, as of the pinned
       # revision with this series applied:
       #
-      #   krun-cpuid    imports `kvm_bindings` unconditionally. KVM is Linux-only; the crate
-      #                 needs the x86 CPUID templates separated from the KVM structures that
-      #                 currently carry them.
+      #   krun-vmm      The real blocker, and it is not a compile error to chip away at:
+      #                 libkrun has no Windows hypervisor backend at all. `src/vmm/src/lib.rs`
+      #                 declares only `mod linux` and `mod macos`, and `device_manager/` holds
+      #                 only `kvm/` and `hvf/`. `krun-whp` — the WHP bindings — compiles and is
+      #                 in the required step above, but nothing calls it: the vstate and MMIO
+      #                 glue that turns those bindings into a running VM is unwritten. For
+      #                 scale, the equivalents are 778 + 569 lines on macOS and 2088 + 588 on
+      #                 Linux. The ~58 errors this step reports are downstream of that absence,
+      #                 so fixing them individually would be churn.
       #
-      #   krun-devices  4 errors. Two in `legacy/x86_64/serial.rs`, which calls `as_raw_fd()`
-      #                 on a `Box<dyn ReadableFd>` — the trait is Unix-only and the serial
-      #                 device needs a handle abstraction rather than a raw fd. Two in
-      #                 `virtio/fs/device.rs`, which references `PermissionSemantics` and
-      #                 `Config.semantics`; the Windows `passthrough.rs` does not define
-      #                 either yet, because `LinuxSimplified` semantics store mode bits in the
-      #                 host file system and NTFS has nowhere to put them.
+      #   libkrun       The cdylib. Blocked on krun-vmm; it is the last thing to go green, and
+      #                 when it does, `krun.dll` exists.
       #
-      #   krun-vmm      Blocked on krun-cpuid above, plus `vm-memory` built with its `rawfd`
-      #                 feature, which refuses to compile for Windows outright, and
-      #                 `std::os::fd` imports that do not exist there.
-      #
-      #   libkrun       The cdylib. Blocked on everything above; it is the last thing to go
-      #                 green, and when it does, `krun.dll` exists.
+      # krun-cpuid is deliberately absent from both lists. It is built against `kvm_bindings`,
+      # and KVM is Linux-only, so the series gates it out of the Windows dependency graph
+      # rather than porting it — WHP handles CPUID exits itself, via `complete_cpuid`. Checking
+      # it for Windows would be asking whether a crate the Windows build never uses compiles.
       #
       # MOVE A CRATE UP to the required step above as soon as it compiles. That is the whole
       # ratchet: this step shrinks, that step grows, and neither is ever quietly relaxed.
@@ -165,7 +169,7 @@ jobs:
         run: |
           set -uo pipefail
           failed=()
-          for crate in krun-cpuid krun-devices krun-vmm libkrun; do
+          for crate in krun-vmm libkrun; do
             echo "::group::cargo check -p $crate"
             if cargo check --target x86_64-pc-windows-msvc -p "$crate"; then
               echo "$crate COMPILES"

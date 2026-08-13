@@ -1,0 +1,145 @@
+From 2555b7b44640d21112152d0be154b86b8539ba4f Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 13:39:51 +0200
+Subject: [PATCH 4/5] windows: align fs passthrough with PermissionSemantics,
+ poll serial input by HANDLE
+
+The in-tree Windows virtio-fs passthrough predates the PermissionSemantics
+split, so the shared fs device code no longer compiled against it. Add the
+enum and Config field. Only LinuxComplete is implementable: it is exactly what
+the Windows passthrough already does (uid/gid/mode persisted in the
+override_stat alternate data stream, the analogue of the macOS xattr), whereas
+LinuxSimplified requires the mode bits to live in the host file system and NTFS
+has no POSIX mode. Selecting it is rejected in PassthroughFs::new() rather than
+silently downgraded.
+
+Also give the Windows ReadableFd trait the AsRawFd shim from utils so the
+serial device can register its input handle with the IOCP-backed epoll, as it
+does with a fd on Unix.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/legacy/mod.rs                 |  4 +-
+ .../src/virtio/fs/windows/passthrough.rs      | 47 +++++++++++++++++++
+ src/utils/src/windows/mod.rs                  | 10 ++++
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/src/devices/src/legacy/mod.rs b/src/devices/src/legacy/mod.rs
+index 151a132..e6771cc 100644
+--- a/src/devices/src/legacy/mod.rs
++++ b/src/devices/src/legacy/mod.rs
+@@ -89,8 +89,10 @@ pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
+ #[cfg(unix)]
+ impl ReadableFd for std::fs::File {}
+ 
++// Same composition on Windows, but over the `AsRawFd` shim from `utils` (a `RawFd` there is a
++// `HANDLE`), so that the serial device can hand its input handle to the IOCP-backed epoll.
+ #[cfg(windows)]
+-pub trait ReadableFd: std::io::Read + Send {}
++pub trait ReadableFd: std::io::Read + Send + utils::windows::AsRawFd {}
+ #[cfg(windows)]
+ impl ReadableFd for std::fs::File {}
+ 
+diff --git a/src/devices/src/virtio/fs/windows/passthrough.rs b/src/devices/src/virtio/fs/windows/passthrough.rs
+index 899e477..ca58b1d 100644
+--- a/src/devices/src/virtio/fs/windows/passthrough.rs
++++ b/src/devices/src/virtio/fs/windows/passthrough.rs
+@@ -193,6 +193,37 @@ impl FromStr for CachePolicy {
+     }
+ }
+ 
++/// The permission semantics to be emulated by this file system personality.
++///
++/// Mirrors the Linux and macOS definitions so that the shared `virtio-fs` device code can be
++/// built unchanged on every host.
++#[derive(Debug, Default, Clone, Copy)]
++pub enum PermissionSemantics {
++    /// Be as close as possible to the common semantics of Linux file systems.
++    ///
++    /// On Windows this is what the rest of this file implements: uid/gid/mode have no NTFS
++    /// equivalent, so they are persisted out of band in the `override_stat` alternate data
++    /// stream (the Windows analogue of the macOS `user.libkrun.stat` xattr) and layered on top
++    /// of the host metadata by `metadata_to_stat64()`.
++    #[default]
++    LinuxComplete,
++
++    /// As `LinuxComplete`, with the following simplifications:
++    ///  - Extended attributes are not supported.
++    ///  - Idmaps are not supported.
++    ///  - Ownership bits are ignored, always returning the uid/gid from the process
++    ///    requesting the operation within the guest (obtained from `Context`).
++    ///  - Permissions bits are stored in the host, not as extended attributes.
++    ///
++    /// This variant is **not implementable on Windows**: its defining property is that the mode
++    /// bits live in the host file system rather than in an out-of-band attribute, and NTFS has
++    /// no POSIX mode to store them in (there is no `chmod`/`fchmod` equivalent — NTFS uses
++    /// ACLs, which are not a lossless representation of a Unix mode). Rather than silently
++    /// degrading to `LinuxComplete` and reporting permissions the guest never set, selecting
++    /// this variant is rejected in `PassthroughFs::new()`.
++    LinuxSimplified,
++}
++
+ /// Options that configure the behavior of the file system.
+ #[derive(Debug, Clone)]
+ pub struct Config {
+@@ -245,6 +276,10 @@ pub struct Config {
+     pub export_fsid: u64,
+     /// Table of exported FDs to share with other subsystems.
+     pub export_table: Option<ExportTable>,
++
++    /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
++    /// more details. Only `LinuxComplete` is supported on Windows.
++    pub semantics: PermissionSemantics,
+ }
+ 
+ impl Default for Config {
+@@ -258,6 +293,7 @@ impl Default for Config {
+             xattr: true,
+             export_fsid: 0,
+             export_table: None,
++            semantics: PermissionSemantics::LinuxComplete,
+         }
+     }
+ }
+@@ -1062,6 +1098,17 @@ unsafe impl Sync for PassthroughFs {}
+ 
+ impl PassthroughFs {
+     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
++        // `LinuxSimplified` requires the mode bits to live in the host file system, which NTFS
++        // cannot represent. Fail loudly instead of quietly serving `LinuxComplete` semantics
++        // under a name that promises different ones. See `PermissionSemantics`.
++        if let PermissionSemantics::LinuxSimplified = cfg.semantics {
++            return Err(io::Error::new(
++                io::ErrorKind::Unsupported,
++                "PermissionSemantics::LinuxSimplified is not supported on Windows: NTFS has no \
++                 POSIX mode to store the permission bits in",
++            ));
++        }
++
+         let root_handle = openat(&cfg.root_dir)?;
+ 
+         Ok(PassthroughFs {
+diff --git a/src/utils/src/windows/mod.rs b/src/utils/src/windows/mod.rs
+index 7a9fb12..1de7387 100644
+--- a/src/utils/src/windows/mod.rs
++++ b/src/utils/src/windows/mod.rs
+@@ -13,6 +13,16 @@ pub trait AsRawFd {
+     fn as_raw_fd(&self) -> RawFd;
+ }
+ 
++/// On Unix, `std::fs::File` implements `AsRawFd` from the standard library, which is what lets
++/// device code register a `File` (e.g. an inherited stdio handle wrapped by the serial console)
++/// with the event manager. Provide the same for the Windows shim; the orphan rule requires this
++/// impl to live next to the trait rather than in the crates that use it.
++impl AsRawFd for std::fs::File {
++    fn as_raw_fd(&self) -> RawFd {
++        std::os::windows::io::AsRawHandle::as_raw_handle(self) as RawFd
++    }
++}
++
+ /// A thin wrapper around a raw `HANDLE` that implements [`Send`].
+ ///
+ /// Raw pointers do not implement `Send`, but Windows kernel handles are safe
+-- 
+2.53.0
+
