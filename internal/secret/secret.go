@@ -32,8 +32,10 @@
 // Not every credential mechanism is a single header, and this model does not assume one.
 // An interactive OAuth flow — sentinel access and refresh tokens written into a guest
 // credential file and swapped by the proxy on requests to a set of resource hosts — is a
-// second mechanism that belongs on Credential beside Inject, not inside an injection rule.
-// Boks does not implement it.
+// second mechanism, and it lives on Credential beside Inject rather than inside an injection
+// rule. See oauth.go. It matters more than the header case for the flagship workload: a
+// Claude.ai subscription user has no API key at all, so an injection rule has nothing to
+// inject and only the OAuth path can carry their credential.
 //
 // # Invariants
 //
@@ -75,6 +77,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/dagsommer/boks/internal/policy"
 )
@@ -260,6 +264,14 @@ type Credential struct {
 	Placeholder string
 	// Inject lists where and how the secret is attached.
 	Inject []Inject
+	// OAuth is the other mechanism: a token pair the guest holds sentinels for, swapped
+	// by the proxy on requests to the resource hosts and refreshed on the host. Nil for
+	// an ordinary API key. See oauth.go.
+	//
+	// A credential has one or the other. Both at once is not rejected outright — a
+	// service could plausibly want a static header alongside an OAuth token — but nothing
+	// builds that today.
+	OAuth *OAuth
 }
 
 // Validate checks a credential and all of its rules.
@@ -267,8 +279,11 @@ func (c Credential) Validate() error {
 	if c.Service == "" {
 		return errors.New("no service name")
 	}
-	if len(c.Inject) == 0 {
+	if len(c.Inject) == 0 && c.OAuth == nil {
 		return fmt.Errorf("credential %q has no injection rules; a credential with nowhere to go is a secret with no purpose", c.Service)
+	}
+	if err := c.OAuth.Validate(); err != nil {
+		return fmt.Errorf("credential %q: %w", c.Service, err)
 	}
 	if strings.ContainsAny(c.Placeholder, "\r\n") {
 		return fmt.Errorf("credential %q: the placeholder contains a newline", c.Service)
@@ -281,13 +296,16 @@ func (c Credential) Validate() error {
 	return nil
 }
 
-// Domains lists the destinations this credential may be sent to.
+// Domains lists the destinations this credential may be sent to — which is also exactly the
+// set of hosts whose TLS will be terminated for it. For an OAuth credential that includes the
+// token endpoint, because a token request is answered by Boks rather than forwarded, and
+// answering one means terminating the flow it arrives on.
 func (c Credential) Domains() []string {
 	out := make([]string, 0, len(c.Inject))
 	for _, r := range c.Inject {
 		out = append(out, r.Domain.String())
 	}
-	return out
+	return append(out, c.OAuth.Domains()...)
 }
 
 func (c Credential) String() string {
@@ -298,6 +316,13 @@ func (c Credential) String() string {
 	}
 	for _, r := range c.Inject {
 		b.WriteString("\n    " + r.String())
+	}
+	if c.OAuth != nil {
+		for _, h := range c.OAuth.ResourceHosts {
+			b.WriteString("\n    " + h.String() + " → oauth access token, substituted for the sentinel in " +
+				strings.Join(c.OAuth.headers(), ", "))
+		}
+		b.WriteString("\n    " + c.OAuth.TokenEndpoint.Host + " → oauth token endpoint, answered on the host")
 	}
 	return b.String()
 }
@@ -450,6 +475,22 @@ func ParseGuestCredential(spec string) (service, env, placeholder string, err er
 type Injector struct {
 	provider    Provider
 	credentials []Credential
+
+	// oauth, saver and refresher are the OAuth half. oauth is where a token pair is read
+	// from, saver is where a rotated one is written back — a provider that cannot persist
+	// simply does not implement OAuthSaver — and refresher is the one place a refresh
+	// token is put on the wire.
+	oauth     OAuthProvider
+	saver     OAuthSaver
+	refresher Refresher
+	skew      time.Duration
+	now       func() time.Time
+
+	// mu guards tokens and serialises refreshes. It is held across the exchange on
+	// purpose: several concurrent requests to a resource host must produce one refresh,
+	// not one each, because a provider that rotates refresh tokens invalidates the loser.
+	mu     sync.Mutex
+	tokens map[string]OAuthTokens
 }
 
 // NewInjector validates the credentials and binds them to a provider.
@@ -467,7 +508,39 @@ func NewInjector(p Provider, credentials ...Credential) (*Injector, error) {
 		}
 		seen[c.Service] = true
 	}
-	return &Injector{provider: p, credentials: credentials}, nil
+	i := &Injector{
+		provider:    p,
+		credentials: credentials,
+		refresher:   HTTPRefresher{},
+		skew:        DefaultRefreshSkew,
+		now:         time.Now,
+		tokens:      map[string]OAuthTokens{},
+	}
+	i.oauth, _ = p.(OAuthProvider)
+	i.saver, _ = p.(OAuthSaver)
+	for _, c := range credentials {
+		if c.OAuth != nil && i.oauth == nil {
+			return nil, fmt.Errorf("credential %q is an oauth credential, but the secret store in use cannot supply one", c.Service)
+		}
+	}
+	return i, nil
+}
+
+// SetRefresher replaces the token exchange. It exists so that a test can drive a refresh
+// without a network, and so that a caller can supply a client with its own trust store.
+func (i *Injector) SetRefresher(r Refresher) {
+	if i == nil || r == nil {
+		return
+	}
+	i.refresher = r
+}
+
+// SetClock replaces the clock, so that expiry can be tested without waiting.
+func (i *Injector) SetClock(now func() time.Time) {
+	if i == nil || now == nil {
+		return
+	}
+	i.now = now
 }
 
 // Credentials returns the configured credentials, sorted by service, for display. They name
@@ -496,6 +569,13 @@ func (i *Injector) Handles(t policy.Target) bool {
 			if r.Domain.Match(t) {
 				return true
 			}
+		}
+		// An OAuth credential's resource hosts need interception for the same reason an
+		// injection rule's domain does — the substitution happens in a header. Its token
+		// endpoint needs it for a different reason: the request has to be *answered*
+		// rather than relayed, and answering means terminating the flow.
+		if c.OAuth.MatchesResource(t) || c.OAuth.MatchesTokenEndpoint(t) {
+			return true
 		}
 	}
 	return false
@@ -592,11 +672,159 @@ func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header) ([
 			}
 			h.Set(r.header(), r.headerValue(v))
 		}
+
+		// The OAuth half: on a resource host, and nowhere else, a sentinel in a permitted
+		// header becomes the real access token. Substitution rather than assignment — a
+		// request that carries no sentinel is left exactly as the guest wrote it.
+		if c.OAuth.MatchesResource(t) {
+			tokens, err := i.accessToken(ctx, c)
+			if err != nil {
+				return nil, err
+			}
+			if c.OAuth.substitute(h, tokens.Access) {
+				matched = true
+			}
+		}
+
 		if matched {
 			used = append(used, c.Service)
 		}
 	}
 	return used, nil
+}
+
+// accessToken returns a usable access token for an OAuth credential, refreshing on the host
+// first if the stored one is at or near its expiry.
+//
+// Nothing about this is visible to the guest. It holds a sentinel, the sentinel does not
+// change when a token rotates, and the request it sent goes out with whatever is current.
+func (i *Injector) accessToken(ctx context.Context, c Credential) (OAuthTokens, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	tokens, ok := i.tokens[c.Service]
+	if !ok {
+		if i.oauth == nil {
+			return OAuthTokens{}, fmt.Errorf("credential %q is an oauth credential and no oauth store is available", c.Service)
+		}
+		var err error
+		tokens, err = i.oauth.LookupOAuth(ctx, c.Service)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return OAuthTokens{}, fmt.Errorf("oauth credential %q is configured but is not in the store; import it with 'boks secret import %s'", c.Service, c.Service)
+			}
+			// The provider's own error text is not passed through: a careless provider
+			// could put the value it failed to decode into it.
+			return OAuthTokens{}, fmt.Errorf("looking up oauth credential %q failed", c.Service)
+		}
+		i.tokens[c.Service] = tokens
+	}
+	if tokens.IsZero() {
+		return OAuthTokens{}, fmt.Errorf("oauth credential %q has no access token", c.Service)
+	}
+	if !tokens.Expired(i.now(), i.skew) {
+		return tokens, nil
+	}
+	return i.refresh(ctx, c, tokens)
+}
+
+// refresh exchanges the refresh token for a new pair and persists it. The caller holds mu.
+//
+// An expired token with no way to renew it is a hard failure, not a request sent with a dead
+// credential: the origin's 401 would surface inside the guest as an authentication problem
+// the user cannot act on, when the real answer is "log in again on the host".
+func (i *Injector) refresh(ctx context.Context, c Credential, current OAuthTokens) (OAuthTokens, error) {
+	if current.Refresh.IsZero() {
+		return OAuthTokens{}, fmt.Errorf("the oauth credential %q expired at %s and carries no refresh token; re-import it with 'boks secret import %s'",
+			c.Service, current.expiryText(), c.Service)
+	}
+	if i.refresher == nil {
+		return OAuthTokens{}, fmt.Errorf("the oauth credential %q expired at %s and nothing is configured to refresh it", c.Service, current.expiryText())
+	}
+	fresh, err := i.refresher.Refresh(ctx, c.OAuth, current.Refresh)
+	if err != nil {
+		// The refresher's errors are written not to contain a token; see HTTPRefresher.
+		return OAuthTokens{}, fmt.Errorf("refreshing the oauth credential %q: %w", c.Service, err)
+	}
+	if fresh.IsZero() {
+		return OAuthTokens{}, fmt.Errorf("refreshing the oauth credential %q produced no access token", c.Service)
+	}
+	if fresh.Refresh.IsZero() {
+		// A provider that returns no new refresh token means "keep using the old one".
+		fresh.Refresh = current.Refresh
+	}
+	i.tokens[c.Service] = fresh
+	if i.saver != nil {
+		if err := i.saver.SaveOAuth(ctx, c.Service, fresh); err != nil {
+			// The new pair works and is in memory; failing the request over a storage
+			// problem would be worse than continuing. The consequence — a provider that
+			// rotates refresh tokens has just invalidated the stored one — is reported
+			// by name, never by value.
+			return fresh, fmt.Errorf("the oauth credential %q was refreshed but could not be saved: %w", c.Service, err)
+		}
+	}
+	return fresh, nil
+}
+
+// TokenEndpointFor reports which credential's token endpoint a request is addressing, if any.
+//
+// Matching is on the host *and* the exact path. A token endpoint's host usually serves other
+// things, and those are none of Boks' business: they are forwarded like any other request on
+// an inspected flow, with no credential attached.
+func (i *Injector) TokenEndpointFor(t policy.Target, path string) (Credential, bool) {
+	if i == nil {
+		return Credential{}, false
+	}
+	for _, c := range i.credentials {
+		if c.OAuth.MatchesTokenEndpoint(t) && path == c.OAuth.TokenEndpoint.Path {
+			return c, true
+		}
+	}
+	return Credential{}, false
+}
+
+// ExchangeToken answers a guest's token request from the host.
+//
+// The guest's request is **not forwarded**. Boks makes sure the host-side pair is current —
+// exchanging it against the token endpoint itself if it has expired — and returns a response
+// carrying the sentinels the guest already holds. See the note at the top of oauth.go for why
+// this, rather than relaying the guest's own refresh with the real token substituted in.
+//
+// A guest cannot use this to make Boks burn refresh tokens: a pair that is still valid is
+// answered without any exchange at all.
+func (i *Injector) ExchangeToken(ctx context.Context, c Credential) (TokenExchange, error) {
+	if c.OAuth == nil {
+		return TokenExchange{}, fmt.Errorf("credential %q is not an oauth credential", c.Service)
+	}
+	exchange := TokenExchange{Service: c.Service, Status: http.StatusOK}
+
+	i.mu.Lock()
+	tokens, ok := i.tokens[c.Service]
+	if !ok && i.oauth != nil {
+		var err error
+		tokens, err = i.oauth.LookupOAuth(ctx, c.Service)
+		if err == nil {
+			i.tokens[c.Service] = tokens
+		}
+	}
+	needsRefresh := tokens.IsZero() || tokens.Expired(i.now(), i.skew)
+	var refreshErr error
+	if needsRefresh && !tokens.Refresh.IsZero() {
+		if _, refreshErr = i.refresh(ctx, c, tokens); refreshErr == nil {
+			exchange.Refreshed = true
+		}
+	}
+	i.mu.Unlock()
+
+	if refreshErr != nil {
+		return TokenExchange{}, refreshErr
+	}
+	body, err := c.OAuth.tokenResponseBody()
+	if err != nil {
+		return TokenExchange{}, fmt.Errorf("composing the token response for %q: %w", c.Service, err)
+	}
+	exchange.Body = body
+	return exchange, nil
 }
 
 // validHeaderName rejects anything that could split a header or forge a second one.
