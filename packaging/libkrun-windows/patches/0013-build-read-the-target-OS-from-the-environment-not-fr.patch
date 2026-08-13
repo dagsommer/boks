@@ -1,7 +1,7 @@
 From 68cdba8118ec9c1c9786985894e7a15476270879 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:46:35 +0200
-Subject: [PATCH 13/26] build: read the target OS from the environment, not
+Subject: [PATCH 13/28] build: read the target OS from the environment, not
  from host cfg
 
 A build script is compiled for and run on the host, so `#[cfg(target_os =

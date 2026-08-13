@@ -1,7 +1,7 @@
 From 3c78b84617454d308f9e81335f3338f40f3029e7 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:41:13 +0200
-Subject: [PATCH 12/26] windows: map the external kernel with a section, and
+Subject: [PATCH 12/28] windows: map the external kernel with a section, and
  name the krunfw DLL
 
 Three loose ends, and libkrun type-checks for x86_64-pc-windows-msvc after

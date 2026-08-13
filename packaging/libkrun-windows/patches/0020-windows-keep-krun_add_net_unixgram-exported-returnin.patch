@@ -1,7 +1,7 @@
 From beb6997797ba823adc0de4f1316446bafae5c82b Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:29:30 +0200
-Subject: [PATCH 20/26] windows: keep krun_add_net_unixgram exported, returning
+Subject: [PATCH 20/28] windows: keep krun_add_net_unixgram exported, returning
  -ENOTSUP
 
 The unixgram backend needs an AF_UNIX SOCK_DGRAM socket. Windows' AF_UNIX,
