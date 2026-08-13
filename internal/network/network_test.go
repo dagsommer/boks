@@ -1,14 +1,21 @@
 package network
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/dagsommer/boks/internal/network/vnettest"
 )
 
 func testConfig(t *testing.T, mode Mode) Config {
@@ -74,9 +81,18 @@ func TestAnnotationsForNAT(t *testing.T) {
 	a := plan.Annotations()
 
 	vm := a["io.containerd.nerdbox.network.0"]
-	for _, want := range []string{"socket=" + plan.Socket, "mode=unixgram", "mac=" + plan.VMMAC} {
+	for _, want := range []string{"socket=" + plan.Socket, "mode=unixstream", "mac=" + plan.VMMAC} {
 		if !strings.Contains(vm, want) {
 			t.Errorf("VM annotation %q lacks %q", vm, want)
+		}
+	}
+	// The two flags that would change the framing on the wire. vfkit=true makes libkrun
+	// send a magic sequence before the first frame, and vnet_hdr=true puts a virtio-net
+	// header in front of every frame; either one turns the stream the host stack reads
+	// into something else, so neither may appear by accident.
+	for _, never := range []string{"vfkit=", "vnet_hdr=", "features="} {
+		if strings.Contains(vm, never) {
+			t.Errorf("VM annotation %q sets %s, which changes the link's framing", vm, never)
 		}
 	}
 
@@ -277,13 +293,13 @@ func TestStartStopLifecycle(t *testing.T) {
 			if _, err := os.Stat(socket); err != nil {
 				t.Fatalf("the link socket does not exist after Start: %v", err)
 			}
-			// The VM connects to this socket during boot; it must be usable
+			// The VM connects to this socket during boot; it must be accepting
 			// immediately, not after a race.
-			conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: socket, Net: "unixgram"})
+			conn, err := net.Dial("unix", socket)
 			if err != nil {
 				t.Fatalf("dialling the link socket: %v", err)
 			}
-			if _, err := conn.Write([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}); err != nil {
+			if _, err := conn.Write(framed(broadcastFrame())); err != nil {
 				t.Errorf("writing to the link socket: %v", err)
 			}
 			conn.Close()
@@ -307,6 +323,10 @@ func TestStartStopLifecycle(t *testing.T) {
 
 // TestContextCancellationClosesTheSocket: SIGINT cancels the context, and nothing must be
 // left holding the socket afterwards.
+//
+// A stream link makes this sharper than the datagram one could: a connect either reaches
+// something that is accepting or it does not, where an unconnected datagram send could
+// succeed against a socket nobody was reading.
 func TestContextCancellationClosesTheSocket(t *testing.T) {
 	n, err := New(testConfig(t, ModeNAT))
 	if err != nil {
@@ -317,28 +337,244 @@ func TestContextCancellationClosesTheSocket(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	socket := n.Plan().Socket
+	if conn, err := net.Dial("unix", socket); err != nil {
+		t.Fatalf("the link socket is not accepting before cancellation: %v", err)
+	} else {
+		conn.Close()
+	}
 	cancel()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: socket, Net: "unixgram"})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, err := net.Dial("unix", socket)
 		if err != nil {
-			conn = nil
+			break // the socket is gone, which is the point
 		}
-		if conn != nil {
-			_, werr := conn.Write([]byte{0})
-			conn.Close()
-			if werr != nil {
-				return // the socket is gone, which is the point
-			}
+		conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("the link socket still accepts connections after the context was cancelled")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// Not fatal on its own: an unconnected datagram send can succeed against a removed
-	// socket on some platforms. Stop must still clean up.
 	if err := n.Stop(); err != nil {
 		t.Errorf("Stop after cancellation: %v", err)
 	}
+}
+
+// echoInside puts an echo server inside the sandbox's virtual network, at the address the
+// proxy would listen on. It is the far end for the round trips below: a guest that reaches it
+// has a working link in both directions, which is the only thing these tests are about.
+func echoInside(t *testing.T, n *Network, port int) {
+	t.Helper()
+	listener, err := n.Listen(port)
+	if err != nil {
+		t.Fatalf("listening inside the virtual network: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+}
+
+// roundTrip sends a line through the link and reads it back, which fails unless frames are
+// crossing the link intact in both directions.
+func roundTrip(t *testing.T, guest *vnettest.Guest, addr, message string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := guest.Dial(ctx, addr)
+	if err != nil {
+		t.Fatalf("the guest could not reach %s: %v", addr, err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte(message)); err != nil {
+		t.Fatalf("writing through the link: %v", err)
+	}
+	buf := make([]byte, len(message))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("reading through the link: %v", err)
+	}
+	if string(buf) != message {
+		t.Fatalf("the link returned %q, want %q", buf, message)
+	}
+}
+
+// linkHeld reports whether a connection currently holds the sandbox's link. It reaches into
+// the gateway because the accept loop's state has no reason to be public: nothing in Boks
+// asks, and only a test that is about reconnection needs to know.
+func linkHeld(t *testing.T, n *Network) bool {
+	t.Helper()
+	g, ok := n.provider.(*gateway)
+	if !ok {
+		t.Fatalf("provider is %T, not a gateway", n.provider)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.conn != nil
+}
+
+// TestTheLinkTakesAVMThatConnectsLateAndOneThatReconnects covers what the stream transport
+// changed about attaching.
+//
+// On the datagram socket there was nothing to attach: the host bound the socket, and the
+// first datagram to arrive both identified the peer and was its first frame. A stream has a
+// connection, and two states come with it. The VM connects *late* — it is still booting when
+// Start returns — so the link has to sit and wait rather than fail. And a VMM that restarts
+// reconnects; if the host only ever served one connection, a restart would leave the sandbox
+// with a socket nobody is reading for the rest of its life.
+func TestTheLinkTakesAVMThatConnectsLateAndOneThatReconnects(t *testing.T) {
+	n, err := New(testConfig(t, ModeNAT))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := n.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer n.Stop()
+
+	const port = 9099
+	echoInside(t, n, port)
+	addr := net.JoinHostPort(n.Plan().Gateway.String(), strconv.Itoa(port))
+
+	// Nothing has connected yet, and the stack has been up for a while: exactly the
+	// position a VM's boot leaves it in.
+	if linkHeld(t, n) {
+		t.Fatal("something is holding the link before any peer connected")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		guest, err := vnettest.Attach(vnettest.Config{
+			Socket:    n.Plan().Socket,
+			GuestIP:   n.Plan().GuestAddr.Addr().String(),
+			GatewayIP: n.Plan().Gateway.String(),
+			Subnet:    n.Plan().Subnet.String(),
+			MTU:       n.Plan().MTU,
+		})
+		if err != nil {
+			t.Fatalf("attempt %d: attaching a guest: %v", attempt, err)
+		}
+		roundTrip(t, guest, addr, "attempt")
+		guest.Close()
+
+		// The host has to notice the peer is gone and go back to accepting, or the
+		// next connection is refused as a second VM.
+		deadline := time.Now().Add(5 * time.Second)
+		for linkHeld(t, n) {
+			if time.Now().After(deadline) {
+				t.Fatalf("attempt %d: the link was still held five seconds after the peer disconnected",
+					attempt)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// TestASecondPeerIsRefusedWhileOneHoldsTheLink is the property a listening socket needs that
+// a datagram socket got for free.
+//
+// One stack serves exactly one VM: it hands out one address, and the switch it sits behind is
+// an Ethernet fabric. A second connection accepted alongside the first would be a second,
+// unaccounted device on that fabric — able to inject frames the sandbox's own guest would
+// receive, and to receive the broadcasts meant for it. The link socket lives in a mode-0700
+// directory, so this is not a boundary between users; it is the difference between a
+// sandbox's network having one occupant and having any number.
+func TestASecondPeerIsRefusedWhileOneHoldsTheLink(t *testing.T) {
+	n, err := New(testConfig(t, ModeNAT))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	log := &syncBuffer{}
+	n.SetLogger(log)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := n.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer n.Stop()
+
+	const port = 9098
+	echoInside(t, n, port)
+	addr := net.JoinHostPort(n.Plan().Gateway.String(), strconv.Itoa(port))
+
+	guest, err := vnettest.Attach(vnettest.Config{
+		Socket:    n.Plan().Socket,
+		GuestIP:   n.Plan().GuestAddr.Addr().String(),
+		GatewayIP: n.Plan().Gateway.String(),
+		Subnet:    n.Plan().Subnet.String(),
+		MTU:       n.Plan().MTU,
+	})
+	if err != nil {
+		t.Fatalf("attaching the guest: %v", err)
+	}
+	defer guest.Close()
+	roundTrip(t, guest, addr, "the first peer")
+
+	intruder, err := net.Dial("unix", n.Plan().Socket)
+	if err != nil {
+		t.Fatalf("dialling the link socket a second time: %v", err)
+	}
+	defer intruder.Close()
+	if err := intruder.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := intruder.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("the second connection read %v, want EOF: it must be closed, not served", err)
+	}
+
+	// And the peer that had the link still has it.
+	roundTrip(t, guest, addr, "still the first peer")
+
+	// Whoever can reach the socket chooses how often it connects, and the stack log is a
+	// file: a line per refusal would make a connect loop a disk-usage primitive. The cap is
+	// the same idea as the one on dropped destinations in stack.go.
+	for i := 0; i < 4*maxLinkNotices; i++ {
+		conn, err := net.Dial("unix", n.Plan().Socket)
+		if err != nil {
+			t.Fatalf("dialling the link socket: %v", err)
+		}
+		conn.Close()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(log.String(), "further messages about this link's connections are suppressed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d refusals never reached the cap:\n%s", 4*maxLinkNotices, log.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := strings.Count(log.String(), "refused a second connection"); got > maxLinkNotices {
+		t.Errorf("%d refusal lines were written for %d connections; the cap is %d",
+			got, 4*maxLinkNotices, maxLinkNotices)
+	}
+}
+
+// syncBuffer collects the stack's operational log from the goroutines that write it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestStaleSocketIsReplaced(t *testing.T) {
