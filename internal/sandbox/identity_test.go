@@ -269,3 +269,28 @@ func TestInfoWorkspace(t *testing.T) {
 		t.Errorf("Workspace() = %q, want empty for a sandbox with none", got)
 	}
 }
+
+// TestWorkspaceSegmentRootSpellings covers the bug a real Windows machine found on
+// 2026-08-13: DeriveName("shell", "/") produced "shell-8a5eda" rather than "shell-root",
+// because root detection asked filepath, which answers with the host's separator — and
+// filepath.Dir("/") is `\` on Windows, so a slash-rooted path was never recognised.
+//
+// These run on every platform. The slash spellings are the ones that regressed; the others
+// are here so that making one convention work does not quietly break the other.
+func TestWorkspaceSegmentRootSpellings(t *testing.T) {
+	// Only the cleaned spelling. Parse resolves and cleans before a path reaches here, so
+	// "//" is not an input this function receives, and asserting it would pin behaviour for
+	// a spelling nothing produces.
+	roots := []string{"/"}
+	for _, r := range roots {
+		if got := workspaceSegment(r); got != "root" {
+			t.Errorf("workspaceSegment(%q) = %q, want %q on every platform", r, got, "root")
+		}
+	}
+	// A path with a name is never a root, whichever separator wrote it.
+	for _, p := range []string{"/srv/code", "/srv/code/"} {
+		if got := workspaceSegment(p); got == "root" {
+			t.Errorf("workspaceSegment(%q) = %q; a named directory is not a filesystem root", p, got)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -24,7 +25,12 @@ func TestParseResolvesToAbsolutePath(t *testing.T) {
 	}
 	// The guest path equalling the host path is the exact-path property Boks exists to
 	// provide; a regression here silently breaks absolute paths inside the sandbox.
-	if ws.GuestPath != ws.HostPath {
+	//
+	// It is a POSIX-host property, not a universal one. On Windows there is no spelling of
+	// C:\Users\x that a Linux guest can mount, so the two necessarily differ and the
+	// equivalent guarantee is the documented mapping — asserted by the guestPath tests.
+	// Asserting equality unconditionally would fail on Windows while the code is correct.
+	if runtime.GOOS != "windows" && ws.GuestPath != ws.HostPath {
 		t.Errorf("GuestPath = %q, want it to equal HostPath %q", ws.GuestPath, ws.HostPath)
 	}
 	if ws.Mode != ModeReadWrite {
@@ -40,7 +46,10 @@ func TestParseRelativePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(\".\"): %v", err)
 	}
-	if !filepath.IsAbs(ws.GuestPath) {
+	// path, not filepath: a guest path is always POSIX, whatever the host is. filepath.IsAbs
+	// applies the host's rules, and on Windows it calls /c/Users/x relative because it has no
+	// volume — failing on a path that is exactly right for the guest that will mount it.
+	if !path.IsAbs(ws.GuestPath) {
 		t.Errorf("GuestPath = %q, want an absolute path", ws.GuestPath)
 	}
 }

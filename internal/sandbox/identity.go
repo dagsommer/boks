@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -182,7 +183,15 @@ func workspaceSegment(hostPath string) string {
 	if hostPath == "" {
 		return ""
 	}
+	// A root is a path that is its own parent. `filepath` answers that using the *host's*
+	// separator, which is not enough here: on Windows `filepath.Dir("/")` is `\`, so a
+	// slash-rooted path is not recognised and falls through to a digest — a real Windows
+	// machine derived `shell-8a5eda` where `shell-root` was meant. Ask both conventions,
+	// because either spelling can legitimately name the same directory there.
 	if filepath.Dir(hostPath) == hostPath {
+		return "root"
+	}
+	if slashed := filepath.ToSlash(hostPath); path.Dir(slashed) == slashed {
 		return "root"
 	}
 	if segment := sanitiseSegment(filepath.Base(hostPath)); segment != "" {

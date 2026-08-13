@@ -186,8 +186,9 @@ func platformCheck() Check {
 				return Result{
 					Status: StatusFail, Detail: detail,
 					Remedy: "Boks does not run sandboxes on Windows yet. The platform can host them, and\n" +
-						"libkrun's Windows Hypervisor Platform backend is in progress upstream — but\n" +
-						"virtio-net, the one device Boks' enforcement needs, is not ported yet.\n" +
+						"a Windows Hypervisor Platform backend for libkrun is being built in this\n" +
+						"project — every crate compiles and krun.dll links in CI — but no sandbox has\n" +
+						"ever booted on Windows, so there is nothing here to start yet.\n" +
 						"Run Boks inside WSL2 in the meantime. See docs/windows.md.",
 				}
 			default:
