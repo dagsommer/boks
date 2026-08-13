@@ -62,7 +62,7 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	fs.StringArrayVar(&f.guest, "guest-credential", nil,
 		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
 	fs.StringArrayVar(&f.oauth, "oauth", nil,
-		"use a stored OAuth credential by name, from 'boks secret adopt' (repeatable)")
+		"name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable)")
 	fs.BoolVar(&f.noSecrets, "no-secrets", false,
 		"do not attach credentials from the store; only what --inject names")
 }
