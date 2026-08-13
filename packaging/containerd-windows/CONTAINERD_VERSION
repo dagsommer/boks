@@ -1,0 +1,14 @@
+# The containerd release the patch in patches/ applies to, and the one containerd.exe is
+# built from.
+#
+# A tag, not a SHA — unlike packaging/libkrun-windows/UPSTREAM_REV and
+# packaging/nerdbox/NERDBOX_REV, which pin unreleased trees where only a SHA is meaningful.
+# containerd cuts real releases and the tag is the thing a user would recognise, compare
+# against their Linux install, and file a bug against. Tags in containerd are not moved.
+#
+# v2.3.3 because that is the containerd that nerdbox vendors at
+# packaging/nerdbox/NERDBOX_REV. The shim and the daemon share containerd's ttrpc and mount
+# types; running a daemon from a different minor than the shim was built against is an extra
+# variable nobody needs while the Windows port is still being brought up. If the nerdbox pin
+# moves to a nerdbox that vendors a different containerd, move this with it.
+v2.3.3
