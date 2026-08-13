@@ -504,7 +504,8 @@ On a host with hardware virtualisation (bare metal Linux with KVM, or Apple sili
    boks doctor
    ```
 
-   Nothing may be `fail`. `vm runtime` in particular must be `ok`.
+   Nothing may be `fail`. `vm runtime` and `guest image` in particular must be `ok` —
+   the second covers the guest kernel and rootfs named in step 4 of the notes below.
 
    On macOS, exactly one check warns on a healthy host, and always will: `virtualization`
    reports `warn` with "Hypervisor.framework assumed available", because there is no

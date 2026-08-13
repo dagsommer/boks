@@ -128,3 +128,11 @@ func hypervisorLibrarySearchPaths() []string {
 	}
 	return paths
 }
+
+// hypervisorLibraryHint explains what a miss on Linux does and does not mean. The shim asks
+// dlopen for the library, so the loader's own configuration — ld.so.conf, its cache — can
+// still find one in a directory this check never stats.
+func hypervisorLibraryHint() string {
+	return "If it is installed elsewhere on the loader's search path this warning\n" +
+		"is harmless; Boks does not parse the dynamic loader configuration."
+}

@@ -178,9 +178,8 @@ each one leaves you holding. The short version:
 - **macOS on Apple silicon** — a Homebrew tap installs the CLI, containerd, libkrun,
   erofs-utils and a nerdbox shim signed with the entitlement libkrun needs. Two files it
   cannot install, nerdbox's guest kernel and root filesystem, are built by
-  `scripts/build-nerdbox-guest.sh`. **`boks doctor` does not check for those two**, so it
-  can report ready on a machine where no sandbox will boot — read the install document
-  before concluding a green `doctor` means you are done.
+  `scripts/build-nerdbox-guest.sh`. `boks doctor` reports those two as `guest image` and
+  fails when they are missing, so a green `doctor` is worth more than it used to be.
 - **Linux** — a tarball, a `.deb` or an `.rpm`, each containing the CLI alone. No
   distribution packages a containerd new enough or nerdbox at all, so the rest is yours to
   assemble. Untested end to end.
