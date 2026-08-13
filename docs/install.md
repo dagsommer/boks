@@ -21,7 +21,7 @@ for every gap. There is one thing it does *not* check, and it is called out belo
 | libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | build from source, or a distro that has it | — |
 | `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | — |
 
-The two rows in bold are why this document is longer than `brew install boks`.
+The cells in bold are why this document is longer than `brew install boks`.
 
 **nerdbox is packaged nowhere.** Not homebrew-core, not the AUR, not nixpkgs, not Debian,
 and not by Repology in any of the ~400 repositories it tracks. Its own release workflow has
