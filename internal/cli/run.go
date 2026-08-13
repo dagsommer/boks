@@ -91,6 +91,10 @@ Agents:
 		if err != nil {
 			return err
 		}
+		// The agent decides a layer of the policy — the destinations its own
+		// definition says it cannot work without — so the policy flags have to know
+		// which agent this is before they resolve anything.
+		netFlags.forAgent(inv.agent)
 		if ephemeral && flags.name == "" {
 			// An ephemeral sandbox must not collide with the persistent one for
 			// this workspace, nor with another ephemeral run of it.

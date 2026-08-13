@@ -375,13 +375,18 @@ credential-bearing host would get.`,
 		Args: needsDestination,
 	}
 	var (
-		flags   policyFlags
-		sandbox string
+		flags     policyFlags
+		sandbox   string
+		agentName string
 	)
 	cmd.Flags().StringVar(&sandbox, "sandbox", "", "check as this sandbox, including rules scoped to it")
+	registerAgentFlag(cmd.Flags(), &agentName)
 	flags.register(cmd.Flags())
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if err := applyAgentFlag(&flags, agentName); err != nil {
+			return err
+		}
 		resolution, err := flags.resolution(sandbox, nil)
 		if err != nil {
 			return err
