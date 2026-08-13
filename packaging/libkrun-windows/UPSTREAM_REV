@@ -1,0 +1,12 @@
+# The containers/libkrun commit the patches in patches/ are generated against.
+#
+# One source of truth: the workflow reads this file rather than repeating the SHA, for the
+# same reason the release workflow reads ImageTag out of internal/agent rather than keeping
+# its own copy. A pin that lives in two places eventually disagrees with itself.
+#
+# A full SHA, not a tag or a branch: the patches apply to this tree and no other, and a
+# moving ref would turn "our patches no longer apply" into a random Tuesday's CI failure on
+# a pull request that touched none of this. See README.md for how to move the pin forward.
+#
+# 07fd40d "CI: verify init-blob bindings are up to date", 2026-08-05, on containers/libkrun main.
+07fd40dcf6da8e14dd47e16a535531f0383fe52c
