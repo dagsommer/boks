@@ -472,6 +472,12 @@ jobs:
           cp containerd-artifact/amd64/containerd.exe staging/
           cp containerd-artifact/amd64/ctr.exe staging/
           cp boks/packaging/containerd-windows/README.md staging/README.md
+          # config.toml is not a convenience. Without its disabled_plugins the cimfs
+          # snapshotter fails unelevated and takes bolt and ~40 plugins with it, and
+          # without its root/state a normal user cannot create C:\ProgramData\containerd
+          # at all. Shipping it is the difference between the README's steps working and
+          # the tester rediscovering both.
+          cp boks/packaging/containerd-windows/config.toml staging/config.toml
           ls -l staging/
 
       - uses: actions/upload-artifact@v4
@@ -487,28 +493,38 @@ jobs:
           {
             echo "## Windows test bundle (amd64)"
             echo
-            echo "Artifact \`containerd-windows-amd64-bundle\` — three binaries plus the README."
+            echo "Artifact \`containerd-windows-amd64-bundle\` — three binaries, a \`config.toml\`"
+            echo "and the README."
             echo
             echo '```'
             (cd staging && sha256sum ./*.exe | sed 's|\./||')
             echo '```'
             echo
-            echo "Unzip all three into one directory and put that directory on \`PATH\` **before**"
+            echo "Unzip all of it into one directory and put that directory on \`PATH\` **before**"
             echo "starting containerd. \`mkfs.erofs.exe\` must be resolvable when containerd"
             echo "initialises, or the erofs differ returns \`ErrSkipPlugin\` and vanishes with no"
             echo "error that mentions it."
+            echo
+            echo "**Run unelevated, and pass \`--config\`.** The defaults fail twice over: a normal"
+            echo "user cannot create \`C:\\ProgramData\\containerd\`, and the cimfs snapshotter"
+            echo "cannot initialise without privileges — which fails bolt, which fails roughly"
+            echo "forty plugins including the erofs differ. The shipped \`config.toml\` moves the"
+            echo "state to \`C:\\cdtest\`, uses a private pipe, and disables the cimfs plugins."
             echo
             echo "Then, in order — full commands and what each proves are in \`README.md\` in the"
             echo "artifact:"
             echo
             echo '```powershell'
+            echo 'mkdir C:\cdtest\root, C:\cdtest\state'
             echo 'mkfs.erofs -V                        # the exe runs at all'
-            echo 'containerd.exe --log-level debug     # leave running in its own console'
+            echo 'containerd.exe --config .\config.toml --log-level debug   # own console'
+            echo '$env:CONTAINERD_ADDRESS = ''\\.\pipe\boks-containerd'''
             echo 'ctr.exe plugins ls | Select-String erofs   # both plugins must say ok, not skip'
             echo 'ctr.exe -n test images pull --platform linux/amd64 --snapshotter erofs docker.io/library/alpine:latest'
             echo '```'
             echo
-            echo "**Nothing here has been run.** Every binary was cross-compiled and inspected on"
-            echo "a Linux runner. \`ctr plugins ls\` is in the list because the erofs differ"
-            echo "skipping itself is silent, and must be checked rather than assumed."
+            echo "**No Windows binary here has been run.** Everything was cross-compiled and"
+            echo "inspected on a Linux runner. \`ctr plugins ls\` saying \`ok\` is a weak signal by"
+            echo "construction — it means a plugin initialised, not that anything calls it — so"
+            echo "the pull, not the plugin table, is what answers the question."
           } >>"$GITHUB_STEP_SUMMARY"
