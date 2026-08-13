@@ -2,7 +2,8 @@
 layout: home
 ---
 
-<!-- The landing page.
+{% comment %}
+The landing page.
 
      Two rules govern what may be written here, and they are not in tension as often as they
      look. The first is that nothing on this page may be a claim the documents do not already
@@ -14,7 +15,8 @@ layout: home
      What is deliberately absent: the provenance of any measurement. Hardware, dates and
      host-versus-guest tables are a development record, and they live in docs/verification.md,
      which every claim here links to. The conclusion belongs on a front page; the lab notebook
-     does not. -->
+     does not.
+{% endcomment %}
 
 <section class="band">
   <div class="wrap">
@@ -77,8 +79,10 @@ make build
     <p class="band-lede">Boks is the orchestration layer, not a hypervisor. Everything below
       the CLI is existing open-source software.</p>
 
-    <div class="stack" role="img"
-         aria-label="boks CLI to containerd to the nerdbox shim to libkrun, then a hypervisor boundary, then a microVM containing the workspace over virtiofs and your command.">
+    <!-- The diagram is boxes, rules and text: no image, and nothing here is decorative
+         except the connectors. It reads correctly as plain text in source order, so it is
+         not marked role="img" with a summary that would replace it. -->
+    <div class="stack">
       <div class="stack-host">
         <p class="stack-label">Your machine</p>
         <div class="chain">
