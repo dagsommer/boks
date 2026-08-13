@@ -1,7 +1,7 @@
 From ca14949b24917755d5d1af660be5673af62a3f29 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 13:35:42 +0200
-Subject: [PATCH 3/3] windows: implement scatter-gather file I/O over
+Subject: [PATCH 3/5] windows: implement scatter-gather file I/O over
  ReadFile/WriteFile
 
 ---
@@ -215,3 +215,6 @@ index e7d2ca1..d08ed81 100644
  macro_rules! volatile_impl {
      ($ty:ty) => {
          impl FileReadWriteVolatile for $ty {
+-- 
+2.53.0
+

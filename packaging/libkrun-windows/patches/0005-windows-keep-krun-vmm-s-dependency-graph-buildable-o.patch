@@ -1,0 +1,80 @@
+From 123dcee3150ef841bddf594c37993c98d4ff3606 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 13:46:08 +0200
+Subject: [PATCH 5/5] windows: keep krun-vmm's dependency graph buildable on
+ Windows
+
+Two dependency-level blockers stopped krun-vmm from even reaching its own
+source on x86_64-pc-windows-msvc:
+
+ - krun-cpuid is written against kvm_bindings::CpuId, but was pulled in for
+   every x86_64 target. Gate it to Linux; WHP services CPUID exits through
+   whp::WhpVcpu::complete_cpuid.
+ - linux-loader depends on vm-memory with default features, and vm-memory's
+   default 'rawfd' feature is a compile_error! on Windows. Cargo unifies
+   features across the graph, so its mere presence broke the build. Exclude it
+   on Windows, mirroring what krun-arch already does for the same reason.
+
+krun-vmm still does not build on Windows: it has no WHP vstate and no
+device_manager::whp::mmio. Linux is unaffected (cargo check -p krun-vmm: 0
+errors).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/vmm/Cargo.toml     | 16 ++++++++++++++--
+ src/vmm/src/builder.rs |  3 +++
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 1a4a105..6b318ae 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -23,7 +23,6 @@ vhost-user = ["devices/vhost-user"]
+ crossbeam-channel = ">=0.5.15"
+ flate2 = "1.0.35"
+ libc = ">=0.2.39"
+-linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
+ log = "0.4.0"
+ vm-memory = { version = "0.17.0", default-features = false, features = ["backend-mmap"] }
+ vmm-sys-util = "0.14"
+@@ -47,9 +46,22 @@ bitflags = { version = "2.10.0", optional = true }
+ 
+ [target.'cfg(target_arch = "x86_64")'.dependencies]
+ bzip2 = "0.5"
+-cpuid = { package = "krun-cpuid", version = "=0.1.0-2.0.0-dev", path = "../cpuid" }
+ zstd = "0.13"
+ 
++# krun-cpuid is written against the KVM CPUID entry layout (kvm_bindings::CpuId), so it only
++# builds where kvm-bindings does. The Windows/WHP backend services CPUID exits through
++# `whp::WhpVcpu::complete_cpuid` instead.
++[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
++cpuid = { package = "krun-cpuid", version = "=0.1.0-2.0.0-dev", path = "../cpuid" }
++
++# linux-loader depends on vm-memory *with default features*, and vm-memory's default `rawfd`
++# feature raises a `compile_error!` on Windows targets. Because Cargo unifies features across the
++# whole graph, merely having linux-loader in the Windows dependency tree breaks the build, so it
++# is excluded there — the same workaround krun-arch already applies. The Windows kernel loading
++# path has to be provided separately; see the note in builder.rs.
++[target.'cfg(not(target_os = "windows"))'.dependencies]
++linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
++
+ [target.'cfg(unix)'.dependencies]
+ nix = { version = "0.30.1", features = ["fs", "term"] }
+ 
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index af3db97..505fd67 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -100,6 +100,9 @@ use krun_display::IntoDisplayBackend;
+ use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+ #[cfg(unix)]
+ use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
++// linux-loader is not available on Windows: it pulls vm-memory with default features, whose
++// `rawfd` feature is a hard `compile_error!` on Windows targets (see src/vmm/Cargo.toml). The
++// Windows kernel loading path still has to be written; it cannot reuse this import.
+ #[cfg(target_arch = "x86_64")]
+ use linux_loader::loader::{self, KernelLoader};
+ #[cfg(unix)]
+-- 
+2.53.0
+
