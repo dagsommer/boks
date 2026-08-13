@@ -36,10 +36,10 @@ flags rather than the host's. A shared-kernel container cannot produce any of th
 Not yet, natively — it is in progress. A Windows Hypervisor Platform backend for libkrun is
 being built in this repository's patch series. Every libkrun crate now compiles for Windows
 and `krun.dll` links on a real Windows runner in CI, `virtio-net` included — so the pieces
-exist. What has not happened is a boot: **no sandbox has ever started on Windows**, the
-hypervisor backend has never executed an instruction, and not one Ethernet frame has crossed
-that device. Compiling is not running, and until a VM starts, nothing here is a claim that it
-works.
+exist, and one of them now runs. On 2026-08-13 a Linux 6.12.44 guest booted through that backend on real Windows 11 hardware: kernel entry, device init, IOAPIC programming, virtio-blk I/O against the EROFS image, VFS mount and `execve` of userspace. **A kernel booting is not a sandbox running** — that still needs containerd and the nerdbox shim on Windows, which nothing has exercised — and the guest's clock does not advance, which is an open bug.
+
+So the honest line has moved, but not to "yes": the hypervisor backend executes instructions
+correctly, and no Ethernet frame has yet crossed the virtio-net device.
 
 Inside WSL2 it should work unchanged, with workspace paths preserved exactly, and nobody has
 run it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2).

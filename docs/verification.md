@@ -677,6 +677,48 @@ policy decision, not a missing one.
 **This measurement covers macOS on Apple silicon only.** The change was made for Windows, and
 nothing here says anything about Linux or about Windows, where no VM has ever booted.
 
+### First Linux boot on Windows, 2026-08-13
+
+A Linux 6.12.44 guest booted through this project's WHP backend for libkrun, on a real
+Windows 11 machine. It is the first time a VM has started on Windows here, and it took six
+attempts, each of which failed differently and usefully.
+
+**What was observed**, from the guest's own console over a named pipe:
+
+```
+[    0.190255] virtio_blk virtio3: [vda] 17760 512-byte logical blocks (9.09 MB/8.67 MiB)
+[    0.190255] erofs: (device vda): mounted with root inode @ nid 36.
+[    0.190255] VFS: Mounted root (erofs filesystem) readonly on device 254:0.
+[    0.190255] Freeing unused kernel image (initmem) memory: 2064K
+[    0.190255] Run /sbin/vminitd as init process
+```
+
+So the backend carried a real kernel from its ELF entry point through device init, IOAPIC
+programming, virtio-blk I/O against the EROFS image, a VFS mount and an `execve` of userspace.
+
+**What this is not.** It is not a sandbox. The boot was a direct C probe against `krun.dll`;
+Boks reaches libkrun through containerd and the nerdbox shim, and neither has been exercised
+on Windows. No Ethernet frame has crossed the virtio-net device. Nothing here says `boks run`
+works on Windows, and it does not.
+
+**Two faults visible in that output, and the first is a real bug.** Every printk timestamp
+reads `[    0.190255]` — all 78 lines, one distinct value, against ~1.3 s of host wall clock.
+The guest's clocksource is not advancing, which breaks every timeout and scheduling decision
+in the guest. Second, `vminitd` exited and the kernel panicked with `Attempted to kill init!`;
+the probe configured no vsock, so the init process had no control channel to the host, which
+is what nerdbox normally provides. The first is being fixed; the second is expected of a bare
+probe and needs the shim to test properly.
+
+**The bug that stood between round 5 and this.** Round 5 died with a deterministic access
+violation in `WHvSetVirtualProcessorRegisters`, reading `0xFFFFFFFFFFFFFFFF`, before any guest
+instruction ran. The cause was not in libkrun: `windows-sys 0.61.2` declares
+`WHV_REGISTER_VALUE` as plain `repr(C)` where `WinHvPlatformDefs.h` declares it
+`DECLSPEC_ALIGN(16)` — Rust computed align 8, C requires 16, and the sizes matched at 16, so
+nothing caught it. What identified it was a *passing* test: a standalone probe making the same
+calls succeeded while the real path faulted every time, which no theory about handle lifetimes
+could explain and misalignment explains exactly, since the two differ only in stack frame
+offset.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been

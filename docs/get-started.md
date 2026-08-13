@@ -20,7 +20,7 @@ worth your time.
 | **macOS on Apple silicon** | **Works.** This is the platform the VM boundary and the network policy were measured on. |
 | **Linux with `/dev/kvm`** | **Built, not yet verified.** The KVM path is designed for and built, and has not been exercised end to end by anyone on this project. Expect to be the first. |
 | **macOS on Intel** | No. There is no VM backend for it, and none is planned. |
-| **Windows, natively** | **In progress.** A Windows Hypervisor Platform backend for libkrun is being built here: every libkrun crate now compiles for Windows and `krun.dll` links on a real Windows runner in this project's CI, virtio-net included. What has not happened is a boot — no sandbox has ever started on Windows, and until one does this line says nothing about whether it works. See [Windows](windows.md). |
+| **Windows, natively** | **In progress, and it boots.** A Windows Hypervisor Platform backend for libkrun is being built here. On 2026-08-13 a Linux 6.12.44 guest booted through it on real hardware — device init, virtio-blk against the EROFS image, VFS mount, `execve` of userspace. What that is *not* is a working sandbox: that needs containerd and the nerdbox shim on Windows, which nothing has exercised, and the guest clock does not yet advance. See [Windows](windows.md). |
 | **Windows via WSL2** | **Designed for, not yet run.** Every ingredient is present in a stock WSL2 and `boks doctor` diagnoses the two things that go wrong, but nobody on this project has executed it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2). |
 
 "Verified" here means a specific thing, and [Verification](verification.md) is where the
