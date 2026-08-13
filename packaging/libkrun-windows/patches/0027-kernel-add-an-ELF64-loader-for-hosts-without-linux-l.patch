@@ -1,7 +1,7 @@
 From 9d0b8af7c8fbf02d6b1a317154479631ebe9a17a Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 17:33:41 +0200
-Subject: [PATCH 27/30] kernel: add an ELF64 loader for hosts without
+Subject: [PATCH 27/31] kernel: add an ELF64 loader for hosts without
  linux-loader
 
 Every libkrun host loads a caller-supplied vmlinux with linux-loader.
