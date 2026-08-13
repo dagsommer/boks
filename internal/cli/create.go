@@ -81,7 +81,7 @@ Agents:
 		// sandbox that did not carry its own would come up under the default preset
 		// instead of the one it was created with.
 		record := netFlags.sandboxRecord()
-		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record)
+		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, env.Stderr)
 		if err != nil {
 			return err
 		}
