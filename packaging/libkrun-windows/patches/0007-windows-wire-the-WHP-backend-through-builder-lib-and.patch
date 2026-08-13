@@ -1,0 +1,910 @@
+From 0b0df81ac35465951aa63bfa4a9ab9339c053b66 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:23:55 +0200
+Subject: [PATCH 7/8] windows: wire the WHP backend through builder, lib and
+ worker
+
+With the WHP vstate and MMIO manager in place, this connects them to the rest
+of krun-vmm and gates off the pieces that are genuinely Linux-only.
+
+The WHP-specific paths:
+
+* `setup_vm` takes the vCPU count, because `WHvSetupPartition` locks the
+  processor count in and vCPUs can be created neither before that call nor
+  after it -- neither KVM nor HVF needs this.
+* The x86_64 interrupt-controller block splits by OS. WHP emulates the LAPIC
+  but not the IOAPIC, so `split_irqchip` has no meaning there: the userspace
+  IOAPIC is the only option and its MMIO window always goes on the bus.
+* `create_vcpus_x86_64` gains a WHP variant, without the CPUID/MSR lists that
+  only exist in the KVM API.
+* `Payload::KernelCopy` is extended to x86_64-on-Windows. `KernelMmap` inserts
+  the caller's kernel pages as an extra guest memory region via
+  `MmapRegion::build_raw`, which only exists in vm-memory's Unix backend; the
+  copy path is what the aarch64 and riscv64 ports have always used and it
+  works here unchanged, once `arch_memory_regions` is asked for a contiguous
+  layout rather than one with the kernel range carved out.
+
+Gated off on Windows, each with the reason at the gate: virtio-vsock and TSI
+(socket-based, Unix-only in krun-devices -- left gated as they were), the
+linux-loader-typed error variants, and `sysconf(_SC_PAGESIZE)`, which becomes
+`GetSystemInfo().dwPageSize`.
+
+Two gaps are recorded rather than papered over. Loading an *external* kernel
+image returns `KernelLoaderUnavailable` naming what is missing, since every
+format libkrun accepts is decoded by linux-loader. And legacy COM-port input
+interrupts have no path to the guest on WHP, because the x86_64 Serial model
+raises interrupts only through an eventfd bound with KVM_IRQFD; the comment on
+the Windows `attach_legacy_devices` says so, and says why virtio-console (what
+Boks actually uses) is unaffected.
+
+krun-vmm on x86_64-pc-windows-msvc: 48 errors -> 0.
+Host Linux (`cargo check --all-targets -p krun-vmm -p libkrun`): 0 errors.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/file_traits.rs    |   7 +-
+ src/vmm/Cargo.toml                       |   1 +
+ src/vmm/src/builder.rs                   | 298 +++++++++++++++++++----
+ src/vmm/src/device_manager/legacy.rs     |  10 +
+ src/vmm/src/lib.rs                       |  27 +-
+ src/vmm/src/resources.rs                 |  38 ++-
+ src/vmm/src/vmm_config/kernel_cmdline.rs |   3 +
+ src/vmm/src/vmm_config/mod.rs            |   4 +
+ src/vmm/src/worker.rs                    |  14 +-
+ 9 files changed, 334 insertions(+), 68 deletions(-)
+
+diff --git a/src/devices/src/virtio/file_traits.rs b/src/devices/src/virtio/file_traits.rs
+index d08ed81..5371951 100644
+--- a/src/devices/src/virtio/file_traits.rs
++++ b/src/devices/src/virtio/file_traits.rs
+@@ -251,7 +251,12 @@ mod win_io {
+ 
+     /// # Safety
+     /// `buf` must point to at least `len` bytes that stay mapped for the call.
+-    pub unsafe fn read_at(h: HANDLE, buf: *mut u8, len: usize, offset: Option<u64>) -> Result<usize> {
++    pub unsafe fn read_at(
++        h: HANDLE,
++        buf: *mut u8,
++        len: usize,
++        offset: Option<u64>,
++    ) -> Result<usize> {
+         let len = len.min(u32::MAX as usize) as u32;
+         let mut done: u32 = 0;
+         let ok = match offset {
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 6e6ad75..9d3953f 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -79,6 +79,7 @@ windows-sys = { version = "0.61.2", features = [
+     "Win32_Foundation",
+     "Win32_System_Console",
+     "Win32_System_Hypervisor",
++    "Win32_System_SystemInformation",
+ ] }
+ 
+ [dev-dependencies]
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index 505fd67..a89fa7b 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -11,15 +11,16 @@ use kernel::cmdline::Cmdline;
+ use std::collections::HashMap;
+ use std::fmt::{Display, Formatter};
+ use std::fs::File;
+-use std::io::{self, IsTerminal, Read};
++use std::io::{self, IsTerminal};
++// Only the decompressing kernel loaders read from a stream, and those are Unix-only.
++#[cfg(not(target_os = "windows"))]
++use std::io::Read;
+ #[cfg(unix)]
+ use std::os::fd::AsRawFd;
+ #[cfg(unix)]
+ use std::os::fd::{BorrowedFd, FromRawFd};
+ #[cfg(windows)]
+-use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
+-#[cfg(windows)]
+-use std::path::PathBuf;
++use std::os::windows::io::{BorrowedHandle, FromRawHandle};
+ use std::sync::atomic::AtomicI32;
+ use std::sync::{Arc, Mutex};
+ #[cfg(windows)]
+@@ -36,31 +37,41 @@ use super::{Error, Vmm};
+ #[cfg(target_arch = "x86_64")]
+ use crate::device_manager::legacy::PortIODeviceManager;
+ use crate::device_manager::mmio::MMIODeviceManager;
++#[cfg(unix)]
++use crate::resources::TsiFlags;
+ use crate::resources::{
+-    DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
++    DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode, VmResources,
+ };
+-use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
++use crate::vmm_config::external_kernel::ExternalKernel;
++#[cfg(not(target_os = "windows"))]
++use crate::vmm_config::external_kernel::KernelFormat;
+ #[cfg(feature = "net")]
+ use crate::vmm_config::net::NetBuilder;
+ #[cfg(target_arch = "x86_64")]
+ use devices::legacy::Cmos;
++#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++use devices::legacy::IoApic;
++#[cfg(target_arch = "x86_64")]
++use devices::legacy::IrqChipT;
+ #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+ use devices::legacy::KvmAia;
+-#[cfg(target_arch = "x86_64")]
++#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+ use devices::legacy::KvmIoapic;
+ use devices::legacy::Serial;
+ #[cfg(target_os = "macos")]
+ use devices::legacy::VcpuList;
++#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
++use devices::legacy::WhpIoapic;
+ #[cfg(target_os = "macos")]
+ use devices::legacy::{GicV3, HvfGicV3};
+-#[cfg(target_arch = "x86_64")]
+-use devices::legacy::{IoApic, IrqChipT};
+ use devices::legacy::{IrqChip, IrqChipDevice};
+ #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+ use devices::legacy::{KvmGicV2, KvmGicV3};
++#[cfg(unix)]
++use devices::virtio::Vsock;
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+ use devices::virtio::passthrough::PermissionSemantics;
+-use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, Vsock, port_io};
++use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, port_io};
+ 
+ #[cfg(feature = "tee")]
+ use kbs_types::Tee;
+@@ -91,6 +102,7 @@ use devices::display::DisplayInfo;
+ use devices::display::NoopDisplayBackend;
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+ use devices::virtio::{VirtioShmRegion, fs::ExportTable};
++#[cfg(not(target_os = "windows"))]
+ use flate2::read::GzDecoder;
+ #[cfg(feature = "gpu")]
+ use krun_display::DisplayBackend;
+@@ -103,7 +115,7 @@ use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
+ // linux-loader is not available on Windows: it pulls vm-memory with default features, whose
+ // `rawfd` feature is a hard `compile_error!` on Windows targets (see src/vmm/Cargo.toml). The
+ // Windows kernel loading path still has to be written; it cannot reuse this import.
+-#[cfg(target_arch = "x86_64")]
++#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+ use linux_loader::loader::{self, KernelLoader};
+ #[cfg(unix)]
+ use nix::unistd::isatty;
+@@ -117,15 +129,20 @@ use vm_memory::Bytes;
+ use vm_memory::FileOffset;
+ #[cfg(not(feature = "aws-nitro"))]
+ use vm_memory::GuestMemory;
+-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
++#[cfg(all(
++    target_arch = "x86_64",
++    not(feature = "tee"),
++    not(target_os = "windows")
++))]
+ use vm_memory::GuestRegionMmap;
+-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
++#[cfg(all(
++    target_arch = "x86_64",
++    not(feature = "tee"),
++    not(target_os = "windows")
++))]
+ use vm_memory::mmap::MmapRegion;
+ use vm_memory::{GuestAddress, GuestMemoryMmap};
+ 
+-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+-use arch::x86_64::layout::AP_TRAMPOLINE_START;
+-
+ /// Errors associated with starting the instance.
+ #[derive(Debug)]
+ pub enum StartMicrovmError {
+@@ -142,6 +159,7 @@ pub enum StartMicrovmError {
+     /// Cannot open the file containing the kernel code.
+     ElfOpenKernel(io::Error),
+     /// Cannot load the kernel into the VM.
++    #[cfg(not(target_os = "windows"))]
+     ElfLoadKernel(linux_loader::loader::Error),
+     /// The firmware can't be loaded into the provided memory address.
+     FirmwareInvalidAddress(vm_memory::GuestMemoryError),
+@@ -154,6 +172,7 @@ pub enum StartMicrovmError {
+     /// Cannot find compressed kernel in file.
+     ImageBz2Invalid,
+     /// Cannot load the kernel from the uncompressed ELF data.
++    #[cfg(not(target_os = "windows"))]
+     ImageBz2LoadKernel(linux_loader::loader::Error),
+     /// Cannot open the file containing the kernel code.
+     ImageBz2OpenKernel(io::Error),
+@@ -162,6 +181,7 @@ pub enum StartMicrovmError {
+     /// Cannot find compressed kernel in file.
+     ImageGzInvalid,
+     /// Cannot load the kernel from the uncompressed ELF data.
++    #[cfg(not(target_os = "windows"))]
+     ImageGzLoadKernel(linux_loader::loader::Error),
+     /// Cannot open the file containing the kernel code.
+     ImageGzOpenKernel(io::Error),
+@@ -170,6 +190,7 @@ pub enum StartMicrovmError {
+     /// Cannot find compressed kernel in file.
+     ImageZstdInvalid,
+     /// Cannot load the kernel from the uncompressed ELF data.
++    #[cfg(not(target_os = "windows"))]
+     ImageZstdLoadKernel(linux_loader::loader::Error),
+     /// Cannot open the file containing the kernel code.
+     ImageZstdOpenKernel(io::Error),
+@@ -187,6 +208,15 @@ pub enum StartMicrovmError {
+     KernelDoesNotFit(u64, usize),
+     /// The supplied kernel format is not supported.
+     KernelFormatUnsupported,
++    /// Loading a kernel is not implemented on this host yet.
++    ///
++    /// Every kernel-loading path libkrun has -- ELF/bzImage parsing for an external kernel, and
++    /// the zero-copy `MmapRegion::build_raw` injection plus PVH boot configurator for a bundled
++    /// one -- goes through `linux-loader` and the Unix `vm-memory` backend, neither of which
++    /// builds for Windows. Only the "copy the bundled kernel into guest RAM" path exists there;
++    /// see `load_payload`.
++    #[cfg(target_os = "windows")]
++    KernelLoaderUnavailable(&'static str),
+     /// Cannot load command line string.
+     LoadCommandline(kernel::cmdline::Error),
+     /// The start command was issued more than once.
+@@ -275,6 +305,7 @@ impl Display for StartMicrovmError {
+             ElfOpenKernel(ref err) => {
+                 write!(f, "Cannot open the file containing the kernel code: {err}")
+             }
++            #[cfg(not(target_os = "windows"))]
+             ElfLoadKernel(ref err) => {
+                 write!(f, "Cannot load the kernel into the VM: {err}")
+             }
+@@ -299,6 +330,7 @@ impl Display for StartMicrovmError {
+             ImageBz2Invalid => {
+                 write!(f, "Cannot find compressed kernel in file.")
+             }
++            #[cfg(not(target_os = "windows"))]
+             ImageBz2LoadKernel(ref err) => {
+                 write!(
+                     f,
+@@ -314,6 +346,7 @@ impl Display for StartMicrovmError {
+             ImageGzInvalid => {
+                 write!(f, "Cannot find compressed kernel in file.")
+             }
++            #[cfg(not(target_os = "windows"))]
+             ImageGzLoadKernel(ref err) => {
+                 write!(
+                     f,
+@@ -329,6 +362,7 @@ impl Display for StartMicrovmError {
+             ImageZstdInvalid => {
+                 write!(f, "Cannot find compressed kernel in file.")
+             }
++            #[cfg(not(target_os = "windows"))]
+             ImageZstdLoadKernel(ref err) => {
+                 write!(
+                     f,
+@@ -361,6 +395,12 @@ impl Display for StartMicrovmError {
+             KernelFormatUnsupported => {
+                 write!(f, "The supplied kernel format is not supported.")
+             }
++            #[cfg(target_os = "windows")]
++            KernelLoaderUnavailable(what) => write!(
++                f,
++                "{what} is not implemented on Windows: libkrun's kernel loading is built on \
++                 linux-loader, which does not build for Windows targets"
++            ),
+             LoadCommandline(ref err) => {
+                 let mut err_msg = format!("{err}");
+                 err_msg = err_msg.replace('\"', "");
+@@ -540,9 +580,23 @@ impl Display for StartMicrovmError {
+ }
+ 
+ pub enum Payload {
+-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
++    /// Insert the caller's kernel pages into the guest physical address space as an extra memory
++    /// region, so the kernel is never copied. Needs `MmapRegion::build_raw`, which only exists in
++    /// `vm-memory`'s Unix backend.
++    #[cfg(all(
++        target_arch = "x86_64",
++        not(feature = "tee"),
++        not(target_os = "windows")
++    ))]
+     KernelMmap,
+-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
++    /// Copy the caller's kernel into ordinary guest RAM. This is what the non-x86 ports have
++    /// always done, and it is what x86_64 falls back to on Windows, where `KernelMmap` is
++    /// unavailable. The cost is one memcpy of the kernel at boot.
++    #[cfg(any(
++        target_arch = "aarch64",
++        target_arch = "riscv64",
++        all(target_arch = "x86_64", target_os = "windows")
++    ))]
+     KernelCopy,
+     ExternalKernel(ExternalKernel),
+     #[cfg(test)]
+@@ -565,7 +619,11 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
+         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+         return Ok(Payload::KernelMmap);
+ 
+-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
++        #[cfg(any(
++            target_arch = "aarch64",
++            target_arch = "riscv64",
++            all(target_arch = "x86_64", target_os = "windows")
++        ))]
+         return Ok(Payload::KernelCopy);
+     } else if let Some(external_kernel) = vm_resources.external_kernel() {
+         Ok(Payload::ExternalKernel(external_kernel.clone()))
+@@ -632,10 +690,20 @@ pub fn build_microvm(
+         kernel_cmdline.insert_str(cmdline).unwrap();
+     }
+ 
+-    #[cfg(not(feature = "tee"))]
++    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+     #[allow(unused_mut)]
+     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+ 
++    #[cfg(target_os = "windows")]
++    #[allow(unused_mut)]
++    let mut vm = setup_vm(
++        &guest_memory,
++        vm_resources
++            .vm_config()
++            .vcpu_count
++            .ok_or(StartMicrovmError::MissingKernelConfig)?,
++    )?;
++
+     #[cfg(feature = "tee")]
+     let (_kvm, vm) = {
+         let kvm = KvmContext::new()
+@@ -845,7 +913,7 @@ pub fn build_microvm(
+     let intc: IrqChip;
+     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
+     // while on aarch64 we need to do it the other way around.
+-    #[cfg(target_arch = "x86_64")]
++    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+     {
+         let ioapic: Box<dyn IrqChipT> = if vm_resources.split_irqchip {
+             Box::new(
+@@ -882,6 +950,34 @@ pub fn build_microvm(
+         .map_err(StartMicrovmError::Internal)?;
+     }
+ 
++    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
++    {
++        // WHP emulates the LAPIC but not the IOAPIC, so there is no "in-kernel irqchip" to
++        // choose between: the userspace IOAPIC is the only option and `split_irqchip` has no
++        // meaning here. Its MMIO window therefore always has to go on the bus.
++        let ioapic: Box<dyn IrqChipT> = Box::new(WhpIoapic::new(vm.whp_vm().clone()));
++        intc = Arc::new(Mutex::new(IrqChipDevice::new(ioapic)));
++
++        attach_legacy_devices(
++            &mut pio_device_manager,
++            &mut mmio_device_manager,
++            Some(intc.clone()),
++        )?;
++
++        let kernel_boot = vm_resources.firmware_config.is_none();
++
++        vcpus = create_vcpus_x86_64(
++            &vm,
++            &vcpu_config,
++            &guest_memory,
++            payload_config.entry_addr,
++            &pio_device_manager.io_bus,
++            &exit_evt,
++            kernel_boot,
++        )
++        .map_err(StartMicrovmError::Internal)?;
++    }
++
+     #[cfg(feature = "tdx")]
+     {
+         for vcpu in &vcpus {
+@@ -1113,6 +1209,8 @@ pub fn build_microvm(
+     #[cfg(feature = "blk")]
+     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
+ 
++    // virtio-vsock and TSI are Unix-only in krun-devices; see `vmm_config::vsock`.
++    #[cfg(unix)]
+     if let Some(vsock) = vm_resources.vsock.get() {
+         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
+         let tsi_flags = vm_resources.vsock.tsi_flags();
+@@ -1197,6 +1295,27 @@ pub fn build_microvm(
+     Ok(vmm)
+ }
+ 
++/// Loading a caller-supplied kernel image is not available on Windows.
++///
++/// Every format libkrun accepts here (ELF, bzImage, and the compressed variants) is decoded by
++/// `linux-loader`, which is excluded from the Windows dependency tree -- see the note on the
++/// dependency in `src/vmm/Cargo.toml`. This reports the gap rather than pretending to load
++/// something; the bundled-kernel path in `load_payload` is what works on Windows today.
++#[cfg(target_os = "windows")]
++fn load_external_kernel(
++    _guest_mem: &GuestMemoryMmap,
++    _arch_mem_info: &ArchMemoryInfo,
++    _external_kernel: &ExternalKernel,
++) -> std::result::Result<
++    (GuestAddress, Option<InitrdConfig>, Option<String>, bool),
++    StartMicrovmError,
++> {
++    Err(StartMicrovmError::KernelLoaderUnavailable(
++        "loading an external kernel image",
++    ))
++}
++
++#[cfg(not(target_os = "windows"))]
+ fn load_external_kernel(
+     guest_mem: &GuestMemoryMmap,
+     arch_mem_info: &ArchMemoryInfo,
+@@ -1371,7 +1490,11 @@ fn load_payload(
+     payload: &Payload,
+ ) -> std::result::Result<LoadedPayload, StartMicrovmError> {
+     match payload {
+-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
++        #[cfg(any(
++            target_arch = "aarch64",
++            target_arch = "riscv64",
++            all(target_arch = "x86_64", target_os = "windows")
++        ))]
+         Payload::KernelCopy => {
+             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
+                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
+@@ -1404,7 +1527,11 @@ fn load_payload(
+                 pvh: false,
+             })
+         }
+-        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
++        #[cfg(all(
++            target_arch = "x86_64",
++            not(feature = "tee"),
++            not(target_os = "windows")
++        ))]
+         Payload::KernelMmap => {
+             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
+                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
+@@ -1621,7 +1748,12 @@ pub fn create_guest_memory(
+ 
+     #[cfg(target_arch = "x86_64")]
+     let (arch_mem_info, mut arch_mem_regions) = match payload {
+-        #[cfg(not(feature = "tee"))]
++        // Unlike `KernelMmap` below, nothing is carved out of RAM for the kernel: it is copied
++        // into RAM that already covers its load address, so `arch_memory_regions` is asked for a
++        // plain contiguous layout.
++        #[cfg(target_os = "windows")]
++        Payload::KernelCopy => arch::arch_memory_regions(mem_size, None, 0, 0, firmware_size),
++        #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+         Payload::KernelMmap => {
+             let (kernel_guest_addr, kernel_size) =
+                 if let Some(kernel_bundle) = &vm_resources.kernel_bundle {
+@@ -1838,6 +1970,25 @@ pub(crate) fn setup_vm(
+         .map_err(StartMicrovmError::Internal)?;
+     Ok(vm)
+ }
++/// Creates the WHP partition and maps guest memory into it.
++///
++/// Takes the vCPU count, which the KVM and HVF equivalents do not need: `WHvSetupPartition`
++/// finalizes the partition and locks its processor count in, and virtual processors can neither
++/// be created before that call nor added after it.
++#[cfg(target_os = "windows")]
++pub(crate) fn setup_vm(
++    guest_memory: &GuestMemoryMmap,
++    vcpu_count: u8,
++) -> std::result::Result<Vm, StartMicrovmError> {
++    let mut vm = Vm::new(vcpu_count)
++        .map_err(Error::Vm)
++        .map_err(StartMicrovmError::Internal)?;
++    vm.memory_init(guest_memory)
++        .map_err(Error::Vm)
++        .map_err(StartMicrovmError::Internal)?;
++    Ok(vm)
++}
++
+ #[cfg(target_os = "macos")]
+ pub(crate) fn setup_vm(
+     guest_memory: &GuestMemoryMmap,
+@@ -1874,7 +2025,38 @@ pub fn setup_serial_device(
+     Ok(serial)
+ }
+ 
+-#[cfg(target_arch = "x86_64")]
++/// x86_64 legacy devices on WHP.
++///
++/// The KVM version binds each legacy device's eventfd to a guest IRQ line with `KVM_IRQFD`, so
++/// that writing the fd from a device thread raises the interrupt without the VMM being involved.
++/// WHP has no irqfd, so there is nothing to register here.
++///
++/// KNOWN GAP: that also means nothing currently carries a COM port's `interrupt_evt` to the
++/// IOAPIC. Serial *output* is unaffected (it is a port write the vCPU dispatches synchronously),
++/// and so is `earlycon`; serial *input* will not interrupt the guest until the x86_64 `Serial`
++/// model grows the `set_intc`/`set_irq_line` pair its aarch64 counterpart already has. Boks
++/// drives its console over virtio-console, which raises interrupts through the `IrqChip` and is
++/// unaffected.
++#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
++fn attach_legacy_devices(
++    pio_device_manager: &mut PortIODeviceManager,
++    mmio_device_manager: &mut MMIODeviceManager,
++    intc: Option<Arc<Mutex<IrqChipDevice>>>,
++) -> std::result::Result<(), StartMicrovmError> {
++    pio_device_manager
++        .register_devices()
++        .map_err(Error::LegacyIOBus)
++        .map_err(StartMicrovmError::Internal)?;
++
++    mmio_device_manager
++        .register_mmio_ioapic(intc)
++        .map_err(Error::RegisterMMIODevice)
++        .map_err(StartMicrovmError::Internal)?;
++
++    Ok(())
++}
++
++#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+ fn attach_legacy_devices(
+     vm: &Vm,
+     split_irqchip: bool,
+@@ -1979,7 +2161,37 @@ fn attach_legacy_devices(
+     Ok(())
+ }
+ 
+-#[cfg(target_arch = "x86_64")]
++#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
++#[allow(clippy::too_many_arguments)]
++fn create_vcpus_x86_64(
++    vm: &Vm,
++    vcpu_config: &VcpuConfig,
++    guest_mem: &GuestMemoryMmap,
++    entry_addr: GuestAddress,
++    io_bus: &devices::Bus,
++    exit_evt: &EventFd,
++    kernel_boot: bool,
++) -> super::Result<Vec<Vcpu>> {
++    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
++    for cpu_index in 0..vcpu_config.vcpu_count {
++        let mut vcpu = Vcpu::new_x86_64(
++            cpu_index,
++            vm,
++            io_bus.clone(),
++            guest_mem.clone(),
++            exit_evt.try_clone().map_err(Error::EventFd)?,
++        )
++        .map_err(Error::Vcpu)?;
++
++        vcpu.configure_x86_64(guest_mem, entry_addr, vcpu_config, kernel_boot)
++            .map_err(Error::Vcpu)?;
++
++        vcpus.push(vcpu);
++    }
++    Ok(vcpus)
++}
++
++#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+ #[allow(clippy::too_many_arguments)]
+ fn create_vcpus_x86_64(
+     vm: &Vm,
+@@ -2125,7 +2337,9 @@ fn attach_mmio_device(
+     let (_mmio_base, _irq) =
+         vmm.mmio_device_manager
+             .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+-    #[cfg(target_os = "macos")]
++    // Neither HVF nor WHP has an ioeventfd/irqfd to register the device against, so unlike the
++    // KVM path the partition/VM is not involved in registration at all.
++    #[cfg(any(target_os = "macos", target_os = "windows"))]
+     let (_mmio_base, _irq) =
+         vmm.mmio_device_manager
+             .register_mmio_device(mmio_device, type_id, id)?;
+@@ -2290,35 +2504,10 @@ fn is_valid_handle(h: *mut core::ffi::c_void) -> bool {
+ #[cfg(target_os = "windows")]
+ fn autoconfigure_console_ports(
+     vmm: &mut Vmm,
+-    vm_resources: &VmResources,
++    _vm_resources: &VmResources,
+     cfg: Option<&DefaultVirtioConsoleConfig>,
+-    creating_implicit_console: bool,
+ ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
+-    use self::StartMicrovmError::*;
+-
+-    let mut console_output_path: Option<PathBuf> = None;
+-    if let Some(path) = vm_resources.console_output.clone() {
+-        if !vm_resources.disable_implicit_console && creating_implicit_console {
+-            console_output_path = Some(path)
+-        }
+-    }
+-
+-    if let Some(console_output_path) = console_output_path {
+-        let file = File::create(console_output_path).map_err(OpenConsoleFile)?;
+-        // Manually emulate our Legacy behavior: In the case of output_path we have always used the
+-        // stdin to determine the console size
+-        let stdin_h = unsafe { BorrowedHandle::borrow_raw(GetStdHandle(STD_INPUT_HANDLE)) };
+-        let term_h = if stdin_h.is_terminal() {
+-            port_io::term_handle(stdin_h.as_raw_handle()).unwrap()
+-        } else {
+-            port_io::term_fixed_size(0, 0)
+-        };
+-        Ok(vec![PortDescription::console(
+-            Some(port_io::input_empty().unwrap()),
+-            Some(port_io::output_file(file).unwrap()),
+-            term_h,
+-        )])
+-    } else {
++    {
+         let (input_h, output_h, err_h) = match cfg {
+             Some(c) => (
+                 c.input_handle.as_raw_handle(),
+@@ -2595,6 +2784,7 @@ fn attach_net_devices(
+     Ok(())
+ }
+ 
++#[cfg(unix)]
+ fn attach_unixsock_vsock_device(
+     vmm: &mut Vmm,
+     unix_vsock: &Arc<Mutex<Vsock>>,
+diff --git a/src/vmm/src/device_manager/legacy.rs b/src/vmm/src/device_manager/legacy.rs
+index 27033aa..745a53f 100644
+--- a/src/vmm/src/device_manager/legacy.rs
++++ b/src/vmm/src/device_manager/legacy.rs
+@@ -43,10 +43,20 @@ pub struct PortIODeviceManager {
+     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
+     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
+ 
++    // These are the eventfds the KVM backend binds to guest IRQ lines with `KVM_IRQFD`, so that a
++    // device thread can raise a legacy interrupt without the VMM being involved. WHP has no
++    // irqfd, so on Windows they are constructed (the devices hold clones and still signal them)
++    // but nothing on this side consumes them; see the note on the Windows `attach_legacy_devices`
++    // in builder.rs for what that costs.
++    #[cfg_attr(target_os = "windows", allow(dead_code))]
+     pub com_evt_1: EventFd,
++    #[cfg_attr(target_os = "windows", allow(dead_code))]
+     pub com_evt_2: EventFd,
++    #[cfg_attr(target_os = "windows", allow(dead_code))]
+     pub com_evt_3: EventFd,
++    #[cfg_attr(target_os = "windows", allow(dead_code))]
+     pub com_evt_4: EventFd,
++    #[cfg_attr(target_os = "windows", allow(dead_code))]
+     pub kbd_evt: EventFd,
+ }
+ 
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 262fd18..e8e4128 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -42,11 +42,16 @@ use windows::vstate;
+ 
+ use std::fmt::{Display, Formatter};
+ use std::io;
++#[cfg(unix)]
+ use std::os::unix::io::AsRawFd;
++// `RawFd` is a `HANDLE` on Windows and the standard-library trait does not exist there, so the
++// event manager's descriptors are named through the shim in `krun-utils` instead.
+ use std::sync::atomic::{AtomicI32, Ordering};
+ use std::sync::{Arc, Mutex};
+ #[cfg(target_os = "linux")]
+ use std::time::Duration;
++#[cfg(windows)]
++use utils::windows::AsRawFd;
+ 
+ #[cfg(target_arch = "x86_64")]
+ use crate::device_manager::legacy::PortIODeviceManager;
+@@ -56,6 +61,16 @@ use crate::vstate::VcpuEvent;
+ use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
+ 
+ use arch::{ArchMemoryInfo, InitrdConfig};
++
++/// Error type reported by [`VmmEventsObserver`].
++///
++/// `vmm_sys_util`'s `errno::Error` is a thin wrapper over a Unix `errno` and is not built on
++/// Windows; `std::io::Error` carries the Win32 error code in the same role there.
++#[cfg(unix)]
++pub type ObserverError = utils::errno::Error;
++/// See the Unix variant above.
++#[cfg(windows)]
++pub type ObserverError = std::io::Error;
+ #[cfg(target_os = "macos")]
+ use crossbeam_channel::Sender;
+ #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+@@ -138,9 +153,9 @@ pub enum Error {
+     /// Vm error.
+     Vm(vstate::Error),
+     /// Error thrown by observer object on Vmm initialization.
+-    VmmObserverInit(utils::errno::Error),
++    VmmObserverInit(ObserverError),
+     /// Error thrown by observer object on Vmm teardown.
+-    VmmObserverTeardown(utils::errno::Error),
++    VmmObserverTeardown(ObserverError),
+ }
+ 
+ impl Display for Error {
+@@ -185,11 +200,11 @@ impl Display for Error {
+ /// Trait for objects that need custom initialization and teardown during the Vmm lifetime.
+ pub trait VmmEventsObserver {
+     /// This function will be called during microVm boot.
+-    fn on_vmm_boot(&mut self) -> std::result::Result<(), utils::errno::Error> {
++    fn on_vmm_boot(&mut self) -> std::result::Result<(), ObserverError> {
+         Ok(())
+     }
+     /// This function will be called on microVm teardown.
+-    fn on_vmm_stop(&mut self) -> std::result::Result<(), utils::errno::Error> {
++    fn on_vmm_stop(&mut self) -> std::result::Result<(), ObserverError> {
+         Ok(())
+     }
+ }
+@@ -291,7 +306,9 @@ impl Vmm {
+         Ok(())
+     }
+ 
+-    #[cfg(target_os = "macos")]
++    /// The KVM backend starts its vCPUs in the `Paused` state and needs an explicit kick; the
++    /// HVF and WHP backends start theirs running, so there is nothing to resume.
++    #[cfg(any(target_os = "macos", target_os = "windows"))]
+     pub fn resume_vcpus(&mut self) -> Result<()> {
+         Ok(())
+     }
+diff --git a/src/vmm/src/resources.rs b/src/vmm/src/resources.rs
+index 081d527..733c377 100644
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -30,6 +30,7 @@ use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfig
+ use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
+ #[cfg(feature = "net")]
+ use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
++#[cfg(unix)]
+ use crate::vmm_config::vsock::*;
+ use crate::vstate::VcpuConfig;
+ #[cfg(any(feature = "gpu", feature = "vhost-user"))]
+@@ -41,7 +42,35 @@ use krun_display::DisplayBackend;
+ 
+ type Result<E> = std::result::Result<(), E>;
+ 
+-// Re-export TsiFlags from devices crate
++/// Host page size, used to validate the alignment of a caller-supplied kernel bundle.
++///
++/// `sysconf(_SC_PAGESIZE)` has no Windows counterpart; `GetSystemInfo` reports the same quantity
++/// as `dwPageSize`. (Note this is deliberately *not* `dwAllocationGranularity`, which is the
++/// coarser 64 KiB granularity `VirtualAlloc` hands out reservations at -- what is being checked
++/// here is page alignment, not allocation alignment.)
++#[cfg(unix)]
++fn host_page_size() -> usize {
++    // Safe because this call just returns the page size and doesn't have any side effects.
++    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
++}
++
++/// See the Unix variant above.
++#[cfg(windows)]
++fn host_page_size() -> usize {
++    use std::mem::MaybeUninit;
++    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
++
++    let mut info = MaybeUninit::<SYSTEM_INFO>::uninit();
++    // Safe because `GetSystemInfo` fully initializes the struct it is handed and has no other
++    // side effects.
++    unsafe {
++        GetSystemInfo(info.as_mut_ptr());
++        info.assume_init().dwPageSize as usize
++    }
++}
++
++// Re-export TsiFlags from devices crate. Unix-only: see `vmm_config::vsock`.
++#[cfg(unix)]
+ pub use devices::virtio::TsiFlags;
+ 
+ #[cfg(feature = "vhost-user")]
+@@ -76,6 +105,7 @@ pub enum Error {
+     /// microVM vCpus or memory configuration error.
+     VmConfig(VmConfigError),
+     /// Vsock device configuration error.
++    #[cfg(unix)]
+     VsockDevice(VsockConfigError),
+ }
+ 
+@@ -162,6 +192,7 @@ pub enum PortConfig {
+ }
+ 
+ /// Configuration for the vsock device
++#[cfg(unix)]
+ #[derive(Debug, Default, Clone, Eq, PartialEq)]
+ pub enum VsockConfig {
+     /// No vsock device
+@@ -195,6 +226,7 @@ pub struct VmResources {
+     #[cfg(not(feature = "tee"))]
+     pub fs: Vec<FsDeviceConfig>,
+     /// The vsock device.
++    #[cfg(unix)]
+     pub vsock: VsockBuilder,
+     /// The virtio-blk device.
+     #[cfg(feature = "blk")]
+@@ -308,8 +340,7 @@ impl VmResources {
+     }
+ 
+     pub fn set_kernel_bundle(&mut self, kernel_bundle: KernelBundle) -> Result<KernelBundleError> {
+-        // Safe because this call just returns the page size and doesn't have any side effects.
+-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
++        let page_size = host_page_size();
+ 
+         if kernel_bundle.host_addr == 0 || (kernel_bundle.host_addr as usize) & (page_size - 1) != 0
+         {
+@@ -373,6 +404,7 @@ impl VmResources {
+     }
+ 
+     /// Sets a vsock device to be attached when the VM starts.
++    #[cfg(unix)]
+     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
+         self.vsock.insert(config)
+     }
+diff --git a/src/vmm/src/vmm_config/kernel_cmdline.rs b/src/vmm/src/vmm_config/kernel_cmdline.rs
+index 94bd775..c4e00fe 100644
+--- a/src/vmm/src/vmm_config/kernel_cmdline.rs
++++ b/src/vmm/src/vmm_config/kernel_cmdline.rs
+@@ -7,6 +7,9 @@ use std::fmt::{Display, Formatter, Result};
+ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
+                                           rootfstype=virtiofs rw quiet no-kvmapf";
+ #[cfg(target_os = "macos")]
++pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
++                                          rootfstype=virtiofs rw quiet no-kvmapf";
++#[cfg(target_os = "windows")]
+ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
+                                           rootfstype=virtiofs rw quiet no-kvmapf";
+ 
+diff --git a/src/vmm/src/vmm_config/mod.rs b/src/vmm/src/vmm_config/mod.rs
+index d324f54..cc5e02b 100644
+--- a/src/vmm/src/vmm_config/mod.rs
++++ b/src/vmm/src/vmm_config/mod.rs
+@@ -28,6 +28,10 @@ pub mod kernel_bundle;
+ pub mod machine_config;
+ 
+ /// Wrapper for configuring the vsock devices attached to the microVM.
++///
++/// virtio-vsock and TSI are Unix-only in `krun-devices` (they are built on `AF_UNIX`/`AF_INET`
++/// sockets reached through raw fds), so their configuration surface is gated the same way.
++#[cfg(unix)]
+ pub mod vsock;
+ 
+ /// Wrapper for configuring the network devices attached to the microVM.
+diff --git a/src/vmm/src/worker.rs b/src/vmm/src/worker.rs
+index 3da5240..3728c6b 100644
+--- a/src/vmm/src/worker.rs
++++ b/src/vmm/src/worker.rs
+@@ -30,9 +30,8 @@ pub fn start_worker_thread(
+                 let received = receiver.recv();
+                 match received {
+                     Err(e) => error!("error receiving message from vmm worker thread: {e:?}"),
+-                    #[cfg(target_os = "macos")]
+-                    Ok(message) => vmm.lock().unwrap().match_worker_message(message),
+-                    #[cfg(target_os = "linux")]
++                    // On Windows `WorkerMessage` currently has no variants (every one of them
++                    // is gated off), so this arm is uninhabited there rather than absent.
+                     Ok(message) => vmm.lock().unwrap().match_worker_message(message),
+                 }
+             }
+@@ -42,12 +41,16 @@ pub fn start_worker_thread(
+ 
+ impl super::Vmm {
+     fn match_worker_message(&self, msg: WorkerMessage) {
++        // The cfgs below mirror the ones on `WorkerMessage` itself. On Windows the enum has no
++        // variants, so this is an empty (and exhaustive) match: WHP has no GSI routing table and
++        // no irq-line ioctl -- the IOAPIC model in krun-devices owns both, and injects straight
++        // into the partition with `WHvRequestInterrupt` -- and `ConvertMemory` is TEE-only.
+         match msg {
+             #[cfg(target_os = "macos")]
+             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
+             #[cfg(target_os = "macos")]
+             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
+-            #[cfg(target_arch = "x86_64")]
++            #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+             WorkerMessage::GsiRoute(sender, entries) => {
+                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();
+                 let routing_entries = routing.as_mut_slice();
+@@ -56,12 +59,13 @@ impl super::Vmm {
+                     .send(self.vm.fd().set_gsi_routing(&routing).is_ok())
+                     .unwrap();
+             }
+-            #[cfg(target_arch = "x86_64")]
++            #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+             WorkerMessage::IrqLine(sender, irq, active) => {
+                 sender
+                     .send(self.vm.fd().set_irq_line(irq, active).is_ok())
+                     .unwrap();
+             }
++            #[cfg(not(target_os = "windows"))]
+             WorkerMessage::ConvertMemory(_sender, _properties) => {
+                 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
+                 {
+-- 
+2.53.0
+

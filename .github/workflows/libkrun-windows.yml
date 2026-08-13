@@ -125,7 +125,7 @@ jobs:
         working-directory: libkrun
         run: |
           set -euo pipefail
-          for crate in krun-utils krun-polly krun-arch-gen krun-smbios krun-whp krun-kernel krun-arch krun-devices; do
+          for crate in krun-utils krun-polly krun-arch-gen krun-smbios krun-whp krun-kernel krun-arch krun-devices krun-vmm; do
             echo "::group::cargo check -p $crate"
             cargo check --target x86_64-pc-windows-msvc -p "$crate"
             echo "::endgroup::"
@@ -141,18 +141,17 @@ jobs:
       # a progress report, not a gate. Each entry names what is blocking it, as of the pinned
       # revision with this series applied:
       #
-      #   krun-vmm      The real blocker, and it is not a compile error to chip away at:
-      #                 libkrun has no Windows hypervisor backend at all. `src/vmm/src/lib.rs`
-      #                 declares only `mod linux` and `mod macos`, and `device_manager/` holds
-      #                 only `kvm/` and `hvf/`. `krun-whp` — the WHP bindings — compiles and is
-      #                 in the required step above, but nothing calls it: the vstate and MMIO
-      #                 glue that turns those bindings into a running VM is unwritten. For
-      #                 scale, the equivalents are 778 + 569 lines on macOS and 2088 + 588 on
-      #                 Linux. The ~58 errors this step reports are downstream of that absence,
-      #                 so fixing them individually would be churn.
+      #   libkrun       The cdylib, and the last thing standing between this series and a
+      #                 `krun.dll` existing. ~20 errors, all in `src/libkrun/src/lib.rs` and
+      #                 none of them hypervisor-related — it is the C API layer:
+      #                 `libc::{uid_t,gid_t,setuid,setgid,mmap}`, `File::from_raw_fd`, the
+      #                 `KRUNFW_NAME` dlopen, and the vsock entry points the series gates off.
+      #                 A coherent, separate piece of work rather than a long tail.
       #
-      #   libkrun       The cdylib. Blocked on krun-vmm; it is the last thing to go green, and
-      #                 when it does, `krun.dll` exists.
+      # krun-vmm moved up on 2026-08-13, when `src/vmm/src/windows/` and
+      # `device_manager/whp/` were written against the WHP bindings. Read that as "it
+      # compiles": nothing in this workflow has ever started a VM, and the backend has never
+      # executed a single instruction.
       #
       # krun-cpuid is deliberately absent from both lists. It is built against `kvm_bindings`,
       # and KVM is Linux-only, so the series gates it out of the Windows dependency graph
@@ -169,7 +168,7 @@ jobs:
         run: |
           set -uo pipefail
           failed=()
-          for crate in krun-vmm libkrun; do
+          for crate in libkrun; do
             echo "::group::cargo check -p $crate"
             if cargo check --target x86_64-pc-windows-msvc -p "$crate"; then
               echo "$crate COMPILES"
