@@ -16,11 +16,16 @@ import (
 // traffic in a userspace network stack. That is Boks' architecture, running on Windows, in a
 // shipping product. So the platform is not the obstacle and this check must not imply it is.
 //
-// The obstacle is no longer a missing device. This project maintains a WHP backend for libkrun
-// in packaging/libkrun-windows/, and as of 2026-08-13 every libkrun crate compiles for Windows
-// and krun.dll links on a Windows CI runner with virtio-fs, -blk, -console, -balloon, -rng and
-// virtio-net. What has not happened is a boot: no sandbox has ever started on Windows, that
-// backend has never executed an instruction, and no Ethernet frame has crossed that device.
+// The obstacle is no longer a missing device, and as of 2026-08-13 it is no longer a question
+// of whether the hypervisor backend runs. This project maintains a WHP backend for libkrun in
+// packaging/libkrun-windows/; every crate compiles, krun.dll links on a Windows CI runner, and
+// a Linux 6.12.44 guest booted through it on real hardware — device init, virtio-blk against
+// the EROFS rootfs, VFS mount, execve of userspace.
+//
+// What that is not is a sandbox. Boks reaches libkrun through containerd and the nerdbox shim,
+// and neither has been exercised on Windows; the boot above was a direct C probe against the
+// DLL. The guest clock also does not advance yet. So this check still fails, and the reason it
+// gives has to be the real one rather than the old one.
 //
 // So this check must say something narrower than it used to, and harder to get right: the
 // pieces exist and have never been run together. Telling a user to enable a Windows feature
@@ -44,10 +49,11 @@ func virtualizationCheck() Check {
 					"Windows exposes a user-mode hypervisor API — the Windows Hypervisor Platform —\n" +
 					"which supports exactly the microVM-plus-userspace-netstack design Boks uses, and\n" +
 					"the reference product ships on it. A WHP backend for libkrun is being built in\n" +
-					"this project: every crate now compiles for Windows and krun.dll links in CI,\n" +
-					"virtio-net included. No sandbox has ever booted on Windows, so none of that is\n" +
-					"yet a working VM, and enabling Hyper-V or the Hypervisor Platform will not make\n" +
-					"one — nothing here is wired up to use it.\n" +
+					"this project, and on 2026-08-13 a Linux guest booted through it on real Windows\n" +
+					"hardware, mounted its root filesystem and reached userspace. That was a direct\n" +
+					"probe against krun.dll: Boks drives libkrun through containerd and the nerdbox\n" +
+					"shim, and neither has been exercised on Windows, so there is still no sandbox\n" +
+					"here to start. Enabling Hyper-V or the Hypervisor Platform will not change that.\n" +
 					"\n" +
 					"To use Boks on this machine today, run it inside WSL2 with nested\n" +
 					"virtualisation, where it is an ordinary Linux program. See docs/windows.md.",
