@@ -1,0 +1,364 @@
+From f55235f2d71953ec56be3e7e5053eb20c8b22025 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 22:11:51 +0200
+Subject: [PATCH 31/31] windows: take CPUID exits, and make leaf 0x15 reachable
+ on any host
+
+---
+ src/vmm/src/windows/vstate.rs | 116 ++++++++++++++++++++++----
+ src/whp/src/lib.rs            | 150 ++++++++++++++++++++++++++++++----
+ 2 files changed, 233 insertions(+), 33 deletions(-)
+
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+index fcaf729..885705c 100644
+--- a/src/vmm/src/windows/vstate.rs
++++ b/src/vmm/src/windows/vstate.rs
+@@ -21,10 +21,13 @@
+ //!   through the `IrqChip` instead, exactly as the HVF backend does.
+ //! * **CPUID filtering.** KVM lets the VMM install a complete CPUID table with
+ //!   `KVM_SET_CPUID2`, which is how `krun-cpuid` normalises topology and
+-//!   applies the T2/C3 templates. WHP's `CpuidResultList` only *overrides*
+-//!   individual leaves, and taking a full exit per CPUID needs
+-//!   `WHvPartitionPropertyCodeCpuidExitList`, which the partition setup does not
+-//!   request. CPU templates are therefore rejected rather than ignored — see
++//!   applies the T2/C3 templates. WHP has no equivalent: `CpuidResultList`
++//!   *replaces* individual leaves wholesale, and
++//!   `WHvPartitionPropertyCodeCpuidExitList` traps a named set of leaves for
++//!   the VMM to answer one at a time. The partition setup uses both — see
++//!   [`normalize_cpuid`] for the trapped leaves and `WhpVm::configure_partition`
++//!   for the replaced ones — but neither gives the whole-table rewrite a CPU
++//!   template needs, so templates are still rejected rather than ignored; see
+ //!   [`Vcpu::configure_x86_64`].
+ //! * **A PIT.** `KvmIoapic::new` asks KVM for an in-kernel i8254 alongside the
+ //!   irqchip, and that PIT is what a Linux guest measures its TSC and its local
+@@ -58,7 +61,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
+ use crossbeam_channel::{Receiver, Sender, unbounded};
+ use utils::eventfd::EventFd;
+ use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+-use whp::{VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
++use whp::{CpuidExitInfo, VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
+ 
+ /// How long a vCPU parks after a `HLT` it can still be woken from, before
+ /// re-entering the guest. See [`Vcpu::wait_for_interrupt`] for why this is a
+@@ -210,6 +213,87 @@ impl Vm {
+     }
+ }
+ 
++/// Answers a trapped CPUID with WHP's own default result, with the minimum
++/// set of bits changed that the guest needs to see.
++///
++/// Only the leaves listed in `WHvPartitionPropertyCodeCpuidExitList` reach
++/// here; every other leaf is answered by WHP without an exit. The default
++/// result is preserved wherever it is not explicitly overridden, so that
++/// WHP's feature filtering — which reflects what the partition can actually
++/// execute — is never widened.
++///
++/// Returns the `(eax, ebx, ecx, edx)` to complete the instruction with.
++///
++/// # Leaf 0: maximum standard leaf
++///
++/// EAX is raised to at least 0x15 so that the synthetic TSC leaf installed in
++/// `WhpVm::configure_partition` is reachable. Linux's `native_calibrate_tsc()`
++/// reads leaf 0x15 only when `boot_cpu_data.cpuid_level >= 0x15`; leaf 0 is
++/// otherwise passed through from the host, and AMD hosts stop at 0xD, so on
++/// those hosts the synthesized leaf is written but never read. The vendor
++/// string in EBX/ECX/EDX is left exactly as WHP reported it.
++///
++/// # Leaf 1: feature bits
++///
++/// **ECX bit 21 (x2APIC)** is cleared. The partition is created with
++/// `WHvX64LocalApicEmulationModeXApic`, so there is no x2APIC behind the
++/// advertisement; a guest that believed the bit would drive the APIC through
++/// MSRs the emulated xAPIC does not implement.
++///
++/// **ECX bit 31 (hypervisor present) is deliberately left as WHP set it.**
++/// Setting it is tempting — it is `X86_FEATURE_HYPERVISOR`, and
++/// `ms_hyperv_platform()` returns 0 without it, so it is what would make the
++/// Hyper-V leaves in `WhpVm::configure_partition` reachable. But making them
++/// reachable is not currently an improvement. `ms_hyperv_init_platform()`
++/// (arch/x86/kernel/cpu/mshyperv.c) ends with
++///
++/// ```text
++/// if (!(ms_hyperv.features & HV_ACCESS_TSC_INVARIANT))
++///         mark_tsc_unstable("running on Hyper-V");
++/// ```
++///
++/// and an unstable sched_clock is exactly what engages the
++/// `sched_clock_local()` clamp that froze every printk timestamp in the first
++/// place. Turning this bit on without the rest of the enlightenment story
++/// being true would trade one frozen-clock mechanism for another. The feature
++/// leaf now advertises `HV_ACCESS_TSC_INVARIANT` for that reason, but flipping
++/// this bit remains a separate, deliberate experiment rather than something
++/// bundled into an unrelated fix — not least because doing both at once would
++/// make the next boot's result impossible to attribute.
++///
++/// Everything else in leaf 1, including the APIC ID and topology fields in
++/// EBX, is passed through. Rewriting those is a change to AP bring-up rather
++/// than to timekeeping, and is left alone deliberately.
++#[cfg(target_arch = "x86_64")]
++fn normalize_cpuid(info: &CpuidExitInfo) -> (u64, u64, u64, u64) {
++    /// CPUID leaf 1, ECX bit 21 — x2APIC support.
++    const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
++    /// The lowest maximum-standard-leaf that leaves 0x15 reachable.
++    const MIN_MAX_STANDARD_LEAF: u32 = 0x15;
++
++    let (mut eax, ebx, mut ecx, edx) = (
++        info.default_eax,
++        info.default_ebx,
++        info.default_ecx,
++        info.default_edx,
++    );
++
++    match info.leaf as u32 {
++        0x0 => {
++            eax = u64::from((eax as u32).max(MIN_MAX_STANDARD_LEAF));
++        }
++        0x1 => {
++            ecx = u64::from(ecx as u32 & !CPUID_1_ECX_X2APIC);
++        }
++        // Trapped without a rewrite. Reachable only if the exit list and this
++        // function disagree; replaying the default keeps that a no-op rather
++        // than a hang.
++        _ => {}
++    }
++
++    (eax, ebx, ecx, edx)
++}
++
+ /// Encapsulates configuration parameters for the guest vCPUS.
+ #[derive(Debug, Eq, PartialEq)]
+ pub struct VcpuConfig {
+@@ -458,24 +542,20 @@ impl Vcpu {
+                 Ok(VcpuEmulation::Handled)
+             }
+             VcpuExitReason::CpuidAccess => {
+-                // Unreachable as the partition stands: without
+-                // `WHvPartitionPropertyCodeCpuidExitList`, WHP answers CPUID
+-                // itself from its defaults plus the `CpuidResultList` installed
+-                // in `WhpVm::configure_partition`. Handled anyway, by replaying
+-                // the default result WHP computed, so that adding an exit list
+-                // later cannot turn into a hang.
++                // Reached for the leaves named in
++                // `WHvPartitionPropertyCodeCpuidExitList`, which
++                // `WhpVm::configure_partition` sets to the leaves that must be
++                // WHP's own answer with a few bits changed. Every other leaf is
++                // still answered by WHP itself, from its defaults plus the
++                // whole-leaf `CpuidResultList` overrides.
+                 let info = whp_vcpu.cpuid_exit_info();
++                let (eax, ebx, ecx, edx) = normalize_cpuid(&info);
+                 debug!(
+-                    "vCPU {} CPUID leaf 0x{:x} subleaf 0x{:x}",
++                    "vCPU {} CPUID leaf 0x{:x} subleaf 0x{:x} -> {eax:#x} {ebx:#x} {ecx:#x} {edx:#x}",
+                     self.id, info.leaf, info.subleaf
+                 );
+                 whp_vcpu
+-                    .complete_cpuid(
+-                        info.default_eax,
+-                        info.default_ebx,
+-                        info.default_ecx,
+-                        info.default_edx,
+-                    )
++                    .complete_cpuid(eax, ebx, ecx, edx)
+                     .map_err(Error::VcpuRegisterAccess)?;
+                 Ok(VcpuEmulation::Handled)
+             }
+diff --git a/src/whp/src/lib.rs b/src/whp/src/lib.rs
+index cd5e6a6..12fb5d9 100644
+--- a/src/whp/src/lib.rs
++++ b/src/whp/src/lib.rs
+@@ -22,11 +22,12 @@ use windows_sys::Win32::System::Hypervisor::{
+     WHV_TRANSLATE_GVA_RESULT_CODE, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT,
+     WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
+     WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeInterruptClockFrequency,
+-    WHvCapabilityCodeProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor,
+-    WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator,
+-    WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
+-    WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
+-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList,
++    WHvCapabilityCodeProcessorClockFrequency, WHvCapabilityCodeProcessorFeaturesBanks,
++    WHvCreatePartition, WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
++    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
++    WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
++    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
++    WHvPartitionPropertyCodeCpuidExitList, WHvPartitionPropertyCodeCpuidResultList,
+     WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+     WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
+     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+@@ -320,12 +321,53 @@ impl WhpVm {
+             },
+         )?;
+ 
+-        // Enable MSR exits (bit 1)
++        // Enable CPUID exits (bit 0) and MSR exits (bit 1).
+         // https://github.com/google/crosvm/blob/main/hypervisor/src/whpx/whpx_sys/WinHvPlatformDefs.h#L74
++        //
++        // CPUID exits are not a blanket trap: they fire only for the leaves
++        // named in `CpuidExitList` below. See that list for why the leaves it
++        // holds cannot be served from `CpuidResultList` instead.
+         Self::set_property(handle, WHvPartitionPropertyCodeExtendedVmExits, |p| {
+-            p.ExtendedVmExits.AsUINT64 = 0b10; // bit 1 = X64MsrExit
++            p.ExtendedVmExits.AsUINT64 = 0b11; // bit 0 = X64CpuidExit, bit 1 = X64MsrExit
+         })?;
+ 
++        // The leaves the VMM rewrites on each exit, in `normalize_cpuid`.
++        //
++        // `CpuidResultList` (used further down for the purely synthetic leaves)
++        // is a *whole-leaf* override: it replaces all four registers with
++        // constants chosen before the partition starts. That is exactly right
++        // for a leaf invented wholesale, and exactly wrong for these two, each
++        // of which has to be WHP's own answer with a few bits changed:
++        //
++        // * `0x0` — the vendor string in EBX/ECX/EDX must survive untouched;
++        //   only EAX (the maximum standard leaf) is raised, so that the guest
++        //   goes on to read the synthetic 0x15 installed below. AMD hosts
++        //   report a maximum of 0xD, and Linux reads 0x15 only when
++        //   `cpuid_level` is at least 0x15, which is what puts the leaf out of
++        //   reach there today.
++        // * `0x1` — ECX and EDX carry WHP's *filtered* feature set, i.e. the
++        //   features this partition can actually use. Rebuilding the leaf from
++        //   a host `__cpuid(1)` would re-advertise whatever WHP masked off and
++        //   hand the guest instructions the partition cannot execute.
++        //
++        // Both leaves are read a handful of times during guest boot and never
++        // on a hot path, so trapping them costs nothing measurable. Topology
++        // (0xB/0x1F) is deliberately *not* trapped: nothing in the timekeeping
++        // path depends on it, and rewriting it is a change to AP bring-up that
++        // cannot be justified by the bug this list exists to fix.
++        const CPUID_EXIT_LEAVES: [u32; 2] = [0x0, 0x1];
++        let hr = unsafe {
++            WHvSetPartitionProperty(
++                handle,
++                WHvPartitionPropertyCodeCpuidExitList,
++                CPUID_EXIT_LEAVES.as_ptr().cast(),
++                std::mem::size_of_val(&CPUID_EXIT_LEAVES) as u32,
++            )
++        };
++        if hr != S_OK {
++            return Err(Error::SetPartitionProperty(hr));
++        }
++
+         // Configure how MSRs are handled
+         // We just set the bit 0 (UnhandledMsrs) so that any MSR read/write does not automatically fail
+         // but it triggers an exit that we can handle
+@@ -407,21 +449,54 @@ impl WhpVm {
+             Edx: 0,
+         });
+         // 0x40000003 — Feature identification (Hyper-V TLFS §2.4)
++        //
++        // This leaf must advertise only what this backend actually backs.
++        // Linux reads it as `ms_hyperv.features` and each bit switches on code
++        // that reads a synthetic MSR; anything advertised but unimplemented
++        // becomes an MSR read that `Vcpu::handle_msr_access` answers with 0,
++        // which is indistinguishable from a stopped clock.
++        //
++        // Deliberately *not* advertised:
++        //
++        // * `ACCESS_REF_COUNTER` (bit 1) and `ACCESS_REF_TSC` (bit 9). These
++        //   gate `hv_init_clocksource()` (drivers/clocksource/hyperv_timer.c),
++        //   which registers Hyper-V clocksources that read the reference
++        //   counter at MSR 0x40000020. A write to enable the reference-TSC
++        //   page (MSR 0x40000021) that this backend drops leaves the page
++        //   invalid, and the read path then falls back to that same MSR. A
++        //   clocksource wired to an MSR that always reads 0 is a *worse*
++        //   failure than having no paravirtualised clocksource: it is frozen
++        //   and it outranks the TSC. WHP may well implement both MSRs — the
++        //   matching `SyntheticProcessorFeaturesBanks` bits are set — but that
++        //   is unverified, and the guest does not need them.
++        //
++        // `ACCESS_TSC_INVARIANT` (bit 15) *is* advertised, and is the one bit
++        // here that changes timekeeping for the better. Without it,
++        // `ms_hyperv_init_platform()` ends with
++        //
++        //     if (!(ms_hyperv.features & HV_ACCESS_TSC_INVARIANT))
++        //             mark_tsc_unstable("running on Hyper-V");
++        //
++        // and an unstable sched_clock is precisely what arms the
++        // `sched_clock_local()` clamp that pins every printk timestamp to
++        // `tick_gtod + TICK_NSEC`. The claim it makes is true here: the
++        // partition is configured for an invariant TSC, which is also what
++        // CPUID 0x80000007 EDX bit 8 below reports. The MSR write the guest
++        // makes in response (0x40000118) only asks the hypervisor to expose
++        // that same CPUID bit, so dropping the write costs nothing.
+         const ACCESS_VP_RUNTIME: u32 = 1 << 0;
+-        const ACCESS_REF_COUNTER: u32 = 1 << 1;
+         const ACCESS_HYPERCALLS: u32 = 1 << 5;
+         const ACCESS_VP_INDEX: u32 = 1 << 6;
+-        const ACCESS_REF_TSC: u32 = 1 << 9;
+         const ACCESS_FREQ_REGS: u32 = 1 << 11;
++        const ACCESS_TSC_INVARIANT: u32 = 1 << 15;
+         cpuid_results.push(WHV_X64_CPUID_RESULT {
+             Function: 0x40000003,
+             Reserved: [0; 3],
+             Eax: ACCESS_VP_RUNTIME
+-                | ACCESS_REF_COUNTER
+                 | ACCESS_HYPERCALLS
+                 | ACCESS_VP_INDEX
+-                | ACCESS_REF_TSC
+-                | ACCESS_FREQ_REGS,
++                | ACCESS_FREQ_REGS
++                | ACCESS_TSC_INVARIANT,
+             Ebx: 0,
+             Ecx: 0,
+             Edx: 0,
+@@ -527,10 +602,55 @@ impl WhpVm {
+         }
+     }
+ 
+-    /// Detect the host TSC frequency in Hz.
+-    /// Tries CPUID 0x15, then 0x16 (Intel), then falls back to measuring
+-    /// via RDTSC over a short sleep (works on AMD and all other x86_64).
++    /// Detect the rate, in Hz, at which the guest's TSC advances.
++    ///
++    /// Sources are tried in descending order of authority:
++    ///
++    /// 1. `WHvCapabilityCodeProcessorClockFrequency`. This is the platform's
++    ///    own statement of the rate it runs the partition's TSC at, which is
++    ///    the number the guest actually needs; everything below is an
++    ///    inference about the *host* that happens to usually match.
++    /// 2. CPUID 0x15 / 0x16 on the host, when the host CPU reports them
++    ///    (Intel; AMD generally does not).
++    /// 3. Measuring RDTSC against QPC over a 10 ms window.
++    ///
++    /// The capability is range-checked before it is believed: a value outside
++    /// any plausible clock rate is more likely to be a field this build of WHP
++    /// does not populate than a real frequency, and falling through to the
++    /// measurement is better than handing the guest a nonsense TSC rate that
++    /// would scale every timeout it computes.
+     fn detect_tsc_frequency() -> u64 {
++        // 100 MHz to 100 GHz. Wide enough not to reject any real machine,
++        // narrow enough to catch a zero or an uninitialised field.
++        const MIN_PLAUSIBLE_TSC_HZ: u64 = 100_000_000;
++        const MAX_PLAUSIBLE_TSC_HZ: u64 = 100_000_000_000;
++
++        let mut capability: mem::MaybeUninit<WHV_CAPABILITY> = mem::MaybeUninit::uninit();
++        let mut written_size = 0;
++        let reported = unsafe {
++            let hr = WHvGetCapability(
++                WHvCapabilityCodeProcessorClockFrequency,
++                capability.as_mut_ptr().cast(),
++                mem::size_of::<WHV_CAPABILITY>() as u32,
++                &mut written_size,
++            );
++
++            if hr == S_OK {
++                capability.assume_init().ProcessorClockFrequency
++            } else {
++                debug!("WHvCapabilityCodeProcessorClockFrequency unavailable: HRESULT 0x{hr:08x}");
++                0
++            }
++        };
++
++        if (MIN_PLAUSIBLE_TSC_HZ..=MAX_PLAUSIBLE_TSC_HZ).contains(&reported) {
++            debug!("TSC frequency from WHP: {reported} Hz");
++            return reported;
++        }
++        if reported != 0 {
++            debug!("WHP reported an implausible processor clock frequency {reported} Hz; ignoring");
++        }
++
+         unsafe {
+             // Leaf 0 returns the maximum supported standard leaf in EAX.
+             // leaves 0x15 and 0x16 may not be supported (like in non-Intel hardware (like AMD)
+-- 
+2.53.0
+
