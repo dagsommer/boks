@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ site.title }} — {{ site.description | strip_newlines }}</title>
+    <meta name="description" content="{{ site.description | strip_newlines }}">
+    <meta name="color-scheme" content="light dark">
+    <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+    <link rel="icon" href="{{ '/assets/favicon.svg' | relative_url }}" type="image/svg+xml">
+    <!-- Applied before first paint so a reader who chose a theme does not get a flash of
+         the other one. localStorage only: nothing is sent anywhere. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("boks-theme");
+          if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="home">
+    <a class="skip" href="#content">Skip to content</a>
+
+    <header class="topbar">
+      <a class="brand" href="{{ '/' | relative_url }}">{{ site.title }}</a>
+      <span class="brand-note">documentation</span>
+      <div class="topbar-right">
+        <a class="repo-link" href="{{ '/get-started/' | relative_url }}">Docs</a>
+        <a class="repo-link" href="{{ site.repo }}">GitHub</a>
+        <button class="theme-toggle" id="theme-toggle" title="Switch between light and dark">
+          <span class="theme-toggle-label">Theme</span>
+        </button>
+      </div>
+    </header>
+
+    <main id="content">
+      <!-- The hero. Everything inside .hero-copy is quoted from README.md at build time by
+           _plugins/boks_docs.rb, including the warning, which is why the warning is here and
+           not below a features grid: there is no place further down for it to be moved to. -->
+      <section class="hero">
+        <div class="hero-grid" aria-hidden="true"></div>
+        <div class="hero-inner">
+          <p class="eyebrow">Local-first alternative to Docker Sandboxes</p>
+          <h1 class="hero-title">Boks</h1>
+          <div class="hero-copy">
+            {{ site.home.lede }}
+          </div>
+
+          <div class="cta">
+            <a class="button primary" href="{{ '/get-started/' | relative_url }}">Get started</a>
+            <a class="button" href="{{ '/verification/' | relative_url }}">What was measured</a>
+            <a class="button ghost" href="{{ site.repo }}">Source</a>
+          </div>
+
+          <div class="hero-warning doc">
+            {{ site.home.warning }}
+          </div>
+        </div>
+      </section>
+
+      {{ content }}
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        <a href="{{ site.repo }}">github.com/dagsommer/boks</a> · Apache-2.0 ·
+        the words on this page are
+        <a href="{{ site.repo }}/blob/{{ site.repo_branch }}/{{ site.home.source }}">{{ site.home.source }}</a>'s
+        own, quoted at build time.
+      </p>
+      <p>No analytics, no trackers, no third-party requests. Nothing on this page is loaded
+        from anywhere but this origin.</p>
+    </footer>
+
+    <script src="{{ '/assets/site.js' | relative_url }}" defer></script>
+  </body>
+</html>

@@ -1,0 +1,170 @@
+---
+layout: home
+---
+
+<!-- The landing page.
+
+     Two rules govern what may be written here, and they are not in tension as often as they
+     look. The first is that nothing on this page may be a claim the documents do not already
+     support: no benchmark, no adjective standing in for a measurement, no "enterprise-grade".
+     The second is that the page may be as good-looking as it likes, because a design is not a
+     claim. Where the two meet — the platform table below — the design job is to make an
+     unflattering fact easy to read, not to make it smaller.
+
+     What is deliberately absent: the provenance of any measurement. Hardware, dates and
+     host-versus-guest tables are a development record, and they live in docs/verification.md,
+     which every claim here links to. The conclusion belongs on a front page; the lab notebook
+     does not. -->
+
+<section class="band">
+  <div class="wrap">
+    <h2 class="band-title">Where it runs</h2>
+    <p class="band-lede">Three answers, and only one of them is yes. Check this before you
+      spend an hour on the setup.</p>
+
+    <div class="platforms">
+      <div class="platform yes">
+        <p class="platform-state">Works</p>
+        <h3>macOS on Apple silicon</h3>
+        <p>The platform the VM boundary and the network policy were measured on.</p>
+      </div>
+      <div class="platform maybe">
+        <p class="platform-state">Not verified</p>
+        <h3>Linux with <code>/dev/kvm</code></h3>
+        <p>Built and designed for. Nobody on this project has exercised it end to end, so you
+          would be the first.</p>
+      </div>
+      <div class="platform no">
+        <p class="platform-state">Does not run</p>
+        <h3>Windows</h3>
+        <p>No native build. Inside WSL2 it should run unchanged — designed for, never
+          executed. <a href="{{ '/windows/' | relative_url }}">The whole analysis</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band alt">
+  <div class="wrap split">
+    <div class="split-copy">
+      <h2 class="band-title">First run</h2>
+      <p class="band-lede">An agent, in a directory, inside a microVM of its own. The agent
+        comes first and decides what the sandbox contains; the workspaces follow and default
+        to the current directory.</p>
+      <p><a class="arrow-link" href="{{ '/get-started/' | relative_url }}">Prerequisites and the first run</a></p>
+      <p><a class="arrow-link" href="{{ '/usage/' | relative_url }}">Lifecycle, policy, credentials, ports</a></p>
+    </div>
+    <div class="split-code">
+      <pre><code><span class="c"># build it, then check the host</span>
+make build
+./bin/boks doctor
+
+<span class="c"># a shell in the current directory</span>
+./bin/boks run
+
+<span class="c"># Claude Code, in one directory, and nothing above it</span>
+./bin/boks run claude ~/src/foo
+
+<span class="c"># nothing it can reach at all</span>
+./bin/boks run --net none shell .</code></pre>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <h2 class="band-title">What a sandbox is</h2>
+    <p class="band-lede">Boks is the orchestration layer, not a hypervisor. Everything below
+      the CLI is existing open-source software.</p>
+
+    <div class="stack" role="img"
+         aria-label="boks CLI to containerd to the nerdbox shim to libkrun, then a hypervisor boundary, then a microVM containing the workspace over virtiofs and your command.">
+      <div class="stack-host">
+        <p class="stack-label">Your machine</p>
+        <div class="chain">
+          <span class="node">boks CLI</span>
+          <span class="link" aria-hidden="true"></span>
+          <span class="node">containerd</span>
+          <span class="link" aria-hidden="true"></span>
+          <span class="node">containerd-shim-nerdbox-v1</span>
+          <span class="link" aria-hidden="true"></span>
+          <span class="node">libkrun</span>
+        </div>
+      </div>
+
+      <div class="boundary">
+        <span class="boundary-rule" aria-hidden="true"></span>
+        <span class="boundary-label">hypervisor boundary</span>
+        <span class="boundary-rule" aria-hidden="true"></span>
+      </div>
+
+      <div class="stack-guest">
+        <p class="stack-label">microVM — its own kernel</p>
+        <ul class="guest-items">
+          <li>workspace, via virtiofs, at its exact host path</li>
+          <li>your command</li>
+        </ul>
+      </div>
+    </div>
+
+    <p class="band-note">Assume code in the sandbox is hostile. The hypervisor is the
+      boundary; in-guest permissions are not — the agent has root in the guest by design.
+      <a href="{{ '/security-model/' | relative_url }}">Security model</a> ·
+      <a href="{{ '/architecture/' | relative_url }}">Architecture</a></p>
+  </div>
+</section>
+
+<section class="band alt">
+  <div class="wrap">
+    <h2 class="band-title">How this project talks about itself</h2>
+    <p class="band-lede">The interesting thing about Boks is not the feature list. It is that
+      the claims were tested, and the tests that failed were published rather than quietly
+      fixed.</p>
+
+    <div class="tenets">
+      <div class="tenet">
+        <h3>Measured, or not claimed</h3>
+        <p>Every claim on this site is answerable to one document, which records what was
+          observed and what each observation does not establish.</p>
+        <p><a class="arrow-link" href="{{ '/verification/' | relative_url }}">Verification</a></p>
+      </div>
+      <div class="tenet">
+        <h3>The failures are in it</h3>
+        <p>The network policy was measured broken before it was measured fixed. Both
+          measurements are in the same document, in that order.</p>
+        <p><a class="arrow-link" href="{{ '/verification/' | relative_url }}">What failed, and what happened next</a></p>
+      </div>
+      <div class="tenet">
+        <h3>What is missing is written down</h3>
+        <p>Gaps somebody met and recorded, not empty cells in a feature grid. Two of them
+          exist because a measurement failed.</p>
+        <p><a class="arrow-link" href="{{ '/roadmap/' | relative_url }}">Roadmap</a></p>
+      </div>
+      <div class="tenet">
+        <h3>Nothing is sent anywhere</h3>
+        <p>No account, no cloud service, no telemetry. This page makes no third-party
+          request either, and a build check fails if one appears.</p>
+        <p><a class="arrow-link" href="{{ '/faq/' | relative_url }}">FAQ</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <h2 class="band-title">Documentation</h2>
+    <div class="cards">
+      {%- assign open = false %}
+      {%- for item in site.nav %}
+      {%- if item.section %}
+      {%- if open %}</div>{% endif %}
+      <div class="card"><p class="card-section">{{ item.section }}</p>
+      {%- assign open = true %}
+      {%- else %}
+        <a href="{{ item.url | relative_url }}">{{ item.label }}</a>
+      {%- endif %}
+      {%- endfor %}
+      {%- if open %}</div>{% endif %}
+    </div>
+  </div>
+</section>

@@ -17,6 +17,9 @@ on:
       - "docs/**"
       - "site/**"
       - ".github/workflows/pages.yml"
+      # docs/cli.md is generated from these, and the build refuses to publish a stale copy.
+      - "internal/cli/**"
+      - "cmd/gen-docs/**"
   # A documentation change can break the site — a renamed file that site/_config.yml still
   # lists fails the build on purpose — so pull requests build it without publishing.
   pull_request:
@@ -25,6 +28,9 @@ on:
       - "docs/**"
       - "site/**"
       - ".github/workflows/pages.yml"
+      # docs/cli.md is generated from these, and the build refuses to publish a stale copy.
+      - "internal/cli/**"
+      - "cmd/gen-docs/**"
   workflow_dispatch:
     inputs:
       publish:
@@ -75,6 +81,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # docs/cli.md is generated from the cobra command tree. Checking it here catches the
+      # case this workflow can catch — somebody edited the generated file by hand — and not
+      # the case it cannot, which is a flag renamed in internal/cli without this workflow
+      # being triggered at all. `go test ./internal/cli/` is what catches that one.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: The generated CLI reference is current
+        run: go run ./cmd/gen-docs -check
+
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
@@ -98,11 +115,19 @@ jobs:
       # A site that builds but publishes nothing readable is a silent failure. These are the
       # properties the site exists for: every document present, the warnings still rendered
       # as warnings, and the wide tables still wrapped in something that scrolls.
+      #
+      # The assertions about the landing page are the load-bearing ones, and they are not
+      # about the design. The page may look however it likes; what it may not do is lose the
+      # experimental warning, soften the platform support, or start fetching something from
+      # another origin. Each of those has a grep here because each is a change somebody could
+      # make while meaning well.
       - name: Check the output says what the documents say
         working-directory: site
         run: |
           set -euo pipefail
-          for page in index verification/index security-model/index architecture/index \
+          for page in index get-started/index usage/index agents/index cli/index \
+                      troubleshooting/index faq/index roadmap/index release-notes/index \
+                      verification/index security-model/index architecture/index \
                       docker-sandbox-parity/index windows/index \
                       upstream-libkrun-virtio-net/index; do
             test -s "_site/${page}.html" || { echo "missing _site/${page}.html" >&2; exit 1; }
@@ -118,6 +143,43 @@ jobs:
             || { echo "the parity matrix tables are not wrapped for scrolling" >&2; exit 1; }
           ! grep -rq '\[!WARNING\]\|\[!CAUTION\]\|\[!IMPORTANT\]' _site \
             || { echo "an alert marker was published as literal text" >&2; exit 1; }
+
+          # The warning has to be reachable without scrolling past the page's content, which
+          # in markup terms means inside the hero rather than after it. A redesign that moves
+          # it below a features grid fails here.
+          python3 - <<'PY'
+          import re, sys
+          html = open("_site/index.html", encoding="utf-8").read()
+          hero = re.search(r'<section class="hero".*?</section>', html, re.S)
+          if not hero:
+              sys.exit("the landing page has no hero section to hold the warning")
+          if "alert alert-warning" not in hero.group(0):
+              sys.exit("the experimental warning is no longer inside the hero. It must stay "
+                       "at the top of the landing page, not below the content.")
+          if "Boks is experimental" not in hero.group(0):
+              sys.exit("the hero no longer carries the words 'Boks is experimental'")
+          PY
+
+          # Platform support, stated on the landing page, where someone decides whether to
+          # spend an hour on the setup. These are the facts a redesign is most tempted to
+          # round off.
+          for phrase in 'macOS on Apple silicon' 'Not verified' 'Does not run'; do
+            grep -qF "$phrase" _site/index.html \
+              || { echo "the landing page no longer states platform support: '$phrase'" >&2; exit 1; }
+          done
+
+          # No third-party requests, from any page. The project has a no-telemetry principle
+          # and a site that quietly grew a webfont would contradict it. Prose links are not
+          # requests; script/link/img/iframe/source elements are.
+          if grep -rEoh '<(script|link|img|iframe|source|video|audio|embed|object)[^>]*(src|href|data)="(https?:)?//[^"]*"' _site; then
+            echo "the site loads something from another origin" >&2
+            exit 1
+          fi
+          ! grep -rqE '@import\s+(url\()?["'"'"']?https?:' _site/assets \
+            || { echo "a stylesheet imports from another origin" >&2; exit 1; }
+
+          # A cross-document link that points at a heading somebody renamed.
+          sh check-anchors.sh _site
 
       - uses: actions/upload-pages-artifact@v3
         with:
