@@ -60,8 +60,36 @@ func virtualizationCheck() Check {
 // this does not offer a prerequisite checklist.
 func extraChecks() []Check { return nil }
 
-// hypervisorLibraryNames is empty because a Windows port would not link libkrun at all; the
-// VMM question is open. The shared check reports "not applicable" rather than a false miss.
-func hypervisorLibraryNames() []string { return nil }
+// hypervisorLibraryNames is krun.dll, and used to be nothing at all.
+//
+// Returning nil made the shared check print "hypervisor library  skip  not applicable on this
+// platform" — which was defensible while the VMM question was open, and is not now. The shim
+// that runs on Windows is upstream nerdbox's, and on Windows it loads its VMM from a single
+// filename: `krun.dll` (internal/vm/libkrun/instance.go). "Not applicable" was reported on a
+// Windows 11 machine on 2026-08-13 with a krun.dll sitting in the directory being searched.
+func hypervisorLibraryNames() []string { return []string{"krun.dll"} }
 
-func hypervisorLibrarySearchPaths() []string { return nil }
+// hypervisorLibrarySearchPaths is the shim's own scan, not a Windows-flavoured guess at one.
+//
+// There is no /usr/lib equivalent to enumerate here and no loader configuration to fall back
+// on: the shim builds a path out of PATH and LIBKRUN_PATH and hands the result to
+// syscall.LoadLibrary, so those two variables are the whole search. nerdboxSearchPaths is
+// that list, shared with the guest-image check because the shim resolves both the same way.
+func hypervisorLibrarySearchPaths() []string { return nerdboxSearchPaths() }
+
+// hypervisorLibraryHint says what a miss means here, which is more than it means on Unix: the
+// shim never consults the loader's search path on Windows, so a krun.dll this check cannot
+// find is one the shim cannot find either — subject to containerd's PATH not being ours.
+//
+// Where to get one is the honest hard part, and the remedy must not pretend otherwise.
+// Upstream libkrun does not build a Windows cdylib yet (it is targeted at libkrun 2.0), and
+// packaging/libkrun-windows/ in this repository compile-checks patches towards that — it
+// ships nothing. Anything exporting libkrun's C ABI under this name loads.
+func hypervisorLibraryHint() string {
+	return "Searched PATH and LIBKRUN_PATH, which is the shim's whole search on Windows:\n" +
+		"it loads the resolved path directly and never consults the loader's search path.\n" +
+		"Note that containerd's PATH is the daemon's, not your shell's.\n" +
+		"Upstream libkrun has no Windows build to install yet — the WHP port is targeted at\n" +
+		"libkrun 2.0, and packaging/libkrun-windows/ only compile-checks patches towards it.\n" +
+		"Boks cannot start a sandbox on Windows regardless; see the platform check."
+}
