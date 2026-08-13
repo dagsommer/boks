@@ -133,7 +133,7 @@ func writeCommand(b *strings.Builder, cmd *cobra.Command, level int) {
 	fmt.Fprintf(b, "\n%s %s\n\n", strings.Repeat("#", level), cmd.CommandPath())
 
 	if short := strings.TrimSpace(cmd.Short); short != "" {
-		fmt.Fprintf(b, "%s\n\n", short)
+		fmt.Fprintf(b, "%s\n\n", escapeInlineHTML(short))
 	}
 
 	fmt.Fprintf(b, "```\n%s\n```\n", strings.TrimSpace(cmd.UseLine()))
@@ -183,7 +183,7 @@ func indentedBlocksAsCode(long string) string {
 			continue
 		}
 		for i, line := range lines {
-			lines[i] = escapeBlockStart(line)
+			lines[i] = escapeBlockStart(escapeInlineHTML(line))
 		}
 		out = append(out, strings.Join(lines, "\n"))
 	}
@@ -255,8 +255,27 @@ func writeFlags(b *strings.Builder, set *pflag.FlagSet) {
 
 // cell flattens a usage string into one table cell. A `|` inside one would end the cell.
 func cell(s string) string {
-	s = strings.ReplaceAll(strings.TrimSpace(s), "|", "\\|")
+	s = strings.ReplaceAll(escapeInlineHTML(strings.TrimSpace(s)), "|", "\\|")
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// escapeInlineHTML protects the placeholder notation help text is written in.
+//
+// Help text says `<agent>-<workspace directory>` and `BOKS_CA_CERT_B64=<base64 certificate>`,
+// meaning "put a value here". Markdown passes a run of angle brackets through as raw HTML,
+// so the rendered page turned that into an empty <agent> element and a sentence reading "The
+// sandbox is named - and persists." The document said something different from the command,
+// which is the one thing this generator exists to prevent, and it was invisible in the
+// Markdown — only the built site showed it.
+//
+// Only applied where the text is prose. Anything inside a fence, and anything inside
+// backticks, is already literal.
+//
+// Underscores are deliberately left alone: GFM does not treat an underscore inside a word as
+// emphasis, so HTTP_PROXY and BOKS_SECRETS_PASSPHRASE survive as written. That was checked
+// against the rendered output rather than assumed.
+func escapeInlineHTML(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 func codeList(items []string) string {

@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -105,6 +106,42 @@ func TestReferenceIsTheSameOnEveryMachine(t *testing.T) {
 	}
 	if !strings.Contains(elsewhere, "~/.local/state/boks/") {
 		t.Error("the decision log's default is no longer written as a path under ~")
+	}
+}
+
+// Help text is full of <placeholder> notation, and Markdown reads a run of angle brackets as
+// raw HTML. The rendered page turned "The sandbox is named <agent>-<workspace directory> and
+// persists" into "The sandbox is named  and persists", and the flag table's `--name` row lost
+// everything after "(default: ". Both said something different from the command, which is the
+// failure this whole generator exists to prevent — and neither was visible in the Markdown.
+func TestReferenceKeepsPlaceholdersAsText(t *testing.T) {
+	ref := Reference()
+
+	for _, want := range []string{
+		"&lt;agent&gt;-&lt;workspace directory&gt;",
+		"BOKS_CA_CERT_B64=&lt;base64 certificate&gt;",
+	} {
+		if !strings.Contains(ref, want) {
+			t.Errorf("the reference does not carry %q as text", want)
+		}
+	}
+
+	// Outside a fence, and outside an inline code span, no bare angle bracket survives to be
+	// read as a tag. Inside either it is already literal.
+	inline := regexp.MustCompile("`[^`]*`")
+	fence := false
+	for i, line := range strings.Split(ref, "\n") {
+		if strings.HasPrefix(line, "```") {
+			fence = !fence
+			continue
+		}
+		if fence {
+			continue
+		}
+		if prose := inline.ReplaceAllString(line, ""); strings.ContainsAny(prose, "<>") {
+			t.Errorf("line %d has a bare angle bracket outside a fence, which Markdown "+
+				"will read as a tag: %s", i+1, line)
+		}
 	}
 }
 
