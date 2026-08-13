@@ -46,7 +46,13 @@
         <div class="search-results" id="search-results" hidden></div>
 
         <ul class="nav" id="nav">
+          <li class="nav-item{% if page.url == '/' %} current{% endif %}">
+            <a href="{{ '/' | relative_url }}"{% if page.url == '/' %} aria-current="page"{% endif %}>Home</a>
+          </li>
           {%- for item in site.nav %}
+          {%- if item.section %}
+          <li class="nav-section">{{ item.section }}</li>
+          {%- else %}
           {%- assign current = false %}
           {%- if item.url == page.url %}{% assign current = true %}{% endif %}
           <li class="nav-item{% if current %} current{% endif %}">
@@ -59,6 +65,7 @@
             </ul>
             {%- endif %}
           </li>
+          {%- endif %}
           {%- endfor %}
         </ul>
       </nav>
