@@ -13,13 +13,26 @@ root=${1:-site/_site}
 errors=$(mktemp)
 trap 'rm -f "$errors"' EXIT
 
+# The site is served under a base path (/boks on project pages, possibly empty under a
+# custom domain), and every generated link carries it. Rather than hardcoding it twice,
+# read it off the landing page's own stylesheet link, which Liquid prefixed at build time.
+base=$(grep -o 'href="[^"]*/assets/site.css"' "$root/index.html" | head -n1 |
+	sed 's/^href="//; s|/assets/site.css"$||')
+
 # The site's own links only. Where an external one points is not this build's business.
-# -a because the rendered parity matrix contains bytes grep calls binary.
+# -a because rendered pages can contain bytes grep calls binary.
 grep -rahoE 'href="/[a-z0-9./-]*#[A-Za-z0-9_-]+"' "$root" |
 	sed 's/^href="//; s/"$//' | sort -u |
 	while IFS= read -r link; do
-		page=${link%%#*}
-		anchor=${link#*#}
+		case "$link" in
+		"$base"/*) rel=${link#"$base"} ;;
+		*)
+			echo "  $link — outside the site's base path '$base'" >>"$errors"
+			continue
+			;;
+		esac
+		page=${rel%%#*}
+		anchor=${rel#*#}
 		case "$page" in
 		*/) file="$root${page}index.html" ;;
 		*) file="$root$page" ;;
