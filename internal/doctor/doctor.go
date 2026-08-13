@@ -120,6 +120,7 @@ func Checks() []Check {
 		snapshotterToolsCheck(),
 		runtimeShimCheck(),
 		hypervisorLibraryCheck(),
+		guestImageCheck(),
 	}
 	// Platforms contribute their own requirements rather than every check having to
 	// declare itself irrelevant elsewhere.
