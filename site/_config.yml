@@ -45,16 +45,27 @@ home_source: README.md
 # An entry with only `section` is a heading in the sidebar and produces no page.
 #
 # The order is task-oriented, after the reference product's own documentation: what you do
-# first, then what you do next, then what you look up. The research documents — verification,
-# the parity matrix, the Windows spike — are reference rather than the front door, and are
-# grouped last. They are not diminished by that: Verification is what every claim on this
-# site is answerable to, and pages link into it wherever a reader could reasonably ask how
-# something is known.
+# first, then what you do next, then what you look up.
+#
+# The site publishes the pages a *user* of Boks needs. The engineering record — the
+# verification log, the Docker Sandbox parity matrix, the Windows feasibility spike, the
+# libkrun virtio-net analysis — stays in docs/ for contributors and is deliberately not
+# listed here. Published pages that cite those documents still link to them: the build
+# rewrites a link to an unpublished doc into a link to the file on GitHub, so every claim
+# remains one click from its evidence. The security model is published on purpose — the
+# product's whole claim is isolation, and a user deciding whether to trust it deserves that
+# page.
 boks_docs:
   - section: Guide
   - source: docs/get-started.md
     url: /get-started/
     nav: Get started
+  - source: docs/install.md
+    url: /install/
+    nav: Install
+  - source: docs/walkthrough.md
+    url: /walkthrough/
+    nav: Walkthrough
   - source: docs/usage.md
     url: /usage/
     nav: Usage
@@ -86,20 +97,6 @@ boks_docs:
   - source: docs/release-notes.md
     url: /release-notes/
     nav: Release notes
-
-  - section: Evidence
-  - source: docs/verification.md
-    url: /verification/
-    nav: Verification
-  - source: docs/docker-sandbox-parity.md
-    url: /docker-sandbox-parity/
-    nav: Docker Sandbox parity
-  - source: docs/windows.md
-    url: /windows/
-    nav: Windows
-  - source: docs/upstream-libkrun-virtio-net.md
-    url: /upstream-libkrun-virtio-net/
-    nav: libkrun virtio-net
 
 exclude:
   - Gemfile

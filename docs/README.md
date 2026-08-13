@@ -1,9 +1,10 @@
 # The documents, and the site made from them
 
 The Markdown in this directory is the source of truth. It is written to be read here, in
-the repository, and it is also published at <https://dagsommer.github.io/boks/> — the same
-files, rendered. The site holds no copy of any document, so there is nothing to keep in
-sync and nothing that can drift: edit the file, and the site follows.
+the repository, and the user-facing pages are also published at
+<https://dagsommer.github.io/boks/> — the same files, rendered. The site holds no copy of
+any document, so there is nothing to keep in sync and nothing that can drift: edit the
+file, and the site follows.
 
 ## How the documents are organised
 
@@ -13,15 +14,17 @@ written in.
 
 | | |
 |---|---|
-| **Guide** | [get-started.md](get-started.md), [usage.md](usage.md), [agents.md](agents.md) |
+| **Guide** | [get-started.md](get-started.md), [install.md](install.md), [walkthrough.md](walkthrough.md), [usage.md](usage.md), [agents.md](agents.md) |
 | **Reference** | [architecture.md](architecture.md), [security-model.md](security-model.md), [cli.md](cli.md), [troubleshooting.md](troubleshooting.md), [faq.md](faq.md) |
 | **Project** | [roadmap.md](roadmap.md), [release-notes.md](release-notes.md) |
-| **Evidence** | [verification.md](verification.md), [docker-sandbox-parity.md](docker-sandbox-parity.md), [windows.md](windows.md), [upstream-libkrun-virtio-net.md](upstream-libkrun-virtio-net.md) |
+| **Engineering record** (repo only) | [verification.md](verification.md), [docker-sandbox-parity.md](docker-sandbox-parity.md), [windows.md](windows.md), [upstream-libkrun-virtio-net.md](upstream-libkrun-virtio-net.md) |
 
-The Evidence group is last and is not diminished by that. It is what every claim in the
-other three is answerable to, and the guide pages link into it wherever a reader could
-reasonably ask how something is known. What changed is only which page a newcomer meets
-first.
+The first three groups are the site: the pages a *user* of Boks needs. The engineering
+record stays in the repository for contributors and is deliberately not published — the
+site is a product's front door, not a lab notebook — but it is not diminished by that: it
+is what every claim in the other three groups is answerable to. Published pages that cite
+those documents still link to them, because the build rewrites a link to an unpublished doc
+into a link to the file on GitHub; every claim remains one click from its evidence.
 
 Two of these are not written the way the rest are, and both say so at the top of the file:
 
@@ -50,10 +53,11 @@ failure worth being loud about. Two assertions in
 [`pages.yml`](../.github/workflows/pages.yml) then check that it is still rendered as a
 warning and still inside the hero rather than moved below the content.
 
-Everything else the landing page says — the platform table, the tenets, the diagram — is
-prose in `site/index.html`, and it is held to the same rule as the documents: no claim the
-documents do not already support. Three of its statements have greps in CI, because they
-are the ones a redesign would be most tempted to round off.
+Everything else the landing page says — the platform cards, the feature grid, the diagram —
+is prose in `site/index.html`, and it is held to two rules: no claim the documents do not
+already support, and every sentence is for a visitor deciding whether to use Boks, never
+about how the project works internally. Three of its statements have greps in CI, because
+they are the ones a redesign would be most tempted to round off.
 
 ## Adding a document
 
