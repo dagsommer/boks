@@ -92,6 +92,15 @@ type Config struct {
 	Command []string
 	// Workspaces are host directories shared into the guest.
 	Workspaces []workspace.Workspace
+	// Clone selects clone mode for the primary workspace: the host directory is shared
+	// read-only at workspace.SourcePath, and the guest gets a git clone of it — in the
+	// guest's own filesystem — at the workspace's host path. Nothing the guest writes
+	// reaches the host's disk.
+	//
+	// The caller is responsible for having checked that the primary workspace is a
+	// repository Boks can clone (workspace.InspectRepo) and that no other workspace is
+	// writable, since a single writable share would undo the property.
+	Clone bool
 	// Mounts are further host directories shared into the guest that are not the user's
 	// workspaces — the public half of the interception CA, today. They are kept apart
 	// because a workspace is part of the sandbox's identity, recorded in its labels and
@@ -155,7 +164,7 @@ func Run(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	if _, err := ensureRunning(ctx, container); err != nil {
+	if _, err := ensureRunning(ctx, container, cfg.Stderr); err != nil {
 		return 1, err
 	}
 
@@ -175,12 +184,12 @@ func Run(ctx context.Context, cfg Config) (int, error) {
 		Address: cfg.Address,
 		Name:    cfg.Name,
 		Command: command,
-		Env:     cfg.Env,
-		TTY:     cfg.TTY,
-		Stdin:   cfg.Stdin,
-		Stdout:  cfg.Stdout,
-		Stderr:  cfg.Stderr,
-		client:  c,
+		// No Env: create already put cfg.Env in the spec, and execProcess inherits it.
+		TTY:    cfg.TTY,
+		Stdin:  cfg.Stdin,
+		Stdout: cfg.Stdout,
+		Stderr: cfg.Stderr,
+		client: c,
 	})
 }
 
@@ -199,7 +208,7 @@ func Up(ctx context.Context, cfg Config) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	if _, err := ensureRunning(ctx, container); err != nil {
+	if _, err := ensureRunning(ctx, container, cfg.Stderr); err != nil {
 		return Info{}, err
 	}
 	return describe(ctx, container)
@@ -220,6 +229,18 @@ func ensureContainer(ctx context.Context, c *client.Client, cfg Config) (client.
 	}
 	return container, nil
 }
+
+// runsKeeper reports whether the sandbox's own process is the idle keeper rather than the
+// user's command.
+//
+// A persistent sandbox always runs the keeper: it has to stay up between commands. An
+// ephemeral one normally does not — the command *is* the container process, which is what
+// makes it ephemeral — but in clone mode it does anyway, because the clone has to be made by
+// something before the command can run in it, and only a running task can be exec'd into.
+// The alternative was to bootstrap the clone from inside the command's own process, which
+// cannot work: making the workspace's absolute path in the guest needs root, and the
+// command runs as the image's user.
+func runsKeeper(cfg Config) bool { return !cfg.Ephemeral || cfg.Clone }
 
 // runEphemeral is the create-run-destroy path: the command is the container process and
 // nothing survives it.
@@ -248,7 +269,45 @@ func runEphemeral(ctx context.Context, cfg Config) (exitCode int, err error) {
 		}
 	}()
 
+	if runsKeeper(cfg) {
+		return runEphemeralInKeeper(ctx, container, cfg)
+	}
 	return runTask(ctx, container, cfg)
+}
+
+// runEphemeralInKeeper runs an ephemeral sandbox whose own process is the keeper: the
+// sandbox is brought up, which is what makes its clone, and the command runs inside it as an
+// exec. Everything the sandbox is made of still goes away when the command exits — the
+// caller's deferred delete takes the container and its snapshot, and this takes the task.
+func runEphemeralInKeeper(ctx context.Context, container client.Container, cfg Config) (int, error) {
+	task, err := ensureRunning(ctx, container, cfg.Stderr)
+	if err != nil {
+		return 1, err
+	}
+	defer cleanupTask(ctx, task)
+
+	command := cfg.Command
+	if len(command) == 0 {
+		// The resolved default, which create recorded when it had the image config.
+		labels, err := container.Labels(ctx)
+		if err != nil {
+			return 1, fmt.Errorf("reading sandbox %q: %w", cfg.Name, err)
+		}
+		command = decodeCommand(labels)
+	}
+	if len(command) == 0 {
+		return 1, fmt.Errorf("sandbox %q has no command to run; pass one after '--'", cfg.Name)
+	}
+
+	return execProcess(ctx, container, task, ExecConfig{
+		Name:    cfg.Name,
+		Command: command,
+		// No Env: create already put cfg.Env in the spec, and execProcess inherits it.
+		TTY:    cfg.TTY,
+		Stdin:  cfg.Stdin,
+		Stdout: cfg.Stdout,
+		Stderr: cfg.Stderr,
+	})
 }
 
 // connect opens a containerd client, reporting a missing daemon plainly rather than as a
@@ -309,11 +368,20 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 		return nil, err
 	}
 
+	// The default command is resolved once, here, because this is the only point where the
+	// image config is at hand. It is the container's own process for an ephemeral sandbox,
+	// and what a later `boks run` with no command of its own reads back from the label.
+	command := cfg.Command
+	if len(command) == 0 {
+		command = imageCommand(ctx, image)
+	}
+
 	// The container process differs by lifetime: an ephemeral sandbox exists to run one
-	// command, a persistent one has to stay up between commands.
-	processArgs := cfg.Command
-	if !cfg.Ephemeral {
-		processArgs = keeperCommand
+	// command, a persistent one has to stay up between commands. Clone mode is the
+	// exception on both counts — see runsKeeper.
+	processArgs := keeperCommand
+	if !runsKeeper(cfg) {
+		processArgs = command
 	}
 
 	specOpts := []oci.SpecOpts{
@@ -330,20 +398,26 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	if len(env) > 0 {
 		specOpts = append(specOpts, oci.WithEnv(env))
 	}
-	if cfg.TTY && cfg.Ephemeral {
+	if cfg.TTY && !runsKeeper(cfg) {
+		// Only when the user's command is the container process. A keeper needs no
+		// terminal; the command exec'd into it asks for its own.
 		specOpts = append(specOpts, oci.WithTTY)
 	}
-	if mounts := workspaceMounts(append(slices.Clone(cfg.Workspaces), cfg.Mounts...)); len(mounts) > 0 {
+	if mounts := workspaceMounts(guestShares(cfg)); len(mounts) > 0 {
 		specOpts = append(specOpts, oci.WithMounts(mounts))
 	}
 	if len(cfg.Workspaces) > 0 {
 		// Start in the primary workspace so relative paths behave as they would on
 		// the host. Only a workspace can be that: the plumbing mounts are not places a
 		// user asked to be.
+		//
+		// In clone mode that path is not a mount but a directory in the guest's own
+		// filesystem, which does not exist yet at this point. The runtime creates a
+		// missing cwd (measured against runc), and the clone lands in it.
 		specOpts = append(specOpts, oci.WithProcessCwd(cfg.Workspaces[0].Root()))
 	}
 
-	labels, err := containerLabels(ctx, image, cfg)
+	labels, err := containerLabels(cfg, command)
 	if err != nil {
 		return nil, err
 	}
@@ -362,20 +436,15 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	return container, nil
 }
 
-// containerLabels records what containerd's own container record cannot express.
-func containerLabels(ctx context.Context, image client.Image, cfg Config) (map[string]string, error) {
+// containerLabels records what containerd's own container record cannot express. command is
+// the argv a later `boks run` executes when given none of its own, already resolved against
+// the image.
+func containerLabels(cfg Config, command []string) (map[string]string, error) {
 	workspacesJSON, err := encodeLabel(workspaceRefs(cfg.Workspaces))
 	if err != nil {
 		return nil, err
 	}
 
-	// The default command is resolved once, at creation, because that is the only point
-	// where the image config is at hand. Later `boks run` invocations with no command of
-	// their own read it back from here.
-	command := cfg.Command
-	if len(command) == 0 {
-		command = imageCommand(ctx, image)
-	}
 	commandJSON, err := encodeLabel(command)
 	if err != nil {
 		return nil, err
@@ -386,10 +455,18 @@ func containerLabels(ctx context.Context, image client.Image, cfg Config) (map[s
 		return nil, err
 	}
 
+	filesystemJSON, err := encodeFilesystemLabel(configFilesystem(cfg))
+	if err != nil {
+		return nil, err
+	}
+
 	labels := map[string]string{
 		LabelManaged:    "1",
 		LabelWorkspaces: workspacesJSON,
 		LabelCommand:    commandJSON,
+	}
+	if filesystemJSON != "" {
+		labels[LabelFilesystem] = filesystemJSON
 	}
 	if policyJSON != "" {
 		labels[LabelPolicy] = policyJSON
@@ -451,6 +528,29 @@ func warnWorkspaceMismatch(ctx context.Context, container client.Container, cfg 
 			"         created; remove it or use a different -name to change them.\n",
 		cfg.Name, existing[0].HostPath, cfg.Workspaces[0].HostPath)
 	return nil
+}
+
+// guestShares is the list of host directories a guest actually receives, which in clone mode
+// is not the same list as the sandbox's workspaces.
+//
+// The primary workspace stops being shared at its host path — that path holds the guest's own
+// clone — and appears read-only at workspace.SourcePath instead. Every other entry is passed
+// through unchanged: the caller has already refused any that were writable, because one
+// writable share would undo the property the whole mode exists for.
+func guestShares(cfg Config) []workspace.Workspace {
+	shares := slices.Clone(cfg.Workspaces)
+	if cfg.Clone && len(shares) > 0 {
+		shares[0] = shares[0].Source()
+	}
+	return append(shares, cfg.Mounts...)
+}
+
+// configFilesystem is the record of how this sandbox's workspace reaches its guest.
+func configFilesystem(cfg Config) Filesystem {
+	if cfg.Clone && len(cfg.Workspaces) > 0 {
+		return cloneFilesystem(cfg.Workspaces[0])
+	}
+	return directFilesystem()
 }
 
 // workspaceMounts turns workspaces into OCI bind mounts whose destination is the host path,
