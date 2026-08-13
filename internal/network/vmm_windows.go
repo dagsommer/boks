@@ -19,16 +19,23 @@ import "errors"
 // policy forwarder and the socket all build and run here. Nothing above this function is
 // Unix-specific any more.
 //
-// What Boks lacks is one device in a VMM that is already being ported. libkrun has had a WHP
-// backend in tree since mid-2026 — the vCPU loop, the instruction emulator, an IOCP-based
-// epoll shim, and Windows ports of virtio-fs, -blk, -console, -balloon and -rng — targeting
-// libkrun 2.0. **virtio-net is the single device that was not ported**, which is exactly and
-// only the one this link needs. Upstream nerdbox already builds for windows/amd64 and loads
-// the VMM as a DLL named krun.dll, so nothing above the VMM needs to change either.
+// It also is no longer a missing device, and this comment used to say it was. virtio-net was
+// the one device libkrun's WHP backend had not ported — which was exactly and only the one
+// this link needs — so a Windows sandbox would have bound this socket and waited forever for
+// a peer that could not exist. That stopped being true on 2026-08-13: packaging/libkrun-windows/
+// carries a Winsock AF_UNIX backend for it, krun.dll links with `--features blk,net` on a
+// Windows CI runner, and `krun_add_net_unixstream` is exported.
 //
-// So a Windows sandbox would bind this socket and wait forever for a peer that cannot exist.
-// Refusing here says that once, early, instead of leaving a user with a booting VM and no
-// network.
+// What is missing now is evidence, not capability. Not one Ethernet frame has crossed that
+// device. The guest boots and its clock runs, but every boot so far has been a direct C probe
+// against krun.dll — containerd and the nerdbox shim have only just been made to start on
+// Windows, and neither has yet carried a container. Until a frame is observed arriving here
+// from a real guest, this refusal stands on "unexercised", which is a different and weaker
+// claim than the one it used to make.
+//
+// What would lift it: a sandbox started through containerd and the shim, with the policy
+// engine judging a flow from that guest. Nothing below this line needs to change for that to
+// work — the refusal is the only thing in the way on this side.
 //
 // (Two things that are true and are *not* the reason, recorded so they are not rediscovered
 // as blockers: the Host Compute Service, which drives Hyper-V containers and LCOW, really
@@ -40,8 +47,9 @@ import "errors"
 // None of this has been executed on Windows — no machine on this project has it. See
 // docs/windows.md.
 func vmmSupported() error {
-	return errors.New("network: sandbox networking is not available on Windows; " +
-		"libkrun's Windows Hypervisor Platform backend does not yet include virtio-net, " +
-		"so nothing emits the guest's frames onto a host link this stack could terminate " +
-		"(see docs/windows.md)")
+	return errors.New("network: sandbox networking is not available on Windows yet; " +
+		"the pieces exist — libkrun's Windows backend now carries virtio-net and krun.dll " +
+		"links with it — but no frame has ever crossed that device, and no sandbox has been " +
+		"started through containerd and the shim on Windows, so this is unexercised rather " +
+		"than impossible (see docs/windows.md)")
 }
