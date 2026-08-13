@@ -124,6 +124,9 @@ all ten of its releases carry zero assets.
 So after `brew install boks`, `boks doctor` should pass, and a sandbox will still fail to
 boot with `nerdbox-kernel not found in PATH or LIBKRUN_PATH` until two files exist.
 `scripts/build-nerdbox-guest.sh` builds them; `docs/install.md` says where to put them.
+That script **has been run**: on 2026-08-13 it produced a real arm64 kernel Image and a
+real EROFS filesystem in about four minutes on an ordinary Linux host, so this is a
+publishing decision rather than an engineering problem.
 
 **This is the one thing standing between "installs" and "works", and closing it is the
 owner's decision.** Once those two files are published as assets on a Boks release, the
