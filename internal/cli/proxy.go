@@ -29,18 +29,22 @@ func newProxyCommand(env Env) *cobra.Command {
 		Use:   "proxy [flags]",
 		Short: "Run the host forward proxy on its own, outside any sandbox",
 		Long: `Runs the host forward proxy: HTTP and HTTPS (via CONNECT) are filtered against a network
-policy, and credentials configured with --inject are attached to requests for the hosts
-they name, without the value ever existing inside a sandbox.
+policy, and credentials are attached to requests for the hosts they name, without the value
+ever existing inside a sandbox.
 
-Hosts named by an --inject rule are the only ones whose TLS is terminated: for those, and
-only those, the proxy presents a certificate from the local boks CA, verifies the origin
-itself, and can read the traffic. Every other destination is tunnelled untouched, with
-the origin's own certificate chain intact. 'boks policy log' shows which was which.
+The credentials are the ones in the store — anything stored under a service boks knows is
+attached with no flag at all, exactly as it would be in a sandbox — plus whatever --inject
+names. --no-secrets leaves the store out.
+
+Hosts a credential names are the only ones whose TLS is terminated: for those, and only
+those, the proxy presents a certificate from the local boks CA, verifies the origin itself,
+and can read the traffic. Every other destination is tunnelled untouched, with the origin's
+own certificate chain intact. 'boks policy log' shows which was which.
 
 Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks run'.`,
 		Example: `  boks proxy --policy standard
   boks proxy --policy locked --allow api.example.com:443 -v
-  boks proxy --inject 'anthropic@api.anthropic.com=header:x-api-key'`,
+  boks proxy --inject 'my-api@api.example.com=header:x-api-key'`,
 		Args: noArgs,
 	}
 	var (
@@ -67,13 +71,25 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 		if err != nil {
 			return err
 		}
-		rules, err := flags.credentialRules()
+		// The credential set is the flags plus whatever the store already holds under a
+		// service name; `boks proxy` and `boks run` resolve it identically, because a
+		// user debugging a credential with the standalone proxy is debugging the one
+		// their sandbox will get.
+		// The records are re-read below, from the store this command opens for itself:
+		// `boks proxy` keeps the store rather than handing values to another process, so
+		// it has no use for the copy resolveCredentials made.
+		plan, _, err := flags.resolveCredentials(cmd.Context(), env.Stderr)
 		if err != nil {
 			return err
 		}
+		rules, err := secret.ParseCredentials(plan.inject, plan.guest)
+		if err != nil {
+			return err
+		}
+		plan.describe(env.Stderr)
 
 		var provider secret.Provider
-		if len(rules) > 0 || len(flags.oauth) > 0 {
+		if len(rules) > 0 || len(plan.oauth) > 0 {
 			// The file store is the provider for both kinds. For OAuth that matters
 			// beyond convenience: it is also the OAuthSaver, so a refresh performed
 			// here is written back durably. A sandbox's supervisor has no passphrase
@@ -82,7 +98,7 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 			if err != nil {
 				return err
 			}
-			oauthRules, err := oauthCredentials(cmd.Context(), fileStore, flags.oauth)
+			oauthRules, err := oauthCredentials(cmd.Context(), fileStore, plan.oauth)
 			if err != nil {
 				return err
 			}

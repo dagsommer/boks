@@ -122,7 +122,7 @@ func ensureNetworkForExisting(ctx context.Context, name, address string, stderr 
 	if a, ok := agent.Builtin().Lookup(info.Agent); ok {
 		flags.forAgent(a)
 	}
-	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy)
+	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy, stderr)
 	if err != nil {
 		return err
 	}
