@@ -104,18 +104,39 @@ func (n *Network) Listen(port int) (net.Listener, error) {
 	return n.provider.listen(net.JoinHostPort(n.plan.Gateway.String(), strconv.Itoa(port)))
 }
 
-// Dial opens a connection from the host side into the sandbox's virtual network.
+// Dial opens a connection from the host side to the *gateway* inside the sandbox's virtual
+// network — that is, to something Boks itself bound there, such as the proxy.
 //
-// It is the inverse of Listen, and it exists for two reasons: it is how a test drives the
-// datapath without a hypervisor — dial the gateway, speak to whatever Boks put there — and
-// it is what a future `boks ports` would forward an inbound connection through. It is
-// host→guest only. Nothing here lets the guest reach the host; that direction is decided by
-// the policy engine in front of the proxy.
+// It is the inverse of Listen, and it is how a test drives the datapath without a hypervisor:
+// dial the gateway, speak to whatever Boks put there. It is host→guest only. Nothing here
+// lets the guest reach the host; that direction is decided by the policy engine in front of
+// the proxy.
 func (n *Network) Dial(ctx context.Context, port int) (net.Conn, error) {
 	if err := n.running(); err != nil {
 		return nil, err
 	}
 	return n.provider.dial(ctx, net.JoinHostPort(n.plan.Gateway.String(), strconv.Itoa(port)))
+}
+
+// DialGuest opens a connection from the host side to a port on the *container's* address
+// inside the virtual network. It is the second half of port publishing.
+//
+// The distinction from Dial is the whole feature. Dial reaches the gateway, which is Boks'
+// own end of the link; DialGuest reaches the sandbox, across the same virtio-net link a real
+// VM is attached to. A published host port is exactly this: accept on the host's loopback,
+// dial here, splice the two.
+//
+// Two properties are worth stating, because they are what keeps this from being a general
+// opening of the sandbox. It reaches the guest's *external* interface, so a service bound only
+// to the guest's own 127.0.0.1 is not reachable — the same constraint Docker Sandboxes
+// documents. And it is strictly host→guest: such a connection exists only because something
+// on the host opened it, and nothing in this direction gives the guest a way to reach the
+// host.
+func (n *Network) DialGuest(ctx context.Context, port int) (net.Conn, error) {
+	if err := n.running(); err != nil {
+		return nil, err
+	}
+	return n.provider.dial(ctx, net.JoinHostPort(n.plan.GuestAddr.Addr().String(), strconv.Itoa(port)))
 }
 
 func (n *Network) running() error {
