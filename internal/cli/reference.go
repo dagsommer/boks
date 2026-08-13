@@ -32,6 +32,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // referencePreamble is the only prose in docs/cli.md that is not cobra's own. It says the
@@ -97,6 +99,24 @@ func Reference() string {
 // replaced first, or the home substitution would get there first and leave `~/state`.
 func generalisePaths(s string) string {
 	home, err := os.UserHomeDir()
+
+	// The decision log's default is the one flag default that does not merely sit under
+	// the home directory but sits in a *different place on each operating system*: XDG
+	// state on Linux, ~/Library/Application Support on macOS, %LocalAppData% on Windows,
+	// and with Windows' separator to go with it. The substitutions below cannot reach that,
+	// because they rewrite a prefix and leave the rest of the path spelled the way the
+	// generating machine spells it.
+	//
+	// docs/cli.md is one committed file, so it has to render identically on all three or
+	// the check that keeps it current fails for anyone not on the platform it was last
+	// generated on. That is not hypothetical: it is what made TestReferenceIsCurrent fail
+	// on the Windows CI runner, and it would have failed the same way on any macOS
+	// developer's machine. Replacing the whole computed path — not a prefix of it — is what
+	// makes the page a property of the command tree rather than of the generator's host.
+	//
+	// The Linux spelling is the one written out because Linux is where Boks runs; the
+	// per-platform locations are policy.StateDir's own documentation.
+	s = strings.ReplaceAll(s, policy.DefaultLogPath(), "~/.local/state/boks/policy-log.jsonl")
 
 	for _, sub := range []struct{ env, generic string }{
 		{"XDG_STATE_HOME", "~/.local/state"},

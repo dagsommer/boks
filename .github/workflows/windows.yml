@@ -15,12 +15,17 @@
 #   locally before this workflow was written, and it passed for both Windows architectures.
 #   It is a required check.
 #
-#   `native` is the part we cannot. A binary that links is not a binary that works, and
-#   `go test ./...` on a real Windows host exercises code that has never executed there.
-#   Its test step is `continue-on-error` — see the comment on that step for exactly what has
-#   to land before the marker comes off. It is deliberately NOT deleted or narrowed to a
-#   passing subset: a red step that tells the truth is worth more than a green one that does
-#   not.
+#   `native` is the part we can only partly stand behind. A binary that links is not a
+#   binary that works, and `go test` on a real Windows host exercises code that has never
+#   executed there. So the tests run in two steps rather than one: everything that is
+#   expected to pass is **required**, and the two packages the port has genuinely not
+#   reached are `continue-on-error`.
+#
+#   That split is a ratchet, and it is written as an *exclusion* on purpose — the required
+#   step is "every package except these two", so a package added tomorrow is required by
+#   default and the tolerated list can only ever shrink. A red step that tells the truth is
+#   worth more than a green one that does not; a required step is worth more than either,
+#   and this file should keep converting the former into the latter.
 #
 # See docs/windows.md for why Windows is being pursued at all, and what is still missing.
 name: windows
@@ -120,78 +125,89 @@ jobs:
         run: go vet ./...
 
       # ---------------------------------------------------------------------------------
-      # EXPECTED TO FAIL. Do not delete this step, and do not narrow it to the packages that
-      # pass — either would convert a known gap into a silent one.
+      # REQUIRED. Every package except the two named in the next step, selected by exclusion
+      # so that a package added tomorrow lands here rather than silently going untested.
       #
-      # Every package compiles for Windows; six do not yet *run* there. The list below was
-      # read out of the source rather than observed on a Windows machine — nobody on this
-      # project has one — so treat it as the expectation this step exists to confirm or
-      # correct, not as a result.
+      # Six packages used to fail on this runner. Four of them were ordinary test-portability
+      # bugs with no bearing on the port, and they have been fixed:
       #
-      # Two of them are the port itself, and are not test bugs:
+      #   internal/policy    TestStorePermissions' Windows guard is a runtime.GOOS check with
+      #                      the reason written out, and TestUnreadableStoreFailsClosed no
+      #                      longer assumes mode 0o000 denies reads — on Windows that only
+      #                      sets FILE_ATTRIBUTE_READONLY. The fail-closed property it covers
+      #                      is reached on every platform by TestUnopenableStoreFailsClosed.
+      #   internal/secret    TestFileStoreIsEncryptedAndPrivate narrows the perm&0o077 check
+      #                      rather than skipping the test, so Windows still runs the
+      #                      assertions that the store is ciphertext and leaks no service name.
+      #   internal/sandbox   copy_test.go treats a failed os.Symlink as fatal everywhere
+      #                      except Windows, where the privilege is absent without Developer
+      #                      Mode, and guards the 0o600 assertion the same way.
+      #   internal/cli       hostPath absolutises on both platforms, so cp_test.go compares
+      #                      against filepath.Abs rather than a Unix literal; and the docs
+      #                      generator now rewrites the whole computed decision-log path, not
+      #                      a prefix of it, so docs/cli.md renders identically wherever it is
+      #                      generated. That last one was failing on macOS too.
       #
-      #   internal/network, internal/enforce
-      #       checkSocketPath in internal/network/network.go refuses outright on Windows
-      #       ("the VM runtime does not support Windows yet"), so every test that builds a
-      #       Plan fails, and internal/enforce's shared testSpec helper builds one. This is
-      #       correct behaviour for today and the tests are simply ahead of the port. They go
-      #       green when the guest link moves from unixgram to unixstream — see
-      #       internal/network/gateway_windows.go, which explains why that is the one change
-      #       that matters, and docs/windows.md section 8.
+      # Each fix is guarded on runtime.GOOS, never on an environment variable — store_test.go
+      # once guarded on os.Getenv("GOOS"), which `go test` does not set, so the skip fired on
+      # no platform at all. internal/ca, internal/runtimecfg and internal/workspace already
+      # use the runtime.GOOS pattern; copy it rather than inventing another.
       #
-      # Four are ordinary test-portability bugs, fixable now, with no bearing on the port:
-      #
-      #   internal/policy    store_test.go guards a POSIX-mode assertion with
-      #                      os.Getenv("GOOS"), which is never set in a test binary's
-      #                      environment — it means runtime.GOOS. The guard has never fired
-      #                      anywhere. TestUnreadableStoreFailsClosed also assumes mode 0o000
-      #                      denies reads, which on Windows only sets FILE_ATTRIBUTE_READONLY.
-      #   internal/secret    secret_test.go asserts perm&0o077 == 0 with no Windows guard;
-      #                      Windows reports 0666 for any writable file.
-      #   internal/sandbox   copy_test.go calls os.Symlink unguarded (needs Developer Mode or
-      #                      elevation) and asserts an extracted file is exactly 0o600.
-      #   internal/cli       cp_test.go expects filepath.Abs("/tmp/a:b") to be a no-op, and
-      #                      reference_test.go compares docs/cli.md against a reference whose
-      #                      default log path is %LocalAppData%-derived on Windows.
-      #
-      # internal/ca, internal/runtimecfg and internal/workspace already guard correctly with
-      # runtime.GOOS — copy that pattern rather than inventing another.
-      #
-      # REMOVE `continue-on-error` WHEN: `go test ./...` passes on this runner unassisted.
-      # The four test-portability bugs can be fixed today; the two network packages need
-      # either the unixstream transport or //go:build !windows on their test files. When that
-      # is done, delete this comment block and the marker together.
-      #
-      # Until then the step still runs, still reports, and still shows up in the log — it
-      # just does not block the merge of unrelated work.
+      # What the mode guards give up on Windows is a real hole, not a formality: nothing then
+      # verifies that another local user cannot read the secret store, the policy store, or a
+      # file `boks cp` pulled out of a sandbox. See "Host-side file permissions are not
+      # enforced on Windows" in docs/windows.md.
       # ---------------------------------------------------------------------------------
-      - name: Test (expected to fail — see the comment above this step)
-        id: test
+      - name: Test every package the port has reached
+        run: |
+          set -euo pipefail
+          go test $(go list ./... | grep -Ev '/internal/(network|enforce)(/|$)')
+
+      # ---------------------------------------------------------------------------------
+      # EXPECTED TO FAIL. Do not delete this step and do not fold it into the one above —
+      # either would convert a known gap into a silent one.
+      #
+      # These two are the port itself, not test bugs. checkSocketPath in
+      # internal/network/network.go refuses outright on Windows ("the VM runtime does not
+      # support Windows yet"), so every test that builds a Plan fails, and internal/enforce's
+      # shared testSpec helper builds one. That refusal is correct behaviour for today; the
+      # tests are simply ahead of the port.
+      #
+      # MOVE THEM UP WHEN: they pass here. The change that does it is the guest link moving
+      # from unixgram to unixstream — see internal/network/gateway_windows.go, which explains
+      # why that is the one change that matters, and docs/windows.md section 8. When they go
+      # green, delete this step and the exclusion in the step above together; do not leave a
+      # tolerated step with nothing left to tolerate.
+      # ---------------------------------------------------------------------------------
+      - name: Test the two packages blocked on the port (expected to fail)
+        id: blocked
         continue-on-error: true
-        run: go test ./... 2>&1 | tee test-output.txt
+        run: go test ./internal/network/... ./internal/enforce/... 2>&1 | tee blocked-output.txt
 
       # Puts the verdict on the run's summary page rather than leaving it buried in a log
-      # that people stop opening once they learn the step is allowed to fail. If this ever
-      # reports success, the marker above is ready to come off.
-      - name: Record what the tests did
+      # that people stop opening once they learn the step is allowed to fail.
+      - name: Record what the blocked packages did
         if: always()
         run: |
           set -uo pipefail
           {
-            echo "## \`go test ./...\` on windows-latest"
+            echo "## \`go test\` on windows-latest"
             echo
-            if [ "${{ steps.test.outcome }}" = success ]; then
-              echo "**Passed.** This job no longer needs \`continue-on-error\` — remove it"
-              echo "from the test step, along with the comment block above it."
+            echo "Every other package is tested by the required step before this one; if the"
+            echo "job got here, they passed."
+            echo
+            if [ "${{ steps.blocked.outcome }}" = success ]; then
+              echo "**\`internal/network\` and \`internal/enforce\` passed.** The port has"
+              echo "reached them. Delete the tolerated step in"
+              echo "\`.github/workflows/windows.yml\` and the exclusion in the required step"
+              echo "above it, so that \`go test ./...\` is required whole."
             else
-              echo "**Failed, as expected.** Boks' tests carry Unix assumptions; see the"
-              echo "comment above the test step in \`.github/workflows/windows.yml\` for what"
-              echo "must land before this is required to pass."
-              echo
-              echo "Packages that failed:"
+              echo "**\`internal/network\` and \`internal/enforce\` failed, as expected.**"
+              echo "\`checkSocketPath\` refuses on Windows by design; see the comment above"
+              echo "that step for the change that makes them pass."
               echo
               echo '```'
-              grep -E '^(FAIL|--- FAIL|ok  |\?   )' test-output.txt | grep -v '^ok  ' || true
+              grep -E '^(FAIL|--- FAIL)' blocked-output.txt || true
               echo '```'
             fi
           } >>"$GITHUB_STEP_SUMMARY"

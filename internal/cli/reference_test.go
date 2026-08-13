@@ -98,6 +98,20 @@ func TestReferenceIsTheSameOnEveryMachine(t *testing.T) {
 			"generator's environment has reached the document")
 	}
 
+	// XDG is only how Linux answers the question. macOS puts the state directory under
+	// ~/Library/Application Support and Windows under %LocalAppData%, neither of which is a
+	// prefix this generator would otherwise recognise — so the reference came out different
+	// on those machines and the check that it is current failed there while the command tree
+	// was perfectly fine. BOKS_STATE_DIR reproduces that shape on any host, which is what
+	// makes this regression catchable on the Linux box where the file is generated rather
+	// than only on the platform that suffers from it.
+	t.Setenv("BOKS_STATE_DIR", filepath.Join(t.TempDir(), "AppData", "Local", "boks"))
+	if Reference() != elsewhere {
+		t.Error("the reference changes when the state directory moves out from under the " +
+			"home and XDG paths, as it does on macOS and Windows; docs/cli.md is one " +
+			"committed file and must render the same on every platform")
+	}
+
 	for _, leak := range []string{home, "/home/", "/Users/", "/root/"} {
 		if strings.Contains(elsewhere, leak) {
 			t.Errorf("the reference contains %q, which is a path from the machine that "+
