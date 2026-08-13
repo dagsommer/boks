@@ -44,6 +44,14 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 		"attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
 	fs.StringArrayVar(&f.guest, "guest-credential", nil,
 		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
+}
+
+// registerPublish adds `-p/--publish`, separately from the rest.
+//
+// It is separate because the rest of these flags are shared with `boks proxy` and
+// `boks policy ls`, which describe a policy and have no sandbox to publish a port into. A
+// flag that appears in a command's help and does nothing is worse than a missing one.
+func (f *policyFlags) registerPublish(fs *pflag.FlagSet) {
 	fs.StringArrayVarP(&f.publish, "publish", "p", nil,
 		"publish a sandbox port on the host, bound to loopback (repeatable): "+
 			"[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]")
