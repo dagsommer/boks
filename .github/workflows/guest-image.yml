@@ -1,0 +1,103 @@
+# Build the guest kernel and rootfs a sandbox boots, and publish them as artifacts.
+#
+# WHY THIS EXISTS. A `boks` binary cannot start a sandbox on its own: it needs a guest kernel
+# and an EROFS rootfs for the microVM to boot. nerdbox builds both with Docker Buildx, and its
+# own release workflow has failed on every tag since v0.2.0 — all ten of its GitHub releases
+# carry zero assets — so there is nothing to download for any platform. Anyone bringing Boks
+# up on a new machine has to build them, which needs Docker and a Linux builder.
+#
+# That is a poor thing to ask of someone testing the Windows port, whose machine has neither.
+# This job does it once, on a Linux runner, and leaves the artifacts attached to the run.
+#
+# Both outputs are architecture-specific and byte-reproducible enough to check: the job prints
+# SHA256 for each, so a file that arrives somewhere else can be shown to be the same file.
+name: guest-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Guest architecture"
+        required: false
+        default: x86_64
+        type: choice
+        options: [x86_64, aarch64]
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/guest-image.yml"
+      - "packaging/nerdbox/NERDBOX_REV"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - name: Read the pinned nerdbox revision
+        id: pin
+        run: |
+          set -euo pipefail
+          rev="$(grep -v '^[[:space:]]*#' boks/packaging/nerdbox/NERDBOX_REV | tr -d '[:space:]')"
+          if [ "${#rev}" -ne 40 ]; then
+            echo "NERDBOX_REV must be a full 40-character SHA, got '${rev}'" >&2
+            exit 1
+          fi
+          echo "rev=$rev" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: containerd/nerdbox
+          ref: ${{ steps.pin.outputs.rev }}
+          path: nerdbox
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The kernel is an ELF vmlinux rather than a bzImage — that is the format
+      # `krun_set_kernel` takes, and it is what nerdbox's own instance.go looks for under the
+      # name `nerdbox-kernel-<arch>`. Do not "fix" it into a bzImage.
+      - name: Build the guest kernel and rootfs
+        working-directory: nerdbox
+        env:
+          KERNEL_ARCH: ${{ inputs.arch || 'x86_64' }}
+          DESTDIR: ./_output
+        run: |
+          set -euo pipefail
+          docker buildx bake kernel
+          docker buildx bake rootfs
+          ls -l _output/
+
+      - name: Checksums
+        working-directory: nerdbox
+        run: |
+          set -euo pipefail
+          sha256sum _output/* | tee _output/SHA256SUMS
+          {
+            echo "## Guest image"
+            echo
+            echo "nerdbox \`${{ steps.pin.outputs.rev }}\`, arch \`${{ inputs.arch || 'x86_64' }}\`."
+            echo
+            echo '```'
+            cat _output/SHA256SUMS | sed 's|_output/||'
+            echo '```'
+            echo
+            echo "Put both files on PATH, or in a directory named by \`LIBKRUN_PATH\`, next to"
+            echo "\`krun.dll\` and the nerdbox shim. Neither file has ever booted on Windows."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nerdbox-guest-${{ inputs.arch || 'x86_64' }}
+          path: nerdbox/_output/*
+          if-no-files-found: error
+          retention-days: 30
