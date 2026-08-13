@@ -333,7 +333,14 @@ func Builtin() *Registry {
 				// a denial here refuses the refresh rather than intercepting it.
 				// Allowing the host does not let a token reach it: see
 				// answerTokenRequest in internal/proxy.
-				{Spec: "console.anthropic.com:443", Why: "the OAuth token endpoint a subscription login refreshes against"},
+				// Read off the 2.1.228 binary, which mentions this host 107 times and
+				// console.anthropic.com not once. The earlier entry named the wrong host,
+				// and that was a security bug rather than a stale note: interception is
+				// per-host, so a record naming a host the agent never contacts leaves the
+				// real token exchange in an untouched tunnel. The login would have
+				// succeeded and the guest would have kept the token — silently, which is
+				// the worst way for this particular property to fail.
+				{Spec: "platform.claude.com:443", Why: "the OAuth token endpoint a subscription login exchanges and refreshes against"},
 			},
 		},
 		{
