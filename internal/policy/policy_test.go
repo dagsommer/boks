@@ -552,6 +552,76 @@ func TestAggregatedCollapsesRepeats(t *testing.T) {
 	}
 }
 
+// TestFilterNarrowsTheFirehose: the decision log is one file for the whole machine, and
+// reading it meant reading every sandbox's traffic back to whenever the file was created.
+// Both fields were already on every decision; only the reading end was missing.
+func TestFilterNarrowsTheFirehose(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	decisions := []Decision{
+		{Time: base, Host: "old.test", Sandbox: "web"},
+		{Time: base.Add(time.Hour), Host: "recent.test", Sandbox: "web"},
+		{Time: base.Add(time.Hour), Host: "other.test", Sandbox: "api"},
+		{Time: base.Add(time.Hour), Host: "standalone.test"},
+	}
+
+	only := func(t *testing.T, f Filter, want ...string) {
+		t.Helper()
+		var got []string
+		for _, d := range f.Apply(decisions) {
+			got = append(got, d.Host)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("filter %+v kept %v, want %v", f, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("filter %+v kept %v, want %v", f, got, want)
+				return
+			}
+		}
+	}
+
+	only(t, Filter{}, "old.test", "recent.test", "other.test", "standalone.test")
+	only(t, Filter{Sandbox: "web"}, "old.test", "recent.test")
+	only(t, Filter{Since: base.Add(30 * time.Minute)}, "recent.test", "other.test", "standalone.test")
+	only(t, Filter{Sandbox: "web", Since: base.Add(30 * time.Minute)}, "recent.test")
+	// A decision the proxy recorded outside any sandbox belongs to no sandbox, so naming
+	// one excludes it rather than matching it by accident.
+	only(t, Filter{Sandbox: "nothing"})
+
+	if !(Filter{}).Empty() || (Filter{Sandbox: "web"}).Empty() {
+		t.Error("Empty does not report whether the filter would keep everything")
+	}
+}
+
+// TestParseSince accepts both spellings of "how far back", because someone debugging a run
+// reaches for a duration and someone comparing records has a timestamp.
+func TestParseSince(t *testing.T) {
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+
+	if got, err := ParseSince("", now); err != nil || !got.IsZero() {
+		t.Errorf("empty --since = %v, %v; want the zero time and no error", got, err)
+	}
+	got, err := ParseSince("2h", now)
+	if err != nil || !got.Equal(now.Add(-2*time.Hour)) {
+		t.Errorf("ParseSince(2h) = %v, %v", got, err)
+	}
+	// A duration is always backwards: the log has no entries in the future, so "-2h" is
+	// the same request as "2h" rather than an error to make someone retype.
+	if got, err := ParseSince("-2h", now); err != nil || !got.Equal(now.Add(-2*time.Hour)) {
+		t.Errorf("ParseSince(-2h) = %v, %v", got, err)
+	}
+	if got, err := ParseSince("2026-08-13T09:30:00Z", now); err != nil || !got.Equal(time.Date(2026, 8, 13, 9, 30, 0, 0, time.UTC)) {
+		t.Errorf("ParseSince(RFC3339) = %v, %v", got, err)
+	}
+	if _, err := ParseSince("2026-08-13", now); err != nil {
+		t.Errorf("a plain date was rejected: %v", err)
+	}
+	if _, err := ParseSince("last tuesday", now); err == nil {
+		t.Error("an unreadable --since was accepted")
+	}
+}
+
 // resolvePolicy is the old preset-plus-flags resolution, expressed through the one
 // resolution path there now is. It keeps these tests exercising the layering the CLI
 // actually uses rather than a second implementation kept alive for them.

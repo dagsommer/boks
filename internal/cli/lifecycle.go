@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/enforce"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
@@ -114,11 +115,17 @@ func ensureNetworkForExisting(ctx context.Context, name, address string, stderr 
 		return nil
 	}
 
+	// A sandbox records the agent it runs, so `start` and `exec` can serve the same agent
+	// layer `run` did without any flags of their own. An agent this build no longer knows
+	// contributes nothing, which is the safe direction: fewer allows, never more.
 	var flags policyFlags
+	if a, ok := agent.Builtin().Lookup(info.Agent); ok {
+		flags.forAgent(a)
+	}
 	// The sandbox's own recorded publish specifications: `start` and `exec` have no port
 	// flags, and a sandbox that came back up without the ports it was created with would
 	// break a bookmark for reasons nothing on screen would explain.
-	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy, info.Ports)
+	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy, info.Ports, stderr)
 	if err != nil {
 		return err
 	}
