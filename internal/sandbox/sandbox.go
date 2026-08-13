@@ -181,12 +181,12 @@ func Run(ctx context.Context, cfg Config) (int, error) {
 		Address: cfg.Address,
 		Name:    cfg.Name,
 		Command: command,
-		Env:     cfg.Env,
-		TTY:     cfg.TTY,
-		Stdin:   cfg.Stdin,
-		Stdout:  cfg.Stdout,
-		Stderr:  cfg.Stderr,
-		client:  c,
+		// No Env: create already put cfg.Env in the spec, and execProcess inherits it.
+		TTY:    cfg.TTY,
+		Stdin:  cfg.Stdin,
+		Stdout: cfg.Stdout,
+		Stderr: cfg.Stderr,
+		client: c,
 	})
 }
 
@@ -227,6 +227,18 @@ func ensureContainer(ctx context.Context, c *client.Client, cfg Config) (client.
 	return container, nil
 }
 
+// runsKeeper reports whether the sandbox's own process is the idle keeper rather than the
+// user's command.
+//
+// A persistent sandbox always runs the keeper: it has to stay up between commands. An
+// ephemeral one normally does not — the command *is* the container process, which is what
+// makes it ephemeral — but in clone mode it does anyway, because the clone has to be made by
+// something before the command can run in it, and only a running task can be exec'd into.
+// The alternative was to bootstrap the clone from inside the command's own process, which
+// cannot work: making the workspace's absolute path in the guest needs root, and the
+// command runs as the image's user.
+func runsKeeper(cfg Config) bool { return !cfg.Ephemeral || cfg.Clone }
+
 // runEphemeral is the create-run-destroy path: the command is the container process and
 // nothing survives it.
 func runEphemeral(ctx context.Context, cfg Config) (exitCode int, err error) {
@@ -254,7 +266,45 @@ func runEphemeral(ctx context.Context, cfg Config) (exitCode int, err error) {
 		}
 	}()
 
+	if runsKeeper(cfg) {
+		return runEphemeralInKeeper(ctx, container, cfg)
+	}
 	return runTask(ctx, container, cfg)
+}
+
+// runEphemeralInKeeper runs an ephemeral sandbox whose own process is the keeper: the
+// sandbox is brought up, which is what makes its clone, and the command runs inside it as an
+// exec. Everything the sandbox is made of still goes away when the command exits — the
+// caller's deferred delete takes the container and its snapshot, and this takes the task.
+func runEphemeralInKeeper(ctx context.Context, container client.Container, cfg Config) (int, error) {
+	task, err := ensureRunning(ctx, container, cfg.Stderr)
+	if err != nil {
+		return 1, err
+	}
+	defer cleanupTask(ctx, task)
+
+	command := cfg.Command
+	if len(command) == 0 {
+		// The resolved default, which create recorded when it had the image config.
+		labels, err := container.Labels(ctx)
+		if err != nil {
+			return 1, fmt.Errorf("reading sandbox %q: %w", cfg.Name, err)
+		}
+		command = decodeCommand(labels)
+	}
+	if len(command) == 0 {
+		return 1, fmt.Errorf("sandbox %q has no command to run; pass one after '--'", cfg.Name)
+	}
+
+	return execProcess(ctx, container, task, ExecConfig{
+		Name:    cfg.Name,
+		Command: command,
+		// No Env: create already put cfg.Env in the spec, and execProcess inherits it.
+		TTY:    cfg.TTY,
+		Stdin:  cfg.Stdin,
+		Stdout: cfg.Stdout,
+		Stderr: cfg.Stderr,
+	})
 }
 
 // connect opens a containerd client, reporting a missing daemon plainly rather than as a
@@ -324,20 +374,11 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	}
 
 	// The container process differs by lifetime: an ephemeral sandbox exists to run one
-	// command, a persistent one has to stay up between commands.
+	// command, a persistent one has to stay up between commands. Clone mode is the
+	// exception on both counts — see runsKeeper.
 	processArgs := keeperCommand
-	if cfg.Ephemeral {
+	if !runsKeeper(cfg) {
 		processArgs = command
-	}
-	if cfg.Clone && cfg.Ephemeral {
-		// An ephemeral sandbox has no earlier moment to clone in — the user's command
-		// *is* the container process — so the clone is bootstrapped ahead of it. A
-		// persistent sandbox clones on its first start instead, in ensureRunning.
-		if len(processArgs) == 0 {
-			return nil, fmt.Errorf("sandbox %q has no command to run, and clone mode cannot "+
-				"prepare a clone without one; pass one after '--'", cfg.Name)
-		}
-		processArgs = cloneBootstrap(cfg.Workspaces[0].GuestPath, processArgs)
 	}
 
 	specOpts := []oci.SpecOpts{
@@ -353,7 +394,9 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	if len(cfg.Env) > 0 {
 		specOpts = append(specOpts, oci.WithEnv(cfg.Env))
 	}
-	if cfg.TTY && cfg.Ephemeral {
+	if cfg.TTY && !runsKeeper(cfg) {
+		// Only when the user's command is the container process. A keeper needs no
+		// terminal; the command exec'd into it asks for its own.
 		specOpts = append(specOpts, oci.WithTTY)
 	}
 	if mounts := workspaceMounts(guestShares(cfg)); len(mounts) > 0 {
