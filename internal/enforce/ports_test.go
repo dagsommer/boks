@@ -261,6 +261,33 @@ func TestTheGuestCannotAskForAPublish(t *testing.T) {
 	}
 }
 
+// TestPortsOnASandboxWithNoNetworkSaysWhy. Such a sandbox does run a supervisor — the VM's
+// NIC has to have somewhere to write — so the generic "no running network stack" would send
+// the user to `boks start` for a sandbox that is already running.
+func TestPortsOnASandboxWithNoNetworkSaysWhy(t *testing.T) {
+	spec := testSpec(t, network.ModeNone)
+	dir := dirFor(spec.StateDir, spec.Sandbox)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release, err := acquire(filepath.Join(dir, lockFile))
+	if err != nil {
+		t.Fatalf("taking the supervisor lock: %v", err)
+	}
+	defer release()
+	if err := writeState(dir, State{Sandbox: spec.Sandbox, Mode: string(network.ModeNone)}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Ports(context.Background(), spec.StateDir, spec.Sandbox)
+	if err == nil {
+		t.Fatal("a sandbox with no network answered a ports request")
+	}
+	if !strings.Contains(err.Error(), "-net none") {
+		t.Errorf("the refusal does not name the reason: %v", err)
+	}
+}
+
 // TestTheControlProtocolRefusesWhatItDoesNotKnow. The set of verbs is closed on purpose —
 // three, none of which can read a secret, a policy or a log — and a supervisor that quietly
 // accepted an unknown one would be a supervisor whose surface nobody can state.

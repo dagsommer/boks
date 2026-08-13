@@ -77,6 +77,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/ports"
 )
 
@@ -272,8 +273,18 @@ func Unpublish(ctx context.Context, stateDir, sandbox string, specs []string) ([
 
 // call performs one exchange with a sandbox's supervisor.
 func call(ctx context.Context, stateDir, sandbox string, req controlRequest) (controlResponse, error) {
-	if _, alive := Lookup(stateDir, sandbox); !alive {
+	st, alive := Lookup(stateDir, sandbox)
+	if !alive {
 		return controlResponse{}, fmt.Errorf("%w: %s", ErrNoSupervisor, sandbox)
+	}
+	// A sandbox with no network runs a supervisor — the VM's NIC has to have somewhere to
+	// write — but no stack, no control socket and nothing to publish into. Saying "no
+	// running network stack" here would send the user to `boks start` for a sandbox that
+	// is already running.
+	if st.Mode == string(network.ModeNone) {
+		return controlResponse{}, fmt.Errorf("sandbox %q was created with -net none, so it has no "+
+			"virtual network to publish a port into.\nRecreate it without -net none: boks rm %s",
+			sandbox, sandbox)
 	}
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", controlPath(stateDir, sandbox))
