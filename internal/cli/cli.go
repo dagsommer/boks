@@ -72,6 +72,10 @@ func Main(ctx context.Context, env Env) int {
 		fmt.Fprintf(env.Stderr, "boks: %v\n", err)
 		return 2
 	}
+	if err := rejectDockerTerminalFlags(args); err != nil {
+		fmt.Fprintf(env.Stderr, "boks: %v\n", err)
+		return 2
+	}
 
 	root.SetArgs(args)
 	root.SetContext(ctx)
@@ -191,6 +195,58 @@ func newVersionCommand(env Env) *cobra.Command {
 func noArgs(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		return usagef("unexpected argument %q; %s takes no arguments", args[0], cmd.CommandPath())
+	}
+	return nil
+}
+
+// rejectDockerTerminalFlags turns `boks run -it` into an explanation instead of a misparse.
+//
+// `-t` means two different things in this CLI, and that is not going to change: on `exec` it
+// is `--tty`, because that is what it is in Docker and in sbx; on `run` it is `--template`,
+// which is sbx's own spelling for the image an agent runs in. Muscle memory says `-it`, and
+// `run` has no terminal flags at all — it attaches a pty exactly when the caller has one, so
+// there is nothing for `-i` or `-t` to switch on.
+//
+// Left alone, the two spellings fail differently and one of them fails *silently*:
+//
+//	boks run -it .    unknown shorthand flag: 'i' in -it — true, and says nothing useful
+//	boks run -ti .    -t takes a value, so this sets --template to "i" and pulls an image
+//	                  called "i". The user is told their image does not exist.
+//
+// The second is the reason this exists. A guard here catches both before pflag sees them and
+// answers the question the user actually has, which is "how do I get a terminal".
+func rejectDockerTerminalFlags(args []string) error {
+	command := ""
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			command = arg
+			break
+		}
+	}
+	if command != "run" && command != "create" {
+		return nil
+	}
+	for _, arg := range args {
+		// Past `--` the flags are the agent's, and `-i` there is an agent's business.
+		if arg == "--" {
+			return nil
+		}
+		if len(arg) < 2 || arg[0] != '-' || arg[1] == '-' {
+			continue
+		}
+		cluster, _, _ := strings.Cut(arg[1:], "=")
+		if !strings.ContainsRune(cluster, 'i') {
+			continue
+		}
+		return fmt.Errorf("'boks %s' has no -i or -t terminal flags, so %q cannot mean what it means\n"+
+			"to docker. A run attaches your terminal exactly when you have one, and gets no pty\n"+
+			"when its output is a pipe — there is nothing to switch on.\n\n"+
+			"On '%s', -t is --template: the image the agent runs in. That is why '-ti' does not\n"+
+			"fail at all, it quietly sets --template to \"i\".\n\n"+
+			"  %-30s a terminal, if you have one\n"+
+			"  %-30s a terminal in a sandbox that already exists",
+			command, arg, command,
+			"boks "+command+" claude .", "boks exec -it SANDBOX sh")
 	}
 	return nil
 }

@@ -524,6 +524,159 @@ Three limits worth being explicit about:
 *(none of it is wired into `boks run`. Any credential you put in a sandbox today is simply
 in the sandbox.)*
 
+#### OAuth credentials, and how they change the answer
+
+Most people running the flagship agent have no API key at all. `claude /login` leaves an
+OAuth **pair** — an access token and a refresh token — in the macOS Keychain under
+`Claude Code-credentials`, and nothing else. A credential model that only knows how to set a
+header cannot carry that, so `boks run claude` could not work for them by any route. The
+`oauth` mechanism in `internal/secret` is that route, and it follows Docker Sandboxes' kit v2
+`oauth` block: sentinels in the guest, substitution on the resource hosts, refresh on the
+host.
+
+`boks secret adopt` reads what the agent already wrote and stores it. The guest is given
+**sentinels** — fakes carrying the real prefix and the real length, because Claude Code checks
+that an OAuth token starts with `sk-ant-oat01-` before it will send one — in an environment
+variable, a read-only credential file, or both. On a request to a configured resource host
+the proxy replaces the sentinel with the real access token, in the `Authorization` header and
+no other.
+
+##### Acquisition: how a credential enters the system on a machine with no login
+
+`adopt` needs a login to read. On a fresh machine there is none, and Boks still will not run
+an OAuth flow of its own — every one begins by identifying *this program* to the vendor with
+a client id issued to a registered application, and Boks holds none. That refusal stands, and
+`boks secret set --oauth` still explains it.
+
+What Boks does instead is what Docker Sandboxes does for the same vendor: **let the agent log
+itself in, inside the sandbox, and keep the result.** sbx's own host-side `--oauth` is
+documented for one vendor only; its answer for Anthropic is `sbx run claude … -- auth login`.
+The agent performs its own OAuth with its own client id, which is legitimate because it *is*
+that program, and the sandbox's proxy already terminates TLS for the token endpoint.
+
+    boks secret login claude-code       # arms a credential-shaped hole: no tokens
+    boks run claude -- auth login       # the agent logs in; boks keeps what comes back
+
+**The two paths through the token endpoint are opposites, and the difference is the security
+argument.** A *refresh* is never forwarded: Boks composes its own request on the host and
+answers the guest from the sentinels it already handed out. An *acquisition* is forwarded and
+its response kept: the authorization code and PKCE verifier that unlock the exchange exist
+only inside the guest, because they came from a redirect Boks never saw. So this is the one
+place a guest-composed request reaches a token endpoint, and the one place a response body is
+buffered rather than streamed.
+
+Which path applies is decided by the **stored record**, never by anything in the request. A
+credential relays exactly once, while it holds no token at all, and the first token it
+acquires closes the door permanently. A guest cannot ask to be relayed and cannot re-open the
+path. (Docker's kit format documents `passthrough: boolean to skip sentinel masking` on its
+`oauth` block, which is very likely this same distinction seen from the other side — a
+relayed response is the only kind that needs masking. Boks has no such switch and should not.)
+
+**The window, because that is the question worth asking.** There is none: the guest never
+holds a real token at any point.
+
+- Before the exchange the guest holds an authorization code and a PKCE verifier. Neither is a
+  token: single-use, redeemable only at the token endpoint, worth nothing once spent.
+- The response carrying the real pair is read by Boks, which terminated the TLS session. The
+  tokens are taken out and stored, and every occurrence of either value is replaced anywhere
+  in the document — not only in the two named fields — before a byte is written to the guest.
+  The result is asserted clean; if a real value would survive, the login fails instead.
+- What the guest receives is the origin's own JSON with sentinels in it. The agent then
+  writes *that* into its own credential file, which was confirmed by driving the real Claude
+  Code through a stand-in origin: it persists exactly what the endpoint returned.
+- The store is written **before** the guest is answered. The reverse ordering would lose the
+  credential entirely on a storage failure, and an authorization code cannot be spent twice.
+
+Four things are fail-closed rather than best-effort, and each would otherwise be a way for a
+real token to reach the guest unread: a response body larger than 1 MiB; a response still
+carrying a content encoding after the relayed request asked for identity; a **successful**
+status whose body Boks could not read as a token response, which is the shape a token in an
+unrecognised form would take; and a body in which masking could not remove every occurrence.
+All four refuse the exchange. A *failed* login is the one thing passed through untouched,
+because only the agent can tell the user that its code was spent — and there is no token in
+such an answer to mask.
+
+**What acquisition does not protect against, stated plainly.** Boks captures the exchange it
+can see. A guest that reached a token endpoint Boks is not intercepting would keep what it
+got — that is not a token Boks ever held, but it is a real credential inside the sandbox. Two
+consequences follow. The token endpoint host recorded for a provider has to be the one the
+agent actually talks to, which is why it was read off the binary rather than assumed (Claude
+Code 2.1.228 uses `platform.claude.com`, and contains no reference to `console.anthropic.com`
+at all). And the network policy still has to be narrow: a login is only captured because the
+proxy is the only way out.
+
+**What this changes about a compromised guest**, stated as the difference from an API key:
+
+- **The credential is bigger.** An API key is usually scoped and revocable on its own; a
+  subscription access token is the account's login. "Use of the credential against approved
+  hosts" therefore now means use of the subscription, and the injection domains are the only
+  thing bounding it. Name them narrowly.
+- **The durable half never enters the sandbox, and cannot be reached from it.** An access
+  token expires; a refresh token is the credential that outlives the sandbox, and is the one
+  worth stealing. Boks never substitutes a refresh token into any request, and the guest's own
+  token request is **answered rather than forwarded** — Boks composes the reply from the
+  sentinels it already gave out, so no request a guest can compose reaches the token endpoint
+  carrying the real refresh token, and no real token ever travels toward the guest in a
+  response body. The alternative design (relay the guest's refresh with the real token
+  substituted in, then rewrite the response) was rejected for exactly this: a request Boks did
+  not understand would produce a response it could not rewrite.
+- **Expiry is a host concern, and the guest is told so.** The credential file and the answer
+  to a refresh report a lifetime a year out. The real token is refreshed on the host when it
+  nears expiry, and whatever is current at that moment is what goes on the wire. An agent that
+  persists what a refresh returned writes back the same sentinels it had, which is why the
+  credential file can be mounted read-only — the write fails, and the file was already right.
+- **A rotation inside a sandbox is not durable, and neither is an acquisition.** The network
+  supervisor deliberately never learns the store's passphrase, so a refresh *or a login* it
+  performs lives only as long as that sandbox. For a provider that rotates refresh tokens —
+  Anthropic does — the copy in the encrypted store is then stale and `boks secret adopt` has
+  to be run again. The decision log says so at the moment it happens. Running the credential
+  through `boks proxy` instead does persist, because that process has the passphrase.
+
+  For acquisition this is the sharper limitation of the two, and it is the one thing standing
+  between `boks secret login` and the fresh-machine story it exists for: the login works, the
+  agent is authenticated, and the credential is gone when the sandbox stops. The fix is the
+  writeback channel `internal/secret/memory.go` already names as missing, and it is not built.
+
+Residual exposure worth knowing, none of it hypothetical:
+
+- **An origin that echoes `Authorization` back would hand the guest the real token.** That is
+  why substitution is restricted to the headers the credential is actually sent in rather than
+  applied to every header a sentinel appears in; a guest can put its sentinel anywhere, and
+  only the allowlisted header is swapped. Bodies are streamed and never scanned, so a client
+  that puts its token in a body is not supported rather than silently unprotected.
+- **A resource host is a decrypted host.** Both the API hosts and the token endpoint are
+  credential hosts, so both have their TLS terminated. The token endpoint is decrypted for a
+  second reason as well: a request has to be answered, which cannot be done through a tunnel.
+- **Other paths on the token endpoint's host are ordinary traffic.** Only the configured path
+  is answered; everything else on that host is forwarded with no credential attached.
+- **An OAuth token is never written onto a plaintext flow.** The guest chooses the scheme, and
+  `http://` to a resource host would otherwise be a downgrade the guest controls. Such a
+  request goes out carrying the sentinel and fails at the origin.
+- **The macOS Keychain read has never been executed.** It shells out to `security
+  find-generic-password`, which cannot run on the Linux machine this was written on. What is
+  tested is everything either side of it — the parsing of the document it returns, from a file
+  and from stdin, and the refusal on a platform with no Keychain. The `security` invocation
+  itself is unproven. Confirming it needs one run of `boks secret adopt claude-code` on a Mac
+  where `claude /login` has been used.
+- **The refresh request's shape is unproven against the real provider.** Boks composes an
+  RFC 6749 `refresh_token` grant, as JSON by default, and posts it to the configured endpoint.
+  That has been demonstrated against a local endpoint, not against `platform.claude.com`. The
+  *shape* is no longer a guess, though: the real Claude Code's own refresh was observed and is
+  a JSON `refresh_token` grant to that endpoint — see
+  [verification.md](verification.md#the-real-claude-code-login-flow-observed).
+- **No acquisition has ever run against the real provider either.** Everything below the
+  network — the relay, the capture, the masking, the refusals — is exercised by tests against
+  a local origin, and the *shape* of the exchange those tests replay was copied from a real
+  Claude Code driven against a stand-in origin. What has not happened is one real login
+  through a real sandbox against Anthropic.
+- **Interception is per-host, so the endpoint has to be right.** Until 2026-08-13 the claude
+  agent's allowlist named `console.anthropic.com`, which the 2.1.228 binary never contacts.
+  That was not a stale note: a record naming a host the agent does not talk to leaves the real
+  exchange in an untouched tunnel, so the login succeeds and the guest keeps the token —
+  silently. Corrected to `platform.claude.com:443`, verified by counting both strings in the
+  shipped binary (107 against 0). Any future move of that endpoint has the same shape, and the
+  failure will look like success.
+
 ### Privileged execution
 
 - Boks does not require a setuid helper.
@@ -569,6 +722,8 @@ in the sandbox.)*
   when it sees one, and recreating it is the only fix.
 - It does **not** claim end-to-end TLS to every destination any more. Hosts you configure a
   credential for are decrypted by Boks, by design; everything else is not.
+- It does **not** claim that reading a credential out of the macOS Keychain works. That path
+  has never been executed; see [OAuth credentials](#oauth-credentials-and-how-they-change-the-answer).
 - It has **no** defence against hypervisor vulnerabilities beyond keeping libkrun current.
 
 Boks aims to be honest about this. If a property is not listed as tested, assume it does not
