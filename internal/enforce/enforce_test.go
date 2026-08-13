@@ -398,9 +398,18 @@ func TestCloseLeavesNothingBehind(t *testing.T) {
 	before := boksGoroutines(t)
 
 	spec := testSpec(t, network.ModeNAT)
+	// A published port is part of what a session leaves behind, and the worst kind: a host
+	// port still bound after teardown accepts connections for a VM that no longer exists.
+	spec.Publish = []string{"3000"}
 	session, err := Open(context.Background(), spec, io.Discard)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
+	}
+	publishedAddr := ""
+	if list := session.Ports(); len(list) == 1 {
+		publishedAddr = net.JoinHostPort(list[0].HostIP, strconv.Itoa(list[0].HostPort))
+	} else {
+		t.Fatalf("the session published %+v, want one binding", list)
 	}
 	guest := attachGuest(t, spec)
 	client, err := guest.HTTPClient(session.ProxyURL())
@@ -423,6 +432,10 @@ func TestCloseLeavesNothingBehind(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Dir(spec.Plan.Socket)); !os.IsNotExist(err) {
 		t.Errorf("the link socket directory survived Close: %v", err)
+	}
+	if conn, err := net.DialTimeout("tcp", publishedAddr, time.Second); err == nil {
+		conn.Close()
+		t.Errorf("the published host port %s is still bound after Close", publishedAddr)
 	}
 
 	// Nothing answers where the proxy was. The stack itself is still up — see the comment
@@ -468,7 +481,7 @@ func boksGoroutines(t *testing.T) int {
 			continue // the test's own goroutines, including this one
 		}
 		if strings.Contains(block, "boks/internal/proxy") || strings.Contains(block, "boks/internal/network.") ||
-			strings.Contains(block, "boks/internal/enforce.") {
+			strings.Contains(block, "boks/internal/enforce.") || strings.Contains(block, "boks/internal/ports.") {
 			count++
 		}
 	}
