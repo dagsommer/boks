@@ -314,7 +314,8 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 	}
 
 	secrets := map[string]string{}
-	if len(credentials) > 0 {
+	var oauth map[string]secret.OAuthRecord
+	if len(credentials) > 0 || len(f.oauth) > 0 {
 		store, err := openSecretStore("")
 		if err != nil {
 			return enforce.Spec{}, err
@@ -326,6 +327,11 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 			}
 			secrets[c.Service] = value.Reveal()
 		}
+		// OAuth credentials travel whole rather than as a value, because their shape
+		// lives with them in the store; see enforce.Spec.
+		if oauth, err = oauthRecords(ctx, store, f.oauth); err != nil {
+			return enforce.Spec{}, err
+		}
 	}
 
 	return enforce.Spec{
@@ -335,6 +341,7 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 		Inject:           f.inject,
 		GuestCredentials: f.guest,
 		Secrets:          secrets,
+		OAuth:            oauth,
 		Intercept:        true,
 		CADir:            caDir(""),
 		StateDir:         policy.StateDir(),

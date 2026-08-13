@@ -327,6 +327,13 @@ func Builtin() *Registry {
 				// allowed. This is the one entry in this file confirmed by a run
 				// rather than by reading.
 				{Spec: "api.anthropic.com:443", Why: "the Claude API; the agent cannot work without it"},
+				// A subscription login refreshes its token here. Boks answers that
+				// request itself and never forwards it — but the policy is checked at
+				// CONNECT, before the proxy reaches the handler that would answer, so
+				// a denial here refuses the refresh rather than intercepting it.
+				// Allowing the host does not let a token reach it: see
+				// answerTokenRequest in internal/proxy.
+				{Spec: "console.anthropic.com:443", Why: "the OAuth token endpoint a subscription login refreshes against"},
 			},
 		},
 		{
