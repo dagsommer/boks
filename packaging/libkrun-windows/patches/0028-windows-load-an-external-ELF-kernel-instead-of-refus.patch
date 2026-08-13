@@ -1,0 +1,232 @@
+From 91dd9235eda4c053e970d166667594229023c7d1 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 17:33:41 +0200
+Subject: [PATCH 28/28] windows: load an external ELF kernel instead of
+ refusing
+
+`krun_start_enter` on Windows failed with -EINVAL and
+KernelLoaderUnavailable("loading an external kernel image") before a WHP
+partition was ever created: build_microvm calls load_payload before
+setup_vm, and Payload::ExternalKernel was a stub.
+
+That stub was not a corner case. `krun_set_kernel` is the only way a
+caller supplies a kernel to a Windows build -- there is no libkrunfw DLL
+in this configuration -- and on x86_64 it produces Payload::KernelCopy
+only for format 0 (Raw), which krun_set_kernel maps as a bundled kernel.
+Format 1 (Elf), which is what containerd's nerdbox passes on x86_64,
+produces Payload::ExternalKernel. So the only load path Windows
+supported and the only one its callers use were disjoint.
+
+Route the ELF format through kernel::loader::elf. Everything the 64-bit
+boot protocol needs already exists on this path and is unchanged: the
+command line is written to CMDLINE_START by load_cmdline, the zero page
+by arch::x86_64::configure_64bit_boot with cmd_line_ptr, the e820 map
+and any ramdisk, and regs::setup_regs enters the guest in long mode at
+e_entry with RSI pointing at the zero page. Only the segment copy and
+the entry address were missing.
+
+pvh is reported as false unconditionally. arch::x86_64::configure_pvh is
+Linux-only, so a `true` would make configure_system skip *all* boot
+configuration and hand the guest an unwritten zero page; and setup_regs
+on WHP always enters in long mode, which is not what a PVH entry point
+expects. A kernel carrying the PVH note still boots, through startup_64
+like a kernel without one -- it just does not take the same path Linux
+would take for that image.
+
+The other formats stay refused, now with KernelFormatUnsupported.
+KernelFormat::Raw cannot reach here on x86_64, and the three compressed
+Image variants decompress to ELF and could use the same loader, but
+nothing on Windows produces them and an untested decompression path is
+worse than a clear refusal.
+
+The initramfs load, which is identical on both paths, moves into a
+shared helper.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/vmm/Cargo.toml     |  4 +-
+ src/vmm/src/builder.rs | 99 +++++++++++++++++++++++++-----------------
+ 2 files changed, 60 insertions(+), 43 deletions(-)
+
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index 9d3953f..f94bbcc 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -57,8 +57,8 @@ cpuid = { package = "krun-cpuid", version = "=0.1.0-2.0.0-dev", path = "../cpuid
+ # linux-loader depends on vm-memory *with default features*, and vm-memory's default `rawfd`
+ # feature raises a `compile_error!` on Windows targets. Because Cargo unifies features across the
+ # whole graph, merely having linux-loader in the Windows dependency tree breaks the build, so it
+-# is excluded there — the same workaround krun-arch already applies. The Windows kernel loading
+-# path has to be provided separately; see the note in builder.rs.
++# is excluded there — the same workaround krun-arch already applies. Windows loads an external
++# ELF kernel with `kernel::loader::elf` instead; see `load_external_kernel` in builder.rs.
+ [target.'cfg(not(target_os = "windows"))'.dependencies]
+ linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
+ 
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index 9ea1f7f..49d6025 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -44,7 +44,6 @@ use crate::resources::{
+     VmResources,
+ };
+ use crate::vmm_config::external_kernel::ExternalKernel;
+-#[cfg(not(target_os = "windows"))]
+ use crate::vmm_config::external_kernel::KernelFormat;
+ #[cfg(feature = "net")]
+ use crate::vmm_config::net::NetBuilder;
+@@ -161,6 +160,9 @@ pub enum StartMicrovmError {
+     /// Cannot load the kernel into the VM.
+     #[cfg(not(target_os = "windows"))]
+     ElfLoadKernel(linux_loader::loader::Error),
++    /// Cannot load the kernel into the VM.
++    #[cfg(target_os = "windows")]
++    ElfLoadKernel(kernel::loader::Error),
+     /// The firmware can't be loaded into the provided memory address.
+     FirmwareInvalidAddress(vm_memory::GuestMemoryError),
+     /// Cannot read firmware contents from file.
+@@ -208,15 +210,6 @@ pub enum StartMicrovmError {
+     KernelDoesNotFit(u64, usize),
+     /// The supplied kernel format is not supported.
+     KernelFormatUnsupported,
+-    /// Loading a kernel is not implemented on this host yet.
+-    ///
+-    /// Every kernel-loading path libkrun has -- ELF/bzImage parsing for an external kernel, and
+-    /// the zero-copy `MmapRegion::build_raw` injection plus PVH boot configurator for a bundled
+-    /// one -- goes through `linux-loader` and the Unix `vm-memory` backend, neither of which
+-    /// builds for Windows. Only the "copy the bundled kernel into guest RAM" path exists there;
+-    /// see `load_payload`.
+-    #[cfg(target_os = "windows")]
+-    KernelLoaderUnavailable(&'static str),
+     /// Cannot load command line string.
+     LoadCommandline(kernel::cmdline::Error),
+     /// The start command was issued more than once.
+@@ -305,7 +298,6 @@ impl Display for StartMicrovmError {
+             ElfOpenKernel(ref err) => {
+                 write!(f, "Cannot open the file containing the kernel code: {err}")
+             }
+-            #[cfg(not(target_os = "windows"))]
+             ElfLoadKernel(ref err) => {
+                 write!(f, "Cannot load the kernel into the VM: {err}")
+             }
+@@ -395,12 +387,6 @@ impl Display for StartMicrovmError {
+             KernelFormatUnsupported => {
+                 write!(f, "The supplied kernel format is not supported.")
+             }
+-            #[cfg(target_os = "windows")]
+-            KernelLoaderUnavailable(what) => write!(
+-                f,
+-                "{what} is not implemented on Windows: libkrun's kernel loading is built on \
+-                 linux-loader, which does not build for Windows targets"
+-            ),
+             LoadCommandline(ref err) => {
+                 let mut err_msg = format!("{err}");
+                 err_msg = err_msg.replace('\"', "");
+@@ -1298,26 +1284,70 @@ pub fn build_microvm(
+     Ok(vmm)
+ }
+ 
+-/// Loading a caller-supplied kernel image is not available on Windows.
++/// Loads a caller-supplied kernel image on Windows.
+ ///
+-/// Every format libkrun accepts here (ELF, bzImage, and the compressed variants) is decoded by
+-/// `linux-loader`, which is excluded from the Windows dependency tree -- see the note on the
+-/// dependency in `src/vmm/Cargo.toml`. This reports the gap rather than pretending to load
+-/// something; the bundled-kernel path in `load_payload` is what works on Windows today.
++/// Only `KernelFormat::Elf` is accepted. `KernelFormat::Raw` never reaches here on x86_64 --
++/// `krun_set_kernel` turns it into a bundled kernel -- and the three compressed `Image` formats
++/// decompress to ELF, so they could route through the same loader, but nothing on Windows
++/// produces them and an untested decompression path is worse than a clear refusal.
++///
++/// Unlike the Unix path this never reports PVH, so the guest is always entered through the
++/// 64-bit boot protocol at `e_entry` (`startup_64`) with the zero page `configure_system` writes.
++/// Two reasons: `arch::x86_64::configure_pvh` is Linux-only, so a `true` here would silently skip
++/// *all* boot configuration; and `regs::setup_regs` on WHP always enters in long mode, which is
++/// not what a PVH entry point expects. A kernel that carries the PVH ELF note still boots -- the
++/// note is additional to `startup_64`, not a replacement -- it just boots the same way a kernel
++/// without the note does.
+ #[cfg(target_os = "windows")]
+ fn load_external_kernel(
+-    _guest_mem: &GuestMemoryMmap,
+-    _arch_mem_info: &ArchMemoryInfo,
+-    _external_kernel: &ExternalKernel,
++    guest_mem: &GuestMemoryMmap,
++    arch_mem_info: &ArchMemoryInfo,
++    external_kernel: &ExternalKernel,
+ ) -> std::result::Result<
+     (GuestAddress, Option<InitrdConfig>, Option<String>, bool),
+     StartMicrovmError,
+ > {
+-    Err(StartMicrovmError::KernelLoaderUnavailable(
+-        "loading an external kernel image",
++    if !matches!(external_kernel.format, KernelFormat::Elf) {
++        return Err(StartMicrovmError::KernelFormatUnsupported);
++    }
++
++    let mut file = File::options()
++        .read(true)
++        .write(false)
++        .open(external_kernel.path.clone())
++        .map_err(StartMicrovmError::ElfOpenKernel)?;
++    let entry_addr = kernel::loader::elf::load_elf(guest_mem, &mut file)
++        .map_err(StartMicrovmError::ElfLoadKernel)?;
++
++    debug!("load_external_kernel: 0x{:x}", entry_addr.0);
++
++    Ok((
++        entry_addr,
++        load_initramfs(guest_mem, arch_mem_info, external_kernel)?,
++        external_kernel.cmdline.clone(),
++        false,
+     ))
+ }
+ 
++fn load_initramfs(
++    guest_mem: &GuestMemoryMmap,
++    arch_mem_info: &ArchMemoryInfo,
++    external_kernel: &ExternalKernel,
++) -> std::result::Result<Option<InitrdConfig>, StartMicrovmError> {
++    let Some(initramfs_path) = &external_kernel.initramfs_path else {
++        return Ok(None);
++    };
++
++    let data = std::fs::read(initramfs_path).map_err(StartMicrovmError::InitrdRead)?;
++    guest_mem
++        .write(&data, GuestAddress(arch_mem_info.initrd_addr))
++        .unwrap();
++    Ok(Some(InitrdConfig {
++        address: GuestAddress(arch_mem_info.initrd_addr),
++        size: data.len(),
++    }))
++}
++
+ #[cfg(not(target_os = "windows"))]
+ fn load_external_kernel(
+     guest_mem: &GuestMemoryMmap,
+@@ -1457,22 +1487,9 @@ fn load_external_kernel(
+ 
+     debug!("load_external_kernel: 0x{:x}", entry_addr.0);
+ 
+-    let initrd_config = if let Some(initramfs_path) = &external_kernel.initramfs_path {
+-        let data = std::fs::read(initramfs_path).map_err(StartMicrovmError::InitrdRead)?;
+-        guest_mem
+-            .write(&data, GuestAddress(arch_mem_info.initrd_addr))
+-            .unwrap();
+-        Some(InitrdConfig {
+-            address: GuestAddress(arch_mem_info.initrd_addr),
+-            size: data.len(),
+-        })
+-    } else {
+-        None
+-    };
+-
+     Ok((
+         entry_addr,
+-        initrd_config,
++        load_initramfs(guest_mem, arch_mem_info, external_kernel)?,
+         external_kernel.cmdline.clone(),
+         pvh,
+     ))
+-- 
+2.53.0
+
