@@ -230,11 +230,13 @@ func (f *policyFlags) resolveCredentials(ctx context.Context, stderr io.Writer) 
 		store = nil
 	}
 	if store == nil && asked {
-		// The flags name a credential and there is no store to read it from. Fail with
-		// the message that says which variable is missing.
+		// The flags name a credential and there is no passphrase to read one with.
+		// openSecretStore's refusal is the message that names the missing variable, so
+		// it is asked for rather than restated here.
 		if _, err := openSecretStore(""); err != nil {
 			return credentialPlan{}, nil, err
 		}
+		return credentialPlan{}, nil, fmt.Errorf("credential rules need the secret store, but it is not available")
 	}
 
 	plan, err := f.planCredentials(store)
