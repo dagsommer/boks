@@ -79,6 +79,7 @@ type sandboxFlags struct {
 	memory      string
 	name        string
 	cpus        int
+	clone       bool
 	env         []string
 	annotations []string
 }
@@ -87,6 +88,7 @@ func registerSandboxFlags(fs *pflag.FlagSet, dev *devFlags) *sandboxFlags {
 	f := &sandboxFlags{dev: dev}
 	fs.StringVarP(&f.image, "template", "t", "",
 		"OCI image for the guest root filesystem (default: the agent's image)")
+	fs.BoolVar(&f.clone, "clone", false, cloneFlagHelp)
 	fs.StringVarP(&f.memory, "memory", "m", "",
 		"guest memory, binary units (1024m, 8g) (default: half the host's, max 32g)")
 	fs.StringVar(&f.name, "name", "", "sandbox name (default: <agent>-<workspace directory>)")

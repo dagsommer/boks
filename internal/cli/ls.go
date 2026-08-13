@@ -59,22 +59,27 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-// writeTable renders the listing with sbx's columns.
+// writeTable renders the listing with sbx's columns, plus one Boks adds.
 //
 // PORTS is empty because nothing publishes ports yet. The column is still there: a listing
 // whose shape changes when a feature lands is a listing nobody can write a script against,
 // and an empty column says "none" where a missing one says nothing at all. Image, creation
 // time and the rest are in --json and 'boks inspect', which is where detail belongs.
+//
+// MODE is the addition, and it earns a column rather than a detail view because it answers
+// the one question a listing should not make anybody go and look up: whether the thing in
+// that row writes to the files on this machine. It sits next to WORKSPACE, which is the
+// directory the answer is about.
 func writeTable(w io.Writer, infos []sandbox.Info) {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(tw, "SANDBOX\tAGENT\tSTATUS\tPORTS\tWORKSPACE")
+	fmt.Fprintln(tw, "SANDBOX\tAGENT\tSTATUS\tPORTS\tMODE\tWORKSPACE")
 	for _, info := range infos {
 		status := info.Status
 		if info.Ephemeral {
 			status += " (ephemeral)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			info.Name, dash(info.Agent), status, "", dash(info.Workspace()))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			info.Name, dash(info.Agent), status, "", info.Filesystem.Mode, dash(info.Workspace()))
 	}
 	_ = tw.Flush()
 }
