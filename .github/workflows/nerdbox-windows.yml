@@ -1,0 +1,198 @@
+# Build nerdbox's shim for Windows with our patches applied, against a pinned upstream tree.
+#
+# Boks' container runtime is nerdbox, and its shim compiles for Windows today but cannot start
+# there: containerd's pkg/shim stubs six process-lifecycle functions with ErrNotImplemented,
+# and run() hits the first of them — setupSignals, at pkg/shim/shim.go:228 — before it looks at
+# the action argument. `packaging/nerdbox-windows/` holds the patches that get past that; this
+# workflow is what stops them from rotting. Read that README first — it explains what the
+# patches are, which one is an unmerged third-party pull request, and why they live here.
+#
+# The pin is `packaging/nerdbox/NERDBOX_REV`, shared with guest-image.yml rather than
+# duplicated. The guest kernel, the rootfs, and the shim that boots them have to come from one
+# nerdbox commit, and a SHA in two files eventually disagrees with itself.
+#
+# ubuntu-latest, not windows-latest — unlike the libkrun series, which needs MSVC and a native
+# runner. Go cross-compiles to windows/amd64 and windows/arm64 with no C toolchain involved
+# (nerdbox's shim is pure Go on Windows; the cgo paths are Linux-only), so a Linux runner
+# produces exactly the same PE a Windows runner would, faster and cheaper. If a future patch
+# introduces cgo on the Windows path, this assumption dies and the runner has to change.
+#
+# WHAT THIS JOB PROVES, AND WHAT IT DOES NOT. It proves the patch series still applies to the
+# pinned revision and still compiles into a PE executable for both Windows architectures. That
+# is enough to stop a merge that breaks the series or drifts the pin.
+#
+# It proves NOTHING about whether the shim runs. Nobody has started this shim on Windows. The
+# bug this whole directory exists to fix was invisible to a compiler — the unpatched shim built
+# perfectly and died at runtime in 118 ms — so a green run here is precisely the kind of
+# evidence that already failed to catch the problem once. Compiling a shim is not starting one.
+#
+# Triggers: only a change to the patches, the pin, or this file. Plus workflow_dispatch, for
+# when you want to know whether the series still applies to a nerdbox that has moved.
+name: nerdbox-windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/nerdbox-windows/**"
+      - "packaging/nerdbox/NERDBOX_REV"
+      - ".github/workflows/nerdbox-windows.yml"
+  pull_request:
+    paths:
+      - "packaging/nerdbox-windows/**"
+      - "packaging/nerdbox/NERDBOX_REV"
+      - ".github/workflows/nerdbox-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nerdbox-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - name: Read the pinned nerdbox revision
+        id: pin
+        run: |
+          set -euo pipefail
+          # Comments and blank lines stripped; the SHA is the one remaining line.
+          rev="$(grep -v '^[[:space:]]*#' boks/packaging/nerdbox/NERDBOX_REV | tr -d '[:space:]')"
+          case "$rev" in
+            [0-9a-f]*) ;;
+            *) echo "NERDBOX_REV does not contain a commit SHA: '$rev'" >&2; exit 1 ;;
+          esac
+          if [ "${#rev}" -ne 40 ]; then
+            echo "NERDBOX_REV must be a full 40-character SHA, got ${#rev} characters" >&2
+            exit 1
+          fi
+          echo "rev=$rev" >>"$GITHUB_OUTPUT"
+
+      # `fetch-depth: 0` because a pinned SHA is not necessarily reachable from the default
+      # branch tip that a shallow clone would fetch.
+      - uses: actions/checkout@v5
+        with:
+          repository: containerd/nerdbox
+          ref: ${{ steps.pin.outputs.rev }}
+          path: nerdbox
+          fetch-depth: 0
+
+      # `git apply`, not `git am`: `am` writes commits, and writing a commit needs a committer
+      # identity that a runner does not have — it fails with "empty ident name" before it ever
+      # looks at the patch. Nothing here needs the history, only the tree.
+      #
+      # No `--3way` and no fuzz. The revision is pinned, so the patches either apply exactly or
+      # the pin and the series have drifted apart, and a fuzzy application would hide precisely
+      # the breakage this job exists to find.
+      - name: Apply the Boks Windows patches
+        working-directory: nerdbox
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(../boks/packaging/nerdbox-windows/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "no patches found — packaging/nerdbox-windows/patches/ is empty" >&2
+            exit 1
+          fi
+          echo "Applying ${#patches[@]} patch(es) onto ${{ steps.pin.outputs.rev }}"
+          git apply --verbose "${patches[@]}"
+
+      # Read nerdbox's own go directive rather than pinning a version here. A shim built with a
+      # different Go than nerdbox expects is a variable we do not need, and `go-version-file`
+      # makes the pin move with the pin.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: nerdbox/go.mod
+          cache: false
+
+      - name: Record the toolchain
+        run: go version
+
+      # ---------------------------------------------------------------------------------
+      # The build. REQUIRED — if the series stops compiling, that is a regression and it
+      # should stop the merge.
+      #
+      # Both architectures: Boks targets windows/amd64 and windows/arm64, and patch 0002
+      # touches a file guarded by `//go:build windows` with no architecture condition, so an
+      # arm64-only break would otherwise go unseen.
+      #
+      # `-mod=vendor` is explicit rather than inferred. Patch 0001 edits a file under vendor/,
+      # and if the build ever silently switched to the module cache it would compile the
+      # UNPATCHED containerd and go green while proving nothing at all.
+      # ---------------------------------------------------------------------------------
+      - name: Build the shim for Windows
+        working-directory: nerdbox
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            echo "::group::GOOS=windows GOARCH=$arch"
+            GOOS=windows GOARCH="$arch" go build \
+              -o "_out/containerd-shim-nerdbox-v1-$arch.exe" \
+              ./cmd/containerd-shim-nerdbox-v1
+            echo "::endgroup::"
+          done
+          ls -l _out/
+
+      # The two-byte "MZ" check is not ceremony. `go build -o foo.exe` will happily produce a
+      # Linux ELF if GOOS leaks or is overridden, and the filename would not tell you. This
+      # asserts the artifact is actually a PE image.
+      - name: Assert the artifacts are PE executables
+        working-directory: nerdbox
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            f="_out/containerd-shim-nerdbox-v1-$arch.exe"
+            magic="$(head -c 2 "$f")"
+            if [ "$magic" != "MZ" ]; then
+              echo "$f is not a PE executable (magic '$magic', expected 'MZ')" >&2
+              exit 1
+            fi
+            echo "  $f: PE, $(wc -c <"$f") bytes"
+          done
+
+      # The patched shim must not fix Windows by breaking Linux. Patch 0002 changes a
+      # `//go:build windows` file, so this should be free — which is exactly why it is cheap
+      # to assert rather than assume.
+      - name: Build for Linux too, so the platform that works stays working
+        working-directory: nerdbox
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -euo pipefail
+          GOOS=linux GOARCH=amd64 go build ./...
+
+      # Uploaded so someone with a Windows machine can test the thing this job cannot: whether
+      # it starts. packaging/nerdbox-windows/README.md has the commands and what to look for.
+      - name: Upload the shim binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: containerd-shim-nerdbox-v1-windows
+          path: nerdbox/_out/*.exe
+          if-no-files-found: error
+
+      - name: Record what was built
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## nerdbox shim for Windows"
+            echo
+            echo "nerdbox \`${{ steps.pin.outputs.rev }}\` + \`packaging/nerdbox-windows/patches/\`."
+            echo
+            echo "The series applies and builds a PE executable for windows/amd64 and windows/arm64."
+            echo
+            echo "**This is compile-time evidence only.** The shim has never been started on"
+            echo "Windows. The unpatched shim compiled cleanly too and died at runtime in 118 ms;"
+            echo "a green run here would not have caught that. Download the artifact and run the"
+            echo "commands in \`packaging/nerdbox-windows/README.md\` to learn anything about"
+            echo "whether it works."
+          } >>"$GITHUB_STEP_SUMMARY"
