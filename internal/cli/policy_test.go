@@ -308,8 +308,12 @@ func TestSecretRoundTripThroughCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("secret ls: %v", err)
 	}
-	if strings.TrimSpace(out) != "github" {
-		t.Errorf("secret ls = %q, want just the name", out)
+	// The listing names the credential and where it goes — github is a service boks
+	// knows, so it resolves to the vendor's hosts and the variable the guest reads.
+	for _, want := range []string{"github", "key", "api.github.com", "GITHUB_TOKEN"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("secret ls = %q, want it to mention %q", out, want)
+		}
 	}
 	// There is no command that prints a value, so the only assertion available is that
 	// listing does not print one.
