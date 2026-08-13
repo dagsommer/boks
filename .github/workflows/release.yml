@@ -1,0 +1,226 @@
+# Build the boks binaries and packages for a release tag, and publish them.
+#
+# This workflow deliberately mirrors the shape of images.yml — resolve the version once,
+# build without a credential, publish with one — for the reason given on that file's `push`
+# job. Read it before reorganising this one. The two run on the same `v*` tag and take the
+# version from the same place (scripts/image-tag.sh, which reads internal/agent.ImageTag),
+# so the images published for a tag and the binary that resolves agents to them can never
+# be built against two different opinions of what the version is.
+#
+# What is built, and what is not:
+#
+#   darwin/arm64   the only verified platform. See docs/verification.md.
+#   linux/amd64    builds and passes its tests; no sandbox has ever been booted on Linux.
+#   linux/arm64    the same, plus .deb and .rpm for both Linux architectures.
+#
+#   darwin/amd64   not shipped. `boks doctor` hard-fails on Intel Macs with "no supported
+#                  hypervisor on amd64" and always will: libkrun uses Hypervisor.framework
+#                  in a configuration that needs Apple silicon.
+#   windows/amd64  not shipped. `GOOS=windows go build ./...` succeeds, and that is the
+#                  whole of it — libkrun has no Windows virtio-net backend, so a sandbox
+#                  cannot get the NIC Boks enforces policy on, and there is no VMM behind
+#                  the shim to boot one anyway. See docs/windows.md. A binary whose only
+#                  possible output is a refusal is worse than no binary: it makes the
+#                  platform look supported and moves the disappointment later. The Windows
+#                  answer today is the linux/amd64 build inside WSL2.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create a GitHub release (otherwise build only)"
+        type: boolean
+        default: false
+
+# Nothing at the top level gets more than read. Each job asks for what it needs.
+permissions:
+  contents: read
+
+env:
+  # Pinned rather than "stable": which compiler produced a released binary is a fact about
+  # that binary, and "whatever was newest that morning" is not a fact anyone can check.
+  GO_VERSION: "1.26.0"
+
+jobs:
+  # Resolve the version once, from internal/agent, and refuse a tag that disagrees with it.
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: resolve
+        run: echo "version=$(scripts/image-tag.sh)" >>"$GITHUB_OUTPUT"
+
+  # A tag whose tree does not pass its own tests must not become a release. This is the
+  # cheapest possible gate and it runs before anything is built.
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+      - run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change: $unformatted" >&2
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+
+  # The job that compiles. It holds no credential — `permissions` is read-only and there is
+  # no login or release step — so the worst a poisoned dependency in the module graph can do
+  # is produce a bad artifact. It cannot publish it, and there is no token here worth
+  # stealing. This is the same split images.yml makes, for the same reason.
+  #
+  # One runner for every target, unlike images.yml: nothing in Boks uses cgo, so these are
+  # ordinary cross-compilations and a native runner per architecture would buy nothing. The
+  # arm64 .deb and .rpm are built here too, since both formats are just archives of files
+  # that were produced somewhere else.
+  build:
+    needs: [version, check]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      # The default shallow checkout is enough: build-release.sh takes SOURCE_DATE_EPOCH
+      # from `git log -1`, which the tip commit satisfies.
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      - name: Build the tarball
+        run: scripts/build-release.sh "${{ matrix.goos }}" "${{ matrix.goarch }}" "${{ needs.version.outputs.version }}"
+
+      - name: Build the Linux packages
+        if: matrix.goos == 'linux'
+        run: |
+          set -euo pipefail
+          # rpm ships rpmbuild; dpkg-deb is already on the runner. Distribution tools, not
+          # a packaging binary downloaded from somewhere.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm
+          scripts/package-linux.sh "${{ matrix.goarch }}" "${{ needs.version.outputs.version }}"
+
+      - name: Check the artifacts against their own checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for sum in *.sha256; do sha256sum -c "$sum"; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 7
+          compression-level: 0 # tarballs, debs and rpms are already compressed
+
+  # The job that holds the credential. It compiles nothing and runs no third-party code: it
+  # downloads what `build` produced, re-verifies every checksum, and creates a release.
+  # Keeping it separate is the whole point — `contents: write` never coexists with a
+  # compiler and someone else's module graph in the same runner.
+  publish:
+    needs: [version, build]
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # sign the provenance attestation
+      attestations: write # record it
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Re-verify every checksum, then join them into one SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # The per-file sums were written next to each artifact by the build job. Checking
+          # them here proves the bytes that will be published are the bytes that were built,
+          # rather than trusting the artifact upload to have been lossless.
+          for sum in *.sha256; do sha256sum -c "$sum"; done
+          rm -f -- *.sha256
+          sha256sum -- * | sort -k2 >SHA256SUMS
+          cat SHA256SUMS
+
+      # Lets anyone run `gh attestation verify <file> --repo dagsommer/boks` and learn which
+      # workflow, at which commit, produced the file they downloaded. Asking people to run
+      # something that boots VMs on their machine and offering them no way to check where it
+      # came from would be a poor trade.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.version.outputs.version) }}
+        run: |
+          set -euo pipefail
+          # A manually dispatched publish has not been through the tag-versus-constant gate
+          # — that only fires on a tag ref — and did not build the agent images, which
+          # images.yml publishes on the same tag. So it produces a draft for a human to
+          # look at, never a release people can install.
+          draft=()
+          [ "${GITHUB_REF_TYPE:-}" = tag ] || draft=(--draft)
+          notes="$(mktemp)"
+          cat >"$notes" <<'EOF'
+          ## Install
+
+          See [docs/install.md](https://github.com/dagsommer/boks/blob/main/docs/install.md).
+          Read it before downloading: a `boks` binary on its own cannot start a sandbox, and
+          the document says exactly what else each platform needs.
+
+          Run `boks doctor` first. It checks every prerequisite and prints what to do about
+          each gap.
+
+          ## Platforms
+
+          | Artifact | State |
+          |---|---|
+          | `darwin_arm64` | The verified platform. The VM boundary and the network policy were both measured here — see [docs/verification.md](https://github.com/dagsommer/boks/blob/main/docs/verification.md). |
+          | `linux_amd64`, `linux_arm64` | Build and pass their tests. **No sandbox has ever been booted on Linux.** |
+          | `.deb`, `.rpm` | The CLI only. Neither can install containerd 2.2+ or nerdbox, because no distribution packages them at a usable version. |
+
+          There is no Windows binary, and no Intel macOS binary. Neither can start a sandbox;
+          see the comment at the top of `.github/workflows/release.yml` for why shipping one
+          anyway would be worse than shipping none.
+
+          ## Verifying what you downloaded
+
+          ```
+          sha256sum -c SHA256SUMS --ignore-missing
+          gh attestation verify <file> --repo dagsommer/boks
+          ```
+          EOF
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "boks $VERSION" \
+            --notes-file "$notes" \
+            "${draft[@]}" \
+            dist/*
