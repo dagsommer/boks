@@ -349,6 +349,119 @@ set `HTTP_PROXY` and share the CA into the sandbox — see the checks above — 
 exercised any of it. What is demonstrated here is the host-side mechanism, driven by a real
 client over real TLS.
 
+## The real Claude Code login flow, observed
+
+*(2026-08-13, Linux host, no hypervisor. `docker run` against the `boks/claude` image, which
+carries the vendor's own native binary — **this says nothing about isolation** and is not
+offered as evidence about it. It is evidence about one thing only: what that binary does.)*
+
+The question that had to be settled before building anything was **how the agent's login
+completes**, because the two common shapes behave very differently in a sandbox. A
+paste-a-code flow works in a sandbox today. A localhost-redirect flow — where the CLI listens
+on `127.0.0.1:PORT` for a callback delivered to a browser on the *host* — would be a hard
+dependency on port publishing, which Boks does not have and sbx does.
+
+**Claude Code 2.1.228 uses paste-a-code, and needs no listener.** Run headless it prints:
+
+```
+Opening browser to sign in…
+If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true
+  &client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code
+  &redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback
+  &scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code…
+  &code_challenge=…&code_challenge_method=S256&state=…
+Paste code here if prompted >
+```
+
+The `redirect_uri` is a vendor-hosted page, not a loopback address, and `code=true` selects
+the paste flow. The binary contains no loopback OAuth callback of any kind. **So acquisition
+does not depend on port publishing.**
+
+Driven to completion against a stand-in origin — a throwaway CA, a container network alias
+for `platform.claude.com`, the code typed at the prompt — the flow finished with
+`Login successful.` and produced exactly two requests, verbatim:
+
+```
+POST /v1/oauth/token HTTP/1.1        Host: platform.claude.com
+Content-Type: application/json       User-Agent: axios/1.15.2
+
+{"grant_type":"authorization_code","code":"probe-authorization-code-1234",
+ "redirect_uri":"https://platform.claude.com/oauth/code/callback",
+ "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+ "code_verifier":"fnmobOUy9ZQMzkQ4AcBob5gEpToa84YY8aA7-9Zm5E0","state":"T68KI1cPJMv…"}
+
+POST /v1/oauth/token HTTP/1.1        Host: platform.claude.com
+Content-Type: application/json       User-Agent: axios/1.15.2
+
+{"grant_type":"refresh_token","refresh_token":"sk-ant-ort01-REAL-REFRESH-TOKEN-FROM-THE-ORIGIN",
+ "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+ "scope":"user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"}
+```
+
+Four things follow, and all of them are load-bearing:
+
+1. **The endpoint is `platform.claude.com/v1/oauth/token`.** `console.anthropic.com` does not
+   appear anywhere in the binary. The registry and the `claude-code` profile were corrected;
+   `internal/agent`'s allowlist has not been (it is outside this change) and still names the
+   old host, so a login through a sandbox needs `boks policy allow platform.claude.com:443`.
+2. **The exchange is a JSON `authorization_code` grant** — the shape the acquisition tests
+   replay.
+3. **The agent refreshes immediately after logging in**, on the same connection. Under Boks
+   the first is relayed and captured and the second is answered from sentinels, which is what
+   `TestAcquisitionHappensOnceAndThenTheEndpointIsAnswered` asserts.
+4. **Claude Code persists whatever the endpoint returned.** With a real pair in the response
+   it wrote, to `~/.claude/.credentials.json`:
+
+   ```
+   {"claudeAiOauth":{"accessToken":"sk-ant-oat01-REAL-ACCESS-TOKEN-FROM-THE-ORIGIN",
+    "refreshToken":"sk-ant-ort01-REAL-REFRESH-TOKEN-FROM-THE-ORIGIN","expiresAt":1786637683936,
+    "refreshTokenExpiresAt":1789200883275,"scopes":["user:inference","user:profile"],
+    "subscriptionType":null,"rateLimitTier":null}}
+   ```
+
+   That is the whole argument for masking the response rather than composing one: the file the
+   agent writes is a copy of what it was given. Give it sentinels and it stores sentinels.
+
+### The acquisition itself, through the proxy
+
+*(`go test -run TestOAuthLoginInsideTheSandboxIsKeptOnTheHost -v ./internal/proxy`)* — a
+simulated guest, a real proxy with a real CA, a real TLS origin. The origin's reply and the
+guest's differ in exactly two values:
+
+```
+the guest sent, and the origin received:
+{"grant_type":"authorization_code","code":"an-authorization-code",
+ "redirect_uri":"https://console.creds.test/oauth/code/callback","client_id":"public-client-id",
+ "code_verifier":"a-pkce-verifier","state":"a-state"}
+
+the origin answered:
+{"token_type":"Bearer","access_token":"sk-ant-oat01-MINTED-BY-THE-ORIGIN-CANARY",
+ "refresh_token":"sk-ant-ort01-MINTED-BY-THE-ORIGIN-CANARY","expires_in":28800,
+ "scope":"user:inference user:profile","account":{"email_address":"someone@example.test"},
+ "organization":{"name":"an org"}}
+
+the guest received:
+{"access_token":"sk-ant-oat01-boksproxymanaged-claude-code-accessipwDKRY5cjqxELSZ6dkryFMT07…",
+ "refresh_token":"sk-ant-ort01-boksproxymanaged-claude-code-refreshjqxELSZ6dkryFMT07elszGNU…",
+ "expires_in":28800,"scope":"user:inference user:profile","token_type":"Bearer",
+ "account":{"email_address":"someone@example.test"},"organization":{"name":"an org"}}
+```
+
+| Claim | Evidence |
+|---|---|
+| the guest's own exchange reached the origin | the origin received the authorization code and PKCE verifier byte for byte; boks could not have composed either |
+| the guest never receives a real token | neither canary appears in the body above; the test greps for both |
+| the origin's own shape survives | `scope`, `expires_in`, `token_type`, `account`, `organization` all present, which is what the agent copies into its credential file |
+| the host keeps the real pair | `store.LookupOAuth` returns both canaries and a non-zero expiry after the exchange |
+| the credential stops being relayable | the stored record is no longer `Pending`; a second exchange is answered, and the origin sees exactly one request |
+| no value reaches a log | the proxy's stderr and every decision are grepped for both tokens and both sentinels; the stderr does say `acquired the oauth credential claude-code from a login on …` |
+| a rejected login still reaches the agent | the origin's `400 invalid_grant` is passed through, and the stored credential is untouched so it can be retried |
+| masking is by value, not by field | a token echoed into an unnamed field, into an array, into prose, and used as an object key is replaced in all four (`internal/secret`) |
+| masking failure is a refusal | a sentinel constructed to contain the real token makes the exchange fail rather than answer (`TestAcquireRefusesWhenMaskingCannotSucceed`) |
+
+**Not verified:** no real login has ever run against Anthropic through a real sandbox. The
+shape being replayed is real; the run is not.
+
 ## What counts as evidence
 
 Weak evidence, do not rely on it:
