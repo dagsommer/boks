@@ -1,7 +1,7 @@
 From 1f9791bd46ac1c5f062e7b59fd9fbf10f8c38a94 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:35:48 +0200
-Subject: [PATCH 09/29] windows: keep the vsock/TSI C entry points exported,
+Subject: [PATCH 09/30] windows: keep the vsock/TSI C entry points exported,
  returning -ENOTSUP
 
 virtio-vsock and TSI live behind AF_UNIX/AF_INET sockets reached through raw
