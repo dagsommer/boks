@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -19,8 +20,19 @@ func TestTarRoundTripDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "sub", "nested.txt"), []byte("nested"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Creating a symlink on Windows needs SeCreateSymbolicLinkPrivilege, which an
+	// unelevated account only has with Developer Mode turned on. Where the privilege is
+	// there — every Unix, and a Windows box set up for it — the symlink half of the round
+	// trip is tested exactly as before; where it is not, the fixture cannot be built and
+	// the rest of the archive is still worth checking. Any other operating system failing
+	// to make a symlink is a real failure and stays fatal.
+	symlinked := true
 	if err := os.Symlink("top.txt", filepath.Join(src, "link")); err != nil {
-		t.Fatal(err)
+		if runtime.GOOS != "windows" {
+			t.Fatal(err)
+		}
+		symlinked = false
+		t.Logf("not testing symlinks: this account cannot create one (%v)", err)
 	}
 
 	info, err := os.Lstat(src)
@@ -46,13 +58,26 @@ func TestTarRoundTripDirectory(t *testing.T) {
 	if string(got) != "nested" {
 		t.Errorf("nested.txt = %q, want %q", got, "nested")
 	}
-	if target, err := os.Readlink(filepath.Join(dest, "renamed", "link")); err != nil || target != "top.txt" {
-		t.Errorf("symlink = %q, %v; want top.txt", target, err)
+	if symlinked {
+		if target, err := os.Readlink(filepath.Join(dest, "renamed", "link")); err != nil || target != "top.txt" {
+			t.Errorf("symlink = %q, %v; want top.txt", target, err)
+		}
 	}
-	if info, err := os.Stat(filepath.Join(dest, "renamed", "sub", "nested.txt")); err != nil {
+	info, err = os.Stat(filepath.Join(dest, "renamed", "sub", "nested.txt"))
+	if err != nil {
 		t.Fatal(err)
-	} else if info.Mode().Perm() != 0o600 {
-		t.Errorf("mode = %v, want 0600 preserved", info.Mode().Perm())
+	}
+	// `boks cp` carrying 0600 out of a sandbox and landing it 0644 on the host would
+	// disclose a file the guest kept private, so the mode is part of what the archive
+	// round-trips. Windows has no POSIX mode to round-trip to: NTFS stores an ACL, and
+	// os.FileMode reports 0666 for any writable file, so the extracted file's real
+	// readability comes from the ACL it inherits from the destination directory. Boks
+	// neither sets nor checks that ACL — an open gap, recorded in docs/windows.md, that
+	// this guard makes visible rather than closes.
+	if runtime.GOOS != "windows" {
+		if info.Mode().Perm() != 0o600 {
+			t.Errorf("mode = %v, want 0600 preserved", info.Mode().Perm())
+		}
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -459,8 +460,22 @@ func TestFileStoreIsEncryptedAndPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm&fs.FileMode(0o077) != 0 {
-		t.Errorf("permissions = %v, want owner-only", perm)
+	// The two halves of this file's defence are checked separately because only one of them
+	// survives the trip to Windows. The ciphertext checks above hold everywhere and are the
+	// half that still protects the secret if the file is copied off the machine. The mode is
+	// the half that keeps another local user from reading it at all, and it can only be
+	// stated on a POSIX filesystem: Windows keeps access control in the file's DACL, which
+	// os.FileMode does not carry — Go derives the mode from FILE_ATTRIBUTE_READONLY alone
+	// and reports 0666 for every writable file regardless of its ACL.
+	//
+	// This is narrowed rather than skipped so that Windows still runs the encryption
+	// assertions; what it does not run is left as a real gap. On Windows the store's
+	// readability by other users is whatever %LocalAppData% grants, which Boks does not set
+	// and nothing here verifies. See docs/windows.md.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm&fs.FileMode(0o077) != 0 {
+			t.Errorf("permissions = %v, want owner-only", perm)
+		}
 	}
 }
 
