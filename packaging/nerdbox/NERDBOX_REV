@@ -1,0 +1,7 @@
+# The containerd/nerdbox commit the guest kernel and rootfs are built from, and the one the
+# shim should be built from to match. Pinned rather than tracking main for the same reason
+# the libkrun pin is: the guest image and the shim that boots it have to agree, and "it broke
+# on a Tuesday" is not a useful failure mode.
+#
+# cd2c23f is v0.2.3 and, as of 2026-08-13, also the tip of main.
+cd2c23fe413cdea8176760d63375d3271aa7e611
