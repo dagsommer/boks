@@ -1,0 +1,49 @@
+From ea3bc6e773b2f11b94f14a5bc7ba180e5c753a52 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:11:25 +0200
+Subject: [PATCH 15/25] windows: let the epoll shim cross a thread boundary
+
+`Epoll` holds `entries: Vec<OVERLAPPED_ENTRY>`, and `OVERLAPPED_ENTRY` contains
+a raw `*mut OVERLAPPED`, so the derived auto-trait makes `Epoll` `!Send`. Device
+code that hands an epoll instance to a worker thread therefore cannot compile:
+`virtio::vsock::muxer_thread::MuxerThread::run()` spawns exactly such a thread.
+
+The `!Send` is an artefact, not a real constraint. `iocp` is an
+`Arc<CompletionPort>`, already `Send + Sync`. `entries` is private, cleared at
+the top of every `wait()`, filled by `GetQueuedCompletionStatusEx` and drained
+before that call returns, so it is never observed from two threads; the pointers
+it transiently holds are kernel-supplied completion keys and OVERLAPPED
+addresses, valid process-wide. Assert `Send` with that reasoning written down.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/utils/src/windows/epoll.rs | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/utils/src/windows/epoll.rs b/src/utils/src/windows/epoll.rs
+index d880cf0..b9e26a9 100644
+--- a/src/utils/src/windows/epoll.rs
++++ b/src/utils/src/windows/epoll.rs
+@@ -214,6 +214,19 @@ pub struct Epoll {
+     entries: Vec<OVERLAPPED_ENTRY>,
+ }
+ 
++// SAFETY: `iocp` is an `Arc<CompletionPort>`, which is already `Send + Sync`.
++// `entries` is a private scratch buffer that only ever holds output written by
++// `GetQueuedCompletionStatusEx` inside `wait()`: it is filled and drained
++// within a single call, is never observed across threads, and is cleared at the
++// top of every `wait()`. The raw pointers it transiently contains are kernel-
++// supplied completion keys and OVERLAPPED addresses, both valid process-wide.
++//
++// This is needed because device code moves an `Epoll` into a worker thread --
++// `virtio::vsock::muxer_thread::MuxerThread::run()` is one such caller -- which
++// the derived auto-trait forbids purely because `OVERLAPPED_ENTRY` contains a
++// raw pointer.
++unsafe impl Send for Epoll {}
++
+ impl Clone for Epoll {
+     fn clone(&self) -> Self {
+         Epoll {
+-- 
+2.53.0
+

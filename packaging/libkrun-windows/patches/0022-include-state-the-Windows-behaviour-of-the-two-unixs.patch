@@ -1,0 +1,49 @@
+From 522da4b8fa54b0ae2d682edf26c4e448cf024ebc Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:30:14 +0200
+Subject: [PATCH 22/25] include: state the Windows behaviour of the two
+ unixstream/unixgram entries
+
+The header is the contract consumers compile against, and both functions now
+behave differently on Windows: unixgram always returns -ENOTSUP because the
+platform has no AF_UNIX datagram socket, and unixstream takes only the path
+form because an `int` cannot carry a Winsock SOCKET. Neither is discoverable
+from the signature.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ include/libkrun.h | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/include/libkrun.h b/include/libkrun.h
+index aa40cdf..9de15ff 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -339,6 +339,10 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
+  * If no network devices are added, networking uses the TSI backend.
+  * This function should be called before krun_set_port_map.
+  *
++ * On Windows only the "c_path" form is supported. A Winsock SOCKET is a
++ * pointer-sized handle rather than an "int", and a CRT file descriptor is
++ * not a socket, so a non-negative "fd" is refused with -ENOTSUP.
++ *
+  * Returns:
+  *  Zero on success or a negative error number on failure.
+  */
+@@ -383,6 +387,13 @@ int32_t krun_add_net_unixstream(uint32_t ctx_id,
+  * If using gvproxy in vfkit mode, NET_FLAG_VFKIT must be passed in
+  * "flags" when using "c_path" to indicate the connection endpoint.
+  *
++ * This backend does not exist on Windows, whose AF_UNIX implements only
++ * SOCK_STREAM and has no datagram socket type at all. The symbol stays
++ * exported there so that loading krun.dll does not fail, and every call
++ * returns -ENOTSUP. Use krun_add_net_unixstream() instead: its 4-byte
++ * big-endian length prefix carries the frame boundaries a datagram
++ * socket would have carried for free.
++ *
+  * Returns:
+  *  Zero on success or a negative error number on failure.
+  */
+-- 
+2.53.0
+

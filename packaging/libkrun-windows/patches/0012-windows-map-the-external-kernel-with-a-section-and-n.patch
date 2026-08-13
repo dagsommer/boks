@@ -1,0 +1,194 @@
+From 3c78b84617454d308f9e81335f3338f40f3029e7 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:41:13 +0200
+Subject: [PATCH 12/25] windows: map the external kernel with a section, and
+ name the krunfw DLL
+
+Three loose ends, and libkrun type-checks for x86_64-pc-windows-msvc after
+them.
+
+map_kernel() handled the raw-x86_64 kernel by mmap'ing it read-only and handing
+the address to the VMM as a KernelBundle. CreateFileMappingW plus MapViewOfFile
+is the same operation: file-backed, read-only, whole file, address chosen by
+the OS, page-aligned, and outliving the handle it was made from. Both spellings
+move behind map_file_readonly() so the two platforms differ only in the mapping
+call. The mapping is never torn down on either side, which is what the VMM
+requires -- the guest reads that memory for as long as it runs.
+
+KRUNFW_NAME gains the versioned-DLL spelling. No libkrunfw is built for Windows
+today, so the load will fail; that is not fatal, because the bundled kernel is
+only consulted when the caller supplied neither an external kernel nor firmware,
+and Windows callers pass a kernel path to krun_set_kernel(). Naming it keeps the
+diagnostic legible instead of leaving a bare cfg hole.
+
+krun_get_shutdown_eventfd() returns int32_t, which cannot carry a HANDLE.
+krun_create_ctx() only builds a shutdown eventfd on macOS/aarch64, so the arm is
+unreachable, but truncating a handle to fit would hand back a plausible-looking
+bogus value -- return -ENOTSUP instead.
+---
+ src/libkrun/src/lib.rs | 113 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 98 insertions(+), 15 deletions(-)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index b6a3b65..e7f2e7d 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -43,8 +43,6 @@ use utils::eventfd::EventFd;
+ #[cfg(target_os = "macos")]
+ use utils::pollable_channel::PollableChannelSender;
+ #[cfg(target_os = "windows")]
+-use utils::windows::AsRawFd;
+-#[cfg(target_os = "windows")]
+ use utils::windows::SendHandle;
+ #[cfg(target_os = "macos")]
+ use vmm::VmCtl;
+@@ -110,6 +108,14 @@ const KRUNFW_NAME: &str = "libkrunfw-sev.so.5";
+ const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
+ #[cfg(target_os = "macos")]
+ const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
++// The versioned-DLL spelling of the same name. No libkrunfw is built for Windows today, so this
++// load is expected to fail; that is not fatal, because the bundled kernel is only consulted when
++// the caller supplied neither an external kernel nor a firmware image, and Windows callers are
++// expected to pass a kernel path to krun_set_kernel(). Naming the library anyway keeps the
++// failure legible ("Couldn't find or load ...") and means a future Windows libkrunfw drops in
++// without further changes here.
++#[cfg(target_os = "windows")]
++const KRUNFW_NAME: &str = "libkrunfw-5.dll";
+ 
+ #[cfg(feature = "aws-nitro")]
+ static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
+@@ -189,6 +195,8 @@ struct ContextConfig {
+     vmr: VmResources,
+     #[cfg(feature = "aws-nitro")]
+     nitro: NitroConfig,
++    // Read when refusing a TSI port map after a NIC has been added, and when naming interfaces.
++    #[cfg(any(unix, feature = "net"))]
+     net_index: u8,
+     #[cfg(unix)]
+     tsi_port_map: Option<HashMap<u16, u16>>,
+@@ -1946,6 +1954,20 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
+                 return efd.get_write_fd();
+                 #[cfg(target_os = "linux")]
+                 return efd.as_raw_fd();
++                // The shutdown eventfd is handed back as an int32_t, which cannot carry a
++                // Windows HANDLE, and truncating one to fit would hand the caller a value that
++                // looks valid and is not. krun_create_ctx() never creates a shutdown eventfd
++                // outside macOS/aarch64, so this arm is unreachable today; keep it explicit
++                // rather than leave the ABI mismatch to be discovered later.
++                #[cfg(target_os = "windows")]
++                {
++                    let _ = efd;
++                    error!(
++                        "krun_get_shutdown_eventfd is not supported on Windows: an int32_t \
++                         cannot represent a HANDLE"
++                    );
++                    return -libc::ENOTSUP;
++                }
+             } else {
+                 -libc::EINVAL
+             }
+@@ -2129,6 +2151,74 @@ fn create_virtio_net(
+         .expect("Failed to create network interface");
+ }
+ 
++/// Maps the whole of `file` read-only into this process and returns the host address of the
++/// mapping, or `None` if the mapping could not be established.
++///
++/// The mapping is deliberately never torn down. Its address is handed to the VMM as a
++/// `KernelBundle`, which the guest reads from for as long as the VM lives.
++#[cfg(all(unix, target_arch = "x86_64", not(feature = "tee")))]
++fn map_file_readonly(file: &File, size: u64) -> Option<*mut c_void> {
++    // Safe because this asks for a fresh mapping of a file we just opened for reading, and the
++    // kernel picks the address.
++    let addr = unsafe {
++        libc::mmap(
++            std::ptr::null_mut(),
++            size as usize,
++            libc::PROT_READ,
++            libc::MAP_SHARED,
++            file.as_raw_fd(),
++            0_i64,
++        )
++    };
++    if std::ptr::eq(addr, libc::MAP_FAILED) {
++        None
++    } else {
++        Some(addr)
++    }
++}
++
++/// See the Unix variant above. A section plus a mapped view is the Windows spelling of the same
++/// read-only, file-backed mapping: passing zero for both the maximum size and the byte count
++/// maps the file in its entirety, and the view is page-aligned because views are handed out at
++/// the (coarser) allocation granularity.
++///
++/// The section handle is closed immediately. A mapped view keeps the section alive by itself,
++/// just as an mmap outlives the descriptor it was made from.
++#[cfg(all(windows, target_arch = "x86_64", not(feature = "tee")))]
++fn map_file_readonly(file: &File, _size: u64) -> Option<*mut c_void> {
++    use std::os::windows::io::AsRawHandle;
++    use windows_sys::Win32::Foundation::CloseHandle;
++    use windows_sys::Win32::System::Memory::{
++        CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY,
++    };
++
++    // Safe because `file` is open for reading and outlives this call.
++    let mapping = unsafe {
++        CreateFileMappingW(
++            file.as_raw_handle(),
++            std::ptr::null(),
++            PAGE_READONLY,
++            0,
++            0,
++            std::ptr::null(),
++        )
++    };
++    if mapping.is_null() {
++        return None;
++    }
++
++    // Safe because `mapping` is the section handle created just above.
++    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) };
++    // Safe because nothing else holds this handle, and the view is unaffected by closing it.
++    unsafe { CloseHandle(mapping) };
++
++    if view.Value.is_null() {
++        None
++    } else {
++        Some(view.Value)
++    }
++}
++
+ #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+ fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
+     let file = match File::options().read(true).write(false).open(kernel_path) {
+@@ -2141,20 +2231,13 @@ fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
+ 
+     let kernel_size = file.metadata().unwrap().len();
+ 
+-    let kernel_host_addr = unsafe {
+-        libc::mmap(
+-            std::ptr::null_mut(),
+-            kernel_size as usize,
+-            libc::PROT_READ,
+-            libc::MAP_SHARED,
+-            file.as_raw_fd(),
+-            0_i64,
+-        )
+-    };
+-    if std::ptr::eq(kernel_host_addr, libc::MAP_FAILED) {
+-        error!("Can't load kernel into process map");
++    let Some(kernel_host_addr) = map_file_readonly(&file, kernel_size) else {
++        error!(
++            "Can't load kernel into process map: {}",
++            std::io::Error::last_os_error()
++        );
+         return -libc::EINVAL;
+-    }
++    };
+ 
+     let kernel_bundle = KernelBundle {
+         host_addr: kernel_host_addr as u64,
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 0b0df81ac35465951aa63bfa4a9ab9339c053b66 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:23:55 +0200
-Subject: [PATCH 7/8] windows: wire the WHP backend through builder, lib and
+Subject: [PATCH 07/25] windows: wire the WHP backend through builder, lib and
  worker
 
 With the WHP vstate and MMIO manager in place, this connects them to the rest

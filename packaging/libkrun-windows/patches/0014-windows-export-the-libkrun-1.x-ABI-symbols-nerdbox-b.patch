@@ -1,0 +1,205 @@
+From a824b762e0be2af3dad9a3ad0d23e4ae7983471b Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:55:49 +0200
+Subject: [PATCH 14/25] windows: export the libkrun 1.x ABI symbols nerdbox
+ binds at load time
+
+containerd's nerdbox shim binds the libkrun 1.x C API. Its loader walks a
+binding struct with reflect and calls GetProcAddress() for every C:"..." tag
+eagerly, before any VM is configured; a missing export makes purego panic and
+the deferred recover() turns that into a failure to load the library at all.
+One absent symbol therefore costs the whole DLL, not one feature.
+
+Export the nine 1.x entry points that 2.0 removed -- krun_set_log_level,
+krun_set_root, krun_set_root_disk, krun_set_data_disk, krun_set_mapped_volumes,
+krun_set_passt_fd, krun_set_gvproxy_path, krun_set_net_mac and
+krun_set_snd_device -- returning -ENOTSUP and naming the 2.x replacement in the
+log, the same shape as the vsock/TSI entry points kept in 1f9791b.
+
+Signatures are copied verbatim from libkrun 1.x include/libkrun.h at v1.14.0
+and reproduced above each function. Arity and argument width matter more than
+behaviour here: under the Win64 convention a mismatched signature corrupts the
+caller's stack rather than failing cleanly.
+
+-ENOTSUP rather than success is deliberate. nerdbox binds three of these
+(krun_set_log_level, krun_set_gvproxy_path, krun_set_net_mac) with zero call
+sites and mentions the other six only in a comment, so nothing calls them
+today; a silent no-op would let some future caller believe it had configured a
+root filesystem or a MAC address and debug the consequences far from the cause.
+
+Gated to Windows: upstream dropped these from the 2.x ABI on every platform,
+and re-adding them to krun.so would convert a clean load failure on Unix into a
+deferred runtime error.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/libkrun/src/lib.rs | 153 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 153 insertions(+)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index e7f2e7d..f2e9fff 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -3324,6 +3324,159 @@ pub extern "C" fn krun_vm_resume(_ctx_id: u32) -> i32 {
+     -libc::ENOTSUP
+ }
+ 
++// ---------------------------------------------------------------------------
++// libkrun 1.x ABI compatibility shims (Windows only)
++// ---------------------------------------------------------------------------
++//
++// The entry points below were part of the libkrun 1.x C API and were removed in
++// 2.0. They exist here purely so that a consumer built against the 1.x ABI can
++// still *load* `krun.dll`.
++//
++// The motivating consumer is containerd's nerdbox shim. Its loader
++// (`internal/vm/libkrun/krun.go`, `openLibkrun`) walks a binding struct with
++// `reflect` and calls `syscall.GetProcAddress` for every `C:"..."` tag eagerly,
++// at load time, before any VM is configured. A missing export makes
++// `registerLibFunc` panic, and the deferred `recover()` turns that panic into a
++// load failure for the whole library. One absent symbol therefore means the DLL
++// cannot be opened at all -- not that one feature is unavailable.
++//
++// nerdbox never *calls* any of these: `krun_set_log_level`,
++// `krun_set_gvproxy_path` and `krun_set_net_mac` are bound but have zero call
++// sites, and the remaining six appear only in a documentation comment listing
++// the 1.x API surface. They are vestigial on both sides.
++//
++// Returning `-ENOTSUP` rather than `KRUN_SUCCESS` is deliberate. A silent
++// no-op would let a future caller believe it had configured a root filesystem,
++// a MAC address or a passt fd, and then debug the resulting misbehaviour
++// somewhere far from the cause. A named negative-errno gives that caller a
++// failure it can attribute, which is the same trade-off made for the
++// vsock/TSI entry points above.
++//
++// Signatures are taken verbatim from libkrun 1.x `include/libkrun.h` (v1.14.0,
++// the last 1.x release). They are reproduced above each function. Getting the
++// arity and argument widths right matters more than the behaviour: under the
++// Win64 calling convention a mismatched signature corrupts the caller's stack
++// instead of failing cleanly.
++//
++// These are gated to Windows. Upstream removed them from the 2.x ABI on every
++// platform, and re-adding them to `krun.so` would turn a clean load failure on
++// Unix into a deferred runtime error. Windows is the only platform where the
++// load-time compatibility problem is ours to solve.
++
++/// `int32_t krun_set_log_level(uint32_t level);`
++#[cfg(windows)]
++#[unsafe(no_mangle)]
++pub extern "C" fn krun_set_log_level(_level: u32) -> i32 {
++    error!(
++        "krun_set_log_level() was removed in libkrun 2.0 and is exported only for 1.x load-time \
++         ABI compatibility; use krun_init_log()"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_root(uint32_t ctx_id, const char *root_path);`
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_set_root(_ctx_id: u32, _c_root_path: *const c_char) -> i32 {
++    error!(
++        "krun_set_root() was removed in libkrun 2.0 and is exported only for 1.x load-time ABI \
++         compatibility; use krun_add_virtiofs3()"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_root_disk(uint32_t ctx_id, const char *disk_path);`
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_set_root_disk(_ctx_id: u32, _c_disk_path: *const c_char) -> i32 {
++    error!(
++        "krun_set_root_disk() was removed in libkrun 2.0 and is exported only for 1.x load-time \
++         ABI compatibility; use krun_add_disk2()"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_data_disk(uint32_t ctx_id, const char *disk_path);`
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_set_data_disk(_ctx_id: u32, _c_disk_path: *const c_char) -> i32 {
++    error!(
++        "krun_set_data_disk() was removed in libkrun 2.0 and is exported only for 1.x load-time \
++         ABI compatibility; use krun_add_disk2()"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_mapped_volumes(uint32_t ctx_id, const char *const mapped_volumes[]);`
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_set_mapped_volumes(
++    _ctx_id: u32,
++    _c_mapped_volumes: *const *const c_char,
++) -> i32 {
++    error!(
++        "krun_set_mapped_volumes() was removed in libkrun 2.0 and is exported only for 1.x \
++         load-time ABI compatibility"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_passt_fd(uint32_t ctx_id, int fd);`
++#[cfg(windows)]
++#[unsafe(no_mangle)]
++pub extern "C" fn krun_set_passt_fd(_ctx_id: u32, _fd: c_int) -> i32 {
++    error!(
++        "krun_set_passt_fd() was removed in libkrun 2.0 and is exported only for 1.x load-time \
++         ABI compatibility; use krun_add_net_unixstream()"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_gvproxy_path(uint32_t ctx_id, char *c_path);`
++///
++/// Note the pointee is non-const in the 1.x header. Kept as-is so the
++/// declaration a 1.x consumer compiled against matches byte for byte.
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_set_gvproxy_path(_ctx_id: u32, _c_path: *mut c_char) -> i32 {
++    error!(
++        "krun_set_gvproxy_path() was removed in libkrun 2.0 and is exported only for 1.x \
++         load-time ABI compatibility; use krun_add_net_unixgram()"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);`
++///
++/// `uint8_t *const` is a const *pointer* to mutable bytes, which is `*mut u8`
++/// on the Rust side; the top-level `const` has no bearing on the ABI.
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_set_net_mac(_ctx_id: u32, _c_mac: *mut u8) -> i32 {
++    error!(
++        "krun_set_net_mac() was removed in libkrun 2.0 and is exported only for 1.x load-time \
++         ABI compatibility; pass the MAC to krun_add_net_unixstream()/krun_add_net_unixgram()"
++    );
++    -libc::ENOTSUP
++}
++
++/// `int32_t krun_set_snd_device(uint32_t ctx_id, bool enable);`
++#[cfg(windows)]
++#[unsafe(no_mangle)]
++pub extern "C" fn krun_set_snd_device(_ctx_id: u32, _enable: bool) -> i32 {
++    error!(
++        "krun_set_snd_device() was removed in libkrun 2.0 and is exported only for 1.x load-time \
++         ABI compatibility"
++    );
++    -libc::ENOTSUP
++}
++
+ #[cfg(feature = "aws-nitro")]
+ #[unsafe(no_mangle)]
+ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
+-- 
+2.53.0
+

@@ -1,0 +1,294 @@
+From 176b73cab9abf1de5221a772f7e271e0b16b1bc7 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:35:53 +0200
+Subject: [PATCH 25/25] net: bound the declared frame length before slicing to
+ it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The length arrives on the wire as four bytes, so a proxy can declare up to 4 GiB,
+and read_frame sliced the guest buffer to it unchecked. A disagreeing or buggy proxy
+therefore panics the virtio-net worker thread and takes the VM with it. This is not
+Windows-specific — it is live on Linux and macOS today, and the Windows backend added
+in this series already rejects the same input, so the two paths disagreed about a
+safety property.
+
+Not a guest escape: the prefix is written by the host-side proxy, not by the guest,
+so a hostile guest cannot reach it. It is a robustness bug, and the cost of fixing it
+is one comparison.
+
+Fatal to the link rather than recoverable, deliberately. Once the framing is lost
+there is no way to find the next boundary in the stream without guessing, and
+guessing at frame boundaries in a data path is how corruption becomes silent.
+
+Also normalises rustfmt across the series; cargo fmt --all --check is clean and the
+only files touched are ones this series already modifies.
+
+Verified: 0 errors on Linux and Windows with --features blk,net, and krun.dll relinks
+after deletion at 4,234,752 bytes.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/net/unixstream.rs      |  8 ++++++
+ .../src/virtio/net/winsock_unixstream.rs      | 17 ++++++-----
+ src/devices/src/virtio/net/worker.rs          |  5 +---
+ src/devices/src/virtio/vsock/muxer.rs         | 10 +++----
+ src/devices/src/virtio/vsock/muxer_thread.rs  | 20 +++++++------
+ src/devices/src/virtio/vsock/proxy.rs         |  2 +-
+ src/devices/src/virtio/vsock/winsock_unix.rs  | 28 +++++++++----------
+ src/libkrun/src/lib.rs                        |  5 +---
+ 8 files changed, 51 insertions(+), 44 deletions(-)
+
+diff --git a/src/devices/src/virtio/net/unixstream.rs b/src/devices/src/virtio/net/unixstream.rs
+index c1b7ba7..47900b4 100644
+--- a/src/devices/src/virtio/net/unixstream.rs
++++ b/src/devices/src/virtio/net/unixstream.rs
+@@ -162,6 +162,14 @@ impl NetBackend for Unixstream {
+         let hdr_len = write_virtio_net_hdr(buf);
+         let buf = &mut buf[hdr_len..];
+         let frame_length = self.expecting_frame_length as usize;
++        // The length arrived on the wire, so it is whatever the proxy said it was — up to
++        // 4 GiB from four bytes. Slicing to it unchecked turns a disagreeing or buggy proxy
++        // into a panic on the worker thread, which takes the VM down with it. Reject the
++        // frame instead; there is no way to resynchronise a stream whose framing we have
++        // already lost, so this is fatal to the link but not to the process.
++        if frame_length > buf.len() {
++            return Err(ReadError::Internal(nix::Error::EMSGSIZE));
++        }
+         self.read_loop(&mut buf[..frame_length], false)?;
+         self.expecting_frame_length = 0;
+         log::trace!("Read eth frame from network proxy: {frame_length} bytes");
+diff --git a/src/devices/src/virtio/net/winsock_unixstream.rs b/src/devices/src/virtio/net/winsock_unixstream.rs
+index deea56a..4645e50 100644
+--- a/src/devices/src/virtio/net/winsock_unixstream.rs
++++ b/src/devices/src/virtio/net/winsock_unixstream.rs
+@@ -97,10 +97,9 @@ use std::sync::Once;
+ use windows_sys::Win32::Networking::WinSock::{
+     AF_UNIX, FD_CLOSE, FD_READ, FD_WRITE, INVALID_SOCKET, SO_RCVBUF, SO_SNDBUF, SOCK_STREAM,
+     SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSACloseEvent, WSACreateEvent,
+-    WSADATA, WSAECONNABORTED, WSAECONNRESET, WSAENETRESET, WSAENOTCONN, WSAESHUTDOWN,
+-    WSAEVENT, WSAEWOULDBLOCK, WSAEnumNetworkEvents, WSAEventSelect, WSAGetLastError,
+-    WSANETWORKEVENTS, WSAStartup, closesocket, connect, getsockopt, recv, send, setsockopt,
+-    socket,
++    WSADATA, WSAECONNABORTED, WSAECONNRESET, WSAENETRESET, WSAENOTCONN, WSAESHUTDOWN, WSAEVENT,
++    WSAEWOULDBLOCK, WSAEnumNetworkEvents, WSAEventSelect, WSAGetLastError, WSANETWORKEVENTS,
++    WSAStartup, closesocket, connect, getsockopt, recv, send, setsockopt, socket,
+ };
+ 
+ use utils::epoll::EventSet;
+@@ -158,9 +157,13 @@ fn wsa_io_error() -> io::Error {
+ /// limitation, not one this function introduces. Go's `net` package writes the
+ /// same bytes, so the two ends agree for any path either can express.
+ fn sockaddr_un(path: &Path) -> Result<(SOCKADDR_UN, i32), ConnectError> {
+-    let bytes = path.as_os_str().to_str().map(str::as_bytes).ok_or_else(|| {
+-        ConnectError::InvalidAddress(io::Error::from(io::ErrorKind::InvalidInput))
+-    })?;
++    let bytes = path
++        .as_os_str()
++        .to_str()
++        .map(str::as_bytes)
++        .ok_or_else(|| {
++            ConnectError::InvalidAddress(io::Error::from(io::ErrorKind::InvalidInput))
++        })?;
+ 
+     let mut addr = SOCKADDR_UN {
+         sun_family: AF_UNIX,
+diff --git a/src/devices/src/virtio/net/worker.rs b/src/devices/src/virtio/net/worker.rs
+index d544c14..011e6b4 100644
+--- a/src/devices/src/virtio/net/worker.rs
++++ b/src/devices/src/virtio/net/worker.rs
+@@ -201,10 +201,7 @@ impl NetWorker {
+                                     if let Err(e) = epoll.ctl(
+                                         ControlOperation::Modify,
+                                         backend_socket,
+-                                        &EpollEvent::new(
+-                                            backend_interest,
+-                                            backend_socket as u64,
+-                                        ),
++                                        &EpollEvent::new(backend_interest, backend_socket as u64),
+                                     ) {
+                                         log::error!(
+                                             "Failed to re-arm the virtio-net backend watch, networking will stall: {e}"
+diff --git a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+index db8dfcd..af480f8 100644
+--- a/src/devices/src/virtio/vsock/muxer.rs
++++ b/src/devices/src/virtio/vsock/muxer.rs
+@@ -1,10 +1,10 @@
+ use std::collections::HashMap;
+ #[cfg(unix)]
+ use std::os::unix::io::RawFd;
+-#[cfg(windows)]
+-use utils::windows::RawFd;
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex, RwLock};
++#[cfg(windows)]
++use utils::windows::RawFd;
+ 
+ use super::super::Queue as VirtQueue;
+ use super::TsiFlags;
+@@ -13,9 +13,9 @@ use super::defs;
+ use super::defs::uapi;
+ use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
+ use super::muxer_thread::MuxerThread;
+-use super::packet::{TsiConnectReq, VsockPacket};
+ #[cfg(unix)]
+ use super::packet::TsiGetnameRsp;
++use super::packet::{TsiConnectReq, VsockPacket};
+ use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
+ use super::reaper::ReaperThread;
+ #[cfg(target_os = "macos")]
+@@ -26,10 +26,10 @@ use super::tsi_dgram::TsiDgramProxy;
+ use super::tsi_stream::TsiStreamProxy;
+ // The host end of a guest-IPC port. Same role on both platforms; different
+ // kernel object underneath.
+-#[cfg(windows)]
+-use super::winsock_unix::WinsockUnixProxy as IpcProxy;
+ #[cfg(unix)]
+ use super::unix::UnixProxy as IpcProxy;
++#[cfg(windows)]
++use super::winsock_unix::WinsockUnixProxy as IpcProxy;
+ use crossbeam_channel::{Sender, unbounded};
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+ use vm_memory::GuestMemoryMmap;
+diff --git a/src/devices/src/virtio/vsock/muxer_thread.rs b/src/devices/src/virtio/vsock/muxer_thread.rs
+index 6217aa3..488bfc1 100644
+--- a/src/devices/src/virtio/vsock/muxer_thread.rs
++++ b/src/devices/src/virtio/vsock/muxer_thread.rs
+@@ -1,11 +1,11 @@
+ use std::collections::HashMap;
+ #[cfg(unix)]
+ use std::os::unix::io::RawFd;
+-#[cfg(windows)]
+-use utils::windows::RawFd;
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+ use std::thread;
++#[cfg(windows)]
++use utils::windows::RawFd;
+ 
+ use super::super::Queue as VirtQueue;
+ use super::muxer::{MuxerRx, ProxyMap, push_packet};
+@@ -16,12 +16,12 @@ use super::tsi_stream::TsiStreamProxy;
+ 
+ use crate::virtio::InterruptTransport;
+ use crate::virtio::vsock::defs;
++#[cfg(unix)]
++use crate::virtio::vsock::unix::{UnixAcceptorProxy as IpcAcceptorProxy, UnixProxy as IpcProxy};
+ #[cfg(windows)]
+ use crate::virtio::vsock::winsock_unix::{
+     WinsockUnixAcceptorProxy as IpcAcceptorProxy, WinsockUnixProxy as IpcProxy,
+ };
+-#[cfg(unix)]
+-use crate::virtio::vsock::unix::{UnixAcceptorProxy as IpcAcceptorProxy, UnixProxy as IpcProxy};
+ use crossbeam_channel::Sender;
+ use rand::{RngExt, rng, rngs::ThreadRng};
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+@@ -116,13 +116,15 @@ impl MuxerThread {
+         let mut should_signal = update.signal_queue;
+ 
+         #[cfg(unix)]
+-        let accepted = update.new_proxy.map(|(peer_port, accept_fd, family, proxy_type)| {
+-            (peer_port, accept_fd, Some(family), proxy_type)
+-        });
+-        #[cfg(windows)]
+         let accepted = update
+             .new_proxy
+-            .map(|(peer_port, accept_fd, proxy_type)| (peer_port, accept_fd, None::<()>, proxy_type));
++            .map(|(peer_port, accept_fd, family, proxy_type)| {
++                (peer_port, accept_fd, Some(family), proxy_type)
++            });
++        #[cfg(windows)]
++        let accepted = update.new_proxy.map(|(peer_port, accept_fd, proxy_type)| {
++            (peer_port, accept_fd, None::<()>, proxy_type)
++        });
+ 
+         if let Some((peer_port, accept_fd, _family, proxy_type)) = accepted {
+             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
+diff --git a/src/devices/src/virtio/vsock/proxy.rs b/src/devices/src/virtio/vsock/proxy.rs
+index a20c25e..cde606c 100644
+--- a/src/devices/src/virtio/vsock/proxy.rs
++++ b/src/devices/src/virtio/vsock/proxy.rs
+@@ -9,9 +9,9 @@ use std::os::unix::io::{AsRawFd, RawFd};
+ use std::os::windows::io::OwnedHandle;
+ 
+ use super::muxer::MuxerRx;
+-use super::packet::{TsiConnectReq, VsockPacket};
+ #[cfg(unix)]
+ use super::packet::{TsiAcceptReq, TsiListenReq, TsiSendtoAddr};
++use super::packet::{TsiConnectReq, VsockPacket};
+ #[cfg(unix)]
+ use nix::sys::socket::AddressFamily;
+ use utils::epoll::EventSet;
+diff --git a/src/devices/src/virtio/vsock/winsock_unix.rs b/src/devices/src/virtio/vsock/winsock_unix.rs
+index b6859bc..efb9d9d 100644
+--- a/src/devices/src/virtio/vsock/winsock_unix.rs
++++ b/src/devices/src/virtio/vsock/winsock_unix.rs
+@@ -70,9 +70,9 @@ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex, Once};
+ 
+ use windows_sys::Win32::Networking::WinSock::{
+-    AF_UNIX, FD_ACCEPT, FD_CLOSE, FD_CONNECT, FD_READ, FD_WRITE, INVALID_SOCKET, SD_BOTH,
+-    SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOMAXCONN,
+-    FD_CONNECT_BIT, WSACloseEvent, WSACreateEvent, WSADATA, WSAEVENT, WSAEWOULDBLOCK,
++    AF_UNIX, FD_ACCEPT, FD_CLOSE, FD_CONNECT, FD_CONNECT_BIT, FD_READ, FD_WRITE, INVALID_SOCKET,
++    SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR,
++    SOMAXCONN, WSACloseEvent, WSACreateEvent, WSADATA, WSAEVENT, WSAEWOULDBLOCK,
+     WSAEnumNetworkEvents, WSAEventSelect, WSAGetLastError, WSANETWORKEVENTS, WSAStartup, accept,
+     bind, closesocket, connect, listen, recv, send, shutdown, socket,
+ };
+@@ -143,12 +143,16 @@ fn guest_errno(wsa_err: i32) -> i32 {
+ /// limitation, not one this function introduces. Go's `net` package writes the
+ /// same bytes, so the two ends agree for any path either can express.
+ fn sockaddr_un(path: &Path) -> Result<(SOCKADDR_UN, i32), ProxyError> {
+-    let bytes = path.as_os_str().to_str().map(str::as_bytes).ok_or_else(|| {
+-        ProxyError::Win32(
+-            "sockaddr_un: path is not valid UTF-8",
+-            std::io::Error::from(std::io::ErrorKind::InvalidInput),
+-        )
+-    })?;
++    let bytes = path
++        .as_os_str()
++        .to_str()
++        .map(str::as_bytes)
++        .ok_or_else(|| {
++            ProxyError::Win32(
++                "sockaddr_un: path is not valid UTF-8",
++                std::io::Error::from(std::io::ErrorKind::InvalidInput),
++            )
++        })?;
+ 
+     let mut addr = SOCKADDR_UN {
+         sun_family: AF_UNIX,
+@@ -651,11 +655,7 @@ impl Proxy for WinsockUnixProxy {
+                     // whenever the peer is slow. `unix.rs` has the same gap:
+                     // the unsent tail is dropped and only logged. Fixing it
+                     // needs a per-connection send queue in both backends.
+-                    error!(
+-                        "couldn't send everything: buf={}, sent={}",
+-                        buf.len(),
+-                        sent
+-                    );
++                    error!("couldn't send everything: buf={}, sent={}", buf.len(), sent);
+                 }
+                 self.tx_cnt += Wrapping(sent as u32);
+                 sent
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 07521ed..0f5851d 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -1173,10 +1173,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
+ #[cfg(windows)]
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+-pub unsafe extern "C" fn krun_set_port_map(
+-    _ctx_id: u32,
+-    _c_port_map: *const *const c_char,
+-) -> i32 {
++pub unsafe extern "C" fn krun_set_port_map(_ctx_id: u32, _c_port_map: *const *const c_char) -> i32 {
+     error!("TSI port mapping is not supported on Windows: no TSI backend is built");
+     -libc::ENOTSUP
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,177 @@
+From 1f9791bd46ac1c5f062e7b59fd9fbf10f8c38a94 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:35:48 +0200
+Subject: [PATCH 09/25] windows: keep the vsock/TSI C entry points exported,
+ returning -ENOTSUP
+
+virtio-vsock and TSI live behind AF_UNIX/AF_INET sockets reached through raw
+fds, so krun-devices only builds them on Unix and vmm_config::vsock is gated
+to match. That leaves four exported functions in the C API with no backing
+device on Windows.
+
+Deleting them is the wrong fix. krun.dll is resolved symbol by symbol through
+GetProcAddress(), where a missing export is an opaque failure in the consumer
+rather than in libkrun. Keep krun_set_port_map(), krun_add_vsock_port(),
+krun_add_vsock_port2() and krun_add_vsock() exported with the same signatures
+and have them log and return -ENOTSUP, following the negative-errno convention
+the rest of the API already uses.
+
+The context fields and helpers they feed (tsi_port_map, vsock_config,
+unix_ipc_port_map) become Unix-only along with the start_enter() block that
+hands them to VmResources::set_vsock_device().
+---
+ src/libkrun/src/lib.rs | 66 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index fcd983a..8d659af 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -49,9 +49,12 @@ use utils::windows::SendHandle;
+ #[cfg(target_os = "macos")]
+ use vmm::VmCtl;
+ use vmm::resources::{
+-    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
+-    VmResources, VsockConfig,
++    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
++    VmResources,
+ };
++// virtio-vsock and TSI are Unix-only in `krun-devices`: see `vmm::vmm_config::vsock`.
++#[cfg(unix)]
++use vmm::resources::{TsiFlags, VsockConfig};
+ #[cfg(feature = "blk")]
+ use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
+ #[cfg(not(feature = "tee"))]
+@@ -67,6 +70,7 @@ use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfi
+ use vmm::vmm_config::machine_config::VmConfig;
+ #[cfg(feature = "net")]
+ use vmm::vmm_config::net::NetworkInterfaceConfig;
++#[cfg(unix)]
+ use vmm::vmm_config::vsock::VsockDeviceConfig;
+ 
+ #[cfg(feature = "aws-nitro")]
+@@ -174,7 +178,9 @@ struct ContextConfig {
+     #[cfg(feature = "aws-nitro")]
+     nitro: NitroConfig,
+     net_index: u8,
++    #[cfg(unix)]
+     tsi_port_map: Option<HashMap<u16, u16>>,
++    #[cfg(unix)]
+     vsock_config: VsockConfig,
+     #[cfg(feature = "blk")]
+     block_cfgs: Vec<BlockDeviceConfig>,
+@@ -182,6 +188,7 @@ struct ContextConfig {
+     block_root: Option<BlockRootConfig>,
+     #[cfg(feature = "tee")]
+     tee_config_file: Option<PathBuf>,
++    #[cfg(unix)]
+     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+     shutdown_efd: Option<EventFd>,
+     gpu_virgl_flags: Option<u32>,
+@@ -255,6 +262,7 @@ impl ContextConfig {
+         self.block_cfgs.clone()
+     }
+ 
++    #[cfg(unix)]
+     fn set_port_map(&mut self, new_port_map: HashMap<u16, u16>) -> Result<(), ()> {
+         if self.net_index != 0 {
+             return Err(());
+@@ -274,6 +282,7 @@ impl ContextConfig {
+         self.tee_config_file.clone()
+     }
+ 
++    #[cfg(unix)]
+     fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
+         if let Some(map) = &mut self.unix_ipc_port_map {
+             map.insert(port, (filepath, listen));
+@@ -995,6 +1004,22 @@ pub unsafe extern "C" fn krun_add_net_tap(
+     -libc::EINVAL
+ }
+ 
++/// The TSI/vsock entry points below are kept exported on every platform even though the
++/// devices behind them only exist on Unix. `krun.dll` is consumed through
++/// `GetProcAddress()`, where a missing export surfaces as an opaque load failure at the
++/// caller; a `-ENOTSUP` return names the problem instead.
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_set_port_map(
++    _ctx_id: u32,
++    _c_port_map: *const *const c_char,
++) -> i32 {
++    error!("TSI port mapping is not supported on Windows: no TSI backend is built");
++    -libc::ENOTSUP
++}
++
++#[cfg(unix)]
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *const c_char) -> i32 {
+@@ -1313,6 +1338,8 @@ pub unsafe extern "C" fn krun_set_tee_config_file(ctx_id: u32, c_filepath: *cons
+     }
+ }
+ 
++/// See `krun_set_port_map` for why these stay exported on Windows.
++#[cfg(windows)]
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn krun_add_vsock_port(
+@@ -1323,6 +1350,31 @@ pub unsafe extern "C" fn krun_add_vsock_port(
+     unsafe { krun_add_vsock_port2(ctx_id, port, c_filepath, false) }
+ }
+ 
++#[cfg(windows)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_add_vsock_port2(
++    _ctx_id: u32,
++    _port: u32,
++    _c_filepath: *const c_char,
++    _listen: bool,
++) -> i32 {
++    error!("guest IPC over vsock is not supported on Windows: no vsock device is built");
++    -libc::ENOTSUP
++}
++
++#[cfg(unix)]
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_add_vsock_port(
++    ctx_id: u32,
++    port: u32,
++    c_filepath: *const c_char,
++) -> i32 {
++    unsafe { krun_add_vsock_port2(ctx_id, port, c_filepath, false) }
++}
++
++#[cfg(unix)]
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn krun_add_vsock_port2(
+@@ -2500,6 +2552,15 @@ pub unsafe extern "C" fn krun_fs_add_overlay_dir(
+     )
+ }
+ 
++/// See `krun_set_port_map` for why this stays exported on Windows.
++#[cfg(windows)]
++#[unsafe(no_mangle)]
++pub extern "C" fn krun_add_vsock(_ctx_id: u32, _tsi_features: u32) -> i32 {
++    error!("vsock/TSI is not supported on Windows: no vsock device is built");
++    -libc::ENOTSUP
++}
++
++#[cfg(unix)]
+ #[unsafe(no_mangle)]
+ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
+     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
+@@ -2928,6 +2989,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+         return -libc::EINVAL;
+     }
+ 
++    #[cfg(unix)]
+     match &ctx_cfg.vsock_config {
+         VsockConfig::Disabled => (),
+         VsockConfig::Explicit { tsi_flags } => {
+-- 
+2.53.0
+
