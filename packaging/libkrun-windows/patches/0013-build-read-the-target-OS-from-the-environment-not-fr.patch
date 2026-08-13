@@ -1,0 +1,65 @@
+From 68cdba8118ec9c1c9786985894e7a15476270879 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:46:35 +0200
+Subject: [PATCH 13/25] build: read the target OS from the environment, not
+ from host cfg
+
+A build script is compiled for and run on the host, so `#[cfg(target_os =
+"linux")]` inside build.rs describes the machine doing the building rather than
+the one being built for. Cross-compiling the cdylib to Windows from a Linux
+host therefore stamped an ELF soname onto a PE:
+
+    rust-lld: warning: ignoring unknown argument '-Wl,-soname,libkrun.so.2'
+
+CARGO_CFG_TARGET_OS is the target, which is what these link args are actually
+selecting on. Windows gets no arm: a DLL carries no soname/install_name
+equivalent and is resolved by file name.
+
+Only a link exposes this; cargo check never runs the linker.
+---
+ src/libkrun/build.rs | 33 ++++++++++++++++++++-------------
+ 1 file changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/src/libkrun/build.rs b/src/libkrun/build.rs
+index ec8a28f..efdec2e 100644
+--- a/src/libkrun/build.rs
++++ b/src/libkrun/build.rs
+@@ -1,15 +1,22 @@
+ fn main() {
+-    #[cfg(target_os = "linux")]
+-    println!(
+-        "cargo:rustc-cdylib-link-arg=-Wl,-soname,libkrun.so.{}",
+-        std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap()
+-    );
+-    #[cfg(target_os = "macos")]
+-    println!(
+-        "cargo:rustc-cdylib-link-arg=-Wl,-install_name,libkrun.{}.dylib,-compatibility_version,{}.0.0,-current_version,{}.{}.0",
+-        std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(),
+-        std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(),
+-        std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(),
+-        std::env::var("CARGO_PKG_VERSION_MINOR").unwrap()
+-    );
++    // A build script is compiled for the host, so `cfg!(target_os = ...)` here describes the
++    // machine doing the building, not the machine being built for. Cross-compiling to Windows
++    // from Linux would otherwise stamp an ELF -soname onto a PE, which lld-link rejects. Read
++    // the real target from the environment instead.
++    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
++    let major = std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap();
++
++    match target_os.as_str() {
++        "linux" => println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libkrun.so.{major}"),
++        "macos" => println!(
++            "cargo:rustc-cdylib-link-arg=-Wl,-install_name,libkrun.{}.dylib,-compatibility_version,{}.0.0,-current_version,{}.{}.0",
++            major,
++            major,
++            major,
++            std::env::var("CARGO_PKG_VERSION_MINOR").unwrap()
++        ),
++        // Windows encodes no equivalent of a soname/install_name in the image; the DLL is found
++        // by file name (krun.dll), so there is nothing to pass to the linker.
++        _ => {}
++    }
+ }
+-- 
+2.53.0
+

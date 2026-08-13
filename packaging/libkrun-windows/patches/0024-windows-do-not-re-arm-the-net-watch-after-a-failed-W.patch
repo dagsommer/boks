@@ -1,0 +1,46 @@
+From 8cfab2850beac81641dc2f2712db84c91ddbd72b Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:33:35 +0200
+Subject: [PATCH 24/25] windows: do not re-arm the net watch after a failed
+ WSAEnumNetworkEvents
+
+Reporting an empty event set when the enumerate fails looked like a dropped
+event and is actually a 100% CPU spin: a failed WSAEnumNetworkEvents has not
+reset the Event, so the worker's re-arm is satisfied immediately and lands
+straight back in the same call.
+
+The enumerate only fails for a socket or event that is no longer usable, which
+is the condition FD_CLOSE already reports, so report HANG_UP and let the worker
+take the path that stops re-arming. vsock/winsock_unix.rs has the same shape and
+the same gap; this does not touch it, but the reasoning transfers.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/net/winsock_unixstream.rs | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/devices/src/virtio/net/winsock_unixstream.rs b/src/devices/src/virtio/net/winsock_unixstream.rs
+index 83246c5..deea56a 100644
+--- a/src/devices/src/virtio/net/winsock_unixstream.rs
++++ b/src/devices/src/virtio/net/winsock_unixstream.rs
+@@ -558,8 +558,15 @@ impl NetBackend for WinsockUnixstream {
+     fn take_backend_events(&mut self) -> EventSet {
+         let mut events: WSANETWORKEVENTS = unsafe { std::mem::zeroed() };
+         if unsafe { WSAEnumNetworkEvents(self.sock, self.event, &mut events) } == SOCKET_ERROR {
+-            log::warn!("WSAEnumNetworkEvents failed: {}", last_wsa_error());
+-            return EventSet::empty();
++            // Reporting nothing here would be a 100% CPU spin, not a dropped
++            // event: a failed enumerate has *not* reset the Event, so the
++            // caller's re-arm would be satisfied immediately and land right
++            // back here. The call only fails for a socket or event that is no
++            // longer usable, which is the same condition FD_CLOSE reports, so
++            // say so and let the worker take the path that stops re-arming.
++            log::error!("WSAEnumNetworkEvents failed: {}", last_wsa_error());
++            self.broken = true;
++            return EventSet::HANG_UP;
+         }
+ 
+         let fired = events.lNetworkEvents as u32;
+-- 
+2.53.0
+

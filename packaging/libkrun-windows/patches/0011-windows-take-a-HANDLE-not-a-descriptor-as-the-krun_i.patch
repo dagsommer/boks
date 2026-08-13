@@ -1,0 +1,193 @@
+From 767eb801fe3fc8b7673c31499eaea3c2e2ae4f5f Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:39:07 +0200
+Subject: [PATCH 11/25] windows: take a HANDLE, not a descriptor, as the
+ krun_init_log target
+
+A CRT file descriptor is private to the CRT instance that created it, and
+krun.dll shares no CRT with the process that loads it, so an int target_fd
+crossing that boundary names nothing. libkrun.h already makes exactly this
+substitution for the virtio-console entry points, where Windows callers pass
+void *handle in place of int fd; krun_init_log now follows suit.
+
+The documented sentinel survives the change for free: KRUN_LOG_TARGET_DEFAULT
+is -1, which as a handle is INVALID_HANDLE_VALUE.
+
+Targets equal to the process stdout or stderr resolve to env_logger's own
+Target::Stdout/Stderr rather than being wrapped, which is both the common case
+and the one where wrapping would be wrong. Any other handle is duplicated
+before it is wrapped in a File, because the logger is installed for the life
+of the process and must not close a handle the caller still owns.
+
+The fd/handle match moves into resolve_log_target() so the two platforms differ
+only in how the target is interpreted, not in how logging is configured.
+---
+ include/libkrun.h      | 19 +++++++--
+ src/libkrun/Cargo.toml |  2 +
+ src/libkrun/src/lib.rs | 96 ++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 105 insertions(+), 12 deletions(-)
+
+diff --git a/include/libkrun.h b/include/libkrun.h
+index 1d66da7..aa40cdf 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -37,9 +37,14 @@ typedef uint32_t gid_t;
+  * Initializes logging for the library.
+  *
+  * Arguments:
+- *  "target_fd" - File descriptor to write log to. Note that using a file descriptor pointing to a regular file on
+- *                filesystem might slow down the VM.
+- *                Use KRUN_LOG_TARGET_DEFAULT to use the default target for log output (stderr).
++ *  "target_fd"     - File descriptor to write log to (Unix). Note that using a file descriptor pointing to a
++ *                    regular file on filesystem might slow down the VM.
++ *                    Use KRUN_LOG_TARGET_DEFAULT to use the default target for log output (stderr).
++ *  "target_handle" - HANDLE to write log to (Windows). A CRT file descriptor is only meaningful to the CRT
++ *                    instance that created it, which krun.dll does not share with its caller, so the target is
++ *                    a handle here. KRUN_LOG_TARGET_DEFAULT is still accepted: as a handle it is
++ *                    INVALID_HANDLE_VALUE. Handles other than the process stdout/stderr are duplicated, so the
++ *                    caller keeps ownership of the one it passes in.
+  *
+  *  "level"     - Level is an integer specifying the level of verbosity, higher number means more verbose log.
+  *                The log levels are described by the constants: KRUN_LOG_LEVEL_{OFF, ERROR, WARN, INFO, DEBUG, TRACE}
+@@ -53,7 +58,13 @@ typedef uint32_t gid_t;
+  * Returns:
+  *  Zero on success or a negative error number on failure.
+  */
+-int32_t krun_init_log(int target_fd, uint32_t level, uint32_t style, uint32_t options);
++int32_t krun_init_log(
++#ifdef _WIN32
++                      void *target_handle,
++#else
++                      int target_fd,
++#endif
++                      uint32_t level, uint32_t style, uint32_t options);
+ 
+ /**
+  * Creates a configuration context.
+diff --git a/src/libkrun/Cargo.toml b/src/libkrun/Cargo.toml
+index f2b7a0e..c917148 100644
+--- a/src/libkrun/Cargo.toml
++++ b/src/libkrun/Cargo.toml
+@@ -49,6 +49,8 @@ vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
+ [target.'cfg(target_os = "windows")'.dependencies]
+ windows-sys = { version = "0.61.2", features = [
+     "Win32_System_Console",
++    "Win32_System_Memory",
++    "Win32_System_Threading",
+ ] }
+ 
+ [lib]
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index ac92dcb..b6a3b65 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -447,18 +447,98 @@ mod log_defs {
+     pub const KRUN_LOG_OPTION_NO_ENV: u32 = 1;
+ }
+ 
+-#[allow(clippy::missing_safety_doc)]
+-#[unsafe(no_mangle)]
+-pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, options: u32) -> i32 {
+-    unsafe {
+-        let target = match target {
+-        ..-1 => return -libc::EINVAL,
++/// Resolves the caller-supplied log target, which is the file descriptor documented in
++/// libkrun.h.
++#[cfg(unix)]
++unsafe fn resolve_log_target(target: RawFd) -> Result<Target, i32> {
++    Ok(match target {
++        ..-1 => return Err(-libc::EINVAL),
+         -1 => Target::default(),
+-        0 /* stdin */ => return -libc::EINVAL,
++        0 /* stdin */ => return Err(-libc::EINVAL),
+         1 /* stdout */ => Target::Stdout,
+         2 /* stderr */ => Target::Stderr,
+-        fd => Target::Pipe(Box::new(File::from_raw_fd(fd))),
++        fd => Target::Pipe(Box::new(unsafe { File::from_raw_fd(fd) })),
++    })
++}
++
++/// See the Unix variant above. On Windows the target is a HANDLE rather than a descriptor --
++/// the same substitution libkrun.h already makes for the virtio-console entry points -- because
++/// a CRT file descriptor only means anything to the CRT instance that produced it, and krun.dll
++/// does not share one with its caller.
++///
++/// KRUN_LOG_TARGET_DEFAULT needs no special case here: -1 as a handle is INVALID_HANDLE_VALUE,
++/// so the documented sentinel keeps working unchanged.
++#[cfg(windows)]
++unsafe fn resolve_log_target(target: *mut c_void) -> Result<Target, i32> {
++    use std::os::windows::io::FromRawHandle;
++    use windows_sys::Win32::Foundation::{
++        DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
++    };
++    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
++    use windows_sys::Win32::System::Threading::GetCurrentProcess;
++
++    let handle: HANDLE = target;
++    if handle == INVALID_HANDLE_VALUE {
++        return Ok(Target::default());
++    }
++    if handle.is_null() {
++        return Err(-libc::EINVAL);
++    }
++
++    // Callers overwhelmingly hand over their own stdout or stderr. Recognising those lets
++    // env_logger write through its own handles, so libkrun never takes on the lifetime of a
++    // handle the caller is still using.
++    if handle == unsafe { GetStdHandle(STD_OUTPUT_HANDLE) } {
++        return Ok(Target::Stdout);
++    }
++    if handle == unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
++        return Ok(Target::Stderr);
++    }
++
++    // Any other handle is written to directly, but duplicate it first: the logger is installed
++    // for the lifetime of the process, and wrapping the caller's handle in a File would make
++    // libkrun responsible for closing something it never owned.
++    let process = unsafe { GetCurrentProcess() };
++    let mut dup: HANDLE = std::ptr::null_mut();
++    // Safe because both handles name this process and `dup` is a valid out-pointer.
++    let ok = unsafe {
++        DuplicateHandle(
++            process,
++            handle,
++            process,
++            &mut dup,
++            0,
++            0,
++            DUPLICATE_SAME_ACCESS,
++        )
+     };
++    if ok == 0 {
++        return Err(-libc::EINVAL);
++    }
++    Ok(Target::Pipe(Box::new(unsafe {
++        File::from_raw_handle(dup)
++    })))
++}
++
++/// The log target is a descriptor on Unix and a HANDLE on Windows; see `resolve_log_target`.
++#[cfg(unix)]
++pub type LogTarget = RawFd;
++#[cfg(windows)]
++pub type LogTarget = *mut c_void;
++
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn krun_init_log(
++    target: LogTarget,
++    level: u32,
++    style: u32,
++    options: u32,
++) -> i32 {
++    unsafe {
++        let target = match resolve_log_target(target) {
++            Ok(target) => target,
++            Err(err) => return err,
++        };
+ 
+         let filter = log_level_to_filter_str(level);
+ 
+-- 
+2.53.0
+

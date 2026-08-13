@@ -1,0 +1,862 @@
+From 53ea1e8d499659a734b65a95b8262ee492f8b3ff Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:29:53 +0200
+Subject: [PATCH 21/25] windows: add a Winsock AF_UNIX backend for the
+ virtio-net unixstream link
+
+This is the last device between libkrun and a VM that boots on Windows with a
+policy-enforced network. The wire protocol is untouched and must stay untouched:
+each Ethernet frame preceded by its length as a 4-byte big-endian integer and
+nothing else, which is byte for byte gvisor-tap-vsock's `qemu` protocol. No
+vfkit magic, no virtio-net header on the socket.
+
+AF_UNIX rather than a named pipe, for the reason vsock/winsock_unix.rs gives at
+length: the peer creates its end in platform-neutral Go with net.Listen("unix",
+path), which Go implements with Winsock AF_UNIX on Windows, so a \\.\pipe\
+endpoint on our side would never meet it. Readiness reaches the epoll shim the
+same way too -- WSAEventSelect() binds the socket to a Windows Event, and that
+Event, never the socket, is what gets registered.
+
+Two things differ from that template, both deliberate:
+
+The connect is done while the socket is still blocking, before the event
+association exists, so a proxy that is not listening is reported synchronously
+from open() exactly as it is on Unix. A guest-IPC vsock port has to report that
+asynchronously to the guest; this link has no such caller.
+
+The receive path is a resumable state machine rather than a translation of
+unixstream.rs's read_loop(). That loop completes a frame with recv(MSG_WAITALL)
+on a blocking socket, and neither half survives here: WSAEventSelect() forces
+the socket non-blocking, and MSG_WAITALL is documented to fail with
+WSAEOPNOTSUPP on a non-blocking socket. Emulating the wait with WSAPoll() would
+block the single worker thread inside read_frame(), stopping the transmit path
+with it, and any bounded timeout on that poll leaves us holding half a frame --
+which needs exactly the partial-frame state kept in the struct. So read_frame()
+never waits: it takes what Winsock has, keeps the partial length prefix and body
+across calls, and reports NothingRead until a whole frame is in hand, which the
+worker already treats as "stop, you will be woken again".
+
+Framing is the security boundary here rather than a detail. The peer is the host
+stack that decides what the guest may reach, so a desynchronised stream would
+deliver bytes every policy check upstream still approves, only cut in the wrong
+places. The declared length is therefore validated before it is acted on, and
+the backend latches itself broken instead of resynchronising by guesswork.
+
+The worker needed two Windows-only changes to drive this. The shim's wait()
+reports back the interest mask that was registered rather than observed
+readiness -- a wait completion packet only says the Event was signaled -- so the
+real state is asked of Winsock through the new take_backend_events(). And
+because that call is what resets the Event, the watch must stay edge-triggered
+and be re-armed after every wake-up; without the re-arm the link goes deaf after
+one frame, and level-triggered would spin at 100% CPU instead.
+
+Compiled for x86_64-pc-windows-msvc and never run. There is no Windows host
+here, no VM has been booted against it, and not one frame has moved through it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/net/device.rs          |  18 +-
+ src/devices/src/virtio/net/mod.rs             |  13 +
+ .../src/virtio/net/winsock_unixstream.rs      | 583 ++++++++++++++++++
+ src/devices/src/virtio/net/worker.rs          |  61 +-
+ 4 files changed, 670 insertions(+), 5 deletions(-)
+ create mode 100644 src/devices/src/virtio/net/winsock_unixstream.rs
+
+diff --git a/src/devices/src/virtio/net/device.rs b/src/devices/src/virtio/net/device.rs
+index 1ccce65..61e9b27 100644
+--- a/src/devices/src/virtio/net/device.rs
++++ b/src/devices/src/virtio/net/device.rs
+@@ -18,6 +18,7 @@ use super::worker::NetWorker;
+ 
+ use std::cmp;
+ use std::io::Write;
++#[cfg(unix)]
+ use std::os::fd::RawFd;
+ use std::path::PathBuf;
+ use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
+@@ -61,9 +62,24 @@ unsafe impl ByteValued for VirtioNetConfig {}
+ 
+ #[derive(Clone)]
+ pub enum VirtioNetBackend {
+-    UnixstreamFd(RawFd),
++    /// An AF_UNIX SOCK_STREAM socket the network proxy is listening on, which
++    /// libkrun connects to. The one backend that exists on every platform.
+     UnixstreamPath(PathBuf),
++    /// An already-connected AF_UNIX SOCK_STREAM socket, handed over as a file
++    /// descriptor.
++    ///
++    /// Unix-only, because the `int` it arrives in cannot carry a Windows
++    /// socket: a Winsock `SOCKET` is a pointer-sized handle, not an `int`, and a
++    /// CRT file descriptor is not a socket there either. Rather than truncate
++    /// one and hope, `krun_add_net_unixstream()` refuses a non-negative `fd` on
++    /// Windows and says why.
++    #[cfg(unix)]
++    UnixstreamFd(RawFd),
++    /// Unix-only: see the note on the `unixgram` module in `mod.rs`. Windows
++    /// AF_UNIX has no SOCK_DGRAM.
++    #[cfg(unix)]
+     UnixgramFd(RawFd),
++    #[cfg(unix)]
+     UnixgramPath(PathBuf, bool),
+     #[cfg(target_os = "linux")]
+     Tap(String),
+diff --git a/src/devices/src/virtio/net/mod.rs b/src/devices/src/virtio/net/mod.rs
+index e0c51f3..41793a6 100644
+--- a/src/devices/src/virtio/net/mod.rs
++++ b/src/devices/src/virtio/net/mod.rs
+@@ -15,8 +15,21 @@ mod backend;
+ pub mod device;
+ #[cfg(target_os = "linux")]
+ mod tap;
++// The unixgram backend needs an AF_UNIX SOCK_DGRAM socket. Windows' AF_UNIX,
++// which has existed since Windows 10 1803, implements SOCK_STREAM and has never
++// implemented a datagram socket type at all -- the same reason
++// gvisor-tap-vsock's Windows build stubs its unixgram transport out. There is
++// nothing to port this to. `krun_add_net_unixgram()` stays exported on Windows
++// and returns -ENOTSUP; see `src/libkrun/src/lib.rs`.
++#[cfg(unix)]
+ mod unixgram;
++#[cfg(unix)]
+ mod unixstream;
++// The Windows counterpart of `unixstream.rs`: the same 4-byte big-endian frame
++// protocol over the same kind of socket, reached through Winsock rather than
++// nix.
++#[cfg(windows)]
++mod winsock_unixstream;
+ mod worker;
+ 
+ // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2050006
+diff --git a/src/devices/src/virtio/net/winsock_unixstream.rs b/src/devices/src/virtio/net/winsock_unixstream.rs
+new file mode 100644
+index 0000000..c3b53ce
+--- /dev/null
++++ b/src/devices/src/virtio/net/winsock_unixstream.rs
+@@ -0,0 +1,583 @@
++//! The Windows end of the virtio-net `unixstream` link.
++//!
++//! This is `unixstream.rs` translated to Winsock. The wire protocol is
++//! unchanged and must stay unchanged: every Ethernet frame is preceded by its
++//! length as a **4-byte big-endian** integer and nothing else, which is byte for
++//! byte gvisor-tap-vsock's `qemu` protocol. Neither the vfkit magic sequence nor
++//! a virtio-net header is ever put on this socket.
++//!
++//! # Why AF_UNIX
++//!
++//! For the same reason `vsock/winsock_unix.rs` gives, and with the same peer
++//! shape: the process on the other end creates its socket in platform-neutral
++//! Go with `net.Listen("unix", path)` on an ordinary filesystem path, which Go
++//! implements with Winsock AF_UNIX on Windows. A `\\.\pipe\...` endpoint on our
++//! side would never meet it. Windows has had AF_UNIX since Windows 10 1803, and
++//! only for `SOCK_STREAM` -- which is exactly the socket type this backend
++//! wants, and the reason its `unixgram` sibling has no Windows counterpart at
++//! all.
++//!
++//! # How readiness reaches the epoll shim
++//!
++//! Identical to `vsock/winsock_unix.rs`, and the reasoning there applies here
++//! unchanged: a Winsock `SOCKET` is not a dispatcher object whose signaled state
++//! means "readable", so it cannot be handed to `utils::windows::epoll`, which
++//! bridges *waitable handles* into an IOCP. `WSAEventSelect()` supplies a
++//! Windows Event that is signaled when the selected network events occur, and
++//! that Event -- never the socket -- is what [`NetBackend::raw_socket_fd`]
++//! returns and what the worker registers.
++//!
++//! Two consequences, both load-bearing:
++//!
++//! 1. The shim's `wait()` reports back the interest mask that was registered,
++//!    not any observed readiness. The real state is recovered with
++//!    `WSAEnumNetworkEvents()`, which is what [`take_backend_events`] does.
++//! 2. That call is also what resets the Event, so the watch must be registered
++//!    `EDGE_TRIGGERED` and re-armed after every enumerate. Level-triggered would
++//!    let the shim re-associate the wait packet before we enumerate, and spin.
++//!
++//! `WSAEventSelect()` additionally forces the socket into non-blocking mode.
++//! That is convenient for the send path -- it is what `MSG_DONTWAIT` buys
++//! `unixstream.rs` -- and it is the reason the receive path below looks
++//! different from the Unix one.
++//!
++//! # Why the receive path is a resumable state machine
++//!
++//! `unixstream.rs` reads a frame in two steps: one non-blocking `recv()` to see
++//! whether anything has arrived, then `recv(MSG_WAITALL)` on a **blocking**
++//! socket to sit there until the rest of the frame has been collected. Neither
++//! half of that is available here.
++//!
++//! * There is no `MSG_DONTWAIT` on Winsock -- immaterial, since
++//!   `WSAEventSelect()` has already made the socket non-blocking.
++//! * `MSG_WAITALL` exists but is documented to fail with `WSAEOPNOTSUPP` on a
++//!   non-blocking socket, and the socket cannot be made blocking again without
++//!   dissolving the event association the poller depends on.
++//!
++//! The remaining option would be to emulate the wait with `WSAPoll()` in a loop.
++//! That is rejected on two counts. It would block the single virtio-net worker
++//! thread inside `read_frame()`, which also stops the transmit path, for as long
++//! as the peer takes to finish a frame -- and any bounded timeout on that poll
++//! leaves us holding half a frame, which needs precisely the partial-frame state
++//! kept below. So the state is cheaper than the alternative *and* strictly
++//! stronger.
++//!
++//! So: `read_frame()` never waits. It consumes whatever Winsock has, keeps the
++//! partially received length prefix and frame body in this struct, and reports
++//! [`ReadError::NothingRead`] until a whole frame is in hand. The worker's
++//! `process_rx()` already treats `NothingRead` as "stop, you will be woken
++//! again", so an incomplete frame simply resumes on the next `FD_READ`.
++//!
++//! The wake-up cannot be lost in between: Winsock re-enables `FD_READ` recording
++//! on *any* call to the re-enabling routine (`recv`) "even one that fails", so
++//! the `recv()` that returned `WSAEWOULDBLOCK` is itself the re-arm on the
++//! Winsock side, and the worker re-arms the shim's wait packet after we return.
++//! The same rule covers `FD_WRITE` and the `send()` that returns
++//! `WSAEWOULDBLOCK` during a partial write.
++//!
++//! # Framing is a security boundary here
++//!
++//! The peer is the host network stack that decides what the guest is allowed to
++//! reach. A desynchronised stream would still deliver bytes that every policy
++//! check upstream approves, only cut in the wrong places, so the length prefix
++//! is validated before it is acted on and the backend latches itself broken
++//! rather than resynchronising by guesswork.
++//!
++//! # Untested
++//!
++//! Nothing in this file has been executed. It has been compiled for
++//! `x86_64-pc-windows-msvc` and never run: there is no Windows host in the
++//! development environment, and no VM has been booted against it, so not one
++//! frame has moved through this code.
++
++use std::io;
++use std::path::{Path, PathBuf};
++use std::sync::Once;
++
++use windows_sys::Win32::Networking::WinSock::{
++    AF_UNIX, FD_CLOSE, FD_READ, FD_WRITE, INVALID_SOCKET, SO_RCVBUF, SO_SNDBUF, SOCK_STREAM,
++    SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSACloseEvent, WSACreateEvent,
++    WSADATA, WSAECONNABORTED, WSAECONNRESET, WSAENETRESET, WSAENOTCONN, WSAESHUTDOWN,
++    WSAEWOULDBLOCK, WSAEnumNetworkEvents, WSAEventSelect, WSAGetLastError, WSANETWORKEVENTS,
++    WSAStartup, closesocket, connect, getsockopt, recv, send, setsockopt, socket,
++};
++
++use utils::epoll::EventSet;
++use utils::windows::RawFd;
++
++use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
++use super::write_virtio_net_hdr;
++use super::{MAX_BUFFER_SIZE, VNET_HDR_LEN};
++
++/// Each frame the network proxy is prepended by a 4 byte "header".
++/// It is interpreted as a big-endian u32 integer and is the length of the following ethernet frame.
++const FRAME_HEADER_LEN: usize = 4;
++
++/// The largest frame body that can still be handed to the guest once the
++/// virtio-net header has been written in front of it. A declared length above
++/// this cannot be a frame we could deliver, so it is treated as a desynchronised
++/// stream rather than as a very large frame.
++const MAX_FRAME_LEN: usize = MAX_BUFFER_SIZE - VNET_HDR_LEN;
++
++/// The network events this link cares about. `FD_WRITE` is selected so that a
++/// send blocked by a full socket buffer is resumed when space appears; it is the
++/// Winsock equivalent of the `EPOLLOUT` the Unix worker relies on to finish a
++/// partial write.
++const LINK_EVENTS: i32 = (FD_READ | FD_WRITE | FD_CLOSE) as i32;
++
++/// Winsock must be initialised once per process before any other ws2_32 call.
++/// `std::net` does this lazily for its own sockets, but nothing guarantees a
++/// `std` socket has been created by the time a network device is configured.
++fn winsock_init() {
++    static START: Once = Once::new();
++    START.call_once(|| {
++        let mut data: WSADATA = unsafe { std::mem::zeroed() };
++        // 2.2 is the highest version Winsock defines and the one every
++        // supported Windows release provides.
++        let ret = unsafe { WSAStartup(0x0202, &mut data) };
++        if ret != 0 {
++            log::error!("WSAStartup failed: {ret}");
++        }
++    });
++}
++
++fn last_wsa_error() -> i32 {
++    unsafe { WSAGetLastError() }
++}
++
++fn wsa_io_error() -> io::Error {
++    io::Error::from_raw_os_error(last_wsa_error())
++}
++
++/// Build a `SOCKADDR_UN` for `path`.
++///
++/// Windows' `sun_path` is 108 bytes including the NUL and is interpreted as a
++/// byte string in the system ANSI code page rather than as UTF-16. Paths that
++/// are not representable there cannot be addressed; that is a Winsock AF_UNIX
++/// limitation, not one this function introduces. Go's `net` package writes the
++/// same bytes, so the two ends agree for any path either can express.
++fn sockaddr_un(path: &Path) -> Result<(SOCKADDR_UN, i32), ConnectError> {
++    let bytes = path.as_os_str().to_str().map(str::as_bytes).ok_or_else(|| {
++        ConnectError::InvalidAddress(io::Error::from(io::ErrorKind::InvalidInput))
++    })?;
++
++    let mut addr = SOCKADDR_UN {
++        sun_family: AF_UNIX,
++        sun_path: [0; 108],
++    };
++    if bytes.len() >= addr.sun_path.len() {
++        return Err(ConnectError::InvalidAddress(io::Error::from(
++            io::ErrorKind::InvalidFilename,
++        )));
++    }
++    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
++        *slot = *byte as i8;
++    }
++
++    // The length passed to connect() covers the family, the path and its
++    // terminating NUL -- not the whole fixed-size array.
++    let len = (std::mem::size_of::<u16>() + bytes.len() + 1) as i32;
++    Ok((addr, len))
++}
++
++/// `setsockopt(SOL_SOCKET, opt, value)`, logged rather than fatal.
++///
++/// `unixstream.rs` treats a failure to grow the send buffer as a performance
++/// note, not an error, and so does this.
++fn set_buf_size(sock: SOCKET, opt: i32, name: &str, value: i32) {
++    let ret = unsafe {
++        setsockopt(
++            sock,
++            SOL_SOCKET,
++            opt,
++            &value as *const i32 as *const u8,
++            std::mem::size_of::<i32>() as i32,
++        )
++    };
++    if ret == SOCKET_ERROR {
++        log::warn!(
++            "Failed to set {name} (performance may be decreased): {}",
++            last_wsa_error()
++        );
++    }
++}
++
++/// One non-blocking `recv()` into `dst`.
++///
++/// `Ok(Some(n))` always has `n > 0`. `Ok(None)` is `WSAEWOULDBLOCK`: nothing
++/// more is buffered, every byte of partial-frame state stays intact for the next
++/// wake-up, and -- per Winsock's rule that *any* call to the re-enabling routine
++/// re-arms the notification, "even one that fails" -- this very call is what
++/// guarantees `FD_READ` fires again. `Err` covers both a socket error and a
++/// peer that closed (`recv` returning 0): no more bytes will ever arrive, so a
++/// half-received frame can never be completed.
++///
++/// A free function rather than a method so that callers can pass a mutable
++/// borrow of one of their own fields as `dst`.
++fn recv_some(sock: SOCKET, dst: &mut [u8]) -> Result<Option<usize>, io::Error> {
++    let cnt = unsafe { recv(sock, dst.as_mut_ptr(), dst.len() as i32, 0) };
++    match cnt {
++        SOCKET_ERROR => {
++            let err = last_wsa_error();
++            if err == WSAEWOULDBLOCK {
++                Ok(None)
++            } else {
++                Err(io::Error::from_raw_os_error(err))
++            }
++        }
++        0 => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
++        n => Ok(Some(n as usize)),
++    }
++}
++
++fn get_buf_size(sock: SOCKET, opt: i32) -> io::Result<i32> {
++    let mut value: i32 = 0;
++    let mut len = std::mem::size_of::<i32>() as i32;
++    let ret = unsafe {
++        getsockopt(
++            sock,
++            SOL_SOCKET,
++            opt,
++            &mut value as *mut i32 as *mut u8,
++            &mut len,
++        )
++    };
++    if ret == SOCKET_ERROR {
++        Err(wsa_io_error())
++    } else {
++        Ok(value)
++    }
++}
++
++pub struct WinsockUnixstream {
++    sock: SOCKET,
++    /// The Event `WSAEventSelect()` signals for `sock`. This, not `sock`, is
++    /// what the worker registers with the epoll shim.
++    event: isize,
++
++    /// The length prefix of the frame currently being received, and how much of
++    /// it has arrived. A prefix is complete exactly when `hdr_filled` reaches
++    /// `FRAME_HEADER_LEN`; there is no sentinel length value, so a peer cannot
++    /// reset our parser state by declaring one.
++    hdr_buf: [u8; FRAME_HEADER_LEN],
++    hdr_filled: usize,
++
++    /// The body of the frame currently being received.
++    ///
++    /// Staged here rather than accumulated straight into the caller's buffer
++    /// because [`NetBackend::read_frame`] promises nothing about that buffer
++    /// surviving unchanged across the calls a partially received frame spans.
++    /// The copy costs one `memcpy` of a frame per frame.
++    frame_buf: Box<[u8]>,
++    frame_filled: usize,
++
++    /// Latched when the stream can no longer be trusted -- a bad length prefix,
++    /// a peer that closed mid-frame, or a socket error. Reads never resume after
++    /// this: resynchronising a length-prefixed stream by guesswork would feed
++    /// the host network stack frames cut in places the guest chose.
++    broken: bool,
++
++    /// 0 if the last write is fully complete, otherwise the length that was written
++    last_partial_write_length: usize,
++}
++
++impl WinsockUnixstream {
++    /// Create the backend opening a connection to the userspace network proxy.
++    ///
++    /// The connect happens while the socket is still blocking and *before* the
++    /// event association is made, so a proxy that is not listening is reported
++    /// here, synchronously, exactly as it is on Unix. (`vsock/winsock_unix.rs`
++    /// arms first and connects later because a guest-IPC port must report the
++    /// outcome to the guest asynchronously; this link has no such caller.)
++    pub fn open(path: PathBuf) -> Result<Self, ConnectError> {
++        winsock_init();
++
++        let sock = unsafe { socket(AF_UNIX as i32, SOCK_STREAM, 0) };
++        if sock == INVALID_SOCKET {
++            return Err(ConnectError::CreateSocket(wsa_io_error()));
++        }
++
++        let (addr, addr_len) = match sockaddr_un(&path) {
++            Ok(a) => a,
++            Err(e) => {
++                unsafe { closesocket(sock) };
++                return Err(e);
++            }
++        };
++
++        if unsafe {
++            connect(
++                sock,
++                &addr as *const SOCKADDR_UN as *const SOCKADDR,
++                addr_len,
++            )
++        } == SOCKET_ERROR
++        {
++            let err = wsa_io_error();
++            unsafe { closesocket(sock) };
++            return Err(ConnectError::Binding(err));
++        }
++
++        set_buf_size(sock, SO_SNDBUF, "SO_SNDBUF", 16 * 1024 * 1024);
++
++        log::debug!(
++            "network proxy socket (sock {sock:?}) buffer sizes: SndBuf={:?} RcvBuf={:?}",
++            get_buf_size(sock, SO_SNDBUF),
++            get_buf_size(sock, SO_RCVBUF)
++        );
++
++        // Arm last: this is also what switches the socket to non-blocking, and
++        // everything above wanted blocking semantics.
++        let event = unsafe { WSACreateEvent() };
++        // WSACreateEvent returns WSA_INVALID_EVENT, which is 0, on failure.
++        if event == 0 {
++            let err = wsa_io_error();
++            unsafe { closesocket(sock) };
++            return Err(ConnectError::CreateSocket(err));
++        }
++        if unsafe { WSAEventSelect(sock, event, LINK_EVENTS) } == SOCKET_ERROR {
++            let err = wsa_io_error();
++            unsafe {
++                WSACloseEvent(event);
++                closesocket(sock);
++            }
++            return Err(ConnectError::CreateSocket(err));
++        }
++
++        Ok(Self {
++            sock,
++            event,
++            hdr_buf: [0u8; FRAME_HEADER_LEN],
++            hdr_filled: 0,
++            frame_buf: vec![0u8; MAX_FRAME_LEN].into_boxed_slice(),
++            frame_filled: 0,
++            broken: false,
++            last_partial_write_length: 0,
++        })
++    }
++
++    /// Mark the link unusable and produce the error to report for it.
++    fn fail(&mut self, err: io::Error) -> ReadError {
++        self.broken = true;
++        ReadError::Internal(err)
++    }
++
++    /// The declared body length of the frame being received, validated.
++    ///
++    /// Only called once the whole prefix is in hand.
++    fn declared_frame_len(&self) -> Result<usize, io::Error> {
++        let len = u32::from_be_bytes(self.hdr_buf) as usize;
++        // A zero-length frame carries no Ethernet header and a frame longer
++        // than the receive buffer cannot be delivered. Either means the stream
++        // is no longer where we think it is; there is nothing to recover.
++        if len == 0 || len > MAX_FRAME_LEN {
++            return Err(io::Error::other(format!(
++                "network proxy declared a {len} byte frame (limit {MAX_FRAME_LEN}); \
++                 the length-prefixed stream is desynchronised"
++            )));
++        }
++        Ok(len)
++    }
++
++    fn write_loop(&mut self, buf: &[u8]) -> Result<(), WriteError> {
++        let mut bytes_sent = 0;
++
++        while bytes_sent < buf.len() {
++            let rest = &buf[bytes_sent..];
++            let cnt = unsafe { send(self.sock, rest.as_ptr(), rest.len() as i32, 0) };
++
++            if cnt == SOCKET_ERROR {
++                let err = last_wsa_error();
++                if err == WSAEWOULDBLOCK {
++                    if bytes_sent == 0 {
++                        return Err(WriteError::NothingWritten);
++                    }
++                    log::trace!(
++                        "Wrote {bytes_sent} bytes, but socket blocked, will need try_finish_write() to finish"
++                    );
++                    self.last_partial_write_length += bytes_sent;
++                    return Err(WriteError::PartialWrite);
++                }
++                // The Winsock spellings of "the peer is gone". `unixstream.rs`
++                // recognises this as EPIPE.
++                return Err(
++                    if matches!(
++                        err,
++                        WSAECONNRESET | WSAECONNABORTED | WSAESHUTDOWN | WSAENETRESET | WSAENOTCONN
++                    ) {
++                        WriteError::ProcessNotRunning
++                    } else {
++                        WriteError::Internal(io::Error::from_raw_os_error(err))
++                    },
++                );
++            }
++
++            if cnt == 0 {
++                // Not documented to happen for a non-empty stream send, but
++                // looping on it would spin forever. Treat it as the socket
++                // refusing more, which the caller already knows how to resume.
++                if bytes_sent == 0 {
++                    return Err(WriteError::NothingWritten);
++                }
++                self.last_partial_write_length += bytes_sent;
++                return Err(WriteError::PartialWrite);
++            }
++
++            bytes_sent += cnt as usize;
++        }
++
++        self.last_partial_write_length = 0;
++        Ok(())
++    }
++}
++
++impl Drop for WinsockUnixstream {
++    fn drop(&mut self) {
++        unsafe {
++            // Cancel the association before tearing either object down, so no
++            // further packets can be queued against a dead watch.
++            WSAEventSelect(self.sock, 0, 0);
++            WSACloseEvent(self.event);
++            closesocket(self.sock);
++        }
++    }
++}
++
++impl NetBackend for WinsockUnixstream {
++    /// Try to read a frame from the proxy.
++    ///
++    /// Reports [`ReadError::NothingRead`] both when nothing has arrived at all
++    /// and when only part of a frame has: in either case the caller should stop
++    /// and wait to be woken, and the frame in progress resumes on the next call.
++    fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
++        if self.broken {
++            return Err(ReadError::Internal(io::Error::other(
++                "virtio-net link is broken; no further frames will be read",
++            )));
++        }
++
++        // Complete the 4-byte big-endian length prefix. Anything already
++        // collected by an earlier call stays where it is.
++        while self.hdr_filled < FRAME_HEADER_LEN {
++            let filled = self.hdr_filled;
++            match recv_some(self.sock, &mut self.hdr_buf[filled..]) {
++                Ok(Some(n)) => self.hdr_filled += n,
++                Ok(None) => return Err(ReadError::NothingRead),
++                Err(e) => return Err(self.fail(e)),
++            }
++        }
++
++        let frame_length = match self.declared_frame_len() {
++            Ok(len) => len,
++            Err(e) => return Err(self.fail(e)),
++        };
++
++        // Collect the body, likewise resuming where the last call stopped.
++        while self.frame_filled < frame_length {
++            let filled = self.frame_filled;
++            match recv_some(self.sock, &mut self.frame_buf[filled..frame_length]) {
++                Ok(Some(n)) => self.frame_filled += n,
++                Ok(None) => return Err(ReadError::NothingRead),
++                Err(e) => return Err(self.fail(e)),
++            }
++        }
++
++        // Checked before `write_virtio_net_hdr()`, which indexes `buf`
++        // unconditionally. `declared_frame_len()` has already bounded
++        // `frame_length` by `MAX_FRAME_LEN`, so this only fires if the caller
++        // passed a buffer smaller than `MAX_BUFFER_SIZE`.
++        if buf.len() < VNET_HDR_LEN + frame_length {
++            return Err(self.fail(io::Error::other(
++                "receive buffer is smaller than the frame the proxy sent",
++            )));
++        }
++        let hdr_len = write_virtio_net_hdr(buf);
++        buf[hdr_len..hdr_len + frame_length].copy_from_slice(&self.frame_buf[..frame_length]);
++
++        self.hdr_filled = 0;
++        self.frame_filled = 0;
++
++        log::trace!("Read eth frame from network proxy: {frame_length} bytes");
++        Ok(hdr_len + frame_length)
++    }
++
++    /// Try to write a frame to the proxy.
++    /// (Will mutate and override parts of buf, with a frame header!)
++    ///
++    /// * `hdr_len` - specifies the size of any existing headers encapsulating the ethernet frame,
++    ///   (such as vnet header), that can be overwritten. Must be >= FRAME_HEADER_LEN.
++    /// * `buf` - the buffer to write to the proxy, `buf[..hdr_len]` may be overwritten
++    ///
++    /// If this function returns WriteError::PartialWrite, you have to finish the write using
++    /// try_finish_write.
++    fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
++        if self.last_partial_write_length != 0 {
++            panic!("Cannot write a frame to the proxy, while a partial write is not resolved.");
++        }
++        assert!(
++            hdr_len >= FRAME_HEADER_LEN,
++            "Not enough space to write the frame header"
++        );
++        assert!(buf.len() > hdr_len);
++        let frame_length = buf.len() - hdr_len;
++
++        buf[hdr_len - FRAME_HEADER_LEN..hdr_len]
++            .copy_from_slice(&(frame_length as u32).to_be_bytes());
++
++        self.write_loop(&buf[hdr_len - FRAME_HEADER_LEN..])?;
++        Ok(())
++    }
++
++    fn has_unfinished_write(&self) -> bool {
++        self.last_partial_write_length != 0
++    }
++
++    /// Try to finish a partial write
++    ///
++    /// If no partial write is required will do nothing and return Ok(())
++    ///
++    /// * `hdr_len` - must be the same value as passed to write_frame, that caused the partial write
++    /// * `buf` - must be same buffer that was given to write_frame, that caused the partial write
++    fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError> {
++        if self.last_partial_write_length != 0 {
++            let already_written = self.last_partial_write_length;
++            log::trace!("Requested to finish partial write");
++            self.write_loop(&buf[hdr_len - FRAME_HEADER_LEN + already_written..])?;
++            log::debug!("Finished partial write ({already_written}bytes written before)")
++        }
++
++        Ok(())
++    }
++
++    /// The Event, not the socket -- see the module docs.
++    fn raw_socket_fd(&self) -> RawFd {
++        self.event as RawFd
++    }
++
++    fn take_backend_events(&mut self) -> EventSet {
++        let mut events: WSANETWORKEVENTS = unsafe { std::mem::zeroed() };
++        if unsafe { WSAEnumNetworkEvents(self.sock, self.event, &mut events) } == SOCKET_ERROR {
++            log::warn!("WSAEnumNetworkEvents failed: {}", last_wsa_error());
++            return EventSet::empty();
++        }
++
++        let fired = events.lNetworkEvents as u32;
++        let mut set = EventSet::empty();
++
++        if fired & FD_READ != 0 {
++            set |= EventSet::IN;
++        }
++        if fired & FD_WRITE != 0 {
++            set |= EventSet::OUT;
++        }
++        if fired & FD_CLOSE != 0 {
++            // `iErrorCode[FD_CLOSE_BIT]` would tell an orderly shutdown from an
++            // abortive one, but the worker does the same thing either way, and
++            // the same thing Linux does for EPOLLHUP/EPOLLRDHUP: the network
++            // proxy is gone and networking stops.
++            set |= EventSet::HANG_UP;
++        }
++
++        set
++    }
++}
+diff --git a/src/devices/src/virtio/net/worker.rs b/src/devices/src/virtio/net/worker.rs
+index 4e2fbb3..d544c14 100644
+--- a/src/devices/src/virtio/net/worker.rs
++++ b/src/devices/src/virtio/net/worker.rs
+@@ -1,8 +1,12 @@
+ use crate::virtio::net::backend::ConnectError;
+ #[cfg(target_os = "linux")]
+ use crate::virtio::net::tap::Tap;
++#[cfg(unix)]
+ use crate::virtio::net::unixgram::Unixgram;
++#[cfg(unix)]
+ use crate::virtio::net::unixstream::Unixstream;
++#[cfg(windows)]
++use crate::virtio::net::winsock_unixstream::WinsockUnixstream;
+ use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
+ use crate::virtio::{DeviceQueue, InterruptTransport};
+ 
+@@ -12,10 +16,13 @@ use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
+ 
+ #[cfg(target_os = "macos")]
+ use std::os::fd::RawFd;
++#[cfg(unix)]
+ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+ use std::thread;
+ use std::{cmp, result};
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
++#[cfg(windows)]
++use utils::windows::AsRawFd;
+ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+ 
+ pub struct NetWorker {
+@@ -46,21 +53,29 @@ impl NetWorker {
+         cfg_backend: VirtioNetBackend,
+     ) -> Result<Self, ConnectError> {
+         let backend = match cfg_backend {
++            #[cfg(unix)]
+             VirtioNetBackend::UnixstreamFd(fd) => {
+                 // SAFETY: we need to trust that the library user has configured
+                 // the backend with a healthy file descriptor.
+                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                 Box::new(Unixstream::new(owned_fd)) as Box<dyn NetBackend + Send>
+             }
++            #[cfg(unix)]
+             VirtioNetBackend::UnixstreamPath(path) => {
+                 Box::new(Unixstream::open(path)?) as Box<dyn NetBackend + Send>
+             }
++            #[cfg(windows)]
++            VirtioNetBackend::UnixstreamPath(path) => {
++                Box::new(WinsockUnixstream::open(path)?) as Box<dyn NetBackend + Send>
++            }
++            #[cfg(unix)]
+             VirtioNetBackend::UnixgramFd(fd) => {
+                 // SAFETY: we need to trust that the library user has configured
+                 // the backend with a healthy file descriptor.
+                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                 Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
+             }
++            #[cfg(unix)]
+             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
+                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
+             }
+@@ -106,6 +121,11 @@ impl NetWorker {
+ 
+         let mut epoll = Epoll::new().unwrap();
+ 
++        // Bound once so the Windows re-arm below cannot drift from the
++        // registration it is meant to reinstate.
++        let backend_interest =
++            EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP;
++
+         let _ = epoll.ctl(
+             ControlOperation::Add,
+             virtq_rx_ev_fd,
+@@ -119,10 +139,7 @@ impl NetWorker {
+         let _ = epoll.ctl(
+             ControlOperation::Add,
+             backend_socket,
+-            &EpollEvent::new(
+-                EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
+-                backend_socket as u64,
+-            ),
++            &EpollEvent::new(backend_interest, backend_socket as u64),
+         );
+ 
+         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+@@ -140,6 +157,16 @@ impl NetWorker {
+                                 self.process_tx_queue_event();
+                             }
+                             _ if source == backend_socket => {
++                                // On Windows the mask the shim hands back is
++                                // the interest that was registered, not what
++                                // happened: a wait completion packet says no
++                                // more than "the Event object was signaled".
++                                // The readiness itself lives in Winsock, so ask
++                                // the backend for it. This also resets the
++                                // Event, which is what the re-arm below repairs.
++                                #[cfg(windows)]
++                                let event_set = self.backend.take_backend_events();
++
+                                 if event_set.contains(EventSet::HANG_UP)
+                                     || event_set.contains(EventSet::READ_HANG_UP)
+                                 {
+@@ -149,6 +176,11 @@ impl NetWorker {
+                                     eprintln!(
+                                         "LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!"
+                                     );
++                                    // Deliberately not re-armed on Windows: the
++                                    // link is dead, and an edge-triggered watch
++                                    // that is never re-armed simply goes quiet
++                                    // rather than spinning on a socket whose
++                                    // FD_CLOSE has already fired.
+                                 } else {
+                                     if event_set.contains(EventSet::IN) {
+                                         self.process_backend_socket_readable()
+@@ -157,6 +189,27 @@ impl NetWorker {
+                                     if event_set.contains(EventSet::OUT) {
+                                         self.process_backend_socket_writeable()
+                                     }
++
++                                    // The watch is edge-triggered, and on
++                                    // Windows nothing re-associates the wait
++                                    // packet for us -- the shim only does that
++                                    // for level-triggered watches, which would
++                                    // spin here because the Event stays
++                                    // signaled until it is enumerated. Without
++                                    // this the link goes deaf after one wake-up.
++                                    #[cfg(windows)]
++                                    if let Err(e) = epoll.ctl(
++                                        ControlOperation::Modify,
++                                        backend_socket,
++                                        &EpollEvent::new(
++                                            backend_interest,
++                                            backend_socket as u64,
++                                        ),
++                                    ) {
++                                        log::error!(
++                                            "Failed to re-arm the virtio-net backend watch, networking will stall: {e}"
++                                        );
++                                    }
+                                 }
+                             }
+                             #[cfg(target_os = "macos")]
+-- 
+2.53.0
+

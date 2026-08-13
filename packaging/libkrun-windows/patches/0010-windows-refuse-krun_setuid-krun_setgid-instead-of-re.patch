@@ -1,0 +1,161 @@
+From 8fe791569a4ec5268279d9b6e7fd2b2db25d8cf4 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 14:37:53 +0200
+Subject: [PATCH 10/25] windows: refuse krun_setuid/krun_setgid instead of
+ recording a dead uid
+
+Windows has no setuid/setgid. Privilege reduction there means constructing a
+restricted token before the process starts, which the caller has to do and
+which cannot be done from inside libkrun once the DLL is loaded.
+
+Recording the uid and quietly skipping the drop would be the dangerous
+failure: the caller asks to be de-privileged, gets KRUN_SUCCESS back, and the
+VM runs with full privilege anyway. Return -ENOTSUP so the request fails
+where it is made.
+
+Both symbols stay exported, matching the treatment of the vsock entry points.
+uid_t/gid_t are spelled through local aliases so the exported signatures keep
+one ABI on a platform where libc defines neither type, and libkrun.h grows the
+matching typedefs since MSVC has no <unistd.h>.
+---
+ include/libkrun.h      |  8 ++++++
+ src/libkrun/src/lib.rs | 56 +++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/include/libkrun.h b/include/libkrun.h
+index 1a14db7..1d66da7 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -8,7 +8,15 @@ extern "C" {
+ #include <inttypes.h>
+ #include <stddef.h>
+ #include <stdbool.h>
++#ifdef _WIN32
++/* No <unistd.h> on MSVC. uid_t/gid_t are 32-bit unsigned integers on every Unix libkrun
++ * supports, so declaring them here keeps one ABI for krun_setuid()/krun_setgid(); note that
++ * both return -ENOTSUP on Windows, which has no setuid/setgid model. */
++typedef uint32_t uid_t;
++typedef uint32_t gid_t;
++#else
+ #include <unistd.h>
++#endif
+ 
+ #define KRUN_LOG_TARGET_DEFAULT -1
+ 
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 8d659af..ac92dcb 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -83,6 +83,18 @@ use krun_input::{InputConfigBackend, InputEventProviderBackend};
+ 
+ // Value returned on success. We use libc's errors otherwise.
+ const KRUN_SUCCESS: i32 = 0;
++
++// `uid_t` and `gid_t` as they appear in the `krun_setuid`/`krun_setgid` prototypes. Both are
++// 32-bit unsigned integers on every Unix libkrun supports, so spelling them out keeps a single
++// ABI for the exported symbols on platforms where libc does not define the types at all.
++#[cfg(unix)]
++type UidT = libc::uid_t;
++#[cfg(windows)]
++type UidT = u32;
++#[cfg(unix)]
++type GidT = libc::gid_t;
++#[cfg(windows)]
++type GidT = u32;
+ // Maximum number of arguments/environment variables we allow
+ const MAX_ARGS: usize = 4096;
+ /// Maximum number of virtqueues allowed by virtio spec (16-bit queue index: 0-65535)
+@@ -193,8 +205,11 @@ struct ContextConfig {
+     shutdown_efd: Option<EventFd>,
+     gpu_virgl_flags: Option<u32>,
+     gpu_shm_size: Option<usize>,
+-    vmm_uid: Option<libc::uid_t>,
+-    vmm_gid: Option<libc::gid_t>,
++    // Dropping privileges before starting the VM is a Unix-only notion; see `krun_setuid`.
++    #[cfg(unix)]
++    vmm_uid: Option<UidT>,
++    #[cfg(unix)]
++    vmm_gid: Option<GidT>,
+ 
+     /// Extra kernel command-line arguments appended via `krun_append_kernel_cmdline`.
+     extra_kernel_cmdline: Vec<String>,
+@@ -301,11 +316,13 @@ impl ContextConfig {
+         self.gpu_shm_size = Some(shm_size);
+     }
+ 
+-    fn set_vmm_uid(&mut self, vmm_uid: libc::uid_t) {
++    #[cfg(unix)]
++    fn set_vmm_uid(&mut self, vmm_uid: UidT) {
+         self.vmm_uid = Some(vmm_uid);
+     }
+ 
+-    fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
++    #[cfg(unix)]
++    fn set_vmm_gid(&mut self, vmm_gid: GidT) {
+         self.vmm_gid = Some(vmm_gid);
+     }
+ }
+@@ -2247,8 +2264,21 @@ unsafe fn load_krunfw_payload(
+     Ok(())
+ }
+ 
++/// Windows has no setuid/setgid model -- privilege reduction there means building a restricted
++/// token before the process starts, which is the caller's job and cannot be done from here once
++/// libkrun is already loaded. Refuse the request instead of recording a uid that
++/// `krun_start_enter` would silently ignore, which would hand the caller a VM running with more
++/// privilege than it asked for.
++#[cfg(windows)]
+ #[unsafe(no_mangle)]
+-pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
++pub extern "C" fn krun_setuid(_ctx_id: u32, _uid: UidT) -> i32 {
++    error!("krun_setuid is not supported on Windows: drop privileges before loading libkrun");
++    -libc::ENOTSUP
++}
++
++#[cfg(unix)]
++#[unsafe(no_mangle)]
++pub extern "C" fn krun_setuid(ctx_id: u32, uid: UidT) -> i32 {
+     match CTX_MAP.lock().unwrap().entry(ctx_id) {
+         Entry::Occupied(mut ctx_cfg) => {
+             let cfg = ctx_cfg.get_mut();
+@@ -2260,8 +2290,17 @@ pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
+     KRUN_SUCCESS
+ }
+ 
++/// See `krun_setuid` for why this refuses rather than records.
++#[cfg(windows)]
+ #[unsafe(no_mangle)]
+-pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
++pub extern "C" fn krun_setgid(_ctx_id: u32, _gid: GidT) -> i32 {
++    error!("krun_setgid is not supported on Windows: drop privileges before loading libkrun");
++    -libc::ENOTSUP
++}
++
++#[cfg(unix)]
++#[unsafe(no_mangle)]
++pub extern "C" fn krun_setgid(ctx_id: u32, gid: GidT) -> i32 {
+     match CTX_MAP.lock().unwrap().entry(ctx_id) {
+         Entry::Occupied(mut ctx_cfg) => {
+             let cfg = ctx_cfg.get_mut();
+@@ -3011,6 +3050,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
+     }
+ 
++    // Windows has no setuid/setgid: privilege reduction there is a different mechanism
++    // (restricted tokens), so `krun_setuid`/`krun_setgid` refuse the request outright rather
++    // than record a uid nothing would ever apply.
++    #[cfg(unix)]
+     if let Some(gid) = ctx_cfg.vmm_gid
+         && unsafe { libc::setgid(gid) } != 0
+     {
+@@ -3018,6 +3061,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+         return -std::io::Error::last_os_error().raw_os_error().unwrap();
+     }
+ 
++    #[cfg(unix)]
+     if let Some(uid) = ctx_cfg.vmm_uid
+         && unsafe { libc::setuid(uid) } != 0
+     {
+-- 
+2.53.0
+
