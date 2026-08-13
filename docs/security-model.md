@@ -534,7 +534,7 @@ header cannot carry that, so `boks run claude` could not work for them by any ro
 `oauth` block: sentinels in the guest, substitution on the resource hosts, refresh on the
 host.
 
-`boks secret import` reads what the agent already wrote and stores it. The guest is given
+`boks secret adopt` reads what the agent already wrote and stores it. The guest is given
 **sentinels** — fakes carrying the real prefix and the real length, because Claude Code checks
 that an OAuth token starts with `sk-ant-oat01-` before it will send one — in an environment
 variable, a read-only credential file, or both. On a request to a configured resource host
@@ -564,7 +564,7 @@ no other.
 - **A rotation inside a sandbox is not durable.** The network supervisor deliberately never
   learns the store's passphrase, so a refresh it performs lives only as long as that sandbox.
   For a provider that rotates refresh tokens — Anthropic does — the copy in the encrypted
-  store is then stale and `boks secret import` has to be run again. The decision log says so
+  store is then stale and `boks secret adopt` has to be run again. The decision log says so
   at the moment it happens. Running the credential through `boks proxy` instead does persist,
   because that process has the passphrase.
 
@@ -587,7 +587,7 @@ Residual exposure worth knowing, none of it hypothetical:
   find-generic-password`, which cannot run on the Linux machine this was written on. What is
   tested is everything either side of it — the parsing of the document it returns, from a file
   and from stdin, and the refusal on a platform with no Keychain. The `security` invocation
-  itself is unproven. Confirming it needs one run of `boks secret import claude-code` on a Mac
+  itself is unproven. Confirming it needs one run of `boks secret adopt claude-code` on a Mac
   where `claude /login` has been used.
 - **The refresh request's shape is unproven against the real provider.** Boks composes an
   RFC 6749 `refresh_token` grant, as JSON by default, and posts it to the configured endpoint.
