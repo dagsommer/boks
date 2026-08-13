@@ -5,10 +5,10 @@ LDFLAGS := -X $(PKG)/internal/cli.Version=$(VERSION)
 
 # The agent images. IMAGE_TAG is read out of the Go registry rather than repeated here:
 # internal/agent is what a running boks resolves an agent to, so it is the source of truth,
-# and a Makefile with its own copy would eventually disagree with it. The release workflow
-# reads the same line and refuses to publish when a git tag does not match it.
+# and a Makefile with its own copy would eventually disagree with it. The images and release
+# workflows call the same script, which additionally refuses a git tag that does not match.
 IMAGE_REPO := ghcr.io/dagsommer/boks
-IMAGE_TAG  := $(shell sed -n 's/^const ImageTag = "\(.*\)"$$/\1/p' internal/agent/agent.go)
+IMAGE_TAG  := $(shell scripts/image-tag.sh)
 # Every directory under images/ except the base, which everything else builds on.
 AGENT_IMAGES := $(filter-out base,$(notdir $(wildcard images/*)))
 

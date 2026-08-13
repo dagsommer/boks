@@ -36,17 +36,10 @@ jobs:
       - id: resolve
         run: |
           set -euo pipefail
-          image_tag="$(sed -n 's/^const ImageTag = "\(.*\)"$/\1/p' internal/agent/agent.go)"
-          if [ -z "$image_tag" ]; then
-            echo "could not read ImageTag from internal/agent/agent.go" >&2
-            exit 1
-          fi
-          # A release tag that disagrees with the constant would publish images the built
-          # binary does not point at. Fail here rather than ship that.
-          if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$image_tag" ]; then
-            echo "git tag ${GITHUB_REF_NAME} does not match agent.ImageTag ${image_tag}" >&2
-            exit 1
-          fi
+          # Reads ImageTag, and fails when a release tag disagrees with it. The same script
+          # gates .github/workflows/release.yml, so the images and the binaries published
+          # for one tag cannot be built against two different opinions of the version.
+          image_tag="$(scripts/image-tag.sh)"
           echo "image_tag=$image_tag" >>"$GITHUB_OUTPUT"
           # The agent images are every directory under images/ except the base.
           # Directories only: images/ also holds a README, and feeding that to buildx
