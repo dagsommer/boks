@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -132,7 +133,7 @@ func TestPrepareShipsTheCAWhenSomethingWillBeDecrypted(t *testing.T) {
 	}
 	// Node ignores the system trust store, so the additive variable has to be set: this
 	// one is safe to point at a file holding only the Boks CA.
-	if env["NODE_EXTRA_CA_CERTS"] != filepath.Join(GuestCADir, certFile) {
+	if env["NODE_EXTRA_CA_CERTS"] != path.Join(GuestCADir, certFile) {
 		t.Errorf("NODE_EXTRA_CA_CERTS = %q", env["NODE_EXTRA_CA_CERTS"])
 	}
 
@@ -168,7 +169,7 @@ func TestPrepareShipsTheCAWhenSomethingWillBeDecrypted(t *testing.T) {
 	// intercept, which is nearly all of them.
 	bundle := filepath.Join(mount.HostPath, bundleFile)
 	if _, err := os.Stat(bundle); err == nil {
-		if env["SSL_CERT_FILE"] != filepath.Join(GuestCADir, bundleFile) {
+		if env["SSL_CERT_FILE"] != path.Join(GuestCADir, bundleFile) {
 			t.Errorf("a bundle was written but SSL_CERT_FILE = %q", env["SSL_CERT_FILE"])
 		}
 	} else if env["SSL_CERT_FILE"] != "" {
