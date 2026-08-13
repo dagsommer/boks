@@ -46,20 +46,20 @@
         <div class="search-results" id="search-results" hidden></div>
 
         <ul class="nav" id="nav">
-          {% for item in site.nav %}
-            {% assign current = false %}
-            {% if item.url == page.url %}{% assign current = true %}{% endif %}
-            <li class="nav-item{% if current %} current{% endif %}">
-              <a href="{{ item.url | relative_url }}"{% if current %} aria-current="page"{% endif %}>{{ item.label }}</a>
-              {% if current and item.toc.size > 0 %}
-                <ul class="toc">
-                  {% for h in item.toc %}
-                    <li class="toc-h{{ h.level }}"><a href="#{{ h.id }}">{{ h.text }}</a></li>
-                  {% endfor %}
-                </ul>
-              {% endif %}
-            </li>
-          {% endfor %}
+          {%- for item in site.nav %}
+          {%- assign current = false %}
+          {%- if item.url == page.url %}{% assign current = true %}{% endif %}
+          <li class="nav-item{% if current %} current{% endif %}">
+            <a href="{{ item.url | relative_url }}"{% if current %} aria-current="page"{% endif %}>{{ item.label }}</a>
+            {%- if current and item.toc.size > 0 %}
+            <ul class="toc">
+              {%- for h in item.toc %}
+              <li class="toc-h{{ h.level }}"><a href="#{{ h.id }}">{{ h.text }}</a></li>
+              {%- endfor %}
+            </ul>
+            {%- endif %}
+          </li>
+          {%- endfor %}
         </ul>
       </nav>
 
