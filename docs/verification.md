@@ -758,6 +758,37 @@ characters at a time — the first chunk is exactly 16 bytes in both runs — an
 queue is live. There is no 8250 in libkrun's legacy device set, so there is no `earlycon`
 to recover them. Early boot is unobservable through this path by construction.
 
+### The nerdbox shim starts on Windows, 2026-08-14
+
+Before this, `containerd-shim-nerdbox-v1.exe -namespace default -id test start` failed in
+118 ms with `io.containerd.nerdbox.v1: not implemented`. The binary was healthy — `-v` and
+`-info` both returned 0, the latter emitting real protobuf including the mount capabilities
+`mkdir/*,format/*,erofs` — but containerd's own `pkg/shim` library stubs six functions on
+Windows, and `setupSignals` is called at `shim.go:228`, before the action switch. `-v` and
+`-info` return at 215 and 219, which is why they worked and nothing else did.
+
+With two carried patches — containerd PR #13948, which is **unmerged upstream**, plus a
+one-line nerdbox fix — the same command now exits 0 in 2.6 s with **empty stderr**, and:
+
+- `boot.bin` is a valid 68-byte bootstrap-params protobuf naming
+  `\\.\pipe\containerd-shim-0b35a3709a06d167007c694829ad2d32` and `ttrpc`
+- a child process survives the parent and is serving both that pipe and a log pipe, with
+  **both accepting a connection**
+- its command line carries `-socket \\.\pipe\containerd-shim-…`, which is direct evidence
+  the second patch took: nerdbox had been passing that address as a `TTRPC_SOCKET`
+  environment variable that **nothing anywhere reads**, while PR #13948 takes it from the
+  `-socket` flag. Unix never hit this because it passes the socket as `cmd.ExtraFiles` fd 3.
+
+**What this is not.** A successful `Connect` proves a listener exists, not that a working
+ttrpc TaskService is behind it. Nothing has spoken ttrpc to that pipe, and containerd has
+never run on Windows here. The five remaining stubs became reachable for the first time with
+this change and have never executed.
+
+**A caution about using pipe enumeration as a signal.** The test machine also has Docker
+Sandboxes installed, and carries an unrelated `containerd-shim-nerdbox-v1.exe` from three
+weeks earlier with 4,497 s of CPU time, plus pipes from that install. Enumerating the pipe
+namespace finds those too; match the exact name from `boot.bin` rather than pattern-matching.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
