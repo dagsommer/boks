@@ -587,10 +587,14 @@ holds a real token at any point.
 - The store is written **before** the guest is answered. The reverse ordering would lose the
   credential entirely on a storage failure, and an authorization code cannot be spent twice.
 
-Three things are fail-closed rather than best-effort, and each would otherwise be a way for a
-real token to reach the guest unread: a response body larger than 1 MiB, a response still
-carrying a content encoding after the relayed request asked for identity, and a body in which
-masking could not remove every occurrence. All three refuse the exchange.
+Four things are fail-closed rather than best-effort, and each would otherwise be a way for a
+real token to reach the guest unread: a response body larger than 1 MiB; a response still
+carrying a content encoding after the relayed request asked for identity; a **successful**
+status whose body Boks could not read as a token response, which is the shape a token in an
+unrecognised form would take; and a body in which masking could not remove every occurrence.
+All four refuse the exchange. A *failed* login is the one thing passed through untouched,
+because only the agent can tell the user that its code was spent — and there is no token in
+such an answer to mask.
 
 **What acquisition does not protect against, stated plainly.** Boks captures the exchange it
 can see. A guest that reached a token endpoint Boks is not intercepting would keep what it
