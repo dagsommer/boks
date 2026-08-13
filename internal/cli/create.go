@@ -61,6 +61,9 @@ Agents:
 		if err != nil {
 			return err
 		}
+		if err := applyCloneMode(flags, inv, &cfg, env); err != nil {
+			return err
+		}
 		cfg.Stderr = env.Stderr
 
 		// Only the wiring, not the stack: nothing starts here, so there is no VM to

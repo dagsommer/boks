@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"syscall"
 	"time"
@@ -36,8 +37,13 @@ type Info struct {
 	Created     time.Time      `json:"created"`
 	Ephemeral   bool           `json:"ephemeral"`
 	Workspaces  []WorkspaceRef `json:"workspaces"`
-	Command     []string       `json:"command,omitempty"`
-	Env         []string       `json:"env,omitempty"`
+	// Filesystem says how the workspace reaches the guest — whether guest writes land
+	// on the host's disk or on a clone inside the VM. It is fixed at creation and it is
+	// the most consequential fact about a sandbox for the files on your machine, so it
+	// is always present rather than omitted when it is the default.
+	Filesystem Filesystem `json:"filesystem"`
+	Command    []string   `json:"command,omitempty"`
+	Env        []string   `json:"env,omitempty"`
 	// Annotations are the OCI annotations the sandbox was created with. They are how the
 	// runtime is configured — resources and networking — so they are the record of what a
 	// sandbox is wired to, and a later command that has to bring it back up reads its
@@ -174,7 +180,11 @@ func Inspect(ctx context.Context, address, name string) (Info, error) {
 
 // Start brings a stopped sandbox up. Starting a running sandbox is not an error: callers
 // mostly want "make sure it is up".
-func Start(ctx context.Context, address, name string) error {
+//
+// out receives anything the guest says while the sandbox comes up — today, a clone-mode
+// sandbox reporting its first clone and what the host's dirty working tree did not bring
+// with it. A nil out discards it.
+func Start(ctx context.Context, address, name string, out io.Writer) error {
 	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
 	c, err := connect(ctx, address)
 	if err != nil {
@@ -186,7 +196,7 @@ func Start(ctx context.Context, address, name string) error {
 	if err != nil {
 		return err
 	}
-	_, err = ensureRunning(ctx, container)
+	_, err = ensureRunning(ctx, container, out)
 	return err
 }
 
@@ -360,11 +370,28 @@ func loadContainer(ctx context.Context, c *client.Client, name string) (client.C
 	return container, nil
 }
 
-// ensureRunning returns the sandbox's running task, starting one if there is none.
+// ensureRunning returns the sandbox's running task, starting one if there is none, and makes
+// sure a clone-mode sandbox holds its clone before anything else runs in it.
+//
+// The clone belongs here rather than in each caller because a sandbox outlives one command:
+// `run`, `exec` and `start` all reach a running task through this function, and any of them
+// may be the first. See ensureClone, which is idempotent for that reason.
+func ensureRunning(ctx context.Context, container client.Container, out io.Writer) (client.Task, error) {
+	task, err := startTask(ctx, container)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureClone(ctx, container, task, out); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+// startTask returns the sandbox's running task, starting one if there is none.
 //
 // A task whose process has already exited is deleted first: containerd keeps the record
 // until it is reaped, and creating a new task on top of it fails with "already exists".
-func ensureRunning(ctx context.Context, container client.Container) (client.Task, error) {
+func startTask(ctx context.Context, container client.Container) (client.Task, error) {
 	task, err := container.Task(ctx, nil)
 	if err == nil {
 		status, statusErr := task.Status(ctx)
@@ -431,6 +458,7 @@ func describe(ctx context.Context, container client.Container) (Info, error) {
 		Created:     info.CreatedAt,
 		Ephemeral:   info.Labels[LabelEphemeral] == "1",
 		Workspaces:  decodeWorkspaces(info.Labels),
+		Filesystem:  decodeFilesystem(info.Labels),
 		Command:     decodeCommand(info.Labels),
 		Policy:      decodePolicy(info.Labels),
 	}
