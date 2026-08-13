@@ -257,14 +257,27 @@ func Image(name string) string { return ImageRepo + "/" + name + ":" + ImageTag 
 
 // initArgv is what every Boks agent image expects in front of the agent's own command.
 //
-// tini is there to be PID 1: a sandbox that lives for hours accumulates zombies without one,
-// and a real Docker Sandboxes guest was observed running tini as PID 1 for the same reason.
-// boks-entrypoint installs the Boks CA — see internal/ca — when BOKS_CA_CERT_B64 is in the
-// environment, and execs straight through when it is not.
+// tini reaps: a sandbox that lives for hours accumulates zombies without an init, and a real
+// Docker Sandboxes guest was observed running tini for the same reason. boks-entrypoint
+// installs the Boks CA — see internal/ca — when BOKS_CA_CERT_B64 is in the environment, and
+// execs straight through when it is not.
+//
+// `-s` is not cosmetic. Without it every run began with three lines of tini warning:
+//
+//	[WARN  tini (7)] Tini is not running as PID 1 and isn't registered as a child subreaper.
+//	Zombie processes will not be re-parented to Tini, so zombie reaping won't work.
+//	To fix the problem, use the -s option or set the environment variable TINI_SUBREAPER …
+//
+// which reads like a fault before the user's own output and is not one — but it was also not
+// spurious. Inside the microVM the guest's own init is PID 1, so tini is not, and a
+// non-subreaper tini that is not PID 1 really does reap nothing: an orphan is re-parented
+// past it to PID 1. `-s` registers tini as a child subreaper (PR_SET_CHILD_SUBREAPER), which
+// makes orphans come back to tini and makes the reaping this prefix exists for actually
+// happen. The warning goes because the condition it warned about is gone.
 //
 // This is a property of the images in images/, so an agent pointed at some other image with
 // -template gets whatever that image does instead.
-var initArgv = []string{"/usr/bin/tini", "--", "/usr/local/bin/boks-entrypoint"}
+var initArgv = []string{"/usr/bin/tini", "-s", "--", "/usr/local/bin/boks-entrypoint"}
 
 // Builtin returns the agents Boks knows about.
 //
