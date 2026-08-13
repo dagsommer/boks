@@ -21,10 +21,12 @@ package enforce
 //
 //   - **Publish only at creation.** `boks ports --publish` on a running sandbox becomes an
 //     error telling the user to restart it. Honest, adds no surface, and rejected: it makes
-//     the feature useless for the case that motivates it most. An OAuth login inside a
-//     sandbox needs a `127.0.0.1` callback forwarded *now*, in the middle of a session that
-//     is already running, and "stop your agent and start it again" is not an answer. sbx
-//     says explicitly that `sbx ports` is how a running sandbox is changed.
+//     the feature useless for the case that motivates it most. You do not know which port
+//     your dev server will use until you have started it, and by then the sandbox is up —
+//     "stop your agent and start it again" is not an answer for something you will do several
+//     times an hour. sbx says explicitly that `sbx ports` is how a running sandbox is
+//     changed, and a restart-only version would also make an OAuth flow with a loopback
+//     redirect unservable, if one turns up.
 //   - **A file plus a signal.** The CLI writes a desired-state file into the sandbox's state
 //     directory and SIGHUPs the supervisor, which reconciles. No socket, no protocol. It was
 //     close, and it lost on the return path: an ephemeral publish has to report *which* port

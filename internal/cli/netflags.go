@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
@@ -23,6 +24,23 @@ type policyFlags struct {
 	inject  []string
 	guest   []string
 	publish []string
+	oauth   []string
+	// noSecrets leaves the credential store out of this run entirely. A credential
+	// stored under a service's name applies without being named again — see
+	// credentialPlan — and this is how a sandbox is run without one.
+	noSecrets bool
+	// agent is the agent the sandbox runs. It is not a flag on `run` — the agent is a
+	// positional there — but it decides a layer of the policy, so it travels with the
+	// rest of what decides one. `boks policy ls` and `boks policy check` set it from
+	// their own --agent flag; `run` and `create` from the resolved invocation; `start`
+	// and `exec` from what the sandbox recorded when it was created.
+	agent agent.Agent
+}
+
+// forAgent labels the flags with the agent whose allowlist applies.
+func (f *policyFlags) forAgent(a agent.Agent) *policyFlags {
+	f.agent = a
+	return f
 }
 
 // register adds the flags to a flag set. The preset default is empty rather than
@@ -44,6 +62,10 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 		"attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
 	fs.StringArrayVar(&f.guest, "guest-credential", nil,
 		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
+	fs.StringArrayVar(&f.oauth, "oauth", nil,
+		"name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable)")
+	fs.BoolVar(&f.noSecrets, "no-secrets", false,
+		"do not attach credentials from the store; only what --inject names")
 }
 
 // registerPublish adds `-p/--publish`, separately from the rest.
@@ -62,7 +84,7 @@ func (f *policyFlags) checkPublish() error { return checkPublishSpecs(f.publish)
 
 // specified reports whether the user set any of them.
 func (f *policyFlags) specified() bool {
-	return f.policySpecified() || f.mode != "" || len(f.inject) > 0 || len(f.guest) > 0
+	return f.policySpecified() || f.mode != "" || len(f.inject) > 0 || len(f.guest) > 0 || len(f.oauth) > 0
 }
 
 // policySpecified reports whether this run asked for a policy of its own, as opposed to the
@@ -137,6 +159,10 @@ func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (
 		return policy.Resolution{}, err
 	}
 	req := record.Request(store, sandbox)
+	// The agent's own allowlist is re-derived from the registry rather than read back
+	// from the sandbox, so that it is always this build's definition of what that agent
+	// needs — including when an entry is removed.
+	req.Agent, req.AgentAllow = f.agent.Name, f.agent.AllowRules()
 	if f.preset != "" {
 		req.Preset = f.preset
 	}

@@ -256,7 +256,8 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	outbound.Header.Del("Proxy-Authorization")
 	outbound.Header.Del("Proxy-Connection")
 
-	used, err := s.cfg.Injector.Apply(r.Context(), target, outbound.Header)
+	// FlowPlaintext: this request is going out in the clear, whatever it is addressed to.
+	used, err := s.cfg.Injector.Apply(r.Context(), target, outbound.Header, secret.FlowPlaintext)
 	if err != nil {
 		// The error names secrets, never values; see internal/secret.
 		http.Error(w, "boks: credential injection failed: "+err.Error()+"\n", http.StatusBadGateway)
@@ -548,7 +549,7 @@ func denialText(d policy.Decision) string {
 
 To permit it, add the destination when starting the sandbox:
 
-  boks run -allow %s:%d ...
+  boks run --allow %s:%d ...
 
 Recent decisions: boks policy log
 `, d.Host, d.Port, d.Stage, d.Policy, d.Reason, d.Host, d.Port)

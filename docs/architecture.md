@@ -364,6 +364,17 @@ validate credential format locally: a marker like `boks-managed` makes `gh` and 
 before a request ever reaches the proxy. Values are wrapped in a type whose `String`,
 `GoString` and JSON forms are redacted, and a test asserts a secret cannot be printed.
 
+Almost nobody should have to write either flag. A **service registry** in the same package
+maps a name — `anthropic`, `github`, `openai`, and the rest of Docker Sandboxes' list — to
+that vendor's hosts, header, guest variable and key shape, so `boks secret set anthropic` is
+the whole configuration and a stored credential applies to every sandbox. It is data in the
+shape `internal/agent` uses, with `Add` as the seam a user-defined service arrives through,
+and each row *renders itself into the two flag spellings above* rather than building rules
+directly — so one parser and one validator govern a built-in row and a hand-typed rule alike,
+and the process that runs a sandbox's proxy needs no knowledge of the registry at all. Two of
+the eleven names carry no rule, because their vendors document a header and not the host their
+CLI sends it to; asking for one says so rather than guessing.
+
 Storage is an AES-256-GCM file keyed by PBKDF2-HMAC-SHA256 over a passphrase from
 `BOKS_SECRETS_PASSPHRASE`. Secret *names* are inside the ciphertext too. A key file next to
 the encrypted file is deliberately not offered: it encrypts nothing against anyone who can

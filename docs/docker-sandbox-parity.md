@@ -68,7 +68,9 @@ output, plus a live `sbx ls`.
 | Image flag | `-t, --template` — "Container image to use for the sandbox (default: agent-specific image)" | Same name and alias. Was `-image` | P1 | done |
 | Sizing defaults | `--cpus` 0 = all host CPUs; `-m, --memory` in binary units, default half the host's memory capped at 32 GiB | Same, including the unit parser. A bare number is bytes, as for `docker --memory`, and a value too small to boot is refused with the spelling the user meant | P1 | done |
 | Detached run | `-d, --detached` prints the sandbox and exits without an interactive session | Same | P1 | done |
-| Interactive by default | `sbx run` attaches an interactive session | Boks allocates a pty when stdin *and* stdout are terminals, and none when either is a pipe. There is no `-t` for it: `-t` is the template flag | P1 | done |
+| Interactive by default | `sbx run` attaches an interactive session | Boks allocates a pty when stdin *and* stdout are terminals, and none when either is a pipe. There is no `-t` for it: `-t` is the template flag. Docker's `-it` on `run` is caught before pflag sees it and answered — `-ti` used to set `--template` to "i" and send the user to debug a missing image | P1 | done |
+| Agent network requirements | Not a separate concept: a kit carries its agent's network rules beside its image and entrypoint | An agent record carries the destinations its CLI cannot work without, resolved as an `agent <name>` layer in `boks policy ls`. `boks run claude` used to fail out of the box and teach the user to read `api.anthropic.com` out of a log. Vendor-documented hosts only, telemetry excluded, empty where no source was found. A deny in any scope still beats it, and `--policy locked` drops the layer | P0 | done |
+| Run output volume | A line or two per run | Full policy, TLS notice and enforcement note on a sandbox's first run and whenever its policy changes; two lines otherwise; `--quiet` for none. An interception host never announced before is announced whatever else is true. Fifty lines per run is how you train someone to grep past a security notice | P1 | done |
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
 | `-p/--publish` | Publishes a sandbox port on the host at creation; ignored when re-attaching | Same flag, same short form, same rule — a re-attaching run says so rather than looking obeyed, and points at `boks ports` | P1 | done |
 | `--clone`, `--kit` | Run flags for clone mode and kits | Not implemented; nothing in the current design blocks them | P1 | none |
@@ -121,7 +123,7 @@ website documents.
 | `cp` | Copy between sandbox and host | `cp` |
 | `ports` | Manage port publishing | `ports`, same flags: `--publish`, `--unpublish`, `--json` |
 | `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | all ten, same spellings; rules are durable and scoped global or per-sandbox |
-| `secret` | Manage stored secrets | `secret set/ls/rm` |
+| `secret` | `set`, `import`, `ls`, `rm`, `set-custom`; **secrets are keyed by a known service name**, not a free-form label | `secret set/import/adopt/login/ls/services/rm/reset`; keyed by service name, free-form names still work | P0 | done | The registry landed — see 5a. `import` now means sbx's thing (host environment variables); reading a stored OAuth credential is `adopt`; `login` arms one for the agent to acquire inside a sandbox, which is sbx's `run … -- auth login` made explicit — see 5b. `services` prints the registry, empty rows included |
 | `kit` | (Experimental) Manage kit artifacts | none |
 | `template` | Manage sandbox templates (the image an agent runs in) | none; `-t, --template` flag only |
 | `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
@@ -337,7 +339,8 @@ socket. No VM has ever been refused a destination by Boks. See
 | Exact + wildcard hosts | Allowlist includes broad wildcards such as `*.googleapis.com` | Exact and wildcard, plus ports, IPs and CIDR | P0 | done | No multi-tenant wildcards in any preset — they allow every tenant's bucket |
 | Host pattern forms | v2 grammar: exact, host with port, single-label wildcard, multi-label wildcard, port ranges, port wildcard, CIDR | Exact, host with port, one wildcard form, port ranges and wildcard, CIDR | P1 | partial | **Gap:** Boks' `*.example.com` matches any subdomain depth, so "exactly one label" cannot be expressed. Not yet worth a second syntax |
 | Deny precedence | Local deny rules still apply under org governance | Deny always wins over allow | P0 | done | Order- and specificity-independent; tested |
-| Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | `ls` shows the stored rules by scope *and* what they resolve to, each rule labelled with the scope that wrote it. Decisions recorded as JSON lines under the state dir; local only |
+| Rule inspection | `sbx policy ls`, `sbx policy log` show rules and recent decisions | `boks policy ls` / `boks policy log` | P1 | done | `ls` shows the stored rules by scope *and* what they resolve to, each rule labelled with the scope that wrote it, `--agent NAME` included. Decisions recorded as JSON lines under the state dir; local only, and narrowed with `--sandbox` and `--since` — one file for the machine is a firehose otherwise |
+| Per-agent allowlist | A kit declares its agent's network rules | The agent record does, resolved as an `agent <name>` layer between the preset and the global scope | P0 | done | Deny still beats it in every scope, tested; `locked` drops it, because "deny everything" has to keep meaning that. Only vendor-documented destinations, no telemetry, and empty for agents with no source |
 | Durable policy | `policy allow/deny/rm` write rules that outlive the invocation | Same, in `<state>/policy/policy.json` — versioned JSON, owner-only, written atomically | P0 | done | A missing store is the uninitialised state and still denies by default. A corrupt, unreadable or future-versioned one is an error every caller stops at: no sandbox starts |
 | Policy scoping | "Local rules can apply globally across all sandboxes or be scoped to one sandbox" | Global, per-sandbox and profile scopes | P0 | done | Deny in any scope beats allow in any scope; only the base preset decides the default action. Tested over every ordered pair of scopes |
 | Policy profiles | `sbx policy profile`; `sbx run --profile` | `boks policy profile ls/show/create/rm`, `boks run --profile` | P1 | done | A profile is a named policy, not a new concept: a preset plus rules. It cannot unsay a deny written elsewhere |
@@ -367,7 +370,10 @@ socket. No VM has ever been refused a destination by Boks. See
 
 **Where Boks stands.** `internal/secret` implements the model and it is now applied by
 `boks run`, over HTTP **and HTTPS**; `boks secret set/ls/rm` manages an encrypted host-side
-store. The values are resolved by the foreground command and handed to the sandbox's network
+store. A credential stored under one of the eleven service names Boks knows needs no further
+configuration — the registry supplies the hosts, the header, the guest's variable and the
+shape of its placeholder — and `--inject` remains for everything else and still overrides.
+The values are resolved by the foreground command and handed to the sandbox's network
 process on a pipe, so no long-lived process ever holds the passphrase and no secret appears
 in a command line. HTTPS injection is paid for with a TLS termination, for the configured
 hosts and no others — see
@@ -378,8 +384,16 @@ hosts and no others — see
 | Injection model | Real value stays on host; proxy injects auth headers into approved outbound requests | Same principle, vendor-neutral | P0 | partial | Applied by `boks run` for HTTP and HTTPS. Never exercised against a real guest |
 | Credential grammar | v2 `credentials[]`: one service owns many `inject` rules, each with a domain, a header and a `format` or `scheme`, plus `proxyManaged` and an env var name | Same two-level shape | P1 | done | `--inject service@host[,host]=bearer\|basic[:user]\|header[:format]`; several hosts share one stored secret |
 | Schemes | `format` (`Bearer %s`) or `scheme` (`bearer`/`basic` with `username`), mutually exclusive | Same, with the same exclusivity enforced | P0 | done | A format string covers every vendor; basic auth keeps a username field because its value is base64(user:secret) |
-| Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | done | `--guest-credential service=ENV=placeholder` sets it in the sandbox's environment; a test drives a canary secret through and asserts only the placeholder arrives |
-| OAuth credentials | v2 `oauth`: sentinel access and refresh tokens in a guest credential file, swapped by the proxy for `resourceHosts` | Not implemented | P2 | none | The model leaves room for it: a credential is not assumed to be a single header |
+| Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | done | `--guest-credential service=ENV=placeholder` sets it in the sandbox's environment; a test drives a canary secret through and asserts only the placeholder arrives. For a known service it is derived from the vendor's documented key prefix and a plausible length, so a client's own format check passes. Prefixes are documented; lengths mostly are not, and the rows say which is which — a wrong prefix breaks a real client, a wrong length can only fail a check the prefix has already passed |
+| OAuth credentials | v2 `oauth`: sentinel access and refresh tokens in a guest credential file, swapped by the proxy for `resourceHosts` | Same shape: `oauth` beside `inject` on a credential | P0 | done | Raised from P2 to P0: a Claude.ai subscription user has no API key, so this is the only route their credential can take. Demonstrated against a local HTTPS origin — guest sent a sentinel, origin received the real token |
+| OAuth sentinels | `sentinels.{accessToken,refreshToken}` the guest holds | Same, derived per credential with the provider's real prefix and length | P0 | done | Shape is functional: Claude Code refuses a token that is not `sk-ant-oat01-…` before any request is made. Substitution is restricted to the credential's own headers, so an origin echoing an arbitrary header cannot leak the token back |
+| OAuth token endpoint | `tokenEndpoint.{host,path}` where tokens are refreshed | Same; the flow is terminated and the request **answered**, never forwarded | P0 | done | Boks refreshes on the host and replies with the sentinels the guest already holds. A guest-composed request never reaches the endpoint carrying the real refresh token, and no origin response body has to be buffered or rewritten |
+| OAuth credential file | `credentialFile.{path,template}`, a Go template rendered into the guest | Same, rendered on the host and shared read-only, as the CA is | P1 | done | The template is executed with a data struct that has no field a real token could occupy. Read-only is safe because a refresh answered by boks returns the same sentinels, so an agent rewriting the file writes back what is there |
+| OAuth response fields / passthrough | `responseFields` overrides, `passthrough` skips masking | `responseFields` equivalent; masking on the acquisition path only, and no way to turn it off | P2 | done | `passthrough` is very likely this same distinction seen from the other side: a *relayed* response is the only kind that needs masking, and a *refresh* is composed from sentinels so there is nothing to mask. Boks masks by value rather than by field — a token echoed anywhere is replaced — and a body it cannot fully mask fails the exchange instead |
+| OAuth adoption | Not documented; sbx obtains it by logging in inside the sandbox | `boks secret adopt`, reading what the agent already wrote | P0 | partial | macOS Keychain via the `security` CLI, `~/.claude/.credentials.json` elsewhere, or a document on stdin. The Keychain read is **unexecuted** — written on Linux. Renamed from `import`, which now means what sbx's means |
+| OAuth acquisition in the sandbox | `sbx run claude … -- auth login`: the real client performs its own OAuth inside the sandbox and sbx ends up holding the token | `boks secret login SERVICE` arms a credential, `boks run claude -- auth login` fills it in | P0 | partial | The initial exchange is **relayed and captured** — the opposite of the refresh path, because the authorization code exists only inside the guest — and the response is rewritten to sentinels before the guest sees a byte. Verified against a local origin, with the exchange shape copied from the real Claude Code. **Not durable through a sandbox**: the network supervisor has no store passphrase, so the login lasts as long as the sandbox. Needs no port publishing — the flow is paste-a-code, confirmed on the real binary |
+| OAuth precedence | An OAuth credential beats an API key for the same service | Same, decided on destinations rather than names | P1 | done | A login adopted as `claude-code` and a key stored as `anthropic` both end at api.anthropic.com; the key is dropped and the run says so. A key with any host of its own is kept |
+| OAuth refresh durability | Not documented | Durable through `boks proxy`; in-sandbox rotation is not | P1 | partial | The network supervisor never learns the store passphrase, so a refresh it performs lasts as long as the sandbox. With a provider that rotates refresh tokens the stored copy then goes stale and must be re-imported |
 | HTTPS injection | Supported | Supported, by terminating TLS for the configured hosts only | P0 | done | Demonstrated: origin received the real secret, client had sent only a placeholder. Every other host stays a blind tunnel |
 | Interception CA | Self-signed proxy CA installed in the guest and exposed as an env var | Local CA under the state dir; `boks ca show/export/env/regenerate` | P0 | done | Private key never leaves the host; leaves minted from the policy target, never from the guest's ClientHello |
 | Secret storage | OS keychain; Linux uses desktop keyring or an encrypted file | Encrypted local file first, keychains later | P1 | partial | AES-256-GCM, PBKDF2-HMAC-SHA256 over `BOKS_SECRETS_PASSPHRASE`; names encrypted too |
@@ -388,10 +402,137 @@ hosts and no others — see
 | Placeholder replacement | Guest holds a placeholder | Existing header is overwritten, never appended | P0 | done | A surviving placeholder would be a silent auth failure at best |
 | Guest secret access | Guest never receives raw values | Same; no host API for the guest to query | P0 | done | The store's only consumer is the proxy's request path. Adding a lookup endpoint would end the guarantee |
 | Never logged | Not documented | Values redacted in every printed and serialised form | P1 | done | Enforced by the `Value` type and asserted by tests |
-| `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set` | P1 | done | Reads from stdin by default; `--value` documented as visible in the process list |
+### 5a. Secrets are keyed by service, and that is the whole UX
+
+Read from real `sbx secret --help` and `sbx secret set/import --help`. **Done**, apart from the
+host-side `--oauth`, which is refused on purpose; the in-sandbox acquisition it exists beside
+is in §5b. What follows is what was found and what was built from it.
+
+sbx does not ask the user how to inject a credential. It has a **fixed list of known
+services** — anthropic, cursor, droid, github, google, groq, mistral, nebius, openai,
+openrouter, xai — and the product already knows what each one means: which hosts it applies
+to, which header carries it, what shape its value has. So the whole ceremony is:
+
+```
+echo "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
+```
+
+Boks used to make the user supply that knowledge instead. It no longer does — `internal/secret`
+has the same registry, in the shape `internal/agent` uses (a struct, an ordered registry,
+`Add` as the seam a user-defined entry arrives through), and the ceremony is now the same one
+line. A row renders itself into the `--inject`/`--guest-credential` grammar rather than
+building rules directly, so there is one parser and one validator, and nothing a registry
+entry can express that a user could not have typed. A stored credential applies to every
+sandbox without being named again, `--inject` still overrides it, and `--no-secrets` leaves
+the store out of a run.
+
+**Nine of the eleven names carry a rule; `cursor` and `droid` do not.** The bar is the one
+`internal/agent` sets for an allowlist: vendor documentation, cited in the entry, or nothing.
+A guessed header produces a request the origin rejects for a reason nobody can see, and the
+guest's placeholder travels to the real API in place of the credential. Both missing rows
+fail for the same reason and it is not the header: Cursor documents `CURSOR_API_KEY` and an
+`api.cursor.com` Admin API, and does not document what `cursor-agent` itself talks to; Factory
+documents `FACTORY_API_KEY` and `Authorization: Bearer fk-…` against the *Analytics* API, and
+does not document the droid CLI's own endpoint. A rule built from the documented half would
+put a placeholder in the variable the agent reads and ship it to a host with no rule.
+
+Two of the nine are worth naming because a plausible guess gets them wrong: **Anthropic takes
+`x-api-key` and Google takes `x-goog-api-key`**, not bearer tokens, and on Anthropic that
+header is reserved for OAuth tokens — so a key sent as a bearer token 401s with no hint that
+the header was the problem.
+
+Three further findings from the same output, and what each became:
+
+- **Two OAuth acquisition paths, and Boks now has both of the ones that matter.**
+  `sbx secret set -g openai --oauth` runs the flow host-side; `sbx run claude … -- auth login`
+  drives it through the agent inside the sandbox. The host-side one is refused here and stays
+  refused — every flow that could acquire a token begins by identifying the program to the
+  vendor with a client id issued to a registered application, and Boks is registered with none
+  — and it is worth noticing that sbx's is documented "openai/global only", which is what
+  holding exactly *one* registration looks like. **The in-sandbox one is not blocked by any of
+  that**, because the client id belongs to the agent, and Boks was already terminating TLS for
+  the endpoint it uses. So `boks secret login` arms a credential and `boks run claude -- auth
+  login` fills it in, with the initial exchange relayed and captured and the response rewritten
+  to sentinels; and `boks secret adopt`, which sbx does not appear to have at all, still covers
+  the machine you already logged in on. See §5b and the rows below.
+- **OAuth takes precedence over an API key** for the same service at runtime, and `secret
+  import` deliberately skips a service that already has one rather than silently shadowing it.
+  Both copied. `secret.PreferOAuth` decides precedence on *destinations* rather than names,
+  because the two credentials usually have different ones — a login adopted as `claude-code`
+  and a key stored as `anthropic` both end at api.anthropic.com — and the run says which
+  credential it dropped rather than dropping it quietly.
+- **`import` means host environment variables**, offered interactively with a Y/n prompt and a
+  last-4 preview, with `--all`, `--force` and `--dry-run`. Boks used the same verb for reading
+  a stored OAuth credential; ours is renamed `boks secret adopt`, and `import` now means what
+  it means in sbx. The registry is what makes it possible: every configured service knows the
+  variable its vendor's tooling reads. The last four characters are the only fragment of a
+  credential Boks prints anywhere, and they exist because a shell can hold two keys for one
+  vendor.
+
+| Service registry | A fixed list of known services; the name is the whole configuration | Same list, same names, same order, as data in `internal/secret/service.go` | P0 | done | 9 of 11 configured, each citing the vendor page it was read from; `cursor` and `droid` registered with no rule, which is the honest state. `Add` is the seam a user-defined service arrives through, and it overrides an empty row |
+| Global vs per-sandbox scope | `-g` stores globally; a sandbox-scoped variant exists | Global only: a stored credential applies to every sandbox | P2 | partial | Scoping a credential to one sandbox is not implemented. `--no-secrets` is the only narrowing, and it is all-or-nothing |
+| Registry secrets | `sbx secret set --registry ghcr.io --password-stdin`, with three scopes: host-only (template and kit pulls, never injected), global (injected by the proxy into every new sandbox's registry login), or one sandbox | None | P2 | none | A category Boks does not have at all. Note the property worth copying: the credential authenticates the pull **without entering the sandbox filesystem** |
+| `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set SERVICE` | P1 | done | Reads from stdin by default; `--value` documented as visible in the process list. A known service resolves to its rule and the command prints what the sandbox will do with it; a known service with no rule is refused by name, because storing it would leave a credential nothing ever attaches |
+| `secret set --oauth` | Runs an OAuth flow from the host | Refused, with the reason, and the refusal now names two routes that work | P2 | none | Still not a missing afternoon's work: every host-side flow starts with a client id the vendor issues to a registered application, and Boks holds none. Note that sbx's `--oauth` is documented "openai/global only", which is what holding exactly one registered client id looks like. `boks secret adopt` covers a machine you have logged in on; `boks secret login` + `boks run claude -- auth login` covers a fresh one, by letting the agent use *its* client id |
+| `secret login` | Not a command; the equivalent is `sbx run claude … -- auth login` with no setup | `boks secret login SERVICE` arms the credential first | P1 | done | Boks makes the arming explicit rather than doing it for every run of an agent, because arming a credential is what decides that boks decrypts that host's traffic — the same bargain every credential rule makes, struck where the user can see it |
+| `secret import` | Walks host environment variables, Y/n each, last-4 preview, `--all`/`--force`/`--dry-run` | Same, built on the registry | P1 | done | Every configured service knows the variable its vendor's tooling reads. The last-4 preview is the only fragment of a credential Boks prints anywhere; a value under 12 characters gets none |
+| `secret ls` | Lists names | Name, kind and destination | P1 | done | Shows which credentials are logins and which are keys, and where each is attached. Never a value |
+| Lost passphrase | Not applicable: sbx keeps credentials in an account-backed store | `boks secret reset --force` deletes the store without decrypting it | P1 | done | Every other subcommand has to decrypt, `rm` included, so the remedy for a forgotten passphrase used to be the command that had just failed. The failure now names the file, the cost and this command. `secret ls` still needs the passphrase: the names are inside the envelope, and a plaintext index of which services you hold credentials for is worth denying an attacker |
 | Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | partial | The mechanism exists (basic auth with a username, over an intercepted flow); never exercised against a real Git host |
 | SSH agent forwarding | Supported; SSH key signing works, GPG/S-MIME do not | Host agent socket forwarding | P2 | none | |
-| OAuth device login | Agent login inside sandbox; session tokens stay on host | Out of scope near-term | P2 | none | |
+| OAuth device login | Agent login inside sandbox; session tokens stay on host | Implemented as acquisition, not as a device flow | P1 | partial | See §5b. No device flow is involved: the agent runs its own authorization-code-with-PKCE login and boks keeps the result |
+
+### 5b. Acquisition: the login happens in the sandbox, the token does not leave the host
+
+The gap `boks secret adopt` cannot close is a **fresh machine**, where there is no login to
+read. sbx closes it with `sbx run claude … -- auth login`, and the reason that works for a
+product with no Anthropic registration is that it is not the product logging in — it is the
+agent, with the agent's own client id, which is legitimate because it *is* that program. Boks
+does the same, and most of the machinery was already there.
+
+**What was determined first, because it decides whether this is possible at all.** Two login
+shapes are common and they behave very differently in a sandbox: paste-a-code works today,
+while a localhost redirect needs the browser on the host to reach a listener in the guest —
+which without port publishing never arrives. Claude Code 2.1.228 was driven headless to find
+out. It uses **paste-a-code**: `redirect_uri` is a vendor-hosted page, `code=true` selects the
+paste flow, and the binary contains no loopback callback at all. So this needs no ports, and
+the fact that sbx *has* `sbx ports` is not the reason its version of this works. See
+[verification.md](verification.md#the-real-claude-code-login-flow-observed).
+
+**The design, in one sentence:** an armed credential — sentinels, endpoint, destinations, no
+tokens — makes the proxy relay the *first* token exchange it sees for that endpoint, keep the
+pair out of the response, and hand the guest the same document with sentinels in it.
+
+The thing to keep straight is that this is the **opposite** of the refresh path, which was
+built earlier and stays as it was:
+
+| | refresh | acquisition |
+|---|---|---|
+| the guest's request | drained and discarded, never forwarded | relayed verbatim |
+| why | Boks can compose the request itself from the stored refresh token | the authorization code and PKCE verifier came from a redirect only the guest saw |
+| the response | composed by Boks from sentinels | the origin's, with the tokens replaced |
+| the body | never buffered | buffered, bounded, and refused if it cannot be masked |
+| how often | every time | once, and never again for that credential |
+
+Which one applies is read from the **stored record**, never from the request: a credential
+relays only while it holds no token, and the first token closes the door. A guest cannot ask
+for the relay path and cannot re-open it.
+
+Docker's v2 grammar documents `passthrough: boolean to skip sentinel masking` on its `oauth`
+block. That is very likely this same distinction from the other side — a relayed response is
+the only kind there is anything to mask *in* — and Boks deliberately has no equivalent switch.
+
+**Two things this does not do**, both worth stating rather than discovering:
+
+- **It is not durable through a sandbox.** The network supervisor never learns the store's
+  passphrase, so a login it captures lasts as long as that sandbox. This is the same
+  limitation `internal/secret/memory.go` already records for refresh, and for acquisition it
+  is the sharper one: it is exactly the fresh-machine story the feature exists for. The
+  writeback channel that would fix it is named there and is not built.
+- **It captures the exchange it can see.** A guest reaching a token endpoint Boks is not
+  intercepting keeps what it gets. That makes the recorded endpoint host load-bearing, which
+  is why it was read off the binary — and why the correction from `console.anthropic.com` to
+  `platform.claude.com` is a security fix rather than a tidy-up.
 
 ## 6. Docker inside the sandbox
 
@@ -502,7 +643,17 @@ hosts and no others — see
    denies them.
 6. **Kit loading.** The credential model now matches the v2 `credentials[]` shape — one
    service, many injection rules — so a loader can be added without reworking it. Nothing
-   parses YAML today, and `oauth` is modelled only to the extent of not designing it out.
+   parses YAML today. `oauth` is no longer merely designed-for: the block is implemented,
+   with the same field names, so a loader has somewhere to put it.
+8. **Where a credential file goes.** The reference format's `credentialFile.path` puts the
+   file where the agent looks, which for Claude Code is `~/.claude/.credentials.json`. Boks
+   shares *directories* (a file bind mount exposes its parent, so `internal/workspace`
+   refuses one), and mounting `~/.claude` read-only would break everything else the agent
+   keeps there. So the file is rendered into a directory of its own and named in the
+   environment, and putting it where the agent looks needs a copy at start-up — which belongs
+   to the image. **The environment variable route works today without any of that**: Claude
+   Code reads `CLAUDE_CODE_OAUTH_TOKEN`, so the sentinel reaches it directly and the proxy
+   substitutes on the way out.
 7. ~~**TSI vs external network provider.**~~ **Answered 2026-08-11.** The external provider
    displaces TSI: with it attached the guest has `eth0` and a host loopback probe that TSI
    answered is refused. Two annotations are needed (`io.containerd.nerdbox.network.N` for

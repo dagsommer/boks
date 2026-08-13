@@ -40,6 +40,9 @@ Agents:
 	var netFlags policyFlags
 	netFlags.register(cmd.Flags())
 	netFlags.registerPublish(cmd.Flags())
+	var quiet bool
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false,
+		"suppress the network summary (a new TLS-interception host is still announced)")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
@@ -60,6 +63,9 @@ Agents:
 			return fmt.Errorf("a sandbox named %q already exists; use 'boks run' to attach to it, "+
 				"or 'boks rm %s' first", inv.name, inv.name)
 		}
+		// The agent's own allowlist is part of the policy this sandbox will run under,
+		// exactly as it is for `run`.
+		netFlags.forAgent(inv.agent)
 
 		cfg, err := flags.config(inv, agentArgs)
 		if err != nil {
@@ -83,11 +89,11 @@ Agents:
 		// recorded on the container and honoured when `run`, `exec` or `start` brings
 		// the sandbox up. They are still validated, because a typo should cost a message
 		// rather than a sandbox that fails to start tomorrow.
-		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, netFlags.publish)
+		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, netFlags.publish, env.Stderr)
 		if err != nil {
 			return err
 		}
-		if err := describeNetwork(&netFlags, spec, mode, env.Stderr); err != nil {
+		if err := describeNetwork(&netFlags, spec, mode, quiet, env.Stderr); err != nil {
 			return err
 		}
 		guest, err := spec.Prepare()

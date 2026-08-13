@@ -18,10 +18,16 @@ import (
 //
 // The command exists because a sandbox you cannot reach is a sandbox you cannot develop in:
 // a dev server inside the VM answers on the guest's own interface, and nothing on the host
-// can open a connection to it without a forwarder. The second reason is less obvious and
-// just as load-bearing — a CLI inside the sandbox that logs in through OAuth listens on
-// 127.0.0.1 *in the guest* and expects a browser *on the host* to arrive there. Without a
-// published port that callback never comes.
+// can open a connection to it without a forwarder.
+//
+// A second motivation is often claimed for this feature and is worth stating carefully,
+// because this repository has since measured it. An OAuth flow whose redirect is a
+// `127.0.0.1` listener cannot work in a sandbox without a published port: the browser is on
+// the host and the listener is in the guest. That is true of the *shape*. It is not true of
+// the login Boks actually has to support — Claude Code 2.1.228 was driven headless and uses
+// paste-a-code, with a vendor-hosted redirect and no loopback callback in the binary at all
+// (see docs/docker-sandbox-parity.md). So this command is for dev servers first, and for a
+// loopback-redirect login only if one turns up.
 func newPortsCommand(env Env) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ports SANDBOX [flags]",
