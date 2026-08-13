@@ -23,6 +23,7 @@ type policyFlags struct {
 	deny    []string
 	inject  []string
 	guest   []string
+	publish []string
 	oauth   []string
 	// noSecrets leaves the credential store out of this run entirely. A credential
 	// stored under a service's name applies without being named again — see
@@ -66,6 +67,20 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	fs.BoolVar(&f.noSecrets, "no-secrets", false,
 		"do not attach credentials from the store; only what --inject names")
 }
+
+// registerPublish adds `-p/--publish`, separately from the rest.
+//
+// It is separate because the rest of these flags are shared with `boks proxy` and
+// `boks policy ls`, which describe a policy and have no sandbox to publish a port into. A
+// flag that appears in a command's help and does nothing is worse than a missing one.
+func (f *policyFlags) registerPublish(fs *pflag.FlagSet) {
+	fs.StringArrayVarP(&f.publish, "publish", "p", nil,
+		"publish a sandbox port on the host, bound to loopback (repeatable): "+
+			"[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]")
+}
+
+// checkPublish rejects a malformed --publish before anything is created or pulled.
+func (f *policyFlags) checkPublish() error { return checkPublishSpecs(f.publish) }
 
 // specified reports whether the user set any of them.
 func (f *policyFlags) specified() bool {

@@ -39,6 +39,7 @@ Agents:
 	// on the runtime's default transport, which is the one that reaches host loopback.
 	var netFlags policyFlags
 	netFlags.register(cmd.Flags())
+	netFlags.registerPublish(cmd.Flags())
 	var quiet bool
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false,
 		"suppress the network summary (a new TLS-interception host is still announced)")
@@ -48,6 +49,9 @@ Agents:
 		ctx := cmd.Context()
 
 		if err := dev.requireIsolation(env.Stderr); err != nil {
+			return err
+		}
+		if err := netFlags.checkPublish(); err != nil {
 			return err
 		}
 
@@ -81,7 +85,11 @@ Agents:
 		// sandbox that did not carry its own would come up under the default preset
 		// instead of the one it was created with.
 		record := netFlags.sandboxRecord()
-		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, env.Stderr)
+		// `create` starts nothing, so nothing is bound here: the specifications are
+		// recorded on the container and honoured when `run`, `exec` or `start` brings
+		// the sandbox up. They are still validated, because a typo should cost a message
+		// rather than a sandbox that fails to start tomorrow.
+		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, netFlags.publish, env.Stderr)
 		if err != nil {
 			return err
 		}
@@ -93,6 +101,7 @@ Agents:
 			return err
 		}
 		cfg.Policy = record
+		cfg.Ports = netFlags.publish
 		cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
 		cfg.Env = append(cfg.Env, guest.Env...)
 		cfg.Mounts = guest.Mounts

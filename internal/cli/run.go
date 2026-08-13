@@ -61,6 +61,7 @@ Agents:
 	// cannot drift apart.
 	var netFlags policyFlags
 	netFlags.register(cmd.Flags())
+	netFlags.registerPublish(cmd.Flags())
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) (err error) {
 		positional, agentArgs := splitAtDash(cmd, args)
@@ -89,6 +90,9 @@ Agents:
 			return err
 		}
 		if _, err := netFlags.networkPlan(sandboxNameFor(flags.name)); err != nil {
+			return err
+		}
+		if err := netFlags.checkPublish(); err != nil {
 			return err
 		}
 

@@ -45,10 +45,14 @@ type Info struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 	// Policy is how the sandbox's network policy was chosen, as recorded when it was
 	// created. Nil for a sandbox that named no policy, or one made before Boks recorded it.
-	Policy   *policy.SandboxPolicy `json:"policy,omitempty"`
-	Cwd      string                `json:"cwd,omitempty"`
-	PID      uint32                `json:"pid,omitempty"`
-	ExitCode *uint32               `json:"exit_code,omitempty"`
+	Policy *policy.SandboxPolicy `json:"policy,omitempty"`
+	// Ports are the publish specifications the sandbox was created with. They are the
+	// request rather than the result: what is actually bound right now lives with the
+	// running network stack, and `boks ports` is what shows it.
+	Ports    []string `json:"ports,omitempty"`
+	Cwd      string   `json:"cwd,omitempty"`
+	PID      uint32   `json:"pid,omitempty"`
+	ExitCode *uint32  `json:"exit_code,omitempty"`
 }
 
 // Workspace returns the sandbox's primary workspace host path, or "" if it has none.
@@ -433,6 +437,7 @@ func describe(ctx context.Context, container client.Container) (Info, error) {
 		Workspaces:  decodeWorkspaces(info.Labels),
 		Command:     decodeCommand(info.Labels),
 		Policy:      decodePolicy(info.Labels),
+		Ports:       decodePorts(info.Labels),
 	}
 
 	if spec, err := container.Spec(ctx); err == nil {

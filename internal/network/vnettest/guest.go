@@ -76,6 +76,10 @@ type Guest struct {
 	conn   *net.UnixConn
 	cancel context.CancelFunc
 	socket string
+	// addr is the guest's own address, which Listen binds.
+	addr net.IP
+	// gateway is the host-side stack's address, which Announce reaches for.
+	gateway net.IP
 }
 
 // defaultMAC is a locally administered unicast address, as the guest's would be.
@@ -157,7 +161,8 @@ func Attach(cfg Config) (*Guest, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	g := &Guest{stack: s, sw: sw, conn: conn, cancel: cancel, socket: guestSocket}
+	g := &Guest{stack: s, sw: sw, conn: conn, cancel: cancel, socket: guestSocket,
+		addr: guestIP, gateway: gatewayIP}
 	go func() {
 		// Ends when the context is cancelled or either side closes the link.
 		_ = sw.Accept(ctx, conn, types.VfkitProtocol)
@@ -222,6 +227,50 @@ func (g *Guest) dialOnce(ctx context.Context, addr string) (net.Conn, error) {
 		Addr: tcpip.AddrFrom4Slice(ip.To4()),
 		Port: uint16(port),
 	}, ipv4.ProtocolNumber)
+}
+
+// Announce makes the guest speak first, and blocks until the host end of the link has heard
+// it.
+//
+// It exists because of an asymmetry in the transport that is easy to miss and matters for
+// anything the *host* initiates — port publishing above all. The link is a SOCK_DGRAM UNIX
+// socket, and the host side does not know where to send frames until it has received one:
+// gvisor-tap-vsock's AcceptVfkit blocks for the peer's first datagram and binds the return
+// path to whatever address it came from. Until that happens the host can accept a connection
+// and dial into the virtual network, and the SYN goes nowhere.
+//
+// A real guest does this by itself, in the ordinary course of bringing an interface up — a
+// gratuitous ARP, a DHCP exchange, the first name it resolves. A fake one has to be asked,
+// and asking explicitly is better than a fixture that sleeps and hopes.
+//
+// The reach is the gateway's own resolver over TCP, which every ModeNAT stack binds. Any
+// off-link destination would do — what puts a frame on the wire is the ARP for the gateway
+// that precedes it.
+func (g *Guest) Announce(ctx context.Context) error {
+	conn, err := g.Dial(ctx, net.JoinHostPort(g.gateway.String(), "53"))
+	if err != nil {
+		return fmt.Errorf("vnettest: the fake guest could not reach the gateway to announce itself: %w", err)
+	}
+	return conn.Close()
+}
+
+// Listen binds a TCP listener on the fake guest's own external address, which is what a
+// service inside a sandbox does when it binds 0.0.0.0 and what a published port forwards to.
+//
+// It binds the guest's address rather than the guest's loopback deliberately. A real service
+// bound only to 127.0.0.1 inside the VM is unreachable from outside it — Docker Sandboxes
+// documents that constraint and Boks has it too — so a fixture that made the loopback case
+// work would prove the wrong thing.
+func (g *Guest) Listen(port int) (net.Listener, error) {
+	l, err := gonet.ListenTCP(g.stack, tcpip.FullAddress{
+		NIC:  1,
+		Addr: tcpip.AddrFrom4Slice(g.addr),
+		Port: uint16(port),
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		return nil, fmt.Errorf("vnettest: listening on port %d inside the fake guest: %w", port, err)
+	}
+	return l, nil
 }
 
 // Refused reports whether a dial failed because the far end refused it — which is what a

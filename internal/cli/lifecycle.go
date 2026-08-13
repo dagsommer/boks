@@ -122,7 +122,10 @@ func ensureNetworkForExisting(ctx context.Context, name, address string, stderr 
 	if a, ok := agent.Builtin().Lookup(info.Agent); ok {
 		flags.forAgent(a)
 	}
-	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy, stderr)
+	// The sandbox's own recorded publish specifications: `start` and `exec` have no port
+	// flags, and a sandbox that came back up without the ports it was created with would
+	// break a bookmark for reasons nothing on screen would explain.
+	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy, info.Ports, stderr)
 	if err != nil {
 		return err
 	}
