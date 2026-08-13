@@ -1,7 +1,7 @@
 From a824b762e0be2af3dad9a3ad0d23e4ae7983471b Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:55:49 +0200
-Subject: [PATCH 14/25] windows: export the libkrun 1.x ABI symbols nerdbox
+Subject: [PATCH 14/26] windows: export the libkrun 1.x ABI symbols nerdbox
  binds at load time
 
 containerd's nerdbox shim binds the libkrun 1.x C API. Its loader walks a

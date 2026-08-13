@@ -1,0 +1,719 @@
+From ce3e58abf1985334111b8e57fc34b82dcdd351d7 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 16:25:44 +0200
+Subject: [PATCH 26/26] console: implement krun_set_console_output outside
+ aws-nitro
+
+The symbol was gated on `aws-nitro`, an unrelated backend, with a FIXME
+saying as much. containerd's nerdbox resolves its whole libkrun binding
+table eagerly at LoadLibrary time, so the one missing export failed the
+load of the entire DLL: 18 of the 19 symbols it binds resolved, and
+krun_set_console_output returned GetLastError=127.
+
+Gate it on `not(aws-nitro)` instead, and give it an implementation on the
+regular VMM path: attach a virtio-console with a single console port
+whose output goes to the caller's sink. The port carries terminal
+properties (fixed 0x0) so the guest marks it VIRTIO_CONSOLE_CONSOLE_PORT
+and exposes it as hvcN, which is what nerdbox's `console=hvc0` command
+line needs. It deliberately does not reuse autoconfigure_console_ports(),
+which routes console output to the VMM log whenever the output is not a
+tty -- precisely what a caller passing an explicit path does not want.
+The aws-nitro build keeps its old behaviour of recording the path.
+
+Windows is not symmetric with Unix here, and cannot be. On Unix the
+consumer owns the path: nerdbox creates the FIFO and opens its read end
+before calling in, so libkrun only opens the write end (O_NONBLOCK, so
+"no reader" fails with ENXIO rather than hanging the caller). On Windows
+nerdbox passes a `\\.\pipe\krun-console-<pid>-<n>` name and then *dials*
+it with winio.DialPipe(), so libkrun must serve the pipe. It is created
+in krun_set_console_output() so the name exists before the consumer's
+first dial, duplex because DialPipe() asks for GENERIC_READ|GENERIC_WRITE
+and an outbound-only pipe would refuse it, and overlapped so that the
+ConnectNamedPipe() that has to precede the first write can be bounded.
+
+That connect happens on the port's tx thread, not in the configuration
+call, which could not block there without deadlocking the consumer that
+only starts dialing once it returns. If it times out, or if the client
+later disappears, the sink falls back to the VMM log after one
+error-level message naming the pipe: discarding the output silently, or
+letting the tx thread stop, would surface as an unexplained guest hang
+once the console virtqueue filled.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ include/libkrun.h                             |  22 +-
+ src/devices/Cargo.toml                        |   1 +
+ .../src/virtio/console/port_io/windows.rs     | 230 +++++++++++++++++-
+ src/libkrun/Cargo.toml                        |   4 +
+ src/libkrun/src/lib.rs                        | 191 ++++++++++++++-
+ src/vmm/src/builder.rs                        |  59 ++++-
+ src/vmm/src/resources.rs                      |  32 +++
+ 7 files changed, 530 insertions(+), 9 deletions(-)
+
+diff --git a/include/libkrun.h b/include/libkrun.h
+index 9de15ff..6a84689 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -951,12 +951,30 @@ int32_t krun_get_shutdown_eventfd(uint32_t ctx_id);
+ 
+ /**
+  * Configures the console device to write its output to "c_filepath".
+- * Only available when built with AWS Nitro support.
++ *
++ * Outside of AWS Nitro builds, this attaches a virtio-console device with a single console
++ * port, which the guest sees as "hvcN". Consoles are numbered in the order they are added,
++ * so call this before any krun_add_virtio_console_*() if this console is to be "hvc0" (as a
++ * "console=hvc0" kernel command line expects). The port is output-only; guest console input
++ * reads EOF.
++ *
++ * On Unix, "c_filepath" is a filesystem path, opened for writing (created if absent). The
++ * caller owns whatever lives at that path: if it is a FIFO, the caller must already have
++ * opened the read end, otherwise this call fails with -ENXIO rather than blocking.
++ *
++ * On Windows, a name of the form "\\.\pipe\..." is treated as a named pipe: libkrun CREATES
++ * that pipe and serves it, so the caller connects to it as a client (e.g. with
++ * CreateFile()/winio.DialPipe()) after this call returns. This is the reverse of the Unix
++ * arrangement, where the caller creates the FIFO. The pipe is created duplex, because
++ * clients commonly open with GENERIC_READ|GENERIC_WRITE, but nothing is read from it. Any
++ * other string is treated as a filesystem path, as on Unix.
++ *
++ * In AWS Nitro builds this only records the path, which the enclave uses directly.
+  *
+  * Arguments:
+  *  "ctx_id"    - the configuration context ID.
+  *  "filepath"  - a null-terminated string representing the path of the file to write the
+- *                console output.
++ *                console output, or, on Windows, the name of a named pipe to serve.
+  *
+  * Returns:
+  *  Zero on success or a negative error number on failure.
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index e6b95bd..3e30d14 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -70,6 +70,7 @@ windows-sys = { version = "0.61.2", features = [
+     "Win32_System_Memory",
+     "Win32_System_Threading",
+     "Win32_System_IO",
++    "Win32_System_Pipes",
+     "Win32_Networking_WinSock",
+     "Win32_System_WindowsProgramming",
+     "Win32_Security",
+diff --git a/src/devices/src/virtio/console/port_io/windows.rs b/src/devices/src/virtio/console/port_io/windows.rs
+index 32274f4..008a8dc 100644
+--- a/src/devices/src/virtio/console/port_io/windows.rs
++++ b/src/devices/src/virtio/console/port_io/windows.rs
+@@ -1,21 +1,27 @@
+ use std::fs::File;
+ use std::io::{self, ErrorKind, IsTerminal};
+ use std::mem::MaybeUninit;
+-use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle, RawHandle};
++use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle};
+ use utils::eventfd::EventFd;
+ use utils::windows::AsRawFd;
+ use vm_memory::VolatileSlice;
+ use vm_memory::bitmap::Bitmap;
+ use windows_sys::Win32::{
+-    Foundation::FALSE,
++    Foundation::{
++        ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED,
++        ERROR_PIPE_NOT_CONNECTED, FALSE, TRUE,
++    },
++    Security::SECURITY_ATTRIBUTES,
+     Storage::FileSystem::{ReadFile, WriteFile},
+     System::{
+         Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo},
+-        Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject},
++        IO::{CancelIo, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED},
++        Pipes::ConnectNamedPipe,
++        Threading::{CreateEventW, INFINITE, WaitForMultipleObjects, WaitForSingleObject},
+     },
+ };
+ 
+-use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties};
++use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties, output_to_log_as_err};
+ 
+ pub fn input_to_handle_dup(
+     handle: *mut core::ffi::c_void,
+@@ -51,6 +57,222 @@ pub fn output_to_handle_dup(
+     Ok(Box::new(PortOutputHandle(owned_handle)))
+ }
+ 
++/// Console output written to the *server* end of a Windows named pipe.
++///
++/// # Why this differs from the Unix file-based console output
++///
++/// On Unix, `krun_set_console_output()` is handed a path that the consumer has
++/// already created and already opened for reading (containerd's nerdbox shim
++/// calls `fifo.OpenFifo(..., O_RDONLY|O_CREAT)` before it calls into libkrun),
++/// so libkrun only has to `open()` it for writing.
++///
++/// On Windows there is no filesystem object to share: the consumer calls
++/// `winio.DialPipe()`, i.e. it is the pipe *client*. libkrun therefore owns the
++/// *server* end -- it creates the pipe in `krun_set_console_output()` (early,
++/// so the client's dial finds it) and must run `ConnectNamedPipe()` before the
++/// first write, because writing to an unconnected pipe instance fails with
++/// ERROR_PIPE_LISTENING.
++///
++/// The connect cannot happen in `krun_set_console_output()` itself: the
++/// consumer only starts dialing *after* that call returns, so a blocking
++/// connect there would deadlock. It happens instead on the first write, from
++/// the port's tx thread, bounded by [`Self::CONNECT_TIMEOUT_MS`].
++///
++/// If no client shows up within that window, or if the client goes away later,
++/// output is *not* discarded and the tx thread is *not* stopped -- either would
++/// turn into an unexplained hang, because a tx thread that stops draining the
++/// virtqueue blocks the guest's console writes forever. Instead the sink is
++/// swapped for the same log sink an unredirected console uses, after one
++/// error-level message naming the pipe and the failure.
++struct PortOutputNamedPipe {
++    /// Kept so that a failure can say which pipe went wrong.
++    name: String,
++    pipe: OwnedHandle,
++    /// Event used by every overlapped operation on `pipe`. Only the tx thread
++    /// touches it, and only one operation is ever in flight.
++    event: OwnedHandle,
++    state: PipeState,
++}
++
++enum PipeState {
++    /// Created, no client connected yet.
++    Listening,
++    Connected,
++    /// The pipe is unusable; console output goes to the VMM log instead.
++    Detached(Box<dyn PortOutput + Send>),
++}
++
++/// Wraps the server end of a named pipe as a console output sink.
++///
++/// # Safety
++///
++/// `handle` must be a valid handle to a named pipe instance created with
++/// FILE_FLAG_OVERLAPPED, and ownership of it transfers to the returned sink,
++/// which closes it on drop.
++pub unsafe fn output_to_named_pipe_server(
++    handle: *mut core::ffi::c_void,
++    name: &str,
++) -> Result<Box<dyn PortOutput + Send>, io::Error> {
++    // Manual-reset, initially unsignaled, unnamed: the standard event for
++    // overlapped I/O where the caller waits for the result itself.
++    let event = unsafe {
++        CreateEventW(
++            std::ptr::null::<SECURITY_ATTRIBUTES>(),
++            TRUE,
++            FALSE,
++            std::ptr::null(),
++        )
++    };
++    if event.is_null() {
++        return Err(io::Error::last_os_error());
++    }
++
++    Ok(Box::new(PortOutputNamedPipe {
++        name: name.to_string(),
++        pipe: unsafe { OwnedHandle::from_raw_handle(handle) },
++        event: unsafe { OwnedHandle::from_raw_handle(event) },
++        state: PipeState::Listening,
++    }))
++}
++
++impl PortOutputNamedPipe {
++    /// How long the first console write waits for a client to connect. The
++    /// consumer starts dialing as soon as `krun_set_console_output()` returns,
++    /// which is long before the guest produces its first console byte, so this
++    /// only ever elapses when nothing is listening at all.
++    const CONNECT_TIMEOUT_MS: u32 = 10_000;
++
++    fn overlapped(&self) -> OVERLAPPED {
++        let mut ov = OVERLAPPED::default();
++        ov.hEvent = self.event.as_raw_handle();
++        ov
++    }
++
++    fn connect(&mut self) -> io::Result<()> {
++        let mut ov = self.overlapped();
++        if unsafe { ConnectNamedPipe(self.pipe.as_raw_handle(), &mut ov) } != 0 {
++            // Documented to always return FALSE for an overlapped pipe, but a
++            // TRUE here still means "connected".
++            return Ok(());
++        }
++
++        let err = io::Error::last_os_error();
++        match err.raw_os_error().map(|e| e as u32) {
++            // The client got here before we did. Not an error.
++            Some(ERROR_PIPE_CONNECTED) => Ok(()),
++            Some(ERROR_IO_PENDING) => {
++                let mut transferred = 0u32;
++                let ok = unsafe {
++                    GetOverlappedResultEx(
++                        self.pipe.as_raw_handle(),
++                        &ov,
++                        &mut transferred,
++                        Self::CONNECT_TIMEOUT_MS,
++                        FALSE,
++                    )
++                };
++                if ok != 0 {
++                    return Ok(());
++                }
++                let err = io::Error::last_os_error();
++                // The OVERLAPPED lives on this stack frame, so the pending
++                // connect has to be cancelled *and waited for* before we
++                // return, or the kernel would write into freed memory.
++                unsafe { CancelIo(self.pipe.as_raw_handle()) };
++                unsafe {
++                    GetOverlappedResult(self.pipe.as_raw_handle(), &ov, &mut transferred, TRUE)
++                };
++                Err(err)
++            }
++            _ => Err(err),
++        }
++    }
++
++    fn write_overlapped(&mut self, buf: &VolatileSlice) -> io::Result<usize> {
++        let len = u32::try_from(buf.len()).map_err(|_| {
++            io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
++        })?;
++        let mut ov = self.overlapped();
++        let ret = unsafe {
++            WriteFile(
++                self.pipe.as_raw_handle(),
++                buf.ptr_guard().as_ptr(),
++                len,
++                std::ptr::null_mut(),
++                &mut ov,
++            )
++        };
++        if ret == 0 {
++            let err = io::Error::last_os_error();
++            if err.raw_os_error().map(|e| e as u32) != Some(ERROR_IO_PENDING) {
++                return Err(err);
++            }
++        }
++
++        // Covers both the synchronous and the pending completion; the write is
++        // issued from the port's own tx thread, which is allowed to block.
++        let mut written = 0u32;
++        if unsafe { GetOverlappedResult(self.pipe.as_raw_handle(), &ov, &mut written, TRUE) } == 0 {
++            return Err(io::Error::last_os_error());
++        }
++        Ok(written as usize)
++    }
++
++    /// Give up on the pipe and keep the guest's console output in the VMM log.
++    fn detach(&mut self, reason: &io::Error) {
++        log::error!(
++            "guest console: named pipe {name} is unusable ({reason}). Nothing is connected to it: \
++             libkrun serves this pipe and the process that asked for it \
++             (krun_set_console_output) was expected to connect as a client. Guest console output \
++             is not lost -- it continues below, in the VMM log -- but nothing will arrive on the \
++             pipe.",
++            name = self.name,
++        );
++        self.state = PipeState::Detached(output_to_log_as_err());
++    }
++}
++
++impl PortOutput for PortOutputNamedPipe {
++    fn write_volatile(&mut self, buf: &VolatileSlice) -> io::Result<usize> {
++        if matches!(self.state, PipeState::Listening) {
++            match self.connect() {
++                Ok(()) => self.state = PipeState::Connected,
++                Err(e) => self.detach(&e),
++            }
++        }
++
++        if let PipeState::Detached(sink) = &mut self.state {
++            return sink.write_volatile(buf);
++        }
++
++        match self.write_overlapped(buf) {
++            Ok(n) => Ok(n),
++            Err(e) => {
++                // A disconnected client must not stop the tx thread: process_tx
++                // returns on BrokenPipe, and a tx thread that stops draining the
++                // virtqueue wedges the guest's console writes. Fall back to the
++                // log instead, and report the write as consumed.
++                if matches!(
++                    e.raw_os_error().map(|e| e as u32),
++                    Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
++                ) {
++                    self.detach(&e);
++                    if let PipeState::Detached(sink) = &mut self.state {
++                        return sink.write_volatile(buf);
++                    }
++                }
++                Err(e)
++            }
++        }
++    }
++
++    fn wait_until_writable(&self) {
++        // Overlapped writes are waited on inline in `write_overlapped`, so
++        // `write_volatile` never reports WouldBlock and process_tx never calls
++        // this. Same contract as PortOutputHandle.
++    }
++}
++
+ struct PortInputHandle(OwnedHandle);
+ 
+ impl AsRawHandle for PortInputHandle {
+diff --git a/src/libkrun/Cargo.toml b/src/libkrun/Cargo.toml
+index c917148..6280344 100644
+--- a/src/libkrun/Cargo.toml
++++ b/src/libkrun/Cargo.toml
+@@ -48,8 +48,12 @@ vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+ windows-sys = { version = "0.61.2", features = [
++    "Win32_Foundation",
++    "Win32_Security",
++    "Win32_Storage_FileSystem",
+     "Win32_System_Console",
+     "Win32_System_Memory",
++    "Win32_System_Pipes",
+     "Win32_System_Threading",
+ ] }
+ 
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 0f5851d..4a77bf5 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -47,8 +47,8 @@ use utils::windows::SendHandle;
+ #[cfg(target_os = "macos")]
+ use vmm::VmCtl;
+ use vmm::resources::{
+-    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
+-    VmResources,
++    ConsoleOutputConfig, DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig,
++    VirtioConsoleConfigMode, VmResources,
+ };
+ use vmm::resources::{TsiFlags, VsockConfig};
+ #[cfg(feature = "blk")]
+@@ -1942,6 +1942,193 @@ pub unsafe extern "C" fn krun_add_vhost_user_device(
+     -libc::ENOTSUP
+ }
+ 
++/// Opens the sink named by `krun_set_console_output()`.
++///
++/// On Unix the argument is a filesystem path, and the consumer owns whatever
++/// lives there: containerd's nerdbox shim creates the FIFO and opens its read
++/// end before calling in, so all libkrun does is open the write end. O_NONBLOCK
++/// is what keeps that honest -- opening a FIFO for writing with no reader
++/// blocks forever otherwise, and this call happens on the caller's thread. With
++/// it, the "nobody is listening" case fails immediately with ENXIO instead of
++/// hanging the caller.
++#[cfg(all(unix, not(feature = "aws-nitro")))]
++fn open_console_sink(path: &str) -> Result<ConsoleOutputConfig, i32> {
++    use std::os::fd::IntoRawFd;
++    use std::os::unix::fs::OpenOptionsExt;
++
++    let file = std::fs::OpenOptions::new()
++        .write(true)
++        .append(true)
++        .create(true)
++        .mode(0o644)
++        .custom_flags(libc::O_NONBLOCK)
++        .open(path)
++        .map_err(|e| {
++            error!("Could not open console output {path}: {e}");
++            -e.raw_os_error().unwrap_or(libc::EIO)
++        })?;
++
++    Ok(ConsoleOutputConfig {
++        output_fd: file.into_raw_fd(),
++    })
++}
++
++/// True for the `\\.\pipe\...` names Windows uses for named pipes.
++///
++/// Only the local-machine form is recognised: `CreateNamedPipeW` cannot create
++/// a pipe on another host, so a `\\server\pipe\...` name could never be served
++/// from here.
++#[cfg(all(target_os = "windows", not(feature = "aws-nitro")))]
++fn is_local_named_pipe_path(path: &str) -> bool {
++    let prefix = r"\\.\pipe\".as_bytes();
++    let path = path.as_bytes();
++    // Compared as bytes, not as a &str slice: the prefix is ASCII but the name
++    // after it need not be, and slicing a &str at a fixed byte offset panics if
++    // that offset lands inside a multi-byte character. This is reachable from
++    // an FFI caller, so it must not panic.
++    path.len() > prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix)
++}
++
++/// Opens the sink named by `krun_set_console_output()`.
++///
++/// DIFFERENT FROM UNIX BY DESIGN. On Windows the argument is normally a named
++/// pipe name, not a filesystem path, and the two ends are the other way round:
++/// containerd's nerdbox shim (`internal/vm/libkrun/console_windows.go`) builds
++/// a name like `\\.\pipe\krun-console-<pid>-<n>`, hands it to this function and
++/// then *dials* it with `winio.DialPipe()`. It is the client; libkrun has to be
++/// the server. So this creates the pipe instance rather than opening one, and
++/// it does so here, in the configuration call, so that the name exists before
++/// the consumer's first dial (it retries for about five seconds, but there is
++/// no reason to make it wait).
++///
++/// The pipe is created duplex because `winio.DialPipe()` opens with
++/// GENERIC_READ|GENERIC_WRITE; an outbound-only pipe would refuse that client
++/// with ERROR_ACCESS_DENIED. Nothing reads the guest's console input from it --
++/// the port is output-only -- the write access is just what the client asks for.
++///
++/// FILE_FLAG_OVERLAPPED is required by `port_io::output_to_named_pipe_server()`,
++/// which needs a bounded wait for the client to connect.
++///
++/// Any other string is treated as a filesystem path, which matches the Unix
++/// behaviour and the header's wording.
++#[cfg(all(target_os = "windows", not(feature = "aws-nitro")))]
++fn open_console_sink(path: &str) -> Result<ConsoleOutputConfig, i32> {
++    use std::ffi::OsStr;
++    use std::os::windows::ffi::OsStrExt;
++    use std::os::windows::io::IntoRawHandle;
++    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
++    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
++    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
++    use windows_sys::Win32::System::Pipes::{
++        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
++    };
++
++    const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
++
++    if is_local_named_pipe_path(path) {
++        let wide: Vec<u16> = OsStr::new(path)
++            .encode_wide()
++            .chain(std::iter::once(0))
++            .collect();
++
++        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call.
++        let handle = unsafe {
++            CreateNamedPipeW(
++                wide.as_ptr(),
++                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
++                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
++                // One console, one consumer. A second instance would let a
++                // second client attach and silently split the output stream.
++                1,
++                PIPE_BUFFER_BYTES,
++                PIPE_BUFFER_BYTES,
++                // Only consulted by clients that call WaitNamedPipe(), which
++                // the consumer does not.
++                0,
++                std::ptr::null::<SECURITY_ATTRIBUTES>(),
++            )
++        };
++        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
++            error!(
++                "Could not create console named pipe {path}: {}",
++                std::io::Error::last_os_error()
++            );
++            return Err(-libc::EIO);
++        }
++
++        return Ok(ConsoleOutputConfig {
++            output_handle: SendHandle::new(handle),
++            named_pipe_server: true,
++            name: path.to_string(),
++        });
++    }
++
++    let file = std::fs::OpenOptions::new()
++        .write(true)
++        .append(true)
++        .create(true)
++        .open(path)
++        .map_err(|e| {
++            error!("Could not open console output {path}: {e}");
++            -e.raw_os_error().unwrap_or(libc::EIO)
++        })?;
++
++    Ok(ConsoleOutputConfig {
++        output_handle: SendHandle::new(file.into_raw_handle()),
++        named_pipe_server: false,
++        name: path.to_string(),
++    })
++}
++
++/// Sends the guest's console to `c_filepath`.
++///
++/// This attaches a virtio-console device with a single console port, so the
++/// guest sees it as `hvcN` and a `console=hvc0` command line works. The number
++/// follows the order consoles are added in, so call this before any
++/// `krun_add_virtio_console_*()` if the redirected console is to be `hvc0`.
++///
++/// See `open_console_sink()` for what `c_filepath` means per platform -- on
++/// Windows it is normally a named pipe name, and libkrun serves that pipe.
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++#[cfg(not(feature = "aws-nitro"))]
++pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32 {
++    unsafe {
++        if c_filepath.is_null() {
++            return -libc::EINVAL;
++        }
++        let filepath = match CStr::from_ptr(c_filepath).to_str() {
++            Ok(f) => f,
++            Err(_) => return -libc::EINVAL,
++        };
++
++        match CTX_MAP.lock().unwrap().entry(ctx_id) {
++            Entry::Occupied(mut ctx_cfg) => {
++                let cfg = ctx_cfg.get_mut();
++                if cfg
++                    .vmr
++                    .virtio_consoles
++                    .iter()
++                    .any(|c| matches!(c, VirtioConsoleConfigMode::Output(_)))
++                {
++                    error!("console output has already been configured for this context");
++                    return -libc::EINVAL;
++                }
++
++                let sink = match open_console_sink(filepath) {
++                    Ok(sink) => sink,
++                    Err(err) => return err,
++                };
++                cfg.vmr
++                    .virtio_consoles
++                    .push(VirtioConsoleConfigMode::Output(sink));
++                KRUN_SUCCESS
++            }
++            Entry::Vacant(_) => -libc::ENOENT,
++        }
++    }
++}
++
+ // FIXME: aws-nitro builds its own NitroEnclave from ContextConfig and needs
+ // the console output path directly. This should be replaced with a proper
+ // console configuration in the nitro path.
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index a749cbe..9ea1f7f 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -40,7 +40,8 @@ use crate::device_manager::mmio::MMIODeviceManager;
+ #[cfg(unix)]
+ use crate::resources::TsiFlags;
+ use crate::resources::{
+-    DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode, VmResources,
++    ConsoleOutputConfig, DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode,
++    VmResources,
+ };
+ use crate::vmm_config::external_kernel::ExternalKernel;
+ #[cfg(not(target_os = "windows"))]
+@@ -2734,6 +2735,59 @@ fn create_explicit_ports(
+     Ok(ports)
+ }
+ 
++/// Builds the single port of a console configured by `krun_set_console_output()`.
++///
++/// The port is a *console* port -- it carries terminal properties, so the guest
++/// marks it VIRTIO_CONSOLE_CONSOLE_PORT and exposes it as `hvcN`, which is what
++/// a `console=hvc0` command line needs. The size is fixed at 0x0 because the
++/// sink is a file or a pipe, not a terminal. Input is empty: the caller asked
++/// for an output sink.
++///
++/// This deliberately does not go through `autoconfigure_console_ports()`: that
++/// one sends console output to the VMM log whenever the output is not a tty,
++/// which is exactly what a caller passing an explicit path does not want.
++#[cfg(unix)]
++fn create_output_only_console_port(
++    cfg: &ConsoleOutputConfig,
++) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
++    let to_err =
++        |e: nix::Error| StartMicrovmError::OpenConsoleFile(io::Error::from_raw_os_error(e as i32));
++
++    let output = port_io::output_to_raw_fd_dup(cfg.output_fd).map_err(to_err)?;
++    let input = port_io::input_empty().map_err(to_err)?;
++
++    Ok(vec![PortDescription::console(
++        Some(input),
++        Some(output),
++        port_io::term_fixed_size(0, 0),
++    )])
++}
++
++#[cfg(target_os = "windows")]
++fn create_output_only_console_port(
++    cfg: &ConsoleOutputConfig,
++) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
++    let output = if cfg.named_pipe_server {
++        // SAFETY: krun_set_console_output() created this overlapped named pipe
++        // instance and handed its only handle to the configuration; building
++        // the microVM consumes the configuration exactly once.
++        unsafe {
++            port_io::output_to_named_pipe_server(cfg.output_handle.as_raw_handle(), &cfg.name)
++        }
++    } else {
++        port_io::output_to_handle_dup(cfg.output_handle.as_raw_handle())
++    }
++    .map_err(StartMicrovmError::OpenConsoleFile)?;
++
++    let input = port_io::input_empty().map_err(StartMicrovmError::OpenConsoleFile)?;
++
++    Ok(vec![PortDescription::console(
++        Some(input),
++        Some(output),
++        port_io::term_fixed_size(0, 0),
++    )])
++}
++
+ fn attach_console_devices(
+     vmm: &mut Vmm,
+     event_manager: &mut EventManager,
+@@ -2750,6 +2804,9 @@ fn attach_console_devices(
+             autoconfigure_console_ports(vmm, vm_resources, Some(autocfg))?
+         }
+         Some(VirtioConsoleConfigMode::Explicit(ports)) => create_explicit_ports(vmm, ports)?,
++        Some(VirtioConsoleConfigMode::Output(output_cfg)) => {
++            create_output_only_console_port(output_cfg)?
++        }
+     };
+ 
+     let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
+diff --git a/src/vmm/src/resources.rs b/src/vmm/src/resources.rs
+index fd0a4ca..42c11c9 100644
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -158,9 +158,41 @@ pub struct DefaultVirtioConsoleConfig {
+     pub err_handle: SendHandle,
+ }
+ 
++/// A single write-only sink for the guest's console, as configured by
++/// `krun_set_console_output()`.
++///
++/// The port built from this is a *console* port (it carries terminal
++/// properties, even though the size is fixed at 0x0), so the guest marks it
++/// with VIRTIO_CONSOLE_CONSOLE_PORT and exposes it as `hvcN` -- which is what
++/// a `console=hvc0` kernel command line needs. Input is left empty: the caller
++/// asked for an output sink, not for a terminal.
++#[cfg(unix)]
++pub struct ConsoleOutputConfig {
++    /// Descriptor already opened for writing by `krun_set_console_output()`.
++    /// The builder dups it; this one stays owned by the configuration.
++    pub output_fd: RawFd,
++}
++
++#[cfg(target_os = "windows")]
++pub struct ConsoleOutputConfig {
++    /// Handle already opened for writing by `krun_set_console_output()`.
++    /// Ownership transfers to the console port when the microVM is built.
++    pub output_handle: SendHandle,
++    /// True when `output_handle` is the *server* end of a named pipe that
++    /// libkrun created and that nobody has connected to yet, so the console
++    /// port has to run `ConnectNamedPipe()` before its first write. See
++    /// `port_io::output_to_named_pipe_server()`.
++    pub named_pipe_server: bool,
++    /// The path or pipe name as given, kept only so that failures can name it.
++    pub name: String,
++}
++
+ pub enum VirtioConsoleConfigMode {
+     Autoconfigure(DefaultVirtioConsoleConfig),
+     Explicit(Vec<PortConfig>),
++    /// A lone console port whose output goes to a host sink chosen by
++    /// `krun_set_console_output()`.
++    Output(ConsoleOutputConfig),
+ }
+ 
+ #[cfg(unix)]
+-- 
+2.53.0
+
