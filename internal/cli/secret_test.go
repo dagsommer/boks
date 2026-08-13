@@ -433,7 +433,7 @@ func TestSecretServicesShowsTheEmptyRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"anthropic", "$ANTHROPIC_API_KEY", "api.anthropic.com", "console.anthropic.com",
+		"anthropic", "$ANTHROPIC_API_KEY", "api.anthropic.com", "platform.claude.com",
 		"cursor", "droid", "no rule yet",
 	} {
 		if !strings.Contains(out, want) {

@@ -507,12 +507,14 @@ var builtinServices = []Service{
 		// observed length of a real key and only shapes the fake.
 		KeyPrefix: "sk-ant-api03-",
 		KeyLength: 108,
-		// The endpoint a Claude.ai subscription login refreshes against, and the one
-		// `boks secret adopt claude-code` already uses — see the claude-code profile in
-		// import.go. Deliberately *not* api.anthropic.com/v1/oauth/token, which the
-		// platform documents for workload-identity federation: that one exchanges an
-		// IdP-issued JWT and would reject the refresh-token grant Boks performs.
-		TokenEndpoint: Endpoint{Host: "console.anthropic.com", Path: "/v1/oauth/token"},
+		// The endpoint a Claude.ai subscription login exchanges and refreshes against, and
+		// the one the claude-code profile in import.go uses. Read off Claude Code 2.1.228
+		// itself rather than from documentation, and it is **platform.claude.com** now:
+		// console.anthropic.com does not appear anywhere in that binary. Deliberately *not*
+		// api.anthropic.com/v1/oauth/token, which the platform documents for
+		// workload-identity federation: that one exchanges an IdP-issued JWT and would
+		// reject the refresh-token grant Boks performs.
+		TokenEndpoint: Endpoint{Host: "platform.claude.com", Path: "/v1/oauth/token"},
 		TokenEncoding: EncodingJSON,
 		OAuthProfile:  "claude-code",
 		Source:        "platform.claude.com/docs/en/manage-claude/authentication and /docs/en/api/overview",
