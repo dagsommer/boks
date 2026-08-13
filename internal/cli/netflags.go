@@ -23,6 +23,7 @@ type policyFlags struct {
 	deny    []string
 	inject  []string
 	guest   []string
+	oauth   []string
 	// agent is the agent the sandbox runs. It is not a flag on `run` — the agent is a
 	// positional there — but it decides a layer of the policy, so it travels with the
 	// rest of what decides one. `boks policy ls` and `boks policy check` set it from
@@ -56,11 +57,13 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 		"attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
 	fs.StringArrayVar(&f.guest, "guest-credential", nil,
 		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
+	fs.StringArrayVar(&f.oauth, "oauth", nil,
+		"use a stored OAuth credential by name, from 'boks secret import' (repeatable)")
 }
 
 // specified reports whether the user set any of them.
 func (f *policyFlags) specified() bool {
-	return f.policySpecified() || f.mode != "" || len(f.inject) > 0 || len(f.guest) > 0
+	return f.policySpecified() || f.mode != "" || len(f.inject) > 0 || len(f.guest) > 0 || len(f.oauth) > 0
 }
 
 // policySpecified reports whether this run asked for a policy of its own, as opposed to the

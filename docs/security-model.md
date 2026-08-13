@@ -524,6 +524,76 @@ Three limits worth being explicit about:
 *(none of it is wired into `boks run`. Any credential you put in a sandbox today is simply
 in the sandbox.)*
 
+#### OAuth credentials, and how they change the answer
+
+Most people running the flagship agent have no API key at all. `claude /login` leaves an
+OAuth **pair** — an access token and a refresh token — in the macOS Keychain under
+`Claude Code-credentials`, and nothing else. A credential model that only knows how to set a
+header cannot carry that, so `boks run claude` could not work for them by any route. The
+`oauth` mechanism in `internal/secret` is that route, and it follows Docker Sandboxes' kit v2
+`oauth` block: sentinels in the guest, substitution on the resource hosts, refresh on the
+host.
+
+`boks secret import` reads what the agent already wrote and stores it. The guest is given
+**sentinels** — fakes carrying the real prefix and the real length, because Claude Code checks
+that an OAuth token starts with `sk-ant-oat01-` before it will send one — in an environment
+variable, a read-only credential file, or both. On a request to a configured resource host
+the proxy replaces the sentinel with the real access token, in the `Authorization` header and
+no other.
+
+**What this changes about a compromised guest**, stated as the difference from an API key:
+
+- **The credential is bigger.** An API key is usually scoped and revocable on its own; a
+  subscription access token is the account's login. "Use of the credential against approved
+  hosts" therefore now means use of the subscription, and the injection domains are the only
+  thing bounding it. Name them narrowly.
+- **The durable half never enters the sandbox, and cannot be reached from it.** An access
+  token expires; a refresh token is the credential that outlives the sandbox, and is the one
+  worth stealing. Boks never substitutes a refresh token into any request, and the guest's own
+  token request is **answered rather than forwarded** — Boks composes the reply from the
+  sentinels it already gave out, so no request a guest can compose reaches the token endpoint
+  carrying the real refresh token, and no real token ever travels toward the guest in a
+  response body. The alternative design (relay the guest's refresh with the real token
+  substituted in, then rewrite the response) was rejected for exactly this: a request Boks did
+  not understand would produce a response it could not rewrite.
+- **Expiry is a host concern, and the guest is told so.** The credential file and the answer
+  to a refresh report a lifetime a year out. The real token is refreshed on the host when it
+  nears expiry, and whatever is current at that moment is what goes on the wire. An agent that
+  persists what a refresh returned writes back the same sentinels it had, which is why the
+  credential file can be mounted read-only — the write fails, and the file was already right.
+- **A rotation inside a sandbox is not durable.** The network supervisor deliberately never
+  learns the store's passphrase, so a refresh it performs lives only as long as that sandbox.
+  For a provider that rotates refresh tokens — Anthropic does — the copy in the encrypted
+  store is then stale and `boks secret import` has to be run again. The decision log says so
+  at the moment it happens. Running the credential through `boks proxy` instead does persist,
+  because that process has the passphrase.
+
+Residual exposure worth knowing, none of it hypothetical:
+
+- **An origin that echoes `Authorization` back would hand the guest the real token.** That is
+  why substitution is restricted to the headers the credential is actually sent in rather than
+  applied to every header a sentinel appears in; a guest can put its sentinel anywhere, and
+  only the allowlisted header is swapped. Bodies are streamed and never scanned, so a client
+  that puts its token in a body is not supported rather than silently unprotected.
+- **A resource host is a decrypted host.** Both the API hosts and the token endpoint are
+  credential hosts, so both have their TLS terminated. The token endpoint is decrypted for a
+  second reason as well: a request has to be answered, which cannot be done through a tunnel.
+- **Other paths on the token endpoint's host are ordinary traffic.** Only the configured path
+  is answered; everything else on that host is forwarded with no credential attached.
+- **An OAuth token is never written onto a plaintext flow.** The guest chooses the scheme, and
+  `http://` to a resource host would otherwise be a downgrade the guest controls. Such a
+  request goes out carrying the sentinel and fails at the origin.
+- **The macOS Keychain read has never been executed.** It shells out to `security
+  find-generic-password`, which cannot run on the Linux machine this was written on. What is
+  tested is everything either side of it — the parsing of the document it returns, from a file
+  and from stdin, and the refusal on a platform with no Keychain. The `security` invocation
+  itself is unproven. Confirming it needs one run of `boks secret import claude-code` on a Mac
+  where `claude /login` has been used.
+- **The refresh request's shape is unproven against the real provider.** Boks composes an
+  RFC 6749 `refresh_token` grant, as JSON by default, and posts it to the configured endpoint.
+  That has been demonstrated against a local endpoint, not against
+  `console.anthropic.com`.
+
 ### Privileged execution
 
 - Boks does not require a setuid helper.
@@ -569,6 +639,8 @@ in the sandbox.)*
   when it sees one, and recreating it is the only fix.
 - It does **not** claim end-to-end TLS to every destination any more. Hosts you configure a
   credential for are decrypted by Boks, by design; everything else is not.
+- It does **not** claim that reading a credential out of the macOS Keychain works. That path
+  has never been executed; see [OAuth credentials](#oauth-credentials-and-how-they-change-the-answer).
 - It has **no** defence against hypervisor vulnerabilities beyond keeping libkrun current.
 
 Boks aims to be honest about this. If a property is not listed as tested, assume it does not
