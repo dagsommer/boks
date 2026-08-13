@@ -1,0 +1,1067 @@
+From 08bf1787cc9aba6b3cfd68f04d8d1b3e05e9a72e Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:12:02 +0200
+Subject: [PATCH 17/25] windows: implement the host end of a guest-IPC vsock
+ port over AF_UNIX
+
+`krun_add_vsock_port2()` is called on every nerdbox boot -- port 1025 for ttrpc
+to vminitd, port 1026 for stdio -- and had no Windows backend. Add one, and
+build the vsock device on Windows.
+
+A named pipe is the obvious-looking analogue of `unix.rs` and is the wrong
+object, for two independent reasons.
+
+The first is interoperability, and it settles it. libkrun owns only one end of
+this connection. nerdbox creates the other in platform-neutral Go with no build
+tags: `internal/vm/libkrun/instance.go` calls `net.Listen("unix", socketPath)`
+for 1025 and `net.Dial("unix", streamPath)` for 1026, on ordinary filesystem
+paths in the shim's state directory. Go implements those with Winsock AF_UNIX on
+Windows. A `\\.\pipe\...` endpoint would never meet theirs. nerdbox does use
+named pipes elsewhere -- `console_windows.go`, `io_copystreams_windows.go` -- so
+the plain paths here are a deliberate distinction.
+
+The second is that a pipe does not fit this device's I/O model. `process_event()`
+is a readiness interface: it learns a handle is ready and then reads into a
+virtqueue descriptor popped *after* waking. Windows named pipes have no
+readiness state -- they are completion-based, so a read's destination must be
+chosen before the wait, which would force a per-connection staging buffer and a
+rewrite of the receive path. AF_UNIX keeps the readiness model, and the new
+proxy is close to a syscall-for-syscall translation of `unix.rs`, with identical
+credit accounting and status transitions.
+
+Readiness reaches the epoll shim through `WSAEventSelect()`. A Winsock SOCKET is
+not a waitable object whose signaled state means "readable", so it cannot be
+registered with `utils::windows::epoll` directly -- that shim bridges handles
+into an IOCP with `NtAssociateWaitCompletionPacket`, which reports a dispatcher
+object becoming signaled. `WSAEventSelect()` provides exactly that: a Windows
+Event, the object the shim was built for. So the registered handle, and what
+`as_raw_fd()` returns, is the WSAEVENT and never the socket.
+
+Two consequences shape the code and are documented at the top of the new module.
+The shim's `wait()` echoes back the interest mask it was given rather than any
+observed readiness, so `process_event()`'s `evset` argument carries no
+information and the real state is recovered with `WSAEnumNetworkEvents()`. And
+because that call, not the kernel, is what resets the event, every registration
+is `EDGE_TRIGGERED` and every `process_event()` returns a `polling` update so
+the muxer's delete-then-add re-arms the watch afterwards.
+
+Winsock errors are translated to negative Linux errnos through the existing
+`linux_errno_raw()`, since `WSAE*` codes are `10000 + BSD errno` and the guest
+interprets the number.
+
+Not executed. This compiles and links for x86_64-pc-windows-msvc -- krun.dll now
+imports the 15 ws2_32 entry points it uses -- and has never run: there is no
+Windows host here and no VM has been booted against it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/Cargo.toml                       |   1 +
+ src/devices/src/virtio/mod.rs                |   2 -
+ src/devices/src/virtio/vsock/winsock_unix.rs | 963 +++++++++++++++++++
+ 3 files changed, 964 insertions(+), 2 deletions(-)
+ create mode 100644 src/devices/src/virtio/vsock/winsock_unix.rs
+
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index 227d174..e6b95bd 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -70,6 +70,7 @@ windows-sys = { version = "0.61.2", features = [
+     "Win32_System_Memory",
+     "Win32_System_Threading",
+     "Win32_System_IO",
++    "Win32_Networking_WinSock",
+     "Win32_System_WindowsProgramming",
+     "Win32_Security",
+     "Wdk",
+diff --git a/src/devices/src/virtio/mod.rs b/src/devices/src/virtio/mod.rs
+index 8b22be7..f0e0f34 100644
+--- a/src/devices/src/virtio/mod.rs
++++ b/src/devices/src/virtio/mod.rs
+@@ -38,7 +38,6 @@ pub mod rng;
+ pub mod vhost_user;
+ // vsock carries libkrun's TSI networking, which is Unix-socket based end to end.
+ // Boks displaces TSI with virtio-net, so Windows does not need it.
+-#[cfg(unix)]
+ pub mod vsock;
+ 
+ #[cfg(not(feature = "tee"))]
+@@ -59,7 +58,6 @@ pub use self::queue::{Descriptor, DescriptorChain, Queue};
+ pub use self::rng::*;
+ #[cfg(feature = "vhost-user")]
+ pub use self::vhost_user::VhostUserDevice;
+-#[cfg(unix)]
+ pub use self::vsock::*;
+ 
+ /// When the driver initializes the device, it lets the device know about the
+diff --git a/src/devices/src/virtio/vsock/winsock_unix.rs b/src/devices/src/virtio/vsock/winsock_unix.rs
+new file mode 100644
+index 0000000..b6859bc
+--- /dev/null
++++ b/src/devices/src/virtio/vsock/winsock_unix.rs
+@@ -0,0 +1,963 @@
++//! The host end of a guest-IPC vsock port on Windows.
++//!
++//! # Why AF_UNIX and not a named pipe
++//!
++//! A named pipe looks like the natural Windows analogue of `unix.rs`: it is
++//! connection-oriented, it has a security descriptor, and it has a name. It is
++//! nevertheless the wrong object here, for two independent reasons.
++//!
++//! The first is interoperability, and it is decisive. `krun_add_vsock_port2()`
++//! does not own both ends of this connection -- it owns the end libkrun drives,
++//! and the consumer owns the other. containerd's nerdbox shim creates its end
++//! in platform-neutral Go, with no build tags: `internal/vm/libkrun/instance.go`
++//! calls `net.Listen("unix", socketPath)` for port 1025 and
++//! `net.Dial("unix", streamPath)` for port 1026, on ordinary filesystem paths
++//! under the shim's state directory (`run_vminitd.sock`, `streaming.sock`). Go
++//! implements those with Winsock AF_UNIX on Windows. A `\\.\pipe\...` endpoint
++//! on our side would simply never meet theirs. That nerdbox uses named pipes
++//! elsewhere -- `console_windows.go`, `io_copystreams_windows.go` -- and plain
++//! paths here is a deliberate distinction, not an oversight.
++//!
++//! The second is that a pipe does not fit the I/O model this device is built
++//! around. `Proxy::process_event()` is a readiness interface: it is told a
++//! handle is ready and then reads into a virtqueue descriptor it pops *after*
++//! waking. Windows named pipes have no readiness state to wait on -- they are
++//! completion-based, so a read's destination buffer must be chosen before the
++//! wait, which would mean a per-connection staging buffer and a rewrite of the
++//! receive path. AF_UNIX sockets keep the readiness model intact.
++//!
++//! # How readiness reaches the epoll shim
++//!
++//! A Winsock `SOCKET` is not itself a waitable object whose signaled state
++//! means "readable", so it cannot be handed to `utils::windows::epoll`
++//! directly: that shim bridges handles into an IOCP with
++//! `NtAssociateWaitCompletionPacket`, which reports a *dispatcher object
++//! becoming signaled*. `WSAEventSelect()` supplies exactly such an object -- it
++//! signals a Windows Event when the selected network events occur -- and Events
++//! are precisely what the shim was built for (`utils::windows::eventfd` uses
++//! the same mechanism). So the handle registered with the shim is the
++//! **WSAEVENT**, not the socket, and `as_raw_fd()` on these proxies returns the
++//! event accordingly.
++//!
++//! Two consequences follow, and both are load-bearing:
++//!
++//! 1. The shim's `wait()` reports back the interest mask that was registered
++//!    (`epoll.rs`: `event_set & (IN | OUT)`), not any observed readiness -- a
++//!    completion packet only says "the object was signaled". The `evset`
++//!    argument to `process_event()` therefore carries no information here, and
++//!    the real state is recovered with `WSAEnumNetworkEvents()`.
++//! 2. `WSAEventSelect()` events are edge-triggered: the event stays signaled
++//!    until `WSAEnumNetworkEvents()` resets it. Registering level-triggered
++//!    would let the shim re-arm the packet before we enumerate and spin. Every
++//!    registration below therefore sets `EventSet::EDGE_TRIGGERED`, and each
++//!    `process_event()` returns a `polling` update so that the muxer's
++//!    delete-then-add re-arms the watch after the enumerate.
++//!
++//! `WSAEventSelect()` also puts the socket into non-blocking mode, which is
++//! what `unix.rs` arranges by hand with `F_SETFL`.
++//!
++//! # Untested
++//!
++//! Nothing in this file has been executed. It has been compiled for
++//! `x86_64-pc-windows-msvc` and never run: there is no Windows host in the
++//! development environment and no VM has been booted against it.
++
++use std::collections::HashMap;
++use std::ffi::c_void;
++use std::num::Wrapping;
++use std::os::windows::io::{FromRawHandle, OwnedHandle};
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex, Once};
++
++use windows_sys::Win32::Networking::WinSock::{
++    AF_UNIX, FD_ACCEPT, FD_CLOSE, FD_CONNECT, FD_READ, FD_WRITE, INVALID_SOCKET, SD_BOTH,
++    SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOMAXCONN,
++    FD_CONNECT_BIT, WSACloseEvent, WSACreateEvent, WSADATA, WSAEVENT, WSAEWOULDBLOCK,
++    WSAEnumNetworkEvents, WSAEventSelect, WSAGetLastError, WSANETWORKEVENTS, WSAStartup, accept,
++    bind, closesocket, connect, listen, recv, send, shutdown, socket,
++};
++
++use super::super::Queue as VirtQueue;
++use super::super::linux_errno::linux_errno_raw;
++use super::muxer::{MuxerRx, push_packet};
++use super::muxer_rxq::MuxerRxQ;
++use super::packet::{TsiConnectReq, VsockPacket};
++use super::proxy::{
++    NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
++};
++use super::{defs, defs::uapi};
++use utils::epoll::EventSet;
++use utils::windows::{AsRawFd, RawFd};
++
++use vm_memory::GuestMemoryMmap;
++
++/// The network events every guest-IPC socket cares about. `FD_WRITE` is
++/// selected only so that a connect completing out-of-line is observable; the
++/// receive path never waits for writability.
++const IPC_EVENTS: i32 = (FD_READ | FD_WRITE | FD_ACCEPT | FD_CONNECT | FD_CLOSE) as i32;
++
++/// Winsock must be initialised once per process before any other ws2_32 call.
++/// `std::net` does this lazily for its own sockets, but nothing guarantees a
++/// `std` socket has been created by the time a vsock port is configured, so
++/// this module does not rely on that.
++fn winsock_init() {
++    static START: Once = Once::new();
++    START.call_once(|| {
++        let mut data: WSADATA = unsafe { std::mem::zeroed() };
++        // 2.2 is the highest version Winsock defines and the one every
++        // supported Windows release provides.
++        let ret = unsafe { WSAStartup(0x0202, &mut data) };
++        if ret != 0 {
++            error!("WSAStartup failed: {ret}");
++        }
++    });
++}
++
++fn last_wsa_error() -> i32 {
++    unsafe { WSAGetLastError() }
++}
++
++fn wsa_io_error(op: &'static str) -> ProxyError {
++    ProxyError::Win32(op, std::io::Error::from_raw_os_error(last_wsa_error()))
++}
++
++/// Translate a Winsock error into the negative Linux errno the guest expects.
++///
++/// The guest's vsock stack interprets these numbers, so they must be Linux
++/// values, exactly as `unix.rs` converts BSD errnos on macOS. `WSAE*` codes are
++/// `10000 + BSD errno`, so subtracting the offset lands on the BSD number that
++/// `linux_errno_raw()` already knows how to map.
++fn guest_errno(wsa_err: i32) -> i32 {
++    if (10000..10100).contains(&wsa_err) {
++        -linux_errno_raw(wsa_err - 10000)
++    } else {
++        -linux_errno_raw(wsa_err)
++    }
++}
++
++/// Build a `SOCKADDR_UN` for `path`.
++///
++/// Windows' `sun_path` is 108 bytes including the NUL, and is interpreted as a
++/// byte string in the system ANSI code page rather than as UTF-16. Paths that
++/// are not representable there cannot be addressed; that is a Winsock AF_UNIX
++/// limitation, not one this function introduces. Go's `net` package writes the
++/// same bytes, so the two ends agree for any path either can express.
++fn sockaddr_un(path: &Path) -> Result<(SOCKADDR_UN, i32), ProxyError> {
++    let bytes = path.as_os_str().to_str().map(str::as_bytes).ok_or_else(|| {
++        ProxyError::Win32(
++            "sockaddr_un: path is not valid UTF-8",
++            std::io::Error::from(std::io::ErrorKind::InvalidInput),
++        )
++    })?;
++
++    let mut addr = SOCKADDR_UN {
++        sun_family: AF_UNIX,
++        sun_path: [0; 108],
++    };
++    if bytes.len() >= addr.sun_path.len() {
++        return Err(ProxyError::Win32(
++            "sockaddr_un: path exceeds 107 bytes",
++            std::io::Error::from(std::io::ErrorKind::InvalidFilename),
++        ));
++    }
++    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
++        *slot = *byte as i8;
++    }
++
++    // The length passed to bind()/connect() covers the family, the path and its
++    // terminating NUL -- not the whole fixed-size array.
++    let len = (std::mem::size_of::<u16>() + bytes.len() + 1) as i32;
++    Ok((addr, len))
++}
++
++/// A socket plus the Event that carries its readiness.
++///
++/// Bundling them keeps the two lifetimes together: the event must outlive every
++/// registration that references it, and both must be released together.
++struct EventSocket {
++    sock: SOCKET,
++    event: WSAEVENT,
++}
++
++impl EventSocket {
++    /// Wrap an already-created socket and arm it for `IPC_EVENTS`.
++    fn adopt(sock: SOCKET) -> Result<Self, ProxyError> {
++        let event = unsafe { WSACreateEvent() };
++        // WSACreateEvent returns WSA_INVALID_EVENT, which is 0, on failure.
++        if event == 0 {
++            let err = wsa_io_error("WSACreateEvent");
++            unsafe { closesocket(sock) };
++            return Err(err);
++        }
++        if unsafe { WSAEventSelect(sock, event, IPC_EVENTS) } == SOCKET_ERROR {
++            let err = wsa_io_error("WSAEventSelect");
++            unsafe {
++                WSACloseEvent(event);
++                closesocket(sock);
++            }
++            return Err(err);
++        }
++        Ok(EventSocket { sock, event })
++    }
++
++    fn create() -> Result<Self, ProxyError> {
++        winsock_init();
++        let sock = unsafe { socket(AF_UNIX as i32, SOCK_STREAM, 0) };
++        if sock == INVALID_SOCKET {
++            return Err(wsa_io_error("socket(AF_UNIX)"));
++        }
++        Self::adopt(sock)
++    }
++
++    /// The handle the epoll shim watches: the Event, never the socket.
++    fn poll_handle(&self) -> RawFd {
++        self.event as *mut c_void
++    }
++
++    /// Drain and reset the socket's pending network events, translating them
++    /// into the `EventSet` vocabulary the muxer speaks.
++    ///
++    /// This is the only place the socket's real state is discovered; the mask
++    /// the shim hands to `process_event()` is just what we registered.
++    fn take_events(&self) -> (EventSet, Option<i32>) {
++        let mut events: WSANETWORKEVENTS = unsafe { std::mem::zeroed() };
++        if unsafe { WSAEnumNetworkEvents(self.sock, self.event, &mut events) } == SOCKET_ERROR {
++            warn!("WSAEnumNetworkEvents failed: {}", last_wsa_error());
++            return (EventSet::empty(), None);
++        }
++
++        let mut set = EventSet::empty();
++        let mut connect_err = None;
++        let fired = events.lNetworkEvents as u32;
++
++        if fired & FD_READ != 0 {
++            set |= EventSet::IN;
++        }
++        if fired & FD_ACCEPT != 0 {
++            set |= EventSet::IN;
++        }
++        if fired & FD_CONNECT != 0 {
++            // iErrorCode is indexed by the *_BIT constants.
++            let err = events.iErrorCode[FD_CONNECT_BIT as usize];
++            if err == 0 {
++                set |= EventSet::OUT;
++            } else {
++                connect_err = Some(err);
++            }
++        }
++        if fired & FD_WRITE != 0 {
++            set |= EventSet::OUT;
++        }
++        if fired & FD_CLOSE != 0 {
++            set |= EventSet::HANG_UP;
++        }
++
++        (set, connect_err)
++    }
++}
++
++impl Drop for EventSocket {
++    fn drop(&mut self) {
++        unsafe {
++            // Cancel the event association before tearing either object down,
++            // so no further packets can be queued against a dead watch.
++            WSAEventSelect(self.sock, 0, 0);
++            WSACloseEvent(self.event);
++            closesocket(self.sock);
++        }
++    }
++}
++
++// SAFETY: a Winsock SOCKET and a Windows Event handle are process-wide kernel
++// objects and may be used from any thread. `EventSocket` owns both exclusively
++// and hands out no interior references.
++unsafe impl Send for EventSocket {}
++
++/// A connected guest-IPC endpoint: the Windows counterpart of `UnixProxy`.
++///
++/// The bookkeeping -- credit accounting, packet framing, status transitions --
++/// is deliberately identical to `unix.rs`; only the syscalls differ.
++pub struct WinsockUnixProxy {
++    id: u64,
++    cid: u64,
++    sock: EventSocket,
++    pub status: ProxyStatus,
++    mem: GuestMemoryMmap,
++    queue: Arc<Mutex<VirtQueue>>,
++    rxq: Arc<Mutex<MuxerRxQ>>,
++    path: PathBuf,
++    peer_port: u32,
++    local_port: u32,
++    control_port: u32,
++    peer_fwd_cnt: Wrapping<u32>,
++    peer_buf_alloc: u32,
++    tx_cnt: Wrapping<u32>,
++    last_tx_cnt_sent: Wrapping<u32>,
++    push_cnt: Wrapping<u32>,
++    rx_cnt: Wrapping<u32>,
++}
++
++impl WinsockUnixProxy {
++    #[allow(clippy::too_many_arguments)]
++    pub fn new(
++        id: u64,
++        cid: u64,
++        local_port: u32,
++        control_port: u32,
++        mem: GuestMemoryMmap,
++        queue: Arc<Mutex<VirtQueue>>,
++        rxq: Arc<Mutex<MuxerRxQ>>,
++        path: PathBuf,
++    ) -> Result<Self, ProxyError> {
++        Ok(WinsockUnixProxy {
++            id,
++            cid,
++            local_port,
++            peer_port: 0,
++            control_port,
++            sock: EventSocket::create()?,
++            status: ProxyStatus::Idle,
++            mem,
++            queue,
++            rxq,
++            peer_buf_alloc: 0,
++            peer_fwd_cnt: Wrapping(0),
++            path,
++            tx_cnt: Wrapping(0),
++            last_tx_cnt_sent: Wrapping(0),
++            push_cnt: Wrapping(0),
++            rx_cnt: Wrapping(0),
++        })
++    }
++
++    /// Adopt a connection accepted by [`WinsockUnixAcceptorProxy`].
++    #[allow(clippy::too_many_arguments)]
++    pub fn new_reverse(
++        id: u64,
++        cid: u64,
++        local_port: u32,
++        peer_port: u32,
++        handle: OwnedHandle,
++        mem: GuestMemoryMmap,
++        queue: Arc<Mutex<VirtQueue>>,
++        rxq: Arc<Mutex<MuxerRxQ>>,
++    ) -> Self {
++        debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
++
++        // The acceptor smuggles the accepted SOCKET through an OwnedHandle so
++        // that `ProxyUpdate` can stay a plain data type. Take it back without
++        // letting the OwnedHandle's Drop call CloseHandle on a socket.
++        let raw = std::os::windows::io::IntoRawHandle::into_raw_handle(handle);
++        let sock = raw as SOCKET;
++
++        // If arming the accepted socket fails there is no way to report it from
++        // here -- `new_reverse` is infallible in the trait's shape. Close the
++        // connection and start in Closed so the muxer reaps it on the first
++        // event rather than leaving a proxy that silently never delivers.
++        let (sock, status) = match EventSocket::adopt(sock) {
++            Ok(s) => (s, ProxyStatus::ReverseInit),
++            Err(e) => {
++                error!("failed to arm accepted socket: id={id}, err={e}");
++                // `adopt` already closed the socket on failure. Build a
++                // placeholder so the struct stays well-formed; it is never
++                // polled because the status is Closed.
++                (
++                    EventSocket {
++                        sock: INVALID_SOCKET,
++                        event: 0,
++                    },
++                    ProxyStatus::Closed,
++                )
++            }
++        };
++
++        WinsockUnixProxy {
++            id,
++            cid,
++            local_port,
++            peer_port,
++            control_port: 0,
++            sock,
++            status,
++            mem,
++            queue,
++            rxq,
++            rx_cnt: Wrapping(0),
++            tx_cnt: Wrapping(0),
++            last_tx_cnt_sent: Wrapping(0),
++            peer_buf_alloc: 0,
++            peer_fwd_cnt: Wrapping(0),
++            push_cnt: Wrapping(0),
++            path: Default::default(),
++        }
++    }
++
++    /// Interest for a socket that is up: readable, plus close.
++    ///
++    /// Edge-triggered because `WSAEnumNetworkEvents()` -- not the kernel -- is
++    /// what clears the event; see the module docs.
++    fn read_interest(&self) -> Option<(u64, RawFd, EventSet)> {
++        Some((
++            self.id,
++            self.sock.poll_handle(),
++            EventSet::IN | EventSet::EDGE_TRIGGERED,
++        ))
++    }
++
++    fn no_interest(&self) -> Option<(u64, RawFd, EventSet)> {
++        Some((self.id, self.sock.poll_handle(), EventSet::empty()))
++    }
++
++    fn push_connect_rsp(&self, result: i32) {
++        debug!(
++            "push_connect_rsp: id: {}, control_port: {}, result: {}",
++            self.id, self.control_port, result
++        );
++
++        let rx = MuxerRx::ConnResponse {
++            local_port: 1025,
++            peer_port: self.control_port,
++            result,
++        };
++        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++    }
++
++    fn push_reset(&self) {
++        debug!(
++            "push_reset: id: {}, peer_port: {}, local_port: {}",
++            self.id, self.peer_port, self.local_port
++        );
++
++        let rx = MuxerRx::Reset {
++            local_port: self.local_port,
++            peer_port: self.peer_port,
++        };
++
++        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++    }
++
++    fn peer_avail_credit(&self) -> usize {
++        (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
++    }
++
++    fn recv_to_pkt(&self, pkt: &mut VsockPacket) -> RecvPkt {
++        if let Some(buf) = pkt.buf_mut() {
++            let peer_credit = self.peer_avail_credit();
++            let max_len = std::cmp::min(buf.len(), peer_credit);
++
++            debug!(
++                "recv_to_pkt: peer_avail_credit={}, buf.len={}, max_len={}",
++                peer_credit,
++                buf.len(),
++                max_len
++            );
++
++            if max_len == 0 {
++                return RecvPkt::WaitForCredit;
++            }
++
++            // The socket is non-blocking (WSAEventSelect made it so), which is
++            // what MSG_DONTWAIT buys on Unix.
++            let cnt = unsafe { recv(self.sock.sock, buf.as_mut_ptr(), max_len as i32, 0) };
++
++            match cnt {
++                SOCKET_ERROR => {
++                    let err = last_wsa_error();
++                    if err == WSAEWOULDBLOCK {
++                        // Nothing left this round; not an error.
++                        debug!("recv_pkt: would block");
++                    } else {
++                        debug!("recv_pkt: recv error: {err}");
++                    }
++                    RecvPkt::Error
++                }
++                0 => RecvPkt::Close,
++                n => {
++                    debug!("recv cnt={n} rx_cnt={}", self.rx_cnt);
++                    RecvPkt::Read(n as usize)
++                }
++            }
++        } else {
++            debug!("recv_pkt: pkt without buf");
++            RecvPkt::Error
++        }
++    }
++
++    fn recv_pkt(&mut self) -> (bool, bool) {
++        let mut have_used = false;
++        let mut wait_credit = false;
++        let mut queue = self.queue.lock().unwrap();
++
++        while let Some(head) = queue.pop(&self.mem) {
++            let len = match VsockPacket::from_rx_virtq_head(&head) {
++                Ok(mut pkt) => match self.recv_to_pkt(&mut pkt) {
++                    RecvPkt::WaitForCredit => {
++                        wait_credit = true;
++                        0
++                    }
++                    RecvPkt::Read(cnt) => {
++                        self.rx_cnt += Wrapping(cnt as u32);
++                        self.init_data_pkt(&mut pkt);
++                        pkt.set_len(cnt as u32);
++                        pkt.hdr().len() + cnt
++                    }
++                    RecvPkt::Close => {
++                        self.status = ProxyStatus::Closed;
++                        0
++                    }
++                    RecvPkt::Error => 0,
++                },
++                Err(e) => {
++                    debug!("recv_pkt: RX queue error: {e:?}");
++                    0
++                }
++            };
++
++            if len == 0 {
++                queue.undo_pop();
++                break;
++            } else {
++                have_used = true;
++                self.push_cnt += Wrapping(len as u32);
++                debug!(
++                    "recv_pkt: pushing packet with {} bytes, push_cnt={}",
++                    len, self.push_cnt
++                );
++                if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
++                    error!("failed to add used elements to the queue: {e:?}");
++                }
++            }
++        }
++
++        debug!("recv_pkt: have_used={have_used}");
++        (have_used, wait_credit)
++    }
++
++    fn init_data_pkt(&self, pkt: &mut VsockPacket) {
++        debug!(
++            "init_data_pkt: id={}, local_port={}, peer_port={}",
++            self.id, self.local_port, self.peer_port
++        );
++
++        pkt.set_op(uapi::VSOCK_OP_RW)
++            .set_src_cid(uapi::VSOCK_HOST_CID)
++            .set_dst_cid(self.cid)
++            .set_src_port(self.local_port)
++            .set_dst_port(self.peer_port)
++            .set_type(uapi::VSOCK_TYPE_STREAM)
++            .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
++            .set_fwd_cnt(self.tx_cnt.0);
++    }
++}
++
++impl Proxy for WinsockUnixProxy {
++    fn id(&self) -> u64 {
++        self.id
++    }
++
++    fn status(&self) -> ProxyStatus {
++        self.status
++    }
++
++    fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
++        let mut update = ProxyUpdate::default();
++
++        let (addr, addr_len) = match sockaddr_un(&self.path) {
++            Ok(a) => a,
++            Err(e) => {
++                error!("connect: bad IPC path {:?}: {e}", self.path);
++                self.push_connect_rsp(-libc::EINVAL);
++                return update;
++            }
++        };
++
++        let ret = unsafe {
++            connect(
++                self.sock.sock,
++                &addr as *const SOCKADDR_UN as *const SOCKADDR,
++                addr_len,
++            )
++        };
++
++        let result = if ret == 0 {
++            debug!("connect: Connected");
++            self.status = ProxyStatus::Connected;
++            0
++        } else {
++            let err = last_wsa_error();
++            if err == WSAEWOULDBLOCK {
++                // A non-blocking AF_UNIX connect reports WSAEWOULDBLOCK, not
++                // WSAEINPROGRESS as the BSD sockets API would. Completion
++                // arrives as FD_CONNECT.
++                debug!("connect: Connecting");
++                self.status = ProxyStatus::Connecting;
++                0
++            } else {
++                debug!("Error connecting: {err}");
++                guest_errno(err)
++            }
++        };
++
++        if self.status == ProxyStatus::Connecting {
++            update.polling = Some((
++                self.id,
++                self.sock.poll_handle(),
++                EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED,
++            ));
++        } else {
++            if self.status == ProxyStatus::Connected {
++                update.polling = self.read_interest();
++            }
++            self.push_connect_rsp(result);
++        }
++
++        update
++    }
++
++    fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
++        debug!(
++            "confirm_connect: local_port={} peer_port={}, src_port={}, dst_port={}",
++            pkt.dst_port(),
++            pkt.src_port(),
++            self.local_port,
++            self.peer_port,
++        );
++
++        self.peer_buf_alloc = pkt.buf_alloc();
++        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
++
++        self.local_port = pkt.dst_port();
++        self.peer_port = pkt.src_port();
++
++        let rx = MuxerRx::OpResponse {
++            local_port: pkt.dst_port(),
++            peer_port: pkt.src_port(),
++        };
++        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++
++        None
++    }
++
++    fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
++        let mut update = ProxyUpdate::default();
++
++        let ret = if let Some(buf) = pkt.buf() {
++            let sent = unsafe { send(self.sock.sock, buf.as_ptr(), buf.len() as i32, 0) };
++            if sent == SOCKET_ERROR {
++                guest_errno(last_wsa_error())
++            } else {
++                if sent as usize != buf.len() {
++                    // The socket is non-blocking, so a short write is possible
++                    // whenever the peer is slow. `unix.rs` has the same gap:
++                    // the unsent tail is dropped and only logged. Fixing it
++                    // needs a per-connection send queue in both backends.
++                    error!(
++                        "couldn't send everything: buf={}, sent={}",
++                        buf.len(),
++                        sent
++                    );
++                }
++                self.tx_cnt += Wrapping(sent as u32);
++                sent
++            }
++        } else {
++            -libc::EINVAL
++        };
++
++        if ret > 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
++            debug!(
++                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
++                self.id, self.tx_cnt, self.last_tx_cnt_sent
++            );
++            self.last_tx_cnt_sent = self.tx_cnt;
++
++            let rx = MuxerRx::CreditUpdate {
++                local_port: pkt.dst_port(),
++                peer_port: pkt.src_port(),
++                fwd_cnt: self.tx_cnt.0,
++            };
++
++            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++            update.signal_queue = true;
++        }
++
++        debug!("sendmsg ret={ret}");
++
++        update
++    }
++
++    fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
++        debug!(
++            "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
++            pkt.buf_alloc(),
++            self.rx_cnt,
++            pkt.fwd_cnt()
++        );
++        self.peer_buf_alloc = pkt.buf_alloc();
++        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
++
++        self.status = ProxyStatus::Connected;
++
++        ProxyUpdate {
++            polling: self.read_interest(),
++            ..Default::default()
++        }
++    }
++
++    fn push_op_request(&self) {
++        debug!(
++            "push_op_request: id={}, local_port={} peer_port={}",
++            self.id, self.local_port, self.peer_port
++        );
++
++        let rx = MuxerRx::OpRequest {
++            local_port: self.local_port,
++            peer_port: self.peer_port,
++        };
++        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++    }
++
++    fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
++        debug!(
++            "process_op_response: id={} src_port={} dst_port={}",
++            self.id,
++            pkt.src_port(),
++            pkt.dst_port()
++        );
++
++        self.peer_buf_alloc = pkt.buf_alloc();
++        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
++
++        self.status = ProxyStatus::Connected;
++
++        ProxyUpdate {
++            polling: self.read_interest(),
++            ..Default::default()
++        }
++    }
++
++    fn shutdown(&mut self, pkt: &VsockPacket) {
++        let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
++        let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
++
++        let how = if recv_off && send_off {
++            SD_BOTH
++        } else if recv_off {
++            SD_RECEIVE
++        } else {
++            SD_SEND
++        };
++
++        if unsafe { shutdown(self.sock.sock, how) } == SOCKET_ERROR {
++            warn!("error sending shutdown to socket: {}", last_wsa_error());
++        }
++    }
++
++    fn release(&mut self) -> ProxyUpdate {
++        debug!(
++            "release: id={}, tx_cnt={}, last_tx_cnt={}",
++            self.id, self.tx_cnt, self.last_tx_cnt_sent
++        );
++
++        ProxyUpdate {
++            remove_proxy: ProxyRemoval::Deferred,
++            ..Default::default()
++        }
++    }
++
++    fn process_event(&mut self, _evset: EventSet) -> ProxyUpdate {
++        let mut update = ProxyUpdate::default();
++
++        // `_evset` is the mask we registered, not what happened; the shim
++        // cannot tell them apart. Recover the truth from Winsock, which also
++        // resets the event so the re-arm below is not immediately re-signaled.
++        let (evset, connect_err) = self.sock.take_events();
++
++        if let Some(err) = connect_err {
++            debug!("process_event: connect failed: {err}");
++            self.push_connect_rsp(guest_errno(err));
++            self.status = ProxyStatus::Closed;
++            update.polling = self.no_interest();
++            update.signal_queue = true;
++            update.remove_proxy = ProxyRemoval::Deferred;
++            return update;
++        }
++
++        if evset.contains(EventSet::OUT) && self.status == ProxyStatus::Connecting {
++            debug!("process_event: connect completed");
++            self.status = ProxyStatus::Connected;
++            self.push_connect_rsp(0);
++            update.signal_queue = true;
++            update.polling = self.read_interest();
++            // Fall through: FD_READ may have arrived in the same enumerate.
++        }
++
++        if evset.contains(EventSet::IN) && self.status == ProxyStatus::Connected {
++            debug!("process_event: IN");
++            let (signal_queue, wait_credit) = self.recv_pkt();
++            update.signal_queue |= signal_queue;
++
++            if wait_credit && self.status != ProxyStatus::WaitingCreditUpdate {
++                self.status = ProxyStatus::WaitingCreditUpdate;
++                update.push_credit_req = Some(MuxerRx::CreditRequest {
++                    local_port: self.local_port,
++                    peer_port: self.peer_port,
++                    fwd_cnt: self.tx_cnt.0,
++                });
++            }
++
++            if self.status == ProxyStatus::WaitingCreditUpdate {
++                debug!("process_event: WaitingCreditUpdate");
++                update.polling = self.no_interest();
++                return update;
++            }
++        }
++
++        // A peer close is reported once, via FD_CLOSE. Handle it after the read
++        // above so that data queued before the close is not lost.
++        if evset.contains(EventSet::HANG_UP) || self.status == ProxyStatus::Closed {
++            debug!("process_event: HANG_UP");
++
++            if self.status == ProxyStatus::Connecting {
++                self.push_connect_rsp(-libc::ECONNREFUSED);
++            } else {
++                self.push_reset();
++            }
++
++            self.status = ProxyStatus::Closed;
++            update.polling = self.no_interest();
++            update.signal_queue = true;
++            update.remove_proxy = ProxyRemoval::Deferred;
++            return update;
++        }
++
++        // Re-arm: the event was reset by the enumerate above, and the muxer's
++        // update_polling() does a delete-then-add which recreates the wait
++        // packet. Without this the connection would go deaf after one event.
++        if update.polling.is_none() && self.status == ProxyStatus::Connected {
++            update.polling = self.read_interest();
++        }
++
++        update
++    }
++}
++
++impl AsRawFd for WinsockUnixProxy {
++    /// The Event, not the socket -- see the module docs.
++    fn as_raw_fd(&self) -> RawFd {
++        self.sock.poll_handle()
++    }
++}
++
++/// The listening half of a guest-IPC port (`krun_add_vsock_port2(.., listen=true)`).
++pub struct WinsockUnixAcceptorProxy {
++    id: u64,
++    sock: EventSocket,
++    peer_port: u32,
++}
++
++impl WinsockUnixAcceptorProxy {
++    pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
++        let sock = EventSocket::create()?;
++        let (addr, addr_len) = sockaddr_un(path)?;
++
++        if unsafe {
++            bind(
++                sock.sock,
++                &addr as *const SOCKADDR_UN as *const SOCKADDR,
++                addr_len,
++            )
++        } == SOCKET_ERROR
++        {
++            return Err(wsa_io_error("bind(AF_UNIX)"));
++        }
++
++        if unsafe { listen(sock.sock, SOMAXCONN as i32) } == SOCKET_ERROR {
++            return Err(wsa_io_error("listen(AF_UNIX)"));
++        }
++
++        Ok(WinsockUnixAcceptorProxy {
++            id,
++            sock,
++            peer_port,
++        })
++    }
++}
++
++impl Proxy for WinsockUnixAcceptorProxy {
++    fn id(&self) -> u64 {
++        self.id
++    }
++    fn status(&self) -> ProxyStatus {
++        ProxyStatus::WaitingOnAccept
++    }
++    fn connect(&mut self, _: &VsockPacket, _: TsiConnectReq) -> ProxyUpdate {
++        unreachable!("a listening IPC port is never asked to connect")
++    }
++    fn sendmsg(&mut self, _: &VsockPacket) -> ProxyUpdate {
++        unreachable!("a listening IPC port carries no data")
++    }
++    fn update_peer_credit(&mut self, _: &VsockPacket) -> ProxyUpdate {
++        unreachable!("a listening IPC port has no peer credit")
++    }
++    fn process_op_response(&mut self, _: &VsockPacket) -> ProxyUpdate {
++        unreachable!("a listening IPC port never issues an OP_REQUEST")
++    }
++    fn release(&mut self) -> ProxyUpdate {
++        unreachable!("a listening IPC port lives as long as the device")
++    }
++
++    fn process_event(&mut self, _evset: EventSet) -> ProxyUpdate {
++        let mut update = ProxyUpdate::default();
++        let (evset, _) = self.sock.take_events();
++
++        if evset.contains(EventSet::HANG_UP) {
++            debug!("process_event: HANG_UP");
++            update.polling = Some((self.id, self.sock.poll_handle(), EventSet::empty()));
++            update.signal_queue = true;
++            update.remove_proxy = ProxyRemoval::Deferred;
++            return update;
++        }
++
++        if evset.contains(EventSet::IN) {
++            let accepted =
++                unsafe { accept(self.sock.sock, std::ptr::null_mut(), std::ptr::null_mut()) };
++            if accepted == INVALID_SOCKET {
++                let err = last_wsa_error();
++                if err != WSAEWOULDBLOCK {
++                    warn!("error accepting connection: id={}, err={err}", self.id);
++                }
++            } else {
++                // The accepted socket travels to `MuxerThread` through
++                // `ProxyUpdate`, whose Windows payload is an `OwnedHandle`.
++                // A SOCKET is a kernel handle value, so this round-trip is
++                // representable; `new_reverse` unwraps it with `into_raw_handle`
++                // rather than letting `OwnedHandle::drop` call `CloseHandle`.
++                //
++                // SAFETY: `accepted` is a freshly returned, exclusively owned
++                // socket handle, and ownership moves into the OwnedHandle here.
++                let handle = unsafe { OwnedHandle::from_raw_handle(accepted as *mut c_void) };
++                update.new_proxy = Some((self.peer_port, handle, NewProxyType::AfUnix));
++            }
++            update.signal_queue = true;
++        }
++
++        // FD_ACCEPT is edge-triggered like every other selected event, so the
++        // listener must be re-armed after each enumerate.
++        if update.polling.is_none() {
++            update.polling = Some((
++                self.id,
++                self.sock.poll_handle(),
++                EventSet::IN | EventSet::EDGE_TRIGGERED,
++            ));
++        }
++
++        update
++    }
++}
++
++impl AsRawFd for WinsockUnixAcceptorProxy {
++    fn as_raw_fd(&self) -> RawFd {
++        self.sock.poll_handle()
++    }
++}
+-- 
+2.53.0
+

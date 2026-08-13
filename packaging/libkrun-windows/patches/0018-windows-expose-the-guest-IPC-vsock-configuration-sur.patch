@@ -1,0 +1,289 @@
+From e5770a95443558d0e6f91093c46915d10cc1be81 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:12:18 +0200
+Subject: [PATCH 18/25] windows: expose the guest-IPC vsock configuration
+ surface
+
+With the device built on Windows, the configuration path that reaches it can
+stop being Unix-only. `vmm_config::vsock`, `VsockConfig`, `VsockBuilder`,
+`VmResources::vsock` and `attach_unixsock_vsock_device()` all lose their gates;
+`krun_add_vsock_port()`, `krun_add_vsock_port2()` and the `unix_ipc_port_map`
+they feed lose the -ENOTSUP stubs added in 1f9791b.
+
+What stays Unix-only is TSI. `krun_set_port_map()` still refuses, so
+`VsockDeviceConfig::host_port_map` is always `None` on Windows, and the
+`tsi_hijack`/`tsi_hijack_unix` cmdline tokens are still only appended there --
+handing them to a guest with no TSI backend would strand it.
+
+`krun_add_vsock()` becomes a single implementation instead of a Windows stub and
+a Unix version. Enabling the device with no feature bits is precisely what a
+guest-IPC-only consumer asks for and now works everywhere, so only a non-empty
+`TsiFlags` is refused with -ENOTSUP. Leaving the whole call refused would have
+made the work in the preceding commits unreachable: `krun_add_vsock_port2()`
+returns -ENODEV unless the device has been enabled first.
+
+Verified: `cargo build --target x86_64-pc-windows-msvc -p libkrun --release`
+links, producing a PE32+ x64 krun.dll with the same 59 exports as before this
+series' vsock work and a new ws2_32.dll import table. `cargo check -p libkrun`
+is at 0 errors for both x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu.
+Nothing has been run on Windows.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/libkrun/src/lib.rs        | 56 ++++++++---------------------------
+ src/vmm/src/builder.rs        | 21 ++++++-------
+ src/vmm/src/resources.rs      |  7 +----
+ src/vmm/src/vmm_config/mod.rs |  6 ++--
+ 4 files changed, 28 insertions(+), 62 deletions(-)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index f2e9fff..d7d0f63 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -50,8 +50,6 @@ use vmm::resources::{
+     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
+     VmResources,
+ };
+-// virtio-vsock and TSI are Unix-only in `krun-devices`: see `vmm::vmm_config::vsock`.
+-#[cfg(unix)]
+ use vmm::resources::{TsiFlags, VsockConfig};
+ #[cfg(feature = "blk")]
+ use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
+@@ -68,7 +66,6 @@ use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfi
+ use vmm::vmm_config::machine_config::VmConfig;
+ #[cfg(feature = "net")]
+ use vmm::vmm_config::net::NetworkInterfaceConfig;
+-#[cfg(unix)]
+ use vmm::vmm_config::vsock::VsockDeviceConfig;
+ 
+ #[cfg(feature = "aws-nitro")]
+@@ -200,7 +197,6 @@ struct ContextConfig {
+     net_index: u8,
+     #[cfg(unix)]
+     tsi_port_map: Option<HashMap<u16, u16>>,
+-    #[cfg(unix)]
+     vsock_config: VsockConfig,
+     #[cfg(feature = "blk")]
+     block_cfgs: Vec<BlockDeviceConfig>,
+@@ -208,7 +204,6 @@ struct ContextConfig {
+     block_root: Option<BlockRootConfig>,
+     #[cfg(feature = "tee")]
+     tee_config_file: Option<PathBuf>,
+-    #[cfg(unix)]
+     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+     shutdown_efd: Option<EventFd>,
+     gpu_virgl_flags: Option<u32>,
+@@ -305,7 +300,6 @@ impl ContextConfig {
+         self.tee_config_file.clone()
+     }
+ 
+-    #[cfg(unix)]
+     fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
+         if let Some(map) = &mut self.unix_ipc_port_map {
+             map.insert(port, (filepath, listen));
+@@ -1443,32 +1437,6 @@ pub unsafe extern "C" fn krun_set_tee_config_file(ctx_id: u32, c_filepath: *cons
+     }
+ }
+ 
+-/// See `krun_set_port_map` for why these stay exported on Windows.
+-#[cfg(windows)]
+-#[allow(clippy::missing_safety_doc)]
+-#[unsafe(no_mangle)]
+-pub unsafe extern "C" fn krun_add_vsock_port(
+-    ctx_id: u32,
+-    port: u32,
+-    c_filepath: *const c_char,
+-) -> i32 {
+-    unsafe { krun_add_vsock_port2(ctx_id, port, c_filepath, false) }
+-}
+-
+-#[cfg(windows)]
+-#[allow(clippy::missing_safety_doc)]
+-#[unsafe(no_mangle)]
+-pub unsafe extern "C" fn krun_add_vsock_port2(
+-    _ctx_id: u32,
+-    _port: u32,
+-    _c_filepath: *const c_char,
+-    _listen: bool,
+-) -> i32 {
+-    error!("guest IPC over vsock is not supported on Windows: no vsock device is built");
+-    -libc::ENOTSUP
+-}
+-
+-#[cfg(unix)]
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn krun_add_vsock_port(
+@@ -1479,7 +1447,6 @@ pub unsafe extern "C" fn krun_add_vsock_port(
+     unsafe { krun_add_vsock_port2(ctx_id, port, c_filepath, false) }
+ }
+ 
+-#[cfg(unix)]
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn krun_add_vsock_port2(
+@@ -2754,15 +2721,6 @@ pub unsafe extern "C" fn krun_fs_add_overlay_dir(
+     )
+ }
+ 
+-/// See `krun_set_port_map` for why this stays exported on Windows.
+-#[cfg(windows)]
+-#[unsafe(no_mangle)]
+-pub extern "C" fn krun_add_vsock(_ctx_id: u32, _tsi_features: u32) -> i32 {
+-    error!("vsock/TSI is not supported on Windows: no vsock device is built");
+-    -libc::ENOTSUP
+-}
+-
+-#[cfg(unix)]
+ #[unsafe(no_mangle)]
+ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
+     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
+@@ -2770,6 +2728,15 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
+         None => return -libc::EINVAL,
+     };
+ 
++    // Enabling the device with no feature bits is what a guest-IPC-only
++    // consumer wants, and that works everywhere. Only the TSI hijacking bits
++    // need a Unix host, so refuse those rather than the whole call.
++    #[cfg(windows)]
++    if tsi_flags.tsi_enabled() {
++        error!("TSI is not supported on Windows: no TSI backend is built");
++        return -libc::ENOTSUP;
++    }
++
+     if cfg!(target_os = "macos") && tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
+         error!("TSI hijacking of UNIX sockets is not yet supported on macOS");
+         return -libc::EINVAL;
+@@ -3191,14 +3158,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+         return -libc::EINVAL;
+     }
+ 
+-    #[cfg(unix)]
+     match &ctx_cfg.vsock_config {
+         VsockConfig::Disabled => (),
+         VsockConfig::Explicit { tsi_flags } => {
+             let vsock_device_config = VsockDeviceConfig {
+                 vsock_id: "vsock0".to_string(),
+                 guest_cid: 3,
++                #[cfg(unix)]
+                 host_port_map: ctx_cfg.tsi_port_map,
++                // Fed only by krun_set_port_map(), which is TSI.
++                #[cfg(windows)]
++                host_port_map: None,
+                 unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                 tsi_flags: *tsi_flags,
+             };
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index a89fa7b..a749cbe 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -67,7 +67,6 @@ use devices::legacy::{GicV3, HvfGicV3};
+ use devices::legacy::{IrqChip, IrqChipDevice};
+ #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+ use devices::legacy::{KvmGicV2, KvmGicV3};
+-#[cfg(unix)]
+ use devices::virtio::Vsock;
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+ use devices::virtio::passthrough::PermissionSemantics;
+@@ -1209,16 +1208,19 @@ pub fn build_microvm(
+     #[cfg(feature = "blk")]
+     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
+ 
+-    // virtio-vsock and TSI are Unix-only in krun-devices; see `vmm_config::vsock`.
+-    #[cfg(unix)]
+     if let Some(vsock) = vm_resources.vsock.get() {
+         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
+-        let tsi_flags = vm_resources.vsock.tsi_flags();
+-        if tsi_flags.contains(TsiFlags::HIJACK_INET) {
+-            vmm.kernel_cmdline.insert_str("tsi_hijack")?;
+-        }
+-        if tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
+-            vmm.kernel_cmdline.insert_str("tsi_hijack_unix")?;
++        // TSI is Unix-only; the flags are always empty elsewhere, and passing
++        // the hijack tokens to a guest with no TSI backend would strand it.
++        #[cfg(unix)]
++        {
++            let tsi_flags = vm_resources.vsock.tsi_flags();
++            if tsi_flags.contains(TsiFlags::HIJACK_INET) {
++                vmm.kernel_cmdline.insert_str("tsi_hijack")?;
++            }
++            if tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
++                vmm.kernel_cmdline.insert_str("tsi_hijack_unix")?;
++            }
+         }
+     }
+ 
+@@ -2784,7 +2786,6 @@ fn attach_net_devices(
+     Ok(())
+ }
+ 
+-#[cfg(unix)]
+ fn attach_unixsock_vsock_device(
+     vmm: &mut Vmm,
+     unix_vsock: &Arc<Mutex<Vsock>>,
+diff --git a/src/vmm/src/resources.rs b/src/vmm/src/resources.rs
+index 733c377..fd0a4ca 100644
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -30,7 +30,6 @@ use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfig
+ use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
+ #[cfg(feature = "net")]
+ use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
+-#[cfg(unix)]
+ use crate::vmm_config::vsock::*;
+ use crate::vstate::VcpuConfig;
+ #[cfg(any(feature = "gpu", feature = "vhost-user"))]
+@@ -69,8 +68,7 @@ fn host_page_size() -> usize {
+     }
+ }
+ 
+-// Re-export TsiFlags from devices crate. Unix-only: see `vmm_config::vsock`.
+-#[cfg(unix)]
++// Re-export TsiFlags from devices crate.
+ pub use devices::virtio::TsiFlags;
+ 
+ #[cfg(feature = "vhost-user")]
+@@ -192,7 +190,6 @@ pub enum PortConfig {
+ }
+ 
+ /// Configuration for the vsock device
+-#[cfg(unix)]
+ #[derive(Debug, Default, Clone, Eq, PartialEq)]
+ pub enum VsockConfig {
+     /// No vsock device
+@@ -226,7 +223,6 @@ pub struct VmResources {
+     #[cfg(not(feature = "tee"))]
+     pub fs: Vec<FsDeviceConfig>,
+     /// The vsock device.
+-    #[cfg(unix)]
+     pub vsock: VsockBuilder,
+     /// The virtio-blk device.
+     #[cfg(feature = "blk")]
+@@ -404,7 +400,6 @@ impl VmResources {
+     }
+ 
+     /// Sets a vsock device to be attached when the VM starts.
+-    #[cfg(unix)]
+     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
+         self.vsock.insert(config)
+     }
+diff --git a/src/vmm/src/vmm_config/mod.rs b/src/vmm/src/vmm_config/mod.rs
+index cc5e02b..cfd4fad 100644
+--- a/src/vmm/src/vmm_config/mod.rs
++++ b/src/vmm/src/vmm_config/mod.rs
+@@ -29,9 +29,9 @@ pub mod machine_config;
+ 
+ /// Wrapper for configuring the vsock devices attached to the microVM.
+ ///
+-/// virtio-vsock and TSI are Unix-only in `krun-devices` (they are built on `AF_UNIX`/`AF_INET`
+-/// sockets reached through raw fds), so their configuration surface is gated the same way.
+-#[cfg(unix)]
++/// The device is built on every platform. Its TSI half is Unix-only -- see
++/// `devices::virtio::vsock` -- but the guest-IPC half that `krun_add_vsock_port2()`
++/// configures is not, so this configuration surface is not gated.
+ pub mod vsock;
+ 
+ /// Wrapper for configuring the network devices attached to the microVM.
+-- 
+2.53.0
+
