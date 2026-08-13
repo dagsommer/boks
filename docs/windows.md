@@ -136,7 +136,7 @@ not the same as active, as the next section explains:
 | Boks needs | In WSL2 |
 |---|---|
 | `/dev/kvm` | **Nested virtualisation is on by default on Windows 11 x64** — `EnableNestedVirtualization = !Arm64 && IsWindows11OrAbove()` in WSL's source — and it is vendor-agnostic, not the Intel-only feature it was on Hyper-V historically. `CONFIG_KVM=m` in the inbox kernel. |
-| `unixgram` (AF_UNIX `SOCK_DGRAM`) for the link | Fine. `CONFIG_UNIX=y`; the datagram type is unconditional upstream. The link is VMM↔netstack, **both inside the distro**, so Windows' stream-only AF_UNIX never enters it. |
+| An AF_UNIX socket for the link | Fine. `CONFIG_UNIX=y`, and the link is `SOCK_STREAM` (`mode=unixstream`) since the transport moved off datagrams, so it is the socket type every platform has. The link is VMM↔netstack, **both inside the distro**, either way. |
 | containerd | Runs. Less trodden than the dockerd path — Rancher Desktop has an open containerd-in-WSL startup bug — but demonstrably works. |
 | `erofs` + `mkfs.erofs` | `CONFIG_EROFS_FS=m` in the inbox kernel, enabled by Microsoft in 2022. |
 
@@ -856,8 +856,8 @@ The Windows equivalent is `LockFileEx` with
 - State belongs under `os.UserCacheDir()` → `%LOCALAPPDATA%`, **not** `os.UserConfigDir()` →
   `%AppData%`, because the latter is the roaming profile and gets synced to a file server in
   domain environments. Machine-local liveness state must not roam.
-- Boks' link socket path would also need attention: Windows supports `AF_UNIX` `SOCK_STREAM`
-  from Windows 10 1803, but **not `unixgram`**, and `sun_path` is still ~108 bytes while
+- Boks' link socket path would also need attention: `SOCK_STREAM` — the type the link now uses
+  — has been available since Windows 10 1803, but `sun_path` is still ~108 bytes while
   `%LOCALAPPDATA%` paths are long. A named pipe (`\\.\pipe\…`) is the idiomatic Windows answer
   and has no stale-file problem.
 
@@ -1081,7 +1081,7 @@ expected.
 (`pkg/tap/protocols.go`). Boks' stack calls:
 
 ```go
-return h.sw.Accept(ctx, conn, types.VfkitProtocol)   // stack_unix.go
+return h.sw.Accept(ctx, newLinkConn(conn), types.QemuProtocol)   // stack.go, since the switch to unixstream
 ```
 
 **Supporting a QEMU-style link is that constant plus a listener.** Everything above the link —
@@ -1190,6 +1190,14 @@ So the Windows link would be: nerdbox `NetworkModeUnixstream` → libkrun `krun_
 loopback TCP would work equally well if AF_UNIX proves awkward, since the protocol only needs a
 stream.
 
+**That change has since been made, on every platform.** Boks does not keep a datagram link for
+Unix and a stream one for Windows: the link is `unixstream` everywhere, so the Windows path is
+the path that is exercised by every test run on Linux rather than a second, untested one. It
+cost slightly more than "one constant and a listener" — a stream's frame boundaries are a
+number the peer writes, so Boks bounds it before the switch allocates on it, refuses a length
+too small to be an Ethernet frame, and never lets a failed write be retried into a
+desynchronised stream (`internal/network/link.go`). None of it has run against a real VMM.
+
 ### What this means for what Boks should do
 
 **Wait, and optionally accelerate exactly one thing.** The structural work Boks would otherwise
@@ -1252,7 +1260,7 @@ Every box except one is either already built or a known port. What changes in Bo
 | Package | Change | Size |
 |---|---|---|
 | **the VMM** | **does not exist for Windows** — see section 8 | the entire question |
-| `internal/network` gateway | a Windows link: the VMM's virtio-net backend, whatever form it takes. Note Windows AF_UNIX is stream-only, so the `unixgram` transport cannot be reused as-is | small once a VMM exists, and shaped by which one |
+| `internal/network` gateway | **done, on the Linux path**: the link is `mode=unixstream` — an AF_UNIX `SOCK_STREAM` socket Boks listens on, `types.QemuProtocol` framing — which Windows AF_UNIX supports. What is left is a VMM to connect to it | none in Boks; all of it in the VMM |
 | `internal/enforce` | `LockFileEx` with a retry, and `CREATE_NEW_PROCESS_GROUP` in place of `setsid` | small (section 6) |
 | `internal/workspace` | Windows host path → `/c/…`; refuse UNC | small — the type already separates `HostPath` from `GuestPath`, so nothing downstream changes |
 | `internal/runtimecfg` | containerd's Windows named-pipe address is already handled; the runtime handler stays `io.containerd.nerdbox.v1` if the shim is the same family | trivial |
@@ -1261,12 +1269,14 @@ Every box except one is either already built or a known port. What changes in Bo
 
 Two measurements support that last row, and both were taken during this spike:
 
-- **The netstack is already portable.** `internal/network/stack_unix.go` imports no
-  platform-specific package and makes no syscall; it carries `!windows` only because the gateway
-  that feeds it does. Removing the build tag and compiling the package for `windows/amd64`
-  succeeds — gvisor's netstack, the tap switch, and the DHCP and DNS services all build. The
-  enforcement engine is not the obstacle. (Demonstrated, then reverted; it says nothing about
-  whether a guest could reach it.)
+- **The netstack is already portable.** `internal/network/stack.go` imports no
+  platform-specific package and makes no syscall; it carried `!windows` only because the
+  datagram link that fed it did. That build tag is gone: the file, the gateway and the link
+  socket compile for `windows/amd64` — gvisor's netstack, the tap switch, and the DHCP and DNS
+  services all build, and `GOOS=windows go build ./...` passes. The enforcement engine is not
+  the obstacle. (It still says nothing about whether a guest could reach it: nothing on
+  Windows emits a frame onto that link, which is why `internal/network/vmm_windows.go`
+  refuses.)
 - **The reference product reaches the same conclusion independently.** Its Windows build links
   the same `gvisor` and `goproxy` versions as its macOS build, and carries all three proxy
   modes. The policy layer is genuinely platform-independent in practice, not just in principle.
@@ -1283,7 +1293,7 @@ Two measurements support that last row, and both were taken during this spike:
   and today there is no Boks Windows backend to enable.
 - `internal/doctor/doctor.go`: the platform check's Windows remedy no longer says "blocked on
   runtime support".
-- `internal/network/gateway_windows.go`, `internal/enforce/lock_windows.go`: the errors and
+- `internal/network/vmm_windows.go` (then `gateway_windows.go`), `internal/enforce/lock_windows.go`: the errors and
   comments now name WHP and the missing VMM, record the HCS and AF_UNIX findings as *true but
   not load-bearing* so they are not rediscovered as blockers, and carry the `LockFileEx` design
   for whoever implements it.
