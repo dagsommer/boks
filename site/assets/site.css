@@ -795,21 +795,22 @@ a:hover { text-decoration-thickness: 2px; }
 
 @media (max-width: 60rem) {
   .home .topbar .brand-note { display: none; }
-  .chain { gap: 0.4rem; }
-  /* The chain stacks rather than scrolls: a diagram you have to drag is not a diagram.
-     The connectors turn from horizontal arrows into vertical ones. */
-  .node { white-space: normal; }
-  .link { flex: 0 0 100%; height: 0.9rem; width: 1px; background: none; margin-left: 0.9rem; }
-  .link::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    border-left: 1px solid var(--border-strong);
+
+  /* The chain stacks rather than scrolls: a diagram you have to drag sideways is not a
+     diagram. The connectors turn from horizontal arrows into vertical ones, and a long
+     binary name is allowed to wrap rather than to widen the page. */
+  .chain { flex-direction: column; align-items: stretch; gap: 0.4rem; }
+  .node { white-space: normal; text-align: left; }
+  .link {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    width: 1px;
+    height: 0.9rem;
+    margin-left: 0.9rem;
+    background: var(--border-strong);
   }
   .link::after { left: -3px; right: auto; top: auto; bottom: 0; transform: rotate(135deg); }
-  .chain { flex-direction: column; align-items: stretch; }
-  .node { text-align: left; }
+
   .boundary-label { font-size: 0.62rem; letter-spacing: 0.1em; }
+  .hero-title { letter-spacing: -0.03em; }
 }
