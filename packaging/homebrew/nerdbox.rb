@@ -80,10 +80,9 @@ class Nerdbox < Formula
   # cross-toolchain, so neither can be produced here, and there is nothing published
   # anywhere to download instead.
   #
-  # This gap does not show up in `boks doctor`, which checks the shim, its entitlement and
-  # libkrun but not the guest assets. A machine with everything this formula installs will
-  # report ready and still fail at boot with "nerdbox-kernel not found in PATH or
-  # LIBKRUN_PATH". Hence the caveat, in the loudest place available.
+  # `boks doctor` reports the gap as `guest image`, scanning the same PATH and LIBKRUN_PATH
+  # the shim does — but it reports it after the install, to someone who may not run it.
+  # Hence the caveat too, in the loudest place available.
   def caveats
     <<~EOS
       This formula installed the shim and signed it with com.apple.security.hypervisor.
@@ -93,7 +92,7 @@ class Nerdbox < Formula
 
         nerdbox-kernel not found in PATH or LIBKRUN_PATH
 
-      and `boks doctor` will not warn you, because it does not check for them.
+      `boks doctor` reports this as `guest image`: fail.
 
       Build them once, on any machine with Docker (they are architecture-specific but not
       host-specific), and install them where the shim looks:

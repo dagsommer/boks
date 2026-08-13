@@ -26,6 +26,10 @@ func extraChecks() []Check                   { return nil }
 func hypervisorLibraryNames() []string       { return nil }
 func hypervisorLibrarySearchPaths() []string { return nil }
 
+// hypervisorLibraryHint is never shown here: with no library names, the check skips before it
+// can miss. It exists because the shared check requires every platform to provide one.
+func hypervisorLibraryHint() string { return "" }
+
 // unsupportedRemedy is for platforms with no VM backend at all.
 //
 // Windows is not one of them and is not handled here — see virt_windows.go, whose build tag
