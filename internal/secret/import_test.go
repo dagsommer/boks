@@ -50,7 +50,7 @@ func TestImportFromFile(t *testing.T) {
 	if record.Subscription != "max" || len(record.Scopes) != 2 {
 		t.Errorf("the non-secret metadata was lost: %+v", record.Scopes)
 	}
-	if record.TokenHost != "console.anthropic.com" || record.TokenPath != "/v1/oauth/token" {
+	if record.TokenHost != "platform.claude.com" || record.TokenPath != "/v1/oauth/token" {
 		t.Errorf("token endpoint = %s%s", record.TokenHost, record.TokenPath)
 	}
 	if len(record.ResourceHosts) != 1 || record.ResourceHosts[0] != "api.anthropic.com" {
