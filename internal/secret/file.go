@@ -59,6 +59,13 @@ const (
 // ErrNoPassphrase reports that the store cannot be opened because no passphrase was given.
 var ErrNoPassphrase = errors.New("no passphrase for the secret store")
 
+// ErrWrongPassphrase reports that the store did not decrypt.
+//
+// GCM cannot tell a wrong key from a damaged file, so neither can this — the two are one
+// error on purpose. It is a sentinel so that the command layer can recognise the one failure
+// every subcommand shares and offer the way out, rather than matching on the message text.
+var ErrWrongPassphrase = errors.New("the secret store did not decrypt")
+
 // PassphraseEnv is the environment variable the CLI reads the passphrase from.
 const PassphraseEnv = "BOKS_SECRETS_PASSPHRASE"
 
@@ -86,7 +93,112 @@ func (s *FileStore) Lookup(_ context.Context, name string) (Value, error) {
 	if !ok {
 		return Value{}, fmt.Errorf("%w: %q", ErrNotFound, name)
 	}
+	if IsOAuth(v) {
+		// Refusing here rather than returning the record is the difference between a
+		// clear error and a JSON blob sent to an origin as an Authorization header.
+		return Value{}, fmt.Errorf("secret %q is an oauth credential; use --oauth rather than --inject for it", name)
+	}
 	return NewValue(v), nil
+}
+
+// LookupOAuth implements OAuthProvider.
+func (s *FileStore) LookupOAuth(ctx context.Context, name string) (OAuthTokens, error) {
+	r, err := s.LookupOAuthRecord(ctx, name)
+	if err != nil {
+		return OAuthTokens{}, err
+	}
+	return r.Tokens(), nil
+}
+
+// LookupOAuthRecord returns the whole stored OAuth credential — tokens and shape.
+//
+// The CLI needs this to hand a sandbox's supervisor a self-contained credential; the
+// injection path needs only the tokens, and asks for those.
+func (s *FileStore) LookupOAuthRecord(_ context.Context, name string) (OAuthRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.load()
+	if err != nil {
+		return OAuthRecord{}, err
+	}
+	v, ok := m[name]
+	if !ok {
+		return OAuthRecord{}, fmt.Errorf("%w: %q", ErrNotFound, name)
+	}
+	return decodeOAuth(name, v)
+}
+
+// SetOAuth stores an OAuth credential, replacing whatever was under that name.
+func (s *FileStore) SetOAuth(name string, r OAuthRecord) error {
+	if name == "" {
+		return errors.New("a secret needs a name")
+	}
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	encoded, err := encodeOAuth(r)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.load()
+	if err != nil {
+		return err
+	}
+	m[name] = encoded
+	return s.save(m)
+}
+
+// SaveOAuth implements OAuthSaver: it replaces the token pair of an existing credential and
+// leaves its configuration alone.
+//
+// A refresh rotates values, never shape. Reading the record back rather than holding one in
+// memory is what keeps a rotation from resurrecting configuration the user has since edited.
+func (s *FileStore) SaveOAuth(_ context.Context, name string, tokens OAuthTokens) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.load()
+	if err != nil {
+		return err
+	}
+	v, ok := m[name]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrNotFound, name)
+	}
+	r, err := decodeOAuth(name, v)
+	if err != nil {
+		return err
+	}
+	encoded, err := encodeOAuth(r.WithTokens(tokens))
+	if err != nil {
+		return err
+	}
+	m[name] = encoded
+	return s.save(m)
+}
+
+// Entry is one stored credential, named and classified. It never carries a value.
+type Entry struct {
+	Name  string
+	OAuth bool
+}
+
+// Entries lists the stored credentials with their kind, sorted. Names and kinds only: there
+// is no subcommand that prints a value, and there should not be.
+func (s *FileStore) Entries() ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Entry, 0, len(m))
+	for name, v := range m {
+		out = append(out, Entry{Name: name, OAuth: IsOAuth(v)})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Name < out[b].Name })
+	return out, nil
 }
 
 // Set stores a secret, creating the file if needed.
@@ -160,7 +272,8 @@ func (s *FileStore) load() (map[string]string, error) {
 	plain, err := aead.Open(nil, env.Nonce, env.Data, nil)
 	if err != nil {
 		// GCM cannot tell a wrong key from a damaged file, and neither can we.
-		return nil, fmt.Errorf("cannot decrypt %s: wrong passphrase, or the file has been modified", s.path)
+		return nil, fmt.Errorf("%w: cannot decrypt %s: wrong passphrase, or the file has been modified",
+			ErrWrongPassphrase, s.path)
 	}
 	m := map[string]string{}
 	if err := json.Unmarshal(plain, &m); err != nil {

@@ -45,10 +45,16 @@ Agents:
 	var (
 		detached  bool
 		ephemeral bool
+		quiet     bool
 	)
 	cmd.Flags().BoolVarP(&detached, "detached", "d", false,
 		"print the sandbox name and exit instead of attaching")
 	cmd.Flags().BoolVar(&ephemeral, "rm", false, "destroy the sandbox when the command exits")
+	// --quiet drops the network summary. It cannot drop the announcement of a host whose
+	// TLS boks is about to terminate and has not announced before: asking for less output
+	// is not consent to being decrypted silently. See internal/cli/notice.go.
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false,
+		"suppress the network summary (a new TLS-interception host is still announced)")
 
 	// The network policy flags decide what the sandbox's network is and what may cross
 	// it. Their definitions live in netflags.go so that `run`, `proxy` and `policy ls`
@@ -95,6 +101,10 @@ Agents:
 		if err != nil {
 			return err
 		}
+		// The agent decides a layer of the policy — the destinations its own
+		// definition says it cannot work without — so the policy flags have to know
+		// which agent this is before they resolve anything.
+		netFlags.forAgent(inv.agent)
 		if ephemeral && flags.name == "" {
 			// An ephemeral sandbox must not collide with the persistent one for
 			// this workspace, nor with another ephemeral run of it.
@@ -112,7 +122,7 @@ Agents:
 		// The network is decided, described and started before the sandbox: its
 		// annotations have to be on the container when it is created, and the host-side
 		// stack has to be holding the link socket before the VM boots and connects to it.
-		started, err := attachSandboxNetwork(ctx, &netFlags, inv, &cfg, requestedMode, env)
+		started, err := attachSandboxNetwork(ctx, &netFlags, inv, &cfg, requestedMode, quiet, env)
 		if err != nil {
 			return err
 		}

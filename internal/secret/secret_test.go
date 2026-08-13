@@ -207,7 +207,7 @@ func TestInjectorAttachmentForms(t *testing.T) {
 				t.Fatalf("NewInjector: %v", err)
 			}
 			h := http.Header{}
-			used, err := inj.Apply(context.Background(), mustTarget(t, "api.example.com:443"), h)
+			used, err := inj.Apply(context.Background(), mustTarget(t, "api.example.com:443"), h, FlowTLS)
 			if err != nil {
 				t.Fatalf("Apply: %v", err)
 			}
@@ -234,7 +234,7 @@ func TestOneSecretManyHosts(t *testing.T) {
 	}
 	for _, host := range []string{"ghe.example.com:443", "api.ghe.example.com:443"} {
 		h := http.Header{}
-		if _, err := inj.Apply(context.Background(), mustTarget(t, host), h); err != nil {
+		if _, err := inj.Apply(context.Background(), mustTarget(t, host), h, FlowTLS); err != nil {
 			t.Fatalf("Apply(%s): %v", host, err)
 		}
 		if h.Get("Authorization") != "Bearer "+canary {
@@ -242,7 +242,7 @@ func TestOneSecretManyHosts(t *testing.T) {
 		}
 	}
 	h := http.Header{}
-	if _, err := inj.Apply(context.Background(), mustTarget(t, "pkgs.example.com:443"), h); err != nil {
+	if _, err := inj.Apply(context.Background(), mustTarget(t, "pkgs.example.com:443"), h, FlowTLS); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+canary))
@@ -273,7 +273,7 @@ func TestInjectorScoping(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.target, func(t *testing.T) {
 			h := http.Header{}
-			used, err := inj.Apply(context.Background(), mustTarget(t, tc.target), h)
+			used, err := inj.Apply(context.Background(), mustTarget(t, tc.target), h, FlowTLS)
 			if err != nil {
 				t.Fatalf("Apply: %v", err)
 			}
@@ -300,7 +300,7 @@ func TestInjectorReportsMissingSecretWithoutLeaking(t *testing.T) {
 		t.Fatalf("NewInjector: %v", err)
 	}
 	h := http.Header{}
-	_, err = inj.Apply(context.Background(), mustTarget(t, "api.example.com:443"), h)
+	_, err = inj.Apply(context.Background(), mustTarget(t, "api.example.com:443"), h, FlowTLS)
 	if err == nil {
 		t.Fatal("Apply succeeded with a missing secret")
 	}
@@ -377,7 +377,7 @@ func TestHostsListsWhatWillBeDecrypted(t *testing.T) {
 func TestNilInjectorIsANoop(t *testing.T) {
 	var inj *Injector
 	h := http.Header{}
-	used, err := inj.Apply(context.Background(), mustTarget(t, "api.example.com:443"), h)
+	used, err := inj.Apply(context.Background(), mustTarget(t, "api.example.com:443"), h, FlowTLS)
 	if err != nil || len(used) != 0 || len(h) != 0 {
 		t.Errorf("nil injector did something: used=%v err=%v h=%v", used, err, h)
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/sandbox"
+	"github.com/dagsommer/boks/internal/secret"
 )
 
 // newNetCommand inspects and controls the per-sandbox network stacks.
@@ -172,7 +174,7 @@ func unwiredSandboxWarning(name string) string {
 // because the VM connects to it during boot. It returns whether this invocation started the
 // stack, which is what tells the caller whether it owns cleaning it up.
 func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocation, cfg *sandbox.Config,
-	requested network.Mode, env Env) (bool, error) {
+	requested network.Mode, quiet bool, env Env) (bool, error) {
 
 	mode, wired := networkFor(inv, requested, flags.mode != "", env.Stderr)
 	if !wired {
@@ -198,11 +200,11 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 	}
 
 	publish := publishFor(flags, inv, env.Stderr)
-	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode, record, publish)
+	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode, record, publish, env.Stderr)
 	if err != nil {
 		return false, err
 	}
-	if err := describeNetwork(flags, spec, mode, env.Stderr); err != nil {
+	if err := describeNetwork(flags, spec, mode, quiet, env.Stderr); err != nil {
 		return false, err
 	}
 	guest, err := spec.Prepare()
@@ -274,21 +276,45 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 		return state, false, nil
 	}
 	if running {
-		// The sandbox is up but its stack is not: the process that served it is gone.
-		// Binding a fresh socket at the same path is the only thing that could restore
-		// it, and whether a running VM re-attaches to one has never been tested — so
-		// try, and say exactly that rather than implying it worked.
-		fmt.Fprintf(stderr,
-			"note: sandbox %q is running but had no network stack; starting one now.\n"+
-				"      Whether a running guest re-attaches to a new link socket is unverified.\n"+
-				"      If the sandbox has no network, restart it: boks stop %s\n",
-			spec.Sandbox, spec.Sandbox)
+		fmt.Fprint(stderr, orphanedStackWarning(spec.Sandbox))
 	}
 	state, err := enforce.Ensure(ctx, spec, stderr)
 	if err != nil {
 		return enforce.State{}, false, err
 	}
 	return state, true, nil
+}
+
+// orphanedStackWarning covers a sandbox that is running while the process serving its
+// network is gone — a crashed or killed supervisor.
+//
+// This used to say that whether a running guest re-attaches to a new link socket was
+// "unverified", and to hope out loud. It was measured on 2026-08-12: it does not. The VMM
+// connects to the link socket once, while the VM boots, and a socket bound at the same path
+// afterwards is a different socket that nothing in the guest will ever speak to. Saying
+// "unverified" was optimistic in the direction that costs the user an afternoon: they read
+// it as "probably fine", and then debug an agent whose network is simply gone.
+//
+// So this states the outcome and gives the command that fixes it. Boks does not do the
+// restart itself, and that is a deliberate choice rather than a missing feature: the sandbox
+// is *running*, and restarting it kills whatever is in it — a build, a test run, an agent
+// half way through a task — to repair something the user may not even need on this
+// invocation. A fresh stack is still started, because it costs nothing and is what the
+// sandbox will attach to when it next boots.
+//
+// It is a WARNING rather than a note because the sandbox is, right now, not doing the thing
+// it appears to be doing.
+func orphanedStackWarning(name string) string {
+	return fmt.Sprintf(
+		"WARNING: sandbox %q is running, but the process serving its network is gone.\n"+
+			"         A running guest does NOT re-attach to a new link socket — measured on\n"+
+			"         2026-08-12 — so this sandbox has no network until it is restarted, and\n"+
+			"         nothing inside it can reach anything. A fresh stack is being started for\n"+
+			"         the next boot; it will not help the VM that is up now.\n"+
+			"         Restart it to get the network back:\n"+
+			"           boks stop %s && boks start %s\n"+
+			"         That kills whatever is running inside, which is why boks does not do it\n"+
+			"         for you.\n\n", name, name, name)
 }
 
 // enforceSpec turns the policy flags into the specification the network stack runs from.
@@ -299,8 +325,12 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 // The record is what the sandbox remembers about its own policy, or nil for a sandbox that
 // does not exist yet. Passing it here rather than reading it inside is what makes `start`,
 // `exec` and `run` produce the same policy for the same sandbox.
+//
+// The credential set is the flags plus whatever the store already holds under a service
+// name — see credentialPlan for why a stored credential applies without being named again,
+// and for the two things that keeps it from being a quiet expansion.
 func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mode network.Mode,
-	record *policy.SandboxPolicy, publish []string) (enforce.Spec, error) {
+	record *policy.SandboxPolicy, publish []string, stderr io.Writer) (enforce.Spec, error) {
 
 	plan, err := f.planFor(name, mode)
 	if err != nil {
@@ -310,23 +340,28 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 	if err != nil {
 		return enforce.Spec{}, err
 	}
-	credentials, err := f.credentialRules()
+	credentials, oauth, err := f.resolveCredentials(ctx, stderr)
 	if err != nil {
 		return enforce.Spec{}, err
 	}
+	services, err := credentials.services()
+	if err != nil {
+		return enforce.Spec{}, err
+	}
+	credentials.describe(stderr)
 
 	secrets := map[string]string{}
-	if len(credentials) > 0 {
+	if len(services) > 0 {
 		store, err := openSecretStore("")
 		if err != nil {
 			return enforce.Spec{}, err
 		}
-		for _, c := range credentials {
-			value, err := store.Lookup(ctx, c.Service)
+		for _, service := range services {
+			value, err := store.Lookup(ctx, service)
 			if err != nil {
-				return enforce.Spec{}, fmt.Errorf("credential %q: %w\nStore it first: boks secret set %s", c.Service, err, c.Service)
+				return enforce.Spec{}, fmt.Errorf("credential %q: %w\nStore it first: boks secret set %s", service, err, service)
 			}
-			secrets[c.Service] = value.Reveal()
+			secrets[service] = value.Reveal()
 		}
 	}
 
@@ -334,9 +369,10 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 		Sandbox:          name,
 		Plan:             plan,
 		Resolution:       &resolution,
-		Inject:           f.inject,
-		GuestCredentials: f.guest,
+		Inject:           credentials.inject,
+		GuestCredentials: credentials.guest,
 		Secrets:          secrets,
+		OAuth:            oauth,
 		Publish:          publish,
 		Intercept:        true,
 		CADir:            caDir(""),
@@ -349,18 +385,33 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 // describeNetwork prints what the sandbox's network will do, before anything runs in it.
 //
 // A user is entitled to know which destinations are permitted and which of their flows will
-// be decrypted *at the moment they ask for it*, not from a certificate error later. How much
-// is said depends on whether they asked: a run that names no policy flags gets one line and a
-// pointer, because a wall of text before every `boks run` is text nobody reads. A run that
-// configures anything gets the whole resolved policy, and a run that will have traffic
-// decrypted gets that spelled out whether it asked or not.
-func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stderr io.Writer) error {
+// be decrypted *at the moment they ask for it*, not from a certificate error later. What
+// decides how much is said is not whether they passed a flag but whether they have been told
+// before: see internal/cli/notice.go for the rule and why it is that one. The short version
+// is that the first encounter with anything consequential is loud, an unchanged policy is two
+// lines, and an interception host that has never been announced is loud whatever else is
+// true — including under --quiet.
+func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, quiet bool, stderr io.Writer) error {
+	shown := loadNotices(policy.StateDir(), spec.Sandbox)
+
 	if mode == network.ModeNone {
+		// Nothing leaves this sandbox, so there is no policy to show and no traffic to
+		// decrypt. The mode is fixed when a sandbox is created, so this is the same
+		// statement on every run: worth making once in full.
+		if quiet {
+			return nil
+		}
+		if shown.Policy == digest(noNetworkNotice) {
+			fmt.Fprintf(stderr, "network: none — nothing leaves sandbox %s.\n", spec.Sandbox)
+			return nil
+		}
 		fmt.Fprint(stderr, noNetworkNotice)
 		if len(f.allow) > 0 || len(f.deny) > 0 || len(f.inject) > 0 || f.preset != "" {
 			fmt.Fprint(stderr, "         The policy flags are not applied: nothing leaves this sandbox to judge.\n")
 		}
 		fmt.Fprintln(stderr)
+		shown.Policy = digest(noNetworkNotice)
+		shown.save(policy.StateDir(), spec.Sandbox)
 		return nil
 	}
 
@@ -372,24 +423,84 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, stder
 	if err != nil {
 		return err
 	}
-	notice := interceptionNotice(credentials)
 
-	if !f.specified() && notice == "" {
-		fmt.Fprintf(stderr, "network: %s, policy %s — 'boks policy ls -sandbox %s' for the rules, "+
-			"'boks policy log' for what they decided.\n", mode, pol.Name, spec.Sandbox)
-		return nil
-	}
-
+	table := pol.Describe()
 	if spec.Resolution != nil {
-		fmt.Fprint(stderr, spec.Resolution.Describe())
-	} else {
-		fmt.Fprint(stderr, pol.Describe())
+		table = spec.Resolution.Describe()
 	}
-	if notice != "" {
-		fmt.Fprintf(stderr, "\n%s", notice)
+	hosts := secret.CredentialHosts(credentials)
+	fresh := shown.newHosts(hosts)
+
+	// A host whose traffic boks is about to decrypt, and that this sandbox has not been
+	// told about, is announced before anything else and regardless of --quiet. Asking for
+	// less output is not consent to silent interception.
+	if len(fresh) > 0 {
+		if len(shown.Intercept) > 0 {
+			fmt.Fprintf(stderr, "NEW: interception now covers %s.\n\n", strings.Join(fresh, ", "))
+		}
+		fmt.Fprint(stderr, interceptionNotice(credentials))
+		fmt.Fprintln(stderr)
 	}
-	fmt.Fprintf(stderr, "\n%s\n", enforcementNote)
+
+	switch {
+	case quiet:
+		// Everything else here describes a state the user can ask for at any time
+		// with `boks policy ls`. The one thing that is not — a host about to be
+		// decrypted for the first time — has already been printed above.
+		//
+		// Nothing is recorded as shown, because nothing was: a quiet run must not
+		// consume the one loud explanation a sandbox gets.
+	case digest(table) != shown.Policy:
+		fmt.Fprint(stderr, table)
+		if !shown.Enforcement {
+			fmt.Fprintf(stderr, "\n%s\n", enforcementNote)
+			shown.Enforcement = true
+		} else {
+			fmt.Fprint(stderr, "\n")
+		}
+		shown.Policy = digest(table)
+	default:
+		fmt.Fprint(stderr, steadyStateLine(pol, mode, spec.Sandbox, f.agent.Name, hosts))
+	}
+
+	// The announced hosts are recorded whether or not this run was quiet, because they
+	// were announced whether or not it was.
+	shown.withHosts(hosts).save(policy.StateDir(), spec.Sandbox)
 	return nil
+}
+
+// steadyStateLine is what a run prints when it has nothing new to say: what the sandbox is
+// running under, and where to look for the detail rather than the detail itself.
+//
+// It is two lines, and it still names the interception state, because "boks is decrypting
+// two of your flows" is not a thing to mention once and then leave out. The rules and the
+// decisions are one command away, and naming those commands is worth more than reprinting
+// what they would say.
+func steadyStateLine(pol policy.Policy, mode network.Mode, sandbox, agentName string, hosts []string) string {
+	allows, denies := 0, 0
+	for _, r := range pol.Rules {
+		if r.Action == policy.Deny {
+			denies++
+			continue
+		}
+		allows++
+	}
+	tls := "no TLS interception"
+	if len(hosts) > 0 {
+		tls = fmt.Sprintf("TLS decrypted for %d host(s): %s", len(hosts), strings.Join(hosts, ", "))
+	}
+	// The `policy ls` invocation has to include the agent, or it would print a policy
+	// without the agent's own layer — a different policy from the one this sandbox is
+	// about to run under, offered as the way to inspect it. `policy ls` contacts nothing,
+	// containerd included, so it cannot look the agent up for itself.
+	ls := "boks policy ls --sandbox " + sandbox
+	if agentName != "" {
+		ls += " --agent " + agentName
+	}
+	return fmt.Sprintf("network: %s · policy %s · %d allow, %d deny · %s\n"+
+		"         unchanged since this sandbox last ran. The rules: %s\n"+
+		"         What they decided: boks policy log --sandbox %s\n",
+		mode, pol.Name, allows, denies, tls, ls, sandbox)
 }
 
 // stopNetworkQuietly and forgetNetworkQuietly are the cleanup paths. Failures are reported

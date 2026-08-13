@@ -3,9 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
@@ -223,6 +227,69 @@ func TestPolicyLogReadsDecisions(t *testing.T) {
 	}
 }
 
+// TestPolicyLogFilters: the log is a global firehose across every sandbox ever run, and it
+// had only --limit and --raw. A tester debugging one run was reading another sandbox's
+// traffic from four hours earlier.
+func TestPolicyLogFilters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	sink, err := policy.NewFileSink(path)
+	if err != nil {
+		t.Fatalf("NewFileSink: %v", err)
+	}
+	old := time.Now().Add(-4 * time.Hour)
+	for _, d := range []policy.Decision{
+		{Time: old, Type: policy.TypeNetwork, Host: "stale.test", Port: 443, Sandbox: "other", Reason: "denied"},
+		{Time: time.Now(), Type: policy.TypeNetwork, Host: "wanted.test", Port: 443, Sandbox: "web", Reason: "denied"},
+		{Time: time.Now(), Type: policy.TypeNetwork, Host: "noise.test", Port: 443, Sandbox: "other", Reason: "denied"},
+	} {
+		sink.Record(d)
+	}
+	sink.Close()
+
+	out, _, err := runCLI(t, "", "policy", "log", "--file", path, "--sandbox", "web")
+	if err != nil {
+		t.Fatalf("policy log --sandbox: %v", err)
+	}
+	if !strings.Contains(out, "wanted.test") || strings.Contains(out, "noise.test") || strings.Contains(out, "stale.test") {
+		t.Errorf("--sandbox did not narrow to one sandbox:\n%s", out)
+	}
+
+	out, _, err = runCLI(t, "", "policy", "log", "--file", path, "--since", "1h")
+	if err != nil {
+		t.Fatalf("policy log --since: %v", err)
+	}
+	if strings.Contains(out, "stale.test") {
+		t.Errorf("--since 1h kept a decision from four hours ago:\n%s", out)
+	}
+	if !strings.Contains(out, "wanted.test") || !strings.Contains(out, "noise.test") {
+		t.Errorf("--since 1h dropped decisions inside the window:\n%s", out)
+	}
+
+	// A filter that matches nothing has to say so as a filter result, or "no decisions"
+	// reads as "nothing was recorded" and sends the user looking for the wrong bug.
+	out, _, err = runCLI(t, "", "policy", "log", "--file", path, "--sandbox", "ghost")
+	if err != nil {
+		t.Fatalf("policy log --sandbox ghost: %v", err)
+	}
+	if !strings.Contains(out, "for sandbox ghost") || !strings.Contains(out, "the filter excluded") {
+		t.Errorf("an empty filter result does not say it was filtered:\n%s", out)
+	}
+
+	// The limit applies to what survived the filter, not to what was read: tailing first
+	// would throw away the decision the filter was looking for.
+	out, _, err = runCLI(t, "", "policy", "log", "--file", path, "--sandbox", "web", "--limit", "1")
+	if err != nil {
+		t.Fatalf("policy log --sandbox --limit: %v", err)
+	}
+	if !strings.Contains(out, "wanted.test") {
+		t.Errorf("--limit was applied before the filter:\n%s", out)
+	}
+
+	if _, _, code := mainExitCode(t, "policy", "log", "--file", path, "--since", "yesterday"); code != 2 {
+		t.Errorf("an unreadable --since exited %d, want 2", code)
+	}
+}
+
 func TestSecretRoundTripThroughCLI(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(secret.PassphraseEnv, "test-passphrase")
@@ -241,8 +308,12 @@ func TestSecretRoundTripThroughCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("secret ls: %v", err)
 	}
-	if strings.TrimSpace(out) != "github" {
-		t.Errorf("secret ls = %q, want just the name", out)
+	// The listing names the credential and where it goes — github is a service boks
+	// knows, so it resolves to the vendor's hosts and the variable the guest reads.
+	for _, want := range []string{"github", "key", "api.github.com", "GITHUB_TOKEN"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("secret ls = %q, want it to mention %q", out, want)
+		}
 	}
 	// There is no command that prints a value, so the only assertion available is that
 	// listing does not print one.
@@ -262,6 +333,64 @@ func TestSecretRoundTripThroughCLI(t *testing.T) {
 	}
 }
 
+// A forgotten passphrase used to be a dead end reachable in one step: every subcommand has
+// to decrypt, `rm` included, so the remedy for "wrong passphrase" was the command that had
+// just failed, and `ls` failed the same way. There was no move left inside the CLI.
+func TestAForgottenPassphraseHasAWayOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BOKS_STATE_DIR", dir)
+
+	t.Setenv(secret.PassphraseEnv, "the-right-one")
+	if _, _, err := runCLI(t, "value\n", "secret", "set", "github"); err != nil {
+		t.Fatalf("secret set: %v", err)
+	}
+
+	t.Setenv(secret.PassphraseEnv, "not-the-right-one")
+	for _, args := range [][]string{{"secret", "ls"}, {"secret", "rm", "github"}, {"secret", "set", "other"}} {
+		_, _, err := runCLI(t, "value\n", args...)
+		if err == nil {
+			t.Fatalf("boks %v succeeded with the wrong passphrase", args)
+		}
+		// The remedy has to name the file, say what deleting it costs, and give the
+		// command — none of which the user can be expected to know otherwise.
+		for _, want := range []string{"secrets.json", "boks secret reset --force", "set again"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("boks %v: the error does not say %q:\n%v", args, want, err)
+			}
+		}
+	}
+
+	// The way out must not itself need the passphrase, or it is not a way out.
+	t.Setenv(secret.PassphraseEnv, "")
+	if _, _, err := runCLI(t, "", "secret", "reset"); err == nil {
+		t.Error("secret reset destroyed the store without --force")
+	}
+	out, _, err := runCLI(t, "", "secret", "reset", "--force")
+	if err != nil {
+		t.Fatalf("secret reset --force: %v", err)
+	}
+	if !strings.Contains(out, "deleted") {
+		t.Errorf("secret reset --force said %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "secrets.json")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the store is still there after a reset: %v", err)
+	}
+
+	// And afterwards the store is usable again, with whatever passphrase you now have.
+	t.Setenv(secret.PassphraseEnv, "a-new-one")
+	if _, _, err := runCLI(t, "value\n", "secret", "set", "github"); err != nil {
+		t.Fatalf("the store was not usable after a reset: %v", err)
+	}
+	// Resetting a store that is not there is a statement, not a failure.
+	if _, _, err := runCLI(t, "", "secret", "reset", "--force"); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = runCLI(t, "", "secret", "reset", "--force")
+	if err != nil || !strings.Contains(out, "nothing to reset") {
+		t.Errorf("resetting an absent store = %q, %v", out, err)
+	}
+}
+
 func TestSecretRequiresAPassphrase(t *testing.T) {
 	t.Setenv(secret.PassphraseEnv, "")
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
@@ -271,6 +400,48 @@ func TestSecretRequiresAPassphrase(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), secret.PassphraseEnv) {
 		t.Errorf("error %q should name the environment variable", err)
+	}
+}
+
+// `-t` means --template on run and --tty on exec, and that is not going to change: both
+// spellings are sbx's. What has to change is what happens when someone types Docker's `-it`
+// at `boks run`, which used to fail two different ways — `-it` with an unhelpful "unknown
+// shorthand flag: 'i'", and `-ti` not failing at all, because it set --template to "i" and
+// sent the user off to debug a missing image.
+func TestDockerTerminalFlagsOnRunAreExplained(t *testing.T) {
+	for _, arg := range []string{"-it", "-ti", "-i"} {
+		out, errOut, code := mainExitCode(t, "run", arg, ".")
+		if code != 2 {
+			t.Errorf("boks run %s . exited %d, want 2", arg, code)
+		}
+		// The answer has to name both halves of the confusion: what -t is here, and
+		// where a terminal actually comes from.
+		for _, want := range []string{"--template", "boks exec -it", "no -i or -t terminal flags"} {
+			if !strings.Contains(errOut, want) {
+				t.Errorf("boks run %s: the message does not say %q:\n%s", arg, want, errOut)
+			}
+		}
+		if strings.Contains(out, "\n") {
+			t.Errorf("boks run %s wrote to stdout: %q", arg, out)
+		}
+	}
+
+	// `create` takes the same flags as `run` and has the same trap.
+	if _, errOut, code := mainExitCode(t, "create", "-it", "."); code != 2 || !strings.Contains(errOut, "--template") {
+		t.Errorf("boks create -it exited %d:\n%s", code, errOut)
+	}
+
+	// The flags this guard is *not* about must be untouched: -t with a value is the
+	// template flag doing its job, and `exec -it` is the documented way to get a terminal.
+	if _, errOut, code := mainExitCode(t, "run", "-t", "example.com/img:1", "--help"); code != 0 {
+		t.Errorf("boks run -t IMAGE --help exited %d:\n%s", code, errOut)
+	}
+	if _, errOut, _ := mainExitCode(t, "exec", "-it", "web", "sh"); strings.Contains(errOut, "no -i or -t terminal flags") {
+		t.Errorf("the guard reached into 'exec', where -it is real:\n%s", errOut)
+	}
+	// And nothing after `--` is ours: an agent may have its own -i.
+	if _, errOut, _ := mainExitCode(t, "run", "shell", ".", "--", "-it"); strings.Contains(errOut, "no -i or -t terminal flags") {
+		t.Errorf("the guard reached past `--` into the agent's own arguments:\n%s", errOut)
 	}
 }
 

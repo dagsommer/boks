@@ -47,7 +47,7 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 		Intercept:  true,
 	}
 	var errOut bytes.Buffer
-	if err := describeNetwork(flags, spec, network.ModeNAT, &errOut); err != nil {
+	if err := describeNetwork(flags, spec, network.ModeNAT, false, &errOut); err != nil {
 		t.Fatalf("describeNetwork: %v", err)
 	}
 	got := errOut.String()
@@ -80,7 +80,7 @@ func TestDescribeNetworkForNoNetwork(t *testing.T) {
 
 	flags := &policyFlags{mode: "none", allow: []string{"example.com"}}
 	var errOut bytes.Buffer
-	if err := describeNetwork(flags, enforce.Spec{Sandbox: "boks-test"}, network.ModeNone, &errOut); err != nil {
+	if err := describeNetwork(flags, enforce.Spec{Sandbox: "boks-test"}, network.ModeNone, false, &errOut); err != nil {
 		t.Fatalf("describeNetwork: %v", err)
 	}
 	got := errOut.String()
@@ -125,6 +125,28 @@ func TestNetworkForHonoursHowTheSandboxWasWired(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "TSI") {
 		t.Errorf("the warning does not name the transport such a sandbox actually uses:\n%s", errOut.String())
+	}
+}
+
+// TestOrphanedStackWarningStatesTheMeasuredOutcome: this text used to say that whether a
+// running guest re-attaches to a fresh link socket was "unverified", which a reader takes as
+// "probably fine". It was measured on 2026-08-12 and it does not re-attach, so the sandbox
+// has no network until it is restarted. Hedging here costs the user a debugging session.
+func TestOrphanedStackWarningStatesTheMeasuredOutcome(t *testing.T) {
+	got := orphanedStackWarning("web")
+	for _, want := range []string{
+		"does NOT re-attach", // the measured outcome, not a hope
+		"2026-08-12",         // when it was measured
+		"no network until it is restarted",
+		"boks stop web && boks start web",  // the remedy, spelled out
+		"kills whatever is running inside", // and its cost, so the user can decide
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the warning does not say %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "unverified") {
+		t.Errorf("the warning still calls a measured outcome unverified:\n%s", got)
 	}
 }
 
