@@ -5,17 +5,23 @@ LDFLAGS := -X $(PKG)/internal/cli.Version=$(VERSION)
 
 # The agent images. IMAGE_TAG is read out of the Go registry rather than repeated here:
 # internal/agent is what a running boks resolves an agent to, so it is the source of truth,
-# and a Makefile with its own copy would eventually disagree with it. The release workflow
-# reads the same line and refuses to publish when a git tag does not match it.
+# and a Makefile with its own copy would eventually disagree with it. The images and release
+# workflows call the same script, which additionally refuses a git tag that does not match.
 IMAGE_REPO := ghcr.io/dagsommer/boks
-IMAGE_TAG  := $(shell sed -n 's/^const ImageTag = "\(.*\)"$$/\1/p' internal/agent/agent.go)
+IMAGE_TAG  := $(shell scripts/image-tag.sh)
 # Every directory under images/ except the base, which everything else builds on.
 AGENT_IMAGES := $(filter-out base,$(notdir $(wildcard images/*)))
 
 # `docker-agent version`, not `docker-agent --version`; everything else takes the flag.
 VERSION_ARG_docker-agent := version
 
-.PHONY: build test check integration vet fmt clean docs docs-check release-notes images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
+# The platforms a release ships. darwin/arm64 is the verified one; Linux builds and has
+# never booted a sandbox. There is no darwin/amd64 target on purpose — see the comment at
+# the top of .github/workflows/release.yml. Windows cross-builds cleanly and is checked in
+# CI, but it cannot run a sandbox until libkrun has a WHP backend, so it is not shipped.
+RELEASE_TARGETS := darwin/arm64 linux/amd64 linux/arm64
+
+.PHONY: build test check integration vet fmt clean dist docs docs-check release-notes images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/boks
@@ -37,7 +43,21 @@ fmt:
 	gofmt -l -w .
 
 clean:
-	rm -rf bin
+	rm -rf bin dist
+
+# --- release artifacts ------------------------------------------------------------
+#
+# The same scripts CI runs, run locally, because a release nobody can reproduce outside
+# GitHub Actions is not a verifiable artefact. Nothing in Boks uses cgo, so every target
+# cross-compiles from any host and the tarballs are byte-identical between runs of one
+# commit: build this twice and the checksums match.
+#
+# .deb and .rpm are not built here — they need dpkg-deb and rpmbuild, which not every host
+# has. Run scripts/package-linux.sh <arch> where they do.
+dist:
+	@for target in $(RELEASE_TARGETS); do \
+		scripts/build-release.sh "$${target%/*}" "$${target#*/}" || exit 1; \
+	done
 
 # --- generated documentation ------------------------------------------------------
 #
