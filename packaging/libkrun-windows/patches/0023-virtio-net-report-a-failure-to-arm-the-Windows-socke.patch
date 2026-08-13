@@ -1,0 +1,80 @@
+From c3116f07f8a2186de68d9e5312ab38b8680cc448 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:32:05 +0200
+Subject: [PATCH 23/25] virtio/net: report a failure to arm the Windows socket
+ as its own error
+
+WSACreateEvent()/WSAEventSelect() failing was reported as
+ConnectError::CreateSocket, which is the one thing that definitely did not
+happen -- the socket exists and is connected by that point. Give the step its
+own variant so a failure names itself, and spell the event field's type as
+WSAEVENT rather than the bare isize it happens to be.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/net/backend.rs            |  5 +++++
+ src/devices/src/virtio/net/winsock_unixstream.rs | 11 ++++++-----
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/src/devices/src/virtio/net/backend.rs b/src/devices/src/virtio/net/backend.rs
+index c74dadf..5d76cb8 100644
+--- a/src/devices/src/virtio/net/backend.rs
++++ b/src/devices/src/virtio/net/backend.rs
+@@ -24,6 +24,11 @@ pub enum ConnectError {
+     CreateSocket(SysError),
+     Binding(SysError),
+     SendingMagic(SysError),
++    /// The socket was created and connected, but could not be bound to the
++    /// Event that carries its readiness. Windows only: there is no such step on
++    /// Unix, where the socket is watchable as it stands.
++    #[cfg(windows)]
++    ArmingSocket(SysError),
+     // Tap backend errors.
+     OpenNetTun(SysError),
+     TunSetIff(io::Error),
+diff --git a/src/devices/src/virtio/net/winsock_unixstream.rs b/src/devices/src/virtio/net/winsock_unixstream.rs
+index c3b53ce..83246c5 100644
+--- a/src/devices/src/virtio/net/winsock_unixstream.rs
++++ b/src/devices/src/virtio/net/winsock_unixstream.rs
+@@ -98,8 +98,9 @@ use windows_sys::Win32::Networking::WinSock::{
+     AF_UNIX, FD_CLOSE, FD_READ, FD_WRITE, INVALID_SOCKET, SO_RCVBUF, SO_SNDBUF, SOCK_STREAM,
+     SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSACloseEvent, WSACreateEvent,
+     WSADATA, WSAECONNABORTED, WSAECONNRESET, WSAENETRESET, WSAENOTCONN, WSAESHUTDOWN,
+-    WSAEWOULDBLOCK, WSAEnumNetworkEvents, WSAEventSelect, WSAGetLastError, WSANETWORKEVENTS,
+-    WSAStartup, closesocket, connect, getsockopt, recv, send, setsockopt, socket,
++    WSAEVENT, WSAEWOULDBLOCK, WSAEnumNetworkEvents, WSAEventSelect, WSAGetLastError,
++    WSANETWORKEVENTS, WSAStartup, closesocket, connect, getsockopt, recv, send, setsockopt,
++    socket,
+ };
+ 
+ use utils::epoll::EventSet;
+@@ -253,7 +254,7 @@ pub struct WinsockUnixstream {
+     sock: SOCKET,
+     /// The Event `WSAEventSelect()` signals for `sock`. This, not `sock`, is
+     /// what the worker registers with the epoll shim.
+-    event: isize,
++    event: WSAEVENT,
+ 
+     /// The length prefix of the frame currently being received, and how much of
+     /// it has arrived. A prefix is complete exactly when `hdr_filled` reaches
+@@ -333,7 +334,7 @@ impl WinsockUnixstream {
+         if event == 0 {
+             let err = wsa_io_error();
+             unsafe { closesocket(sock) };
+-            return Err(ConnectError::CreateSocket(err));
++            return Err(ConnectError::ArmingSocket(err));
+         }
+         if unsafe { WSAEventSelect(sock, event, LINK_EVENTS) } == SOCKET_ERROR {
+             let err = wsa_io_error();
+@@ -341,7 +342,7 @@ impl WinsockUnixstream {
+                 WSACloseEvent(event);
+                 closesocket(sock);
+             }
+-            return Err(ConnectError::CreateSocket(err));
++            return Err(ConnectError::ArmingSocket(err));
+         }
+ 
+         Ok(Self {
+-- 
+2.53.0
+

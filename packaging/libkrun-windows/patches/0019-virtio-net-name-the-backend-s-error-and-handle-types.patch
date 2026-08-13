@@ -1,0 +1,117 @@
+From 86ef0f06d69c3ab4b8b789a3afe2088f4ba01ed4 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:29:14 +0200
+Subject: [PATCH 19/25] virtio/net: name the backend's error and handle types
+ per platform
+
+The three error enums in the net backend carry `nix::Error`, and the trait
+hands back a `std::os::fd::RawFd`. Neither exists on Windows: `nix` is a
+`cfg(unix)` dependency of this crate, and the poller there works in `HANDLE`s.
+
+Introduce `SysError` and take `RawFd` from the platform shim, so the enums stay
+a single type across platforms rather than becoming generic. On Unix `SysError`
+is `nix::Error` and this is a rename with no behaviour attached to it.
+
+Also document what `raw_socket_fd()` is actually for. It is the handle the
+worker's poller watches, which on Windows will not be the socket -- a Winsock
+SOCKET is not a waitable object -- and the trait should say so before a backend
+returns something surprising.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/net/backend.rs | 49 +++++++++++++++++++++++----
+ 1 file changed, 42 insertions(+), 7 deletions(-)
+
+diff --git a/src/devices/src/virtio/net/backend.rs b/src/devices/src/virtio/net/backend.rs
+index dab01c9..c74dadf 100644
+--- a/src/devices/src/virtio/net/backend.rs
++++ b/src/devices/src/virtio/net/backend.rs
+@@ -1,15 +1,31 @@
+ use std::io;
++
++#[cfg(unix)]
+ use std::os::fd::RawFd;
++#[cfg(windows)]
++use utils::windows::RawFd;
++
++/// The error the socket calls of a backend report.
++///
++/// On Unix those calls go through `nix`, which returns its own `Errno`. On
++/// Windows they go through Winsock, whose codes are plain OS error numbers that
++/// `io::Error::from_raw_os_error()` renders. Aliasing rather than making the
++/// enums below generic keeps them one type on every platform and leaves the
++/// Unix backends reading exactly as they did.
++#[cfg(unix)]
++pub type SysError = nix::Error;
++#[cfg(windows)]
++pub type SysError = io::Error;
+ 
+ #[allow(dead_code)]
+ #[derive(Debug)]
+ pub enum ConnectError {
+-    InvalidAddress(nix::Error),
+-    CreateSocket(nix::Error),
+-    Binding(nix::Error),
+-    SendingMagic(nix::Error),
++    InvalidAddress(SysError),
++    CreateSocket(SysError),
++    Binding(SysError),
++    SendingMagic(SysError),
+     // Tap backend errors.
+-    OpenNetTun(nix::Error),
++    OpenNetTun(SysError),
+     TunSetIff(io::Error),
+     TunSetVnetHdrSz(io::Error),
+     TunSetOffload(io::Error),
+@@ -21,7 +37,7 @@ pub enum ReadError {
+     /// Nothing was written
+     NothingRead,
+     /// Another internal error occurred
+-    Internal(nix::Error),
++    Internal(SysError),
+ }
+ 
+ #[allow(dead_code)]
+@@ -34,7 +50,7 @@ pub enum WriteError {
+     /// Passt doesnt seem to be running (received EPIPE)
+     ProcessNotRunning,
+     /// Another internal error occurred
+-    Internal(nix::Error),
++    Internal(SysError),
+ }
+ 
+ pub trait NetBackend {
+@@ -42,6 +58,12 @@ pub trait NetBackend {
+     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
+     fn has_unfinished_write(&self) -> bool;
+     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
++
++    /// The handle the worker's poller watches for this backend.
++    ///
++    /// On Unix that is the socket itself. On Windows a Winsock `SOCKET` is not
++    /// a waitable object, so it is the Windows Event that `WSAEventSelect()`
++    /// signals on the socket's behalf; see `winsock_unixstream.rs`.
+     fn raw_socket_fd(&self) -> RawFd;
+ 
+     /// Delay in microseconds before retrying after NothingWritten.
+@@ -51,4 +73,17 @@ pub trait NetBackend {
+     fn write_retry_delay_us(&self) -> u64 {
+         0
+     }
++
++    /// Drain the backend socket's pending network events and report what
++    /// actually happened, resetting the Event in the process.
++    ///
++    /// Windows only, and unavoidable: the epoll shim delivers a wait completion
++    /// packet that says no more than "the Event object was signaled", so
++    /// `Epoll::wait()` can only hand back the interest mask that was registered
++    /// (`utils::windows::epoll`). The readiness itself lives in Winsock and has
++    /// to be asked for with `WSAEnumNetworkEvents()`. Because that call is also
++    /// what resets the Event, the watch must be edge-triggered and the caller
++    /// must re-arm it after every call.
++    #[cfg(windows)]
++    fn take_backend_events(&mut self) -> utils::epoll::EventSet;
+ }
+-- 
+2.53.0
+

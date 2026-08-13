@@ -1,0 +1,616 @@
+From 4bec79c47d1342db6a5aece5b08270cea5d6f3ff Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:11:42 +0200
+Subject: [PATCH 16/25] vsock: separate TSI from the guest-IPC half of the
+ device
+
+virtio-vsock in this tree carries two unrelated things. TSI hijacks the guest's
+AF_INET/AF_UNIX sockets and re-issues them on the host; guest IPC is the plain
+`krun_add_vsock_port2()` path, where a guest port is bridged to a host endpoint.
+Only TSI is Unix-socket based end to end, but the whole module was gated to Unix
+as one unit, which swept up the IPC path with it.
+
+Draw the line where it actually falls:
+
+- `tsi_stream.rs` and `tsi_dgram.rs` become Unix-only modules. They hold 25 of
+  the 50 errors the module produces when built for Windows, and none of them is
+  worth porting: Boks displaces TSI with virtio-net.
+- The DGRAM dispatch in `send_dgram_pkt()` is TSI's control plane in its
+  entirety -- every port constant is a TSI opcode, and every DGRAM data packet
+  is addressed to a proxy only that control plane can create -- so the whole
+  match is gated rather than each arm.
+- `Proxy`'s `getpeername`/`sendto_addr`/`sendto_data`/`listen`/`accept` are
+  reachable only from those arms; the guest-IPC proxies answer all five with
+  `todo!()`/`unreachable!()`. They leave the trait on non-Unix.
+- The socket-address payloads in `packet.rs` (`SockaddrStorage`, `parse_address`
+  and the readers that use them) exist only to carry TSI addresses, and take
+  `nix` with them.
+
+What remains is written against whichever `RawFd`/`AsRawFd` pair the target
+provides -- `utils::windows::RawFd` is a `HANDLE`, and the muxer only ever
+stores these values and passes them to `Epoll::ctl` -- so the muxer, the muxer
+thread, the RX queue, the event handler and the device itself stop being
+Unix-specific. `ProxyUpdate::new_proxy` becomes a named `AcceptedProxy` alias
+because its accepted-endpoint type genuinely differs per platform; the Unix form
+keeps the `AddressFamily` that TSI's reverse path needs, and nothing else does.
+
+`TsiConnectReq::for_ipc()` replaces the placeholder the muxer used to build
+inline when driving a guest-IPC connect through the shared `Proxy::connect()`.
+
+No behaviour change on Unix: this commit only moves `#[cfg]` boundaries.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/vsock/event_handler.rs |  3 +
+ src/devices/src/virtio/vsock/mod.rs           | 11 ++++
+ src/devices/src/virtio/vsock/muxer.rs         | 47 +++++++++++++---
+ src/devices/src/virtio/vsock/muxer_rxq.rs     |  1 +
+ src/devices/src/virtio/vsock/muxer_thread.rs  | 43 ++++++++++++--
+ src/devices/src/virtio/vsock/packet.rs        | 28 ++++++++++
+ src/devices/src/virtio/vsock/proxy.rs         | 56 ++++++++++++++++++-
+ 7 files changed, 172 insertions(+), 17 deletions(-)
+
+diff --git a/src/devices/src/virtio/vsock/event_handler.rs b/src/devices/src/virtio/vsock/event_handler.rs
+index 641eb26..403196c 100644
+--- a/src/devices/src/virtio/vsock/event_handler.rs
++++ b/src/devices/src/virtio/vsock/event_handler.rs
+@@ -5,7 +5,10 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the THIRD-PARTY file.
+ 
++#[cfg(unix)]
+ use std::os::unix::io::AsRawFd;
++#[cfg(windows)]
++use utils::windows::AsRawFd;
+ 
+ use polly::event_manager::{EventManager, Subscriber};
+ use utils::epoll::{EpollEvent, EventSet};
+diff --git a/src/devices/src/virtio/vsock/mod.rs b/src/devices/src/virtio/vsock/mod.rs
+index e429a9b..dfa9d16 100644
+--- a/src/devices/src/virtio/vsock/mod.rs
++++ b/src/devices/src/virtio/vsock/mod.rs
+@@ -16,9 +16,20 @@ mod proxy;
+ mod reaper;
+ #[cfg(target_os = "macos")]
+ mod timesync;
++// TSI (Transparent Socket Impersonation) hijacks the guest's AF_INET/AF_UNIX
++// sockets and re-issues them as host sockets. It is Unix-socket based end to
++// end and has no Windows counterpart; Boks displaces it with virtio-net. The
++// plain guest-IPC side of vsock below is built on every platform.
++#[cfg(unix)]
+ mod tsi_dgram;
++#[cfg(unix)]
+ mod tsi_stream;
++// The host end of a guest-IPC vsock port. An AF_UNIX socket on both platforms:
++// see `winsock_unix.rs` for why Windows uses AF_UNIX rather than a named pipe.
++#[cfg(unix)]
+ mod unix;
++#[cfg(windows)]
++mod winsock_unix;
+ 
+ pub use self::defs::TsiFlags;
+ pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
+diff --git a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+index 1012ad3..db8dfcd 100644
+--- a/src/devices/src/virtio/vsock/muxer.rs
++++ b/src/devices/src/virtio/vsock/muxer.rs
+@@ -1,5 +1,8 @@
+ use std::collections::HashMap;
++#[cfg(unix)]
+ use std::os::unix::io::RawFd;
++#[cfg(windows)]
++use utils::windows::RawFd;
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex, RwLock};
+ 
+@@ -10,19 +13,29 @@ use super::defs;
+ use super::defs::uapi;
+ use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
+ use super::muxer_thread::MuxerThread;
+-use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
++use super::packet::{TsiConnectReq, VsockPacket};
++#[cfg(unix)]
++use super::packet::TsiGetnameRsp;
+ use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
+ use super::reaper::ReaperThread;
+ #[cfg(target_os = "macos")]
+ use super::timesync::TimesyncThread;
++#[cfg(unix)]
+ use super::tsi_dgram::TsiDgramProxy;
++#[cfg(unix)]
+ use super::tsi_stream::TsiStreamProxy;
+-use super::unix::UnixProxy;
++// The host end of a guest-IPC port. Same role on both platforms; different
++// kernel object underneath.
++#[cfg(windows)]
++use super::winsock_unix::WinsockUnixProxy as IpcProxy;
++#[cfg(unix)]
++use super::unix::UnixProxy as IpcProxy;
+ use crossbeam_channel::{Sender, unbounded};
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+ use vm_memory::GuestMemoryMmap;
+ 
+ use crate::virtio::InterruptTransport;
++#[cfg(unix)]
+ use std::net::{Ipv4Addr, SocketAddrV4};
+ 
+ pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
+@@ -34,6 +47,7 @@ pub enum MuxerRx {
+         local_port: u32,
+         peer_port: u32,
+     },
++    #[cfg(unix)]
+     GetnameResponse {
+         local_port: u32,
+         peer_port: u32,
+@@ -258,6 +272,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_proxy_create(&self, pkt: &VsockPacket) {
+         debug!("proxy create request");
+         if let Some(req) = pkt.read_proxy_create() {
+@@ -353,6 +368,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_connect(&self, pkt: &VsockPacket) {
+         debug!("proxy connect request");
+         if let Some(req) = pkt.read_connect_req() {
+@@ -371,6 +387,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_getname(&self, pkt: &VsockPacket) {
+         debug!("new getname request");
+         if let Some(req) = pkt.read_getname_req() {
+@@ -395,6 +412,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_sendto_addr(&self, pkt: &VsockPacket) {
+         debug!("new DGRAM sendto addr: src={}", pkt.src_port());
+         if let Some(req) = pkt.read_sendto_addr() {
+@@ -413,6 +431,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_sendto_data(&self, pkt: &VsockPacket) {
+         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+         debug!("DGRAM sendto data: id={} src={}", id, pkt.src_port());
+@@ -421,6 +440,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_listen_request(&self, pkt: &VsockPacket) {
+         debug!("DGRAM listen request: src={}", pkt.src_port());
+         if let Some(req) = pkt.read_listen_req() {
+@@ -440,6 +460,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_accept_request(&self, pkt: &VsockPacket) {
+         debug!("DGRAM accept request: src={}", pkt.src_port());
+         if let Some(req) = pkt.read_accept_req() {
+@@ -456,6 +477,7 @@ impl VsockMuxer {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn process_proxy_release(&self, pkt: &VsockPacket) {
+         debug!("DGRAM release request: src={}", pkt.src_port());
+         if let Some(req) = pkt.read_release_req() {
+@@ -485,6 +507,7 @@ impl VsockMuxer {
+         );
+     }
+ 
++    #[cfg(unix)]
+     fn process_dgram_rw(&self, pkt: &VsockPacket) {
+         debug!("DGRAM OP_RW");
+         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+@@ -511,6 +534,12 @@ impl VsockMuxer {
+             return Ok(());
+         }
+ 
++        // Every DGRAM port on the host CID belongs to TSI's control plane, and
++        // every DGRAM data packet is addressed to a proxy that only TSI's
++        // control plane can have created. With TSI absent there is nothing on
++        // this side of the device to route to, so the whole dispatch is
++        // Unix-only rather than each arm individually.
++        #[cfg(unix)]
+         match pkt.dst_port() {
+             defs::TSI_PROXY_CREATE if self.tsi_flags.tsi_enabled() => {
+                 self.process_proxy_create(pkt)
+@@ -533,6 +562,12 @@ impl VsockMuxer {
+             }
+         }
+ 
++        #[cfg(windows)]
++        debug!(
++            "dropping DGRAM pkt for port {}: TSI is not built on Windows",
++            pkt.dst_port()
++        );
++
+         Ok(())
+     }
+ 
+@@ -561,7 +596,7 @@ impl VsockMuxer {
+             }
+             let rxq = self.rxq.clone();
+ 
+-            let mut unix = UnixProxy::new(
++            let mut unix = IpcProxy::new(
+                 id,
+                 self.cid,
+                 pkt.dst_port(),
+@@ -572,11 +607,7 @@ impl VsockMuxer {
+                 path.to_path_buf(),
+             )
+             .unwrap();
+-            let tsi = TsiConnectReq {
+-                peer_port: 0,
+-                addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
+-            };
+-            let update = unix.connect(pkt, tsi);
++            let update = unix.connect(pkt, TsiConnectReq::for_ipc());
+             unix.confirm_connect(pkt);
+             proxy_map.insert(id, Mutex::new(Box::new(unix)));
+             self.process_proxy_update(id, update);
+diff --git a/src/devices/src/virtio/vsock/muxer_rxq.rs b/src/devices/src/virtio/vsock/muxer_rxq.rs
+index ef1f7d7..8bbf336 100644
+--- a/src/devices/src/virtio/vsock/muxer_rxq.rs
++++ b/src/devices/src/virtio/vsock/muxer_rxq.rs
+@@ -150,6 +150,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
+ 
+             pkt.set_len(0);
+         }
++        #[cfg(unix)]
+         MuxerRx::GetnameResponse {
+             local_port,
+             peer_port,
+diff --git a/src/devices/src/virtio/vsock/muxer_thread.rs b/src/devices/src/virtio/vsock/muxer_thread.rs
+index cf0c98a..6217aa3 100644
+--- a/src/devices/src/virtio/vsock/muxer_thread.rs
++++ b/src/devices/src/virtio/vsock/muxer_thread.rs
+@@ -1,5 +1,8 @@
+ use std::collections::HashMap;
++#[cfg(unix)]
+ use std::os::unix::io::RawFd;
++#[cfg(windows)]
++use utils::windows::RawFd;
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+ use std::thread;
+@@ -8,11 +11,17 @@ use super::super::Queue as VirtQueue;
+ use super::muxer::{MuxerRx, ProxyMap, push_packet};
+ use super::muxer_rxq::MuxerRxQ;
+ use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
++#[cfg(unix)]
+ use super::tsi_stream::TsiStreamProxy;
+ 
+ use crate::virtio::InterruptTransport;
+ use crate::virtio::vsock::defs;
+-use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
++#[cfg(windows)]
++use crate::virtio::vsock::winsock_unix::{
++    WinsockUnixAcceptorProxy as IpcAcceptorProxy, WinsockUnixProxy as IpcProxy,
++};
++#[cfg(unix)]
++use crate::virtio::vsock::unix::{UnixAcceptorProxy as IpcAcceptorProxy, UnixProxy as IpcProxy};
+ use crossbeam_channel::Sender;
+ use rand::{RngExt, rng, rngs::ThreadRng};
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+@@ -106,15 +115,36 @@ impl MuxerThread {
+ 
+         let mut should_signal = update.signal_queue;
+ 
+-        if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
++        #[cfg(unix)]
++        let accepted = update.new_proxy.map(|(peer_port, accept_fd, family, proxy_type)| {
++            (peer_port, accept_fd, Some(family), proxy_type)
++        });
++        #[cfg(windows)]
++        let accepted = update
++            .new_proxy
++            .map(|(peer_port, accept_fd, proxy_type)| (peer_port, accept_fd, None::<()>, proxy_type));
++
++        if let Some((peer_port, accept_fd, _family, proxy_type)) = accepted {
+             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
+             let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
+             let new_proxy: Box<dyn Proxy> = match proxy_type {
++                #[cfg(unix)]
+                 NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
+                     new_id,
+                     self.cid,
+                     id,
+-                    family,
++                    _family.unwrap(),
++                    local_port,
++                    peer_port,
++                    accept_fd,
++                    self.mem.clone(),
++                    self.queue.clone(),
++                    self.rxq.clone(),
++                )),
++                #[cfg(unix)]
++                NewProxyType::Unix => Box::new(IpcProxy::new_reverse(
++                    new_id,
++                    self.cid,
+                     local_port,
+                     peer_port,
+                     accept_fd,
+@@ -122,7 +152,8 @@ impl MuxerThread {
+                     self.queue.clone(),
+                     self.rxq.clone(),
+                 )),
+-                NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
++                #[cfg(windows)]
++                NewProxyType::AfUnix => Box::new(IpcProxy::new_reverse(
+                     new_id,
+                     self.cid,
+                     local_port,
+@@ -155,7 +186,7 @@ impl MuxerThread {
+                 continue;
+             }
+             let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+-            let proxy = match UnixAcceptorProxy::new(id, path, *port) {
++            let proxy = match IpcAcceptorProxy::new(id, path, *port) {
+                 Ok(proxy) => proxy,
+                 Err(e) => {
+                     warn!("Failed to create listening proxy at {path:?}: {e:?}");
+@@ -183,7 +214,7 @@ impl MuxerThread {
+             {
+                 Ok(ev_cnt) => {
+                     for ev in &epoll_events[0..ev_cnt] {
+-                        debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
++                        debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
+                         let evset = EventSet::from_bits(ev.events).unwrap();
+                         let id = ev.data();
+ 
+diff --git a/src/devices/src/virtio/vsock/packet.rs b/src/devices/src/virtio/vsock/packet.rs
+index b7e23db..5ccdd8b 100644
+--- a/src/devices/src/virtio/vsock/packet.rs
++++ b/src/devices/src/virtio/vsock/packet.rs
+@@ -23,8 +23,10 @@ use std::net::{Ipv6Addr, SocketAddrV6};
+ use std::os::raw::c_char;
+ use std::result;
+ 
++// Socket addresses only ever reach this module through TSI, which is Unix-only.
+ #[cfg(target_os = "linux")]
+ use nix::sys::socket::{AddressFamily, sockaddr};
++#[cfg(unix)]
+ use nix::sys::socket::{SockaddrLike, SockaddrStorage};
+ use utils::byte_order;
+ use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
+@@ -108,9 +110,25 @@ pub struct TsiProxyCreate {
+ #[repr(C)]
+ pub struct TsiConnectReq {
+     pub peer_port: u32,
++    #[cfg(unix)]
+     pub addr: SockaddrStorage,
+ }
+ 
++impl TsiConnectReq {
++    /// The guest-IPC path reaches `Proxy::connect()` through the same trait
++    /// method TSI uses, but its destination comes from the port map rather than
++    /// from the guest, so there is no address to carry. Both fields are ignored
++    /// by every guest-IPC proxy; this constructor exists so callers do not have
++    /// to spell a per-platform placeholder inline.
++    pub fn for_ipc() -> Self {
++        TsiConnectReq {
++            peer_port: 0,
++            #[cfg(unix)]
++            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 0).into(),
++        }
++    }
++}
++
+ #[repr(C)]
+ pub struct TsiConnectRsp {
+     pub result: i32,
+@@ -123,6 +141,7 @@ pub struct TsiGetnameReq {
+     pub peer: u32,
+ }
+ 
++#[cfg(unix)]
+ #[repr(C)]
+ #[derive(Debug)]
+ pub struct TsiGetnameRsp {
+@@ -131,6 +150,7 @@ pub struct TsiGetnameRsp {
+     pub addr: SockaddrStorage,
+ }
+ 
++#[cfg(unix)]
+ impl Default for TsiGetnameRsp {
+     fn default() -> Self {
+         let addr: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into();
+@@ -143,6 +163,7 @@ impl Default for TsiGetnameRsp {
+     }
+ }
+ 
++#[cfg(unix)]
+ #[repr(C)]
+ #[derive(Debug)]
+ pub struct TsiSendtoAddr {
+@@ -150,6 +171,7 @@ pub struct TsiSendtoAddr {
+     pub addr: SockaddrStorage,
+ }
+ 
++#[cfg(unix)]
+ #[repr(C)]
+ #[derive(Debug)]
+ pub struct TsiListenReq {
+@@ -564,6 +586,7 @@ impl VsockPacket {
+     }
+ 
+     #[cfg(target_os = "linux")]
++    #[allow(dead_code)]
+     fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+         let sockaddr: SockaddrStorage = unsafe {
+             SockaddrStorage::from_raw(&buf[0] as *const _ as *const sockaddr, Some(addr_len))?
+@@ -640,6 +663,7 @@ impl VsockPacket {
+         }
+     }
+ 
++    #[cfg(unix)]
+     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
+         if self.buf_size >= 4 {
+             let buf = self.buf().unwrap();
+@@ -661,6 +685,7 @@ impl VsockPacket {
+         }
+     }
+ 
++    #[cfg(unix)]
+     pub fn read_getname_req(&self) -> Option<TsiGetnameReq> {
+         if self.buf_size >= 12 {
+             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
+@@ -676,6 +701,7 @@ impl VsockPacket {
+         }
+     }
+ 
++    #[cfg(unix)]
+     pub fn write_getname_rsp(&mut self, rsp: TsiGetnameRsp) {
+         if self.buf_size >= 132
+             && let Some(buf) = self.buf_mut()
+@@ -704,6 +730,7 @@ impl VsockPacket {
+         }
+     }
+ 
++    #[cfg(unix)]
+     pub fn read_sendto_addr(&self) -> Option<TsiSendtoAddr> {
+         if self.buf_size >= 4 {
+             let buf = self.buf().unwrap();
+@@ -717,6 +744,7 @@ impl VsockPacket {
+         }
+     }
+ 
++    #[cfg(unix)]
+     pub fn read_listen_req(&self) -> Option<TsiListenReq> {
+         if self.buf_size >= 12 {
+             let buf = self.buf().unwrap();
+diff --git a/src/devices/src/virtio/vsock/proxy.rs b/src/devices/src/virtio/vsock/proxy.rs
+index 254f4b9..a20c25e 100644
+--- a/src/devices/src/virtio/vsock/proxy.rs
++++ b/src/devices/src/virtio/vsock/proxy.rs
+@@ -1,12 +1,26 @@
++#[cfg(unix)]
+ use std::collections::HashMap;
+ use std::fmt;
++#[cfg(unix)]
+ use std::os::fd::OwnedFd;
++#[cfg(unix)]
+ use std::os::unix::io::{AsRawFd, RawFd};
++#[cfg(windows)]
++use std::os::windows::io::OwnedHandle;
+ 
+ use super::muxer::MuxerRx;
+-use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
++use super::packet::{TsiConnectReq, VsockPacket};
++#[cfg(unix)]
++use super::packet::{TsiAcceptReq, TsiListenReq, TsiSendtoAddr};
++#[cfg(unix)]
+ use nix::sys::socket::AddressFamily;
+ use utils::epoll::EventSet;
++// `utils::windows::RawFd` is a `HANDLE`, and the Windows `AsRawFd` shim yields
++// one. Everything the muxer does with these values -- store them, hand them to
++// `Epoll::ctl` -- is identical on both platforms, so the rest of this module is
++// written against whichever pair the target provides.
++#[cfg(windows)]
++use utils::windows::{AsRawFd, RawFd};
+ 
+ #[derive(Debug)]
+ pub enum RecvPkt {
+@@ -19,10 +33,17 @@ pub enum RecvPkt {
+ #[allow(dead_code)]
+ #[derive(Debug)]
+ pub enum ProxyError {
++    #[cfg(unix)]
+     CreatingSocket(nix::errno::Errno),
+     InvalidFamily,
++    #[cfg(unix)]
+     SettingReuseAddr(nix::errno::Errno),
++    #[cfg(unix)]
+     SettingReusePort(nix::errno::Errno),
++    /// A Win32 call failed while setting up the host end of a guest-IPC port.
++    /// Carries the operation name and the `GetLastError()` value.
++    #[cfg(windows)]
++    Win32(&'static str, std::io::Error),
+ }
+ 
+ #[derive(Eq, PartialEq, Clone, Copy, Debug)]
+@@ -47,17 +68,36 @@ pub enum ProxyRemoval {
+ 
+ #[derive(Default)]
+ pub enum NewProxyType {
++    #[cfg(unix)]
+     #[default]
+     Tcp,
++    #[cfg(unix)]
+     Unix,
++    /// The host end of a guest-IPC vsock port on Windows. There is no Windows
++    /// analogue of `Tcp`, which only ever comes from TSI.
++    #[cfg(windows)]
++    #[default]
++    AfUnix,
+ }
+ 
++/// A connection accepted by a listening proxy, to be adopted as a proxy of its
++/// own: `(guest peer port, the accepted endpoint, ...)`.
++///
++/// The Unix form carries the socket's `AddressFamily` because TSI's reverse
++/// path has to know whether it accepted an AF_INET or an AF_UNIX connection.
++/// On Windows the only listener is a named pipe, so there is nothing to
++/// discriminate and the field would always be a placeholder.
++#[cfg(unix)]
++pub type AcceptedProxy = (u32, OwnedFd, AddressFamily, NewProxyType);
++#[cfg(windows)]
++pub type AcceptedProxy = (u32, OwnedHandle, NewProxyType);
++
+ #[derive(Default)]
+ pub struct ProxyUpdate {
+     pub signal_queue: bool,
+     pub remove_proxy: ProxyRemoval,
+     pub polling: Option<(u64, RawFd, EventSet)>,
+-    pub new_proxy: Option<(u32, OwnedFd, AddressFamily, NewProxyType)>,
++    pub new_proxy: Option<AcceptedProxy>,
+     pub push_accept: Option<(u64, u64)>,
+     pub push_credit_req: Option<MuxerRx>,
+ }
+@@ -76,16 +116,26 @@ pub trait Proxy: Send + AsRawFd {
+     fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
+         None
+     }
+-    fn getpeername(&mut self, pkt: &VsockPacket);
+     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
++    // `getpeername`, `sendto_addr`, `sendto_data`, `listen` and `accept` form
++    // TSI's DGRAM control plane: the muxer only ever calls them from the
++    // `send_dgram_pkt` arms that are themselves gated on `tsi_enabled()`, and
++    // the guest-IPC proxies answer all of them with `todo!()`/`unreachable!()`.
++    // TSI is not built on Windows, so neither are they.
++    #[cfg(unix)]
++    fn getpeername(&mut self, pkt: &VsockPacket);
++    #[cfg(unix)]
+     fn sendto_addr(&mut self, req: TsiSendtoAddr) -> ProxyUpdate;
++    #[cfg(unix)]
+     fn sendto_data(&mut self, _pkt: &VsockPacket) {}
++    #[cfg(unix)]
+     fn listen(
+         &mut self,
+         pkt: &VsockPacket,
+         req: TsiListenReq,
+         host_port_map: &Option<HashMap<u16, u16>>,
+     ) -> ProxyUpdate;
++    #[cfg(unix)]
+     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
+     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
+     fn push_op_request(&self) {}
+-- 
+2.53.0
+

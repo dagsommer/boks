@@ -1,0 +1,143 @@
+From beb6997797ba823adc0de4f1316446bafae5c82b Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 15:29:30 +0200
+Subject: [PATCH 20/25] windows: keep krun_add_net_unixgram exported, returning
+ -ENOTSUP
+
+The unixgram backend needs an AF_UNIX SOCK_DGRAM socket. Windows' AF_UNIX,
+which has existed since Windows 10 1803, implements SOCK_STREAM and has never
+implemented a datagram socket type -- the same gap that makes gvisor-tap-vsock
+stub its own unixgram transport out on Windows. There is nothing to port it to,
+so the entry point becomes Unix-only.
+
+It stays exported all the same, with a byte-identical signature. Consumers
+resolve libkrun's symbols eagerly when krun.dll is loaded, so a missing export
+fails the whole load with an error that names nothing; a -ENOTSUP return names
+the problem at the call that wanted it, and points at krun_add_net_unixstream.
+This matches how the TSI/vsock entry points are already handled here.
+
+krun_add_net_unixstream keeps working on Windows, but only in its c_path form.
+A Winsock SOCKET is a pointer-sized handle rather than an `int`, and a CRT file
+descriptor is not a socket, so there is no reading of the `fd` argument that is
+not a guess followed by a truncation. A non-negative fd is refused with
+-ENOTSUP explaining that, rather than accepted and misused.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/libkrun/src/lib.rs | 69 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index d7d0f63..07521ed 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -875,11 +875,13 @@ pub unsafe extern "C" fn krun_add_disk3(
+  * Send the VFKIT magic after establishing the connection,
+  * as required by gvproxy in vfkit mode.
+  */
+-#[cfg(feature = "net")]
++// Only krun_add_net_unixgram() accepts the vfkit flag, so like that function it
++// is Unix-only: there is no AF_UNIX SOCK_DGRAM on Windows to send the magic on.
++#[cfg(all(feature = "net", unix))]
+ const NET_FLAG_VFKIT: u32 = 1 << 0;
+ #[cfg(feature = "net")]
+ const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
+-#[cfg(feature = "net")]
++#[cfg(all(feature = "net", unix))]
+ const NET_FLAG_ALL: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT;
+ 
+ /* Taken from uapi/linux/virtio_net.h */
+@@ -937,11 +939,35 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
+         if fd < 0 && path.is_none() {
+             return -libc::EINVAL;
+         }
++
++        // On Windows only the path form exists. A Winsock `SOCKET` is a
++        // pointer-sized handle rather than an `int`, and a CRT file descriptor
++        // is not a socket at all, so there is no way to read this `fd` as a
++        // connected AF_UNIX socket without guessing at what the caller passed
++        // and truncating it. Refuse and say so.
++        #[cfg(windows)]
++        if fd >= 0 {
++            error!(
++                "krun_add_net_unixstream() cannot take an fd on Windows: a Winsock SOCKET does \
++                 not fit in the `int` this argument is, and a CRT file descriptor is not a \
++                 socket. Pass the socket path in c_path instead."
++            );
++            return -libc::ENOTSUP;
++        }
++
++        #[cfg(unix)]
+         let backend = if let Some(path) = path {
+             VirtioNetBackend::UnixstreamPath(path)
+         } else {
+             VirtioNetBackend::UnixstreamFd(fd)
+         };
++        #[cfg(windows)]
++        let backend = match path {
++            Some(path) => VirtioNetBackend::UnixstreamPath(path),
++            // Not reachable: a negative fd with no path was rejected as EINVAL
++            // above, and a non-negative fd as ENOTSUP.
++            None => return -libc::EINVAL,
++        };
+ 
+         let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
+             Ok(m) => m,
+@@ -971,9 +997,14 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
+     }
+ }
+ 
++/// The unixgram backend needs an AF_UNIX SOCK_DGRAM socket, which Windows has
++/// never had -- its AF_UNIX implements SOCK_STREAM and nothing else. There is
++/// no Windows implementation to call, so this entry point is Unix-only and the
++/// Windows build exports the stub below in its place. Boks does not use it: it
++/// asks for `mode=unixstream`.
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+-#[cfg(feature = "net")]
++#[cfg(all(feature = "net", unix))]
+ pub unsafe extern "C" fn krun_add_net_unixgram(
+     ctx_id: u32,
+     c_path: *const c_char,
+@@ -1034,6 +1065,38 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
+     }
+ }
+ 
++/// The Windows stand-in for `krun_add_net_unixgram()`.
++///
++/// Kept exported, with the signature byte for byte identical to the Unix one,
++/// because consumers resolve libkrun's symbols eagerly when `krun.dll` is
++/// loaded: a missing export fails the whole load with an opaque error naming
++/// nothing, whereas a `-ENOTSUP` return names the problem at the call that
++/// actually wanted it.
++///
++/// It cannot be implemented. Windows' AF_UNIX has only ever provided
++/// SOCK_STREAM -- there is no datagram socket type to bind, and the same gap is
++/// why gvisor-tap-vsock stubs its own unixgram transport out on Windows. Use
++/// `krun_add_net_unixstream()`, whose 4-byte big-endian length prefix carries
++/// the frame boundaries a datagram socket would have carried for free.
++#[allow(clippy::missing_safety_doc)]
++#[unsafe(no_mangle)]
++#[cfg(all(feature = "net", windows))]
++pub unsafe extern "C" fn krun_add_net_unixgram(
++    _ctx_id: u32,
++    _c_path: *const c_char,
++    _fd: c_int,
++    _c_mac: *const u8,
++    _features: u32,
++    _flags: u32,
++) -> i32 {
++    error!(
++        "krun_add_net_unixgram() is not supported on Windows: AF_UNIX there implements only \
++         SOCK_STREAM, so there is no datagram socket for this backend to use. Use \
++         krun_add_net_unixstream()."
++    );
++    -libc::ENOTSUP
++}
++
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+ #[cfg(all(target_os = "linux", feature = "net"))]
+-- 
+2.53.0
+
