@@ -275,20 +275,19 @@ const maxTokenRequestBody = 64 << 10
 // this path only for a credential with no token at all, and the first token it acquires closes
 // it: a guest cannot ask to be relayed, and cannot re-open the path once it has been used.
 //
-// Order of operations, which is not an implementation detail:
-//
-//  1. relay the request, unchanged but for an Accept-Encoding that lets the answer be read;
-//  2. read the whole response, up to a cap, refusing anything larger or still encoded;
-//  3. take the tokens out, store them, and mask them out of the body — all before;
-//  4. the guest is answered.
-//
-// Answering first would mean a store failure left the guest with a sentinel, Boks with
-// nothing, and an authorization code that cannot be spent twice.
+// Order of operations, which is not an implementation detail. The request is relayed
+// unchanged but for an Accept-Encoding that lets the answer be read; the whole response is
+// read, up to a cap, and anything larger or still encoded is refused; the tokens are taken
+// out, stored, and masked out of the body. Only then is the guest answered. Answering first
+// would mean a store failure left the guest with a sentinel, Boks with nothing, and an
+// authorization code that cannot be spent twice.
 func (s *Server) relayTokenRequest(ctx context.Context, target policy.Target, credential secret.Credential,
 	req *http.Request, client net.Conn, upstream *tls.Conn, upstreamReader *bufio.Reader) bool {
 
-	secret.StripForRelay(req.Header)
-	if err := req.Write(upstream); err != nil {
+	secret.PrepareRelay(req.Header)
+	err := req.Write(upstream)
+	req.Body.Close()
+	if err != nil {
 		s.logf("relaying an oauth token request for %s to %s failed", credential.Service, target)
 		writeStatus(client, http.StatusBadGateway, "boks: the login exchange could not be sent\n")
 		return false
@@ -299,7 +298,8 @@ func (s *Server) relayTokenRequest(ctx context.Context, target policy.Target, cr
 	_ = upstream.SetReadDeadline(time.Time{})
 	if err != nil {
 		// Same reasoning as the ordinary path: a malformed-response error quotes the
-		// origin's bytes, and on this endpoint those bytes are the token.
+		// origin's bytes, and on this endpoint those bytes are the token. Nothing derived
+		// from the response is logged here or below.
 		s.logf("oauth token request for %s on %s: the origin's response could not be read", credential.Service, target)
 		writeStatus(client, http.StatusBadGateway, "boks: the login exchange got no readable answer\n")
 		return false

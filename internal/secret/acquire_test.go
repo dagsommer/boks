@@ -225,6 +225,35 @@ func TestAcquireWithNothingToStoreFails(t *testing.T) {
 	}
 }
 
+// TestAcquireRefusesAnUnreadableSuccess: a 2xx boks could not parse is the shape a token in a
+// form boks does not recognise would take, and it is refused rather than forwarded. A
+// *failure* status is passed through, because only the agent can explain it to the user.
+func TestAcquireRefusesAnUnreadableSuccess(t *testing.T) {
+	profile := armedProfile(t)
+	armed, err := profile.Arm("claude-code")
+	if err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+	inj, store, credential := acquisitionInjector(t, armed)
+
+	const opaque = `<html>sk-ant-oat01-A-TOKEN-IN-A-SHAPE-BOKS-DOES-NOT-KNOW</html>`
+	if _, err := inj.AcquireToken(context.Background(), credential, 200, []byte(opaque)); err == nil {
+		t.Fatal("a successful answer boks could not read was forwarded to the guest")
+	}
+	if held := store.Records()[credential.Service]; !held.Pending {
+		t.Error("a refused acquisition changed the stored credential")
+	}
+
+	out, err := inj.AcquireToken(context.Background(), credential, 400,
+		[]byte(`{"error":"invalid_grant"}`))
+	if err != nil {
+		t.Fatalf("a rejected login was not passed through: %v", err)
+	}
+	if out.Acquired || !strings.Contains(string(out.Body), "invalid_grant") {
+		t.Error("the agent cannot see why its login was rejected")
+	}
+}
+
 // readOnlyOAuth is a Provider and OAuthProvider that is deliberately not an OAuthSaver.
 type readOnlyOAuth struct{ record OAuthRecord }
 
