@@ -115,7 +115,10 @@ func ensureNetworkForExisting(ctx context.Context, name, address string, stderr 
 	}
 
 	var flags policyFlags
-	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy)
+	// The sandbox's own recorded publish specifications: `start` and `exec` have no port
+	// flags, and a sandbox that came back up without the ports it was created with would
+	// break a bookmark for reasons nothing on screen would explain.
+	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy, info.Ports)
 	if err != nil {
 		return err
 	}

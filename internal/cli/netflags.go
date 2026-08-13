@@ -22,6 +22,7 @@ type policyFlags struct {
 	deny    []string
 	inject  []string
 	guest   []string
+	publish []string
 }
 
 // register adds the flags to a flag set. The preset default is empty rather than
@@ -43,7 +44,13 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 		"attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
 	fs.StringArrayVar(&f.guest, "guest-credential", nil,
 		"what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable)")
+	fs.StringArrayVarP(&f.publish, "publish", "p", nil,
+		"publish a sandbox port on the host, bound to loopback (repeatable): "+
+			"[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]")
 }
+
+// checkPublish rejects a malformed --publish before anything is created or pulled.
+func (f *policyFlags) checkPublish() error { return checkPublishSpecs(f.publish) }
 
 // specified reports whether the user set any of them.
 func (f *policyFlags) specified() bool {

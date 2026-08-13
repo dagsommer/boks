@@ -197,7 +197,8 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 		}
 	}
 
-	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode, record)
+	publish := publishFor(flags, inv, env.Stderr)
+	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode, record, publish)
 	if err != nil {
 		return false, err
 	}
@@ -210,6 +211,7 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 	}
 	if !inv.exists {
 		cfg.Policy = record
+		cfg.Ports = publish
 	}
 	cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
 	cfg.Env = append(cfg.Env, guest.Env...)
@@ -218,6 +220,32 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 	running := inv.exists && inv.info.Status == sandbox.StatusRunning
 	_, started, err := attachNetwork(ctx, spec, running, env.Stderr)
 	return started, err
+}
+
+// publishFor decides which ports this run publishes, and says so when the answer is not what
+// the flags asked for.
+//
+// `-p` is **ignored when re-attaching**, which is sbx's documented behaviour and worth
+// keeping rather than improving on. A sandbox's published ports are live state of a running
+// network, not a property of the invocation that happened to reach it: two terminals running
+// `boks run` against one sandbox would otherwise fight over which set of ports it has, and
+// the second one would silently win. `boks ports` is the way to change a sandbox that exists,
+// and this says so instead of leaving the flag looking obeyed.
+//
+// A sandbox that exists gets the specifications it was created with, so that `boks run` on a
+// stopped sandbox brings its ports back up.
+func publishFor(flags *policyFlags, inv invocation, stderr io.Writer) []string {
+	if !inv.exists {
+		return flags.publish
+	}
+	if len(flags.publish) > 0 {
+		fmt.Fprintf(stderr,
+			"note: --publish is ignored when re-attaching to an existing sandbox. Sandbox %q keeps\n"+
+				"      the ports it has; change them on the running sandbox instead:\n"+
+				"        boks ports %s --publish %s\n",
+			inv.name, inv.name, flags.publish[0])
+	}
+	return inv.info.Ports
 }
 
 // withNetworkAnnotations merges the network's annotations into whatever the user asked for.
@@ -272,7 +300,7 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 // does not exist yet. Passing it here rather than reading it inside is what makes `start`,
 // `exec` and `run` produce the same policy for the same sandbox.
 func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mode network.Mode,
-	record *policy.SandboxPolicy) (enforce.Spec, error) {
+	record *policy.SandboxPolicy, publish []string) (enforce.Spec, error) {
 
 	plan, err := f.planFor(name, mode)
 	if err != nil {
@@ -309,6 +337,7 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 		Inject:           f.inject,
 		GuestCredentials: f.guest,
 		Secrets:          secrets,
+		Publish:          publish,
 		Intercept:        true,
 		CADir:            caDir(""),
 		StateDir:         policy.StateDir(),
