@@ -47,9 +47,9 @@ There is no recovery for a forgotten passphrase — that is what encryption mean
 is spelled out wherever the store fails to decrypt.`,
 			strings.Join(knownServices.Names(), ", "), secret.PassphraseEnv),
 	}
-	cmd.AddCommand(newSecretSetCommand(env), newSecretAdoptCommand(env), newSecretImportCommand(env),
-		newSecretLsCommand(env), newSecretServicesCommand(env), newSecretRmCommand(env),
-		newSecretResetCommand(env))
+	cmd.AddCommand(newSecretSetCommand(env), newSecretAdoptCommand(env), newSecretLoginCommand(env),
+		newSecretImportCommand(env), newSecretLsCommand(env), newSecretServicesCommand(env),
+		newSecretRmCommand(env), newSecretResetCommand(env))
 	return cmd
 }
 
@@ -270,6 +270,188 @@ covering the same hosts.`,
 		return nil
 	}
 	return cmd
+}
+
+// newSecretLoginCommand arms a credential to be acquired by the agent's own login, inside a
+// sandbox.
+//
+// This is the answer to the case `boks secret adopt` cannot serve: a fresh machine, where
+// there is no login to read. Boks still performs no OAuth flow of its own and still holds no
+// client id — see errOAuthAcquisition, which has not changed its mind. What changed is that
+// the *agent* has a client id, and Boks is already sitting on the flow it uses.
+//
+// So the command stores no credential and contacts nothing. It writes a credential-shaped
+// hole: the vendor's endpoint, the destinations, and the sentinels the guest will hold, with
+// no tokens behind them. The next token exchange the proxy sees for that endpoint is relayed
+// and its answer kept — once — and after that the credential behaves exactly like an adopted
+// one. See internal/secret/acquire.go.
+//
+// Two things are printed that a user cannot infer. The allow rules, because naming a host for
+// a credential does not make it reachable and the default policy denies these. And the fact
+// that arming a credential is what makes boks decrypt that host's traffic, which is the same
+// bargain every credential rule makes and is worth restating where it is being struck.
+func newSecretLoginCommand(env Env) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "login [flags] [NAME]",
+		Short: "Arm a credential to be acquired by the agent's own login inside a sandbox",
+		Long: `Prepares boks to keep the credential an agent's own login produces, without the token ever
+entering the sandbox.
+
+Nothing is contacted and nothing is stored yet: this writes the shape of the credential —
+the vendor's token endpoint, the hosts it is used on, and the sentinels the guest will hold
+— and marks it as awaiting a login. Then you log in the way that agent normally does, inside
+a sandbox:
+
+  boks run claude -- auth login
+
+The agent performs its own OAuth, with its own client id, because it is that program. Boks
+already terminates TLS for the token endpoint, so it relays that one exchange, keeps the
+tokens it returns, and rewrites the answer so what reaches the sandbox is sentinels. The
+agent writes those sentinels into its own credential file; there is no moment at which a
+real token exists inside the guest.
+
+This is not boks running an OAuth flow. It has no client id for any vendor and will not
+borrow another product's — see 'boks secret set --oauth'. It is boks keeping the result of a
+login the agent performed for itself.
+
+The login itself is a paste-a-code flow: the agent prints a URL, you authorise it in a
+browser on this machine, and paste the code back into the sandbox's terminal. Nothing has to
+listen on a port inside the sandbox, which is why this works with no port publishing.`,
+		Example: `  boks secret login claude-code
+  boks run claude -- auth login`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 1 {
+				return usagef("at most one credential name")
+			}
+			return nil
+		},
+	}
+	var (
+		format    string
+		hosts     []string
+		tokenURL  string
+		clientID  string
+		envName   string
+		filePath  string
+		noFile    bool
+		force     bool
+		storePath string
+	)
+	cmd.Flags().StringVar(&format, "format", "claude-code", "credential format: "+strings.Join(secret.ProfileNames(), ", "))
+	cmd.Flags().StringArrayVar(&hosts, "resource-host", nil, "override the hosts where the token is used (repeatable)")
+	cmd.Flags().StringVar(&tokenURL, "token-url", "", "override the token endpoint URL")
+	cmd.Flags().StringVar(&clientID, "client-id", "", "override the OAuth client id")
+	cmd.Flags().StringVar(&envName, "env", "", "guest environment variable holding the access-token sentinel")
+	cmd.Flags().StringVar(&filePath, "file", "", "guest path for the rendered credential file")
+	cmd.Flags().BoolVar(&noFile, "no-file", false, "do not render a credential file into the guest")
+	cmd.Flags().BoolVar(&force, "force", false, "replace a credential that is already stored under this name")
+	storeFlag(cmd, &storePath)
+
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		profile, err := secret.Profile(format)
+		if err != nil {
+			return err
+		}
+		if len(hosts) > 0 {
+			profile.ResourceHosts = hosts
+		}
+		if tokenURL != "" {
+			endpoint, err := parseTokenURL(tokenURL)
+			if err != nil {
+				return err
+			}
+			profile.TokenEndpoint = endpoint
+		}
+		if clientID != "" {
+			profile.ClientID = clientID
+		}
+		if envName != "" {
+			profile.EnvName = envName
+		}
+		if filePath != "" {
+			profile.FilePath = filePath
+		}
+		if noFile {
+			profile.FilePath = ""
+		}
+
+		name := profile.Name
+		if len(args) == 1 {
+			name = args[0]
+		}
+		record, err := profile.Arm(name)
+		if err != nil {
+			return err
+		}
+		store, err := openSecretStore(storePath)
+		if err != nil {
+			return err
+		}
+		if err := refuseToOverwriteALogin(store, name, force); err != nil {
+			return err
+		}
+		if err := store.SetOAuth(name, record); err != nil {
+			return explainSecretFailure(store.Path(), err)
+		}
+
+		fmt.Fprintf(env.Stdout, "%q is armed in %s and holds no token yet.\n", name, store.Path())
+		fmt.Fprintf(env.Stdout, "  acquired at:  %s%s  (relayed once, then kept on the host)\n",
+			record.TokenHost, record.TokenPath)
+		fmt.Fprintf(env.Stdout, "  used on:      %s\n", strings.Join(record.ResourceHosts, ", "))
+		if record.EnvName != "" {
+			fmt.Fprintf(env.Stdout, "  the guest gets a sentinel in $%s\n", record.EnvName)
+		}
+		if record.FilePath != "" {
+			fmt.Fprintf(env.Stdout, "  and a credential file at %s, read-only\n", record.FilePath)
+		}
+		var allows strings.Builder
+		for _, h := range append(append([]string{}, record.ResourceHosts...), record.TokenHost) {
+			fmt.Fprintf(&allows, "  boks policy allow %s:443\n", h)
+		}
+		fmt.Fprintf(env.Stdout, "\nMake those hosts reachable — a credential rule says where a token may go, not\n"+
+			"what is reachable, and the default policy denies them:\n%s", allows.String())
+		fmt.Fprintf(env.Stdout, "\nThen log in inside a sandbox:\n\n  boks run claude -- auth login\n\n"+
+			"The agent prints a URL, you authorise it in a browser here, and paste the code back\n"+
+			"into the sandbox. Boks keeps the tokens; the sandbox receives sentinels.\n")
+		fmt.Fprintf(env.Stdout, "\nOne limitation, stated rather than discovered: a sandbox's network runs in a\n"+
+			"process that never learns this store's passphrase, so a login performed inside one\n"+
+			"lasts for that sandbox and is not written back here. Until that writeback exists,\n"+
+			"use 'boks proxy' — which holds the store — for the login itself, or adopt the\n"+
+			"credential afterwards with 'boks secret adopt'.\n")
+		return nil
+	}
+	return cmd
+}
+
+// refuseToOverwriteALogin stops `boks secret login` from throwing away a credential that
+// already works.
+//
+// Arming a name empties it: the record it writes has no tokens. Doing that silently over a
+// working login would log the user out of every sandbox with no warning and no undo, which is
+// worse than any of the failures --force exists to override.
+func refuseToOverwriteALogin(store *secret.FileStore, name string, force bool) error {
+	if force {
+		return nil
+	}
+	entries, err := store.Entries()
+	if err != nil {
+		return explainSecretFailure(store.Path(), err)
+	}
+	for _, e := range entries {
+		if e.Name != name {
+			continue
+		}
+		kind := "an API key"
+		if e.OAuth {
+			kind = "a credential"
+		}
+		return fmt.Errorf("%q already holds %s, and arming it would empty it.\n\n"+
+			"An armed credential has no tokens behind its sentinels until a login fills them in,\n"+
+			"so this would log every sandbox out with nothing to undo it.\n\n"+
+			"  boks secret login --force %s   # arm it anyway, discarding what is there\n"+
+			"  boks secret rm %s              # remove it first, if that is what you meant", name, kind, name, name)
+	}
+	return nil
 }
 
 // adoptSource turns --from into somewhere to read.
@@ -503,12 +685,20 @@ func errOAuthAcquisition(name string) error {
 		"publish no device flow for third parties.\n\n"+
 		"Reusing another product's client id — so the vendor is told the login is Claude Code's,\n"+
 		"or gh's — would work and is not something boks will do on your behalf.\n\n"+
-		"What boks does instead is take a login you already performed:\n\n"+
+		"There are two things boks does instead, and between them they cover both machines.\n\n"+
+		"On a machine you have already logged in on, take that login:\n\n"+
 		"  boks secret adopt claude-code\n\n"+
 		"which reads Claude Code's own credential from the macOS Keychain, or from\n"+
 		"~/.claude/.credentials.json, and stores the token pair without it ever entering a\n"+
-		"sandbox. That covers the case --oauth exists for on a machine you have logged in on;\n"+
-		"it does nothing for a fresh one, and nothing here pretends otherwise.\n\n"+
+		"sandbox.\n\n"+
+		"On a fresh one, let the agent log itself in and keep the result:\n\n"+
+		"  boks secret login claude-code\n"+
+		"  boks run claude -- auth login\n\n"+
+		"The agent performs its own OAuth with its own client id — legitimately, because it is\n"+
+		"that program — and boks, which already terminates TLS for the token endpoint, keeps the\n"+
+		"tokens and hands the sandbox sentinels. That is the same route sbx takes for Anthropic:\n"+
+		"its own --oauth is documented for one vendor, and its answer for this one is\n"+
+		"'sbx run claude … -- auth login'.\n\n"+
 		"To store an API key for %q instead, drop the flag.", name)
 }
 
@@ -765,6 +955,11 @@ useful to somebody who cannot read the credentials themselves.`,
 				}
 				where = strings.Join(record.ResourceHosts, ", ") +
 					"  (refreshed at " + record.TokenHost + ", on the host)"
+				if record.Pending {
+					kind = "oauth*"
+					where = strings.Join(record.ResourceHosts, ", ") +
+						"  (awaiting a login; run 'boks run claude -- auth login')"
+				}
 			default:
 				if service, ok := knownServices.Lookup(e.Name); ok && service.Configured() {
 					where = strings.Join(service.Hosts(), ", ")
