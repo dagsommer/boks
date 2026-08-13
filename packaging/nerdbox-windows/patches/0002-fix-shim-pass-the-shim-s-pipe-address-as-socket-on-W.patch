@@ -1,0 +1,108 @@
+From 93a399976e886f77e10c7b6960801b2f1bdfe259 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 22:35:43 +0200
+Subject: [PATCH 2/2] fix(shim): pass the shim's pipe address as -socket on
+ Windows
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+manager_windows.go's Start computed the child shim's named pipe address
+and handed it down as a TTRPC_SOCKET environment variable. Nothing reads
+that variable. Grepping the whole nerdbox tree including vendored
+containerd finds exactly two hits, both the write itself — containerd's
+shim only ever knows about TTRPC_ADDRESS, GRPC_ADDRESS, NAMESPACE and
+MAX_SHIM_VERSION. The child therefore started with an empty socketFlag.
+
+On Unix that would be survivable: manager_unix.go binds the socket in
+the parent and passes it down as cmd.ExtraFiles fd 3, and serveListener
+falls back to that descriptor when the flag is empty. Windows named
+pipes cannot be inherited as descriptors, so the address has to travel
+on the command line. containerd's shim.go binds `-socket` to socketFlag
+(pkg/shim/shim.go:138) and serve() passes precisely that variable to
+serveListener (pkg/shim/shim.go:469), which — with the Windows
+implementation from PR #13948 applied — rejects an empty path outright
+and rejects anything not prefixed \\.\pipe\. shimPipeAddress already
+produces a \\.\pipe\containerd-shim-<sha> address, so passing it as
+-socket is all that is missing.
+
+This is a nerdbox bug independent of PR #13948: the environment variable
+was dead code before that PR too. It is only PR #13948 that turns it
+from silently-wrong into an error, because until then serveListener
+never got far enough to care.
+
+Computing the address moved above newCommand, since it is now one of the
+child's arguments rather than something appended to its environment
+afterwards. newCommand grows an `address` parameter to match.
+
+Builds for windows/amd64 and windows/arm64. Not run — no one has started
+this shim on Windows.
+---
+ pkg/shim/manager/manager_windows.go | 28 +++++++++++++++++++---------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/pkg/shim/manager/manager_windows.go b/pkg/shim/manager/manager_windows.go
+index 4979f48..02af16e 100644
+--- a/pkg/shim/manager/manager_windows.go
++++ b/pkg/shim/manager/manager_windows.go
+@@ -40,7 +40,17 @@ import (
+ 	"golang.org/x/sys/windows"
+ )
+ 
+-func newCommand(ctx context.Context, id, containerdAddress, containerdTTRPCAddress string, debug bool) (*exec.Cmd, error) {
++// newCommand builds the long-running shim process.
++//
++// `address` is the named pipe the child will serve its TTRPC API on, and it is
++// passed as `-socket`. That is not cosmetic: containerd's shim.go binds
++// `-socket` to `socketFlag` and serve() passes exactly that variable to
++// serveListener, which on Windows has no way to recover the address if the
++// flag is empty. Unix does not need this because manager_unix.go hands the
++// already-bound socket down as cmd.ExtraFiles fd 3, and serveListener falls
++// back to that descriptor; Windows named pipes cannot be inherited that way,
++// so the path has to travel on the command line.
++func newCommand(ctx context.Context, id, containerdAddress, containerdTTRPCAddress, address string, debug bool) (*exec.Cmd, error) {
+ 	ns, err := namespaces.NamespaceRequired(ctx)
+ 	if err != nil {
+ 		return nil, err
+@@ -57,6 +67,7 @@ func newCommand(ctx context.Context, id, containerdAddress, containerdTTRPCAddre
+ 		"-namespace", ns,
+ 		"-id", id,
+ 		"-address", containerdAddress,
++		"-socket", address,
+ 	}
+ 	if debug {
+ 		args = append(args, "-debug")
+@@ -88,10 +99,6 @@ func (manager) Start(ctx context.Context, bparams *bootapi.BootstrapParams) (_ *
+ 	id := bparams.InstanceID
+ 	debug := bparams.LogLevel <= bootapi.LogLevel_LOG_LEVEL_DEBUG
+ 
+-	cmd, err := newCommand(ctx, id, bparams.ContainerdGrpcAddress, bparams.ContainerdTtrpcAddress, debug)
+-	if err != nil {
+-		return nil, err
+-	}
+ 	grouping := id
+ 	sp, err := readSpec()
+ 	if err != nil {
+@@ -111,15 +118,18 @@ func (manager) Start(ctx context.Context, bparams *bootapi.BootstrapParams) (_ *
+ 		}
+ 	}
+ 
+-	// Generate a named pipe address for the shim TTRPC socket.
++	// Generate a named pipe address for the shim TTRPC socket. This has to
++	// happen before the command is built, because the address is one of the
++	// child's arguments — see newCommand.
+ 	address, err := shimPipeAddress(ctx, bparams.ContainerdGrpcAddress, grouping)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	// Pass the pipe address to the child shim process via environment variable.
+-	// The shim's serveListener reads TTRPC_SOCKET to know where to listen.
+-	cmd.Env = append(cmd.Env, "TTRPC_SOCKET="+address)
++	cmd, err := newCommand(ctx, id, bparams.ContainerdGrpcAddress, bparams.ContainerdTtrpcAddress, address, debug)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	if err := cmd.Start(); err != nil {
+ 		return nil, err
