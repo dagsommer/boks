@@ -110,15 +110,27 @@ func decodeFilesystem(labels map[string]string) Filesystem {
 //     cannot write to the host at all. Cross-filesystem links fail with EXDEV and git falls
 //     back to copying, which is why this has never bitten; a security property must not rest
 //     on the two paths happening to be on different filesystems.
-//   - `safe.directory`. The source is owned by the host user, and the guest process is
-//     usually a different uid, so git's dubious-ownership check refuses it. The exemption
-//     names the one directory Boks put there, not `*`.
+//   - `safe.directory`, in the guest's *system* config. The source is owned by the host user
+//     and the clone runs as another uid, so git's dubious-ownership check refuses it
+//     outright. Neither `git -c safe.directory=…` nor the `GIT_CONFIG_*` environment lifts
+//     it — both measured against git 2.47, which honours the setting only from system or
+//     global configuration. The system file is also the honest place for it: this is a
+//     statement about a mount the whole guest shares, and it means the agent's own
+//     `git fetch origin` works later without meeting the same refusal. The exemption names
+//     the one directory Boks put there, never `*`.
 //   - the uncommitted-work note. A clone carries committed history; whatever is dirty or
 //     staged in the host tree is not in it. That surprise is worth a line, and the check runs
 //     here because this is where a git that can read the source already exists — Boks itself
 //     requires no git on the host.
+//
+// It runs as root and hands the result over, which is not a convenience. The clone lands at
+// the workspace's own absolute path, and every directory leading to it is created by the
+// runtime — as root, mode 0755 — while the agent is typically uid 1000. Measured: the first
+// version ran as the image's user and git got `Permission denied` creating `.git`. Root can
+// make the path and give it away; the image's user cannot make it in the first place.
 const cloneScript = `set -e
 boks_dst=$0
+boks_owner=$1
 boks_src=` + workspace.SourcePath + `
 if [ -e "$boks_dst/.git" ]; then exit 0; fi
 if ! command -v git >/dev/null 2>&1; then
@@ -129,12 +141,13 @@ if [ ! -d "$boks_src/.git" ]; then
 	echo "boks: $boks_src does not hold a git repository; the host share is missing or empty." >&2
 	exit 1
 fi
+git config --system --replace-all safe.directory "$boks_src"
+git config --system --add safe.directory "$boks_src/.git"
 mkdir -p "$boks_dst"
 echo "boks: cloning the host repository into $boks_dst (nothing written here reaches the host)" >&2
-git -c safe.directory="$boks_src" -c safe.directory="$boks_src/.git" \
-	clone --no-hardlinks -- "$boks_src" "$boks_dst" >&2
-boks_dirty=$(git --no-optional-locks -c safe.directory="$boks_src" -C "$boks_src" \
-	status --porcelain 2>/dev/null | wc -l)
+git clone --no-hardlinks -- "$boks_src" "$boks_dst" >&2
+chown -R "$boks_owner" "$boks_dst"
+boks_dirty=$(git --no-optional-locks -C "$boks_src" status --porcelain 2>/dev/null | wc -l)
 if [ "${boks_dirty:-0}" -gt 0 ]; then
 	echo "boks: the host tree has $boks_dirty uncommitted change(s), and a clone carries committed" >&2
 	echo "      history only, so they are not in this sandbox. Commit them, or copy them in with" >&2
@@ -142,21 +155,11 @@ if [ "${boks_dirty:-0}" -gt 0 ]; then
 fi
 `
 
-// cloneCommand is the argv that performs the clone on its own, for a sandbox whose container
-// process is the keeper. The destination travels as $0 rather than being interpolated into
-// the script, so a host path containing a quote is a path and not a shell injection.
-func cloneCommand(dst string) []string {
-	return []string{"/bin/sh", "-c", cloneScript, dst}
-}
-
-// cloneBootstrap wraps a command so that it runs after the clone exists.
-//
-// It exists for the ephemeral sandbox, where the user's command *is* the container process
-// and there is no earlier moment to exec into. `exec "$@"` replaces the shell, so the
-// command keeps the process, its signals and its exit status; the wrapper is gone by the
-// time anything the user asked for runs.
-func cloneBootstrap(dst string, argv []string) []string {
-	return append([]string{"/bin/sh", "-c", cloneScript + "\nexec \"$@\"\n", dst}, argv...)
+// cloneCommand is the argv that makes the clone and gives it to owner, in "uid:gid" form.
+// Both travel as positional arguments rather than being interpolated into the script, so a
+// host path containing a quote is a path and not shell syntax.
+func cloneCommand(dst, owner string) []string {
+	return []string{"/bin/sh", "-c", cloneScript, dst, owner}
 }
 
 // ensureClone makes sure a clone-mode sandbox holds its clone, and reports what the guest
@@ -180,12 +183,20 @@ func ensureClone(ctx context.Context, container client.Container, task client.Ta
 		return nil
 	}
 
+	owner, err := sandboxOwner(ctx, container)
+	if err != nil {
+		return err
+	}
+
 	var stderr bytes.Buffer
 	code, err := execProcess(ctx, container, task, ExecConfig{
 		Name:    container.ID(),
-		Command: cloneCommand(fs.Clone),
-		Stdout:  io.Discard,
-		Stderr:  &stderr,
+		Command: cloneCommand(fs.Clone, owner),
+		// Root, because only root can create the workspace's absolute path inside the
+		// guest; the script gives the result to owner before anything else runs.
+		User:   "0:0",
+		Stdout: io.Discard,
+		Stderr: &stderr,
 	})
 	if err != nil {
 		return fmt.Errorf("preparing the clone in sandbox %q: %w", container.ID(), err)
@@ -198,4 +209,17 @@ func ensureClone(ctx context.Context, container client.Container, task client.Ta
 		fmt.Fprint(out, stderr.String())
 	}
 	return nil
+}
+
+// sandboxOwner is the "uid:gid" the sandbox's own processes run as, read from its spec. It is
+// who the clone has to belong to for the agent to be able to write in it.
+func sandboxOwner(ctx context.Context, container client.Container) (string, error) {
+	spec, err := container.Spec(ctx)
+	if err != nil {
+		return "", fmt.Errorf("reading the spec of sandbox %q: %w", container.ID(), err)
+	}
+	if spec.Process == nil {
+		return "", fmt.Errorf("sandbox %q has no process spec", container.ID())
+	}
+	return fmt.Sprintf("%d:%d", spec.Process.User.UID, spec.Process.User.GID), nil
 }
