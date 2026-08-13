@@ -64,8 +64,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/dagsommer/boks/internal/network"
+	"github.com/dagsommer/boks/internal/ports"
 )
 
 const (
@@ -105,6 +109,14 @@ type State struct {
 	Started   time.Time `json:"started"`
 	LogPath   string    `json:"log_path"`
 	Intercept bool      `json:"intercept"`
+	// Ports is what this sandbox currently publishes, rewritten by the supervisor after
+	// every change.
+	//
+	// It is duplicated here, rather than only being answerable over the control socket,
+	// so that `boks ls` can render a PORTS column for every sandbox by reading files. A
+	// listing that opened a socket per sandbox would be a listing that one wedged
+	// supervisor could hang.
+	Ports []ports.Published `json:"ports,omitempty"`
 }
 
 // dirFor is where one sandbox's network state lives. It is the directory that holds the
@@ -374,10 +386,27 @@ func Serve(ctx context.Context, spec Spec, ready io.Writer, watch func(context.C
 		Started:   time.Now(),
 		LogPath:   filepath.Join(dir, logFile),
 		Intercept: spec.intercepts(),
+		Ports:     session.Ports(),
 	}
 	if err := writeState(dir, st); err != nil {
 		return err
 	}
+
+	// The control socket is what makes `boks ports` work on a *running* sandbox. See
+	// control.go for why a supervisor that was built with no API now has one, and for the
+	// argument that the guest cannot reach it. A sandbox with no network gets none: there
+	// is nothing to publish into, so there is nothing to ask for.
+	if spec.Plan.Mode != network.ModeNone {
+		published := &publishedState{dir: dir, state: st}
+		session.forwarder.OnChange(published.write)
+		control, err := serveControl(controlPath(spec.StateDir, spec.Sandbox), os.Stderr,
+			func(req controlRequest) controlResponse { return handleControl(session, req) })
+		if err != nil {
+			return err
+		}
+		defer func() { _ = control.Close() }()
+	}
+
 	fmt.Fprintln(ready, readyMarker)
 
 	watched := make(chan error, 1)
@@ -395,6 +424,85 @@ func Serve(ctx context.Context, spec Spec, ready io.Writer, watch func(context.C
 	case <-ctx.Done():
 	}
 	return nil
+}
+
+// publishedState keeps the sandbox's state file in step with what is actually published.
+//
+// The forwarder calls write from whichever goroutine changed something — a control request,
+// or a connection that discovered nothing was listening in the guest — so the mutex is doing
+// real work rather than guarding against a theoretical race.
+type publishedState struct {
+	dir string
+	mu  sync.Mutex
+	// state is the whole record, kept so that rewriting the ports does not lose the rest
+	// of it.
+	state State
+}
+
+func (p *publishedState) write(list []ports.Published) {
+	p.mu.Lock()
+	p.state.Ports = list
+	st := p.state
+	p.mu.Unlock()
+	if err := writeState(p.dir, st); err != nil {
+		fmt.Fprintf(os.Stderr, "network: recording the published ports: %v\n", err)
+	}
+}
+
+// handleControl answers one control request. It is the entire API the supervisor exposes.
+//
+// Every specification is parsed here as well as in the CLI. The CLI parses to fail fast on a
+// typo; this parses because a process that trusts what arrives on a socket is a process whose
+// protection is the socket's permissions alone, and one control is not enough for something
+// that opens a hole into a VM.
+func handleControl(session *Session, req controlRequest) controlResponse {
+	if session.forwarder == nil {
+		return controlResponse{Error: "this sandbox has no virtual network to publish a port into"}
+	}
+	switch req.Op {
+	case opList:
+		return controlResponse{Ports: session.Ports()}
+
+	case opPublish:
+		var changed []ports.Published
+		for _, text := range req.Specs {
+			spec, err := ports.ParsePublish(text)
+			if err != nil {
+				return controlResponse{Error: err.Error(), Ports: session.Ports(), Changed: changed}
+			}
+			added, err := session.forwarder.Publish(spec)
+			if err != nil {
+				// Deliberately not unwound. The ports published before the
+				// failure are working, and taking them away would surprise a
+				// user who asked for three and can have two.
+				return controlResponse{Error: err.Error(), Ports: session.Ports(), Changed: changed}
+			}
+			changed = append(changed, added...)
+		}
+		return controlResponse{Ports: session.Ports(), Changed: changed}
+
+	case opUnpublish:
+		var changed []ports.Published
+		for _, text := range req.Specs {
+			spec, err := ports.ParseUnpublish(text)
+			if err != nil {
+				return controlResponse{Error: err.Error(), Ports: session.Ports(), Changed: changed}
+			}
+			removed, err := session.forwarder.Unpublish(spec)
+			if err != nil {
+				return controlResponse{Error: err.Error(), Ports: session.Ports(), Changed: changed}
+			}
+			changed = append(changed, removed...)
+		}
+		return controlResponse{Ports: session.Ports(), Changed: changed}
+
+	default:
+		// Refused rather than ignored. The set of verbs is closed on purpose — nothing
+		// here reads a secret, a policy or a log — and a supervisor that quietly
+		// accepted an unknown one would be a supervisor whose surface nobody can state.
+		return controlResponse{Error: fmt.Sprintf("unknown control operation %q; this socket accepts "+
+			"only %s, %s and %s", req.Op, opList, opPublish, opUnpublish)}
+	}
 }
 
 func writeState(dir string, st State) error {

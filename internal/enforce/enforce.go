@@ -59,6 +59,7 @@ import (
 	"github.com/dagsommer/boks/internal/ca"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
+	"github.com/dagsommer/boks/internal/ports"
 	"github.com/dagsommer/boks/internal/proxy"
 	"github.com/dagsommer/boks/internal/secret"
 	"github.com/dagsommer/boks/internal/workspace"
@@ -127,6 +128,15 @@ type Spec struct {
 	// Intercept permits terminating TLS for credential-bearing hosts. False means no CA
 	// is opened and HTTPS credential rules never fire.
 	Intercept bool `json:"intercept"`
+
+	// Publish are the -p/--publish specifications this sandbox starts with, verbatim.
+	//
+	// They travel as strings for the same reason the policy and the credential rules do:
+	// the CLI parses them to reject a mistake before anything is created, and the
+	// supervisor parses them again because it must not trust what it is handed. A spec
+	// that fails to bind fails the supervisor's start — a sandbox that came up silently
+	// without the port the user asked for would be found out by a browser, later.
+	Publish []string `json:"publish,omitempty"`
 
 	CADir    string `json:"ca_dir,omitempty"`
 	StateDir string `json:"state_dir,omitempty"`
@@ -471,6 +481,9 @@ type Session struct {
 	listener net.Listener
 	sink     *policy.FileSink
 	served   chan error
+	// forwarder owns the host listeners published for this sandbox. It is nil for a
+	// sandbox with no network: there is nothing to forward into.
+	forwarder *ports.Forwarder
 
 	closeOnce sync.Once
 	closeErr  error
@@ -494,6 +507,14 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 		// nothing else does. No stack, no proxy, no listener, no policy to evaluate —
 		// the containment is the absent wiring, not a decision anything takes at
 		// runtime.
+		if len(spec.Publish) > 0 {
+			// Publishing into a sandbox with no network would be a network, arriving
+			// through the back door of a port flag. Refuse rather than bind a host
+			// port that could never carry anything.
+			return nil, fmt.Errorf("enforce: sandbox %q has -net none, so there is no virtual "+
+				"network to publish a port into.\nRecreate it without -net none to publish ports: "+
+				"boks rm %s", spec.Sandbox, spec.Sandbox)
+		}
 		if err := n.Start(ctx); err != nil {
 			return nil, err
 		}
@@ -520,7 +541,43 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 		_ = s.Close()
 		return nil, err
 	}
+
+	// The forwarder exists whether or not anything is published yet, because `boks ports`
+	// can publish into a running sandbox and there has to be something to publish into.
+	// hasIPv6 is false because this stack is IPv4-only: internal/network drops IPv6 at the
+	// link, so a specification naming no address expands to 127.0.0.1 alone.
+	s.forwarder = ports.New(s.net.DialGuest, logger, false)
+	if err := s.publishInitial(spec); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+// publishInitial binds the ports the sandbox was started with.
+//
+// A failure here fails the whole session, and that is the intended severity: `--publish
+// 8080:3000` is a request, not a preference, and a sandbox that came up without the port
+// would be discovered by a browser showing nothing much later.
+func (s *Session) publishInitial(spec Spec) error {
+	for _, text := range spec.Publish {
+		p, err := ports.ParsePublish(text)
+		if err != nil {
+			return err
+		}
+		if _, err := s.forwarder.Publish(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Ports returns the ports currently published for this sandbox.
+func (s *Session) Ports() []ports.Published {
+	if s.forwarder == nil {
+		return nil
+	}
+	return s.forwarder.List()
 }
 
 // newEngine resolves the policy and opens the decision log both enforcement points share.
@@ -624,6 +681,12 @@ func (s *Session) Network() *network.Network { return s.net }
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		var errs []error
+		if s.forwarder != nil {
+			// First: a host port still bound after this returns is a socket
+			// accepting connections for a sandbox that no longer exists, and it is
+			// what a leak check looks for.
+			errs = append(errs, s.forwarder.Close())
+		}
 		if s.proxy != nil {
 			errs = append(errs, s.proxy.Close())
 		}

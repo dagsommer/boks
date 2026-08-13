@@ -51,6 +51,15 @@ const (
 	//
 	// It holds destinations and preset names. It holds no credential and no secret.
 	LabelPolicy = "dev.boks.policy"
+	// LabelPorts is the JSON list of `-p/--publish` specifications the sandbox was
+	// created with, as the user typed them.
+	//
+	// It is recorded for the same reason the policy is: `boks start` has no port flags,
+	// and a sandbox that forgot its published ports on restart would leave the user
+	// wondering why a bookmark stopped working. It is the *request*, not the result — a
+	// specification with no host port asks for an ephemeral one, and which one it gets is
+	// decided afresh each time the sandbox comes up.
+	LabelPorts = "dev.boks.ports"
 )
 
 // maxLabelBytes is containerd's limit on the size of one label's key and value together.
@@ -338,6 +347,17 @@ func decodeCommand(labels map[string]string) []string {
 		_ = json.Unmarshal([]byte(raw), &cmd)
 	}
 	return cmd
+}
+
+// decodePorts reads the publish specifications back. As with every other label, a sandbox
+// whose record is absent or unreadable is not broken — it predates the record — and it comes
+// up with nothing published rather than failing to come up.
+func decodePorts(labels map[string]string) []string {
+	var specs []string
+	if raw := labels[LabelPorts]; raw != "" {
+		_ = json.Unmarshal([]byte(raw), &specs)
+	}
+	return specs
 }
 
 // encodePolicyLabel serialises a sandbox's policy record, refusing to write one containerd

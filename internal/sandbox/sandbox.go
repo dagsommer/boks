@@ -117,6 +117,9 @@ type Config struct {
 	// so that a later `boks start` or `boks exec` — neither of which has policy flags —
 	// serves the sandbox the containment it was created with rather than the default.
 	Policy *policy.SandboxPolicy
+	// Ports are the `-p/--publish` specifications the sandbox is created with, recorded
+	// on the container so that `boks start` — which has no port flags — republishes them.
+	Ports []string
 	// TTY allocates a pseudo-terminal for the guest process.
 	TTY bool
 	// Ephemeral removes the sandbox, its task and its snapshot when the command exits.
@@ -390,6 +393,18 @@ func containerLabels(ctx context.Context, image client.Image, cfg Config) (map[s
 	}
 	if policyJSON != "" {
 		labels[LabelPolicy] = policyJSON
+	}
+	if len(cfg.Ports) > 0 {
+		portsJSON, err := encodeLabel(cfg.Ports)
+		if err != nil {
+			return nil, err
+		}
+		if len(portsJSON)+len(LabelPorts) > maxLabelBytes {
+			return nil, fmt.Errorf("this sandbox publishes too many ports to record on it "+
+				"(%d bytes, limit %d).\nPublish the rest with 'boks ports' once it is running",
+				len(portsJSON), maxLabelBytes-len(LabelPorts))
+		}
+		labels[LabelPorts] = portsJSON
 	}
 	if cfg.Agent != "" {
 		labels[LabelAgent] = cfg.Agent
