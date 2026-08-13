@@ -65,6 +65,15 @@ What works, tested locally:
   per-sandbox process so that it lasts as long as the sandbox's VM rather than as long as
   your command — a build running in a sandbox does not lose the network when you press
   Ctrl-C. `boks net ls` shows them, `boks stop` takes them down.
+- **Port publishing.** `boks run -p 3000` publishes a sandbox port on the host, and
+  `boks ports <name> --publish/--unpublish/--json` changes a sandbox that is already running —
+  which is what an OAuth login needs, since the browser is on your host and the CLI's
+  `127.0.0.1` listener is inside the guest. **Bound to loopback, never `0.0.0.0`**: a
+  published port is a hole from your machine into a VM running code you have not audited, and
+  on all interfaces it would be a hole from the local network into it. Omit the host port to
+  get an ephemeral one. The service inside the sandbox has to listen on the VM's external
+  interface (`0.0.0.0`, not only `127.0.0.1`), and `boks ports` says so when nothing answers.
+  TCP only — see [what is not done](#status). `boks ls` shows the mappings.
 - **Credential injection in a sandbox**, over HTTP and HTTPS. The guest holds a placeholder
   in the environment variable its tooling reads; the real secret stays on the host and is
   attached to requests for the hosts you named. Those hosts — and only those — have their
@@ -83,13 +92,21 @@ What is **not** done:
 - **No policy over names, and no UDP.** DNS is mediated by the sandbox's own resolver and
   cannot be sent anywhere else, but the names themselves are not filtered. UDP and ICMP are
   dropped with no way to ask for them, which costs QUIC and `ping`.
-- **No nested Docker**, no kits, no port publishing.
+- **No nested Docker** and no kits.
+- **Published ports are TCP only.** The grammar accepts `udp`, `udp4` and `udp6` because
+  sbx's does, and refuses them with the reason: the sandbox's network stack drops UDP at the
+  link, so a datagram has no way back. Publishing UDP would mean widening that filter, which
+  is a change to the stack's closed posture rather than a port flag.
+- **Publishing has never been driven by a real guest.** The datapath is exercised end to end
+  against a simulated one — a second gvisor stack on the far end of the real link socket —
+  which proves the host side works. A real VM reaching it through libkrun's virtio-net device
+  has not been tried.
 - **Only the base image has run in a microVM.** The agent layers were exercised with
   `docker run`, which proves each CLI is installed and starts — and nothing about isolation.
   `kiro` has no image (see [images/README.md](images/README.md) for why), and there is still
   no way to define an agent in a file rather than in code.
-- **No terminal dashboard** for bare `boks`, no `--clone`, `--kit`, `--profile` or
-  `--publish`. See the CLI surface section of the parity matrix.
+- **No terminal dashboard** for bare `boks`, and no `--clone` or `--kit`. See the CLI surface
+  section of the parity matrix.
 - **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather
   than exiting 130 silently.
 - **A crashed network supervisor is unrecoverable without a restart.** The running VM does
@@ -144,7 +161,9 @@ re-attaches to it, so installed packages, caches and shell state are still there
 
 ```bash
 ./bin/boks run shell             # create, or re-attach to this directory's shell sandbox
+./bin/boks run shell -p 3000     # ...with sandbox port 3000 on an ephemeral host port
 ./bin/boks ls                    # SANDBOX  AGENT  STATUS  PORTS  WORKSPACE
+./bin/boks ports <name>          # what it publishes; --publish/--unpublish to change it
 ./bin/boks exec -it $(./bin/boks ls -q) sh
 ./bin/boks stop <name>           # keeps everything inside
 ./bin/boks cp ./file.txt <name>:/root/file.txt
@@ -295,6 +314,7 @@ public documentation using open-source components; it is not derived from Docker
 | network policy enforced outside the guest | yes | **yes** — the host stack judges every TCP connection by address before dialling; verified against a real guest |
 | UDP and ICMP blocked at the network layer | yes | **yes**, except DNS to the sandbox's own resolver |
 | credential injection by host proxy | yes | **yes**, HTTP and HTTPS, verified inside a real guest |
+| port publishing, loopback by default | yes | **yes**, TCP; same grammar, same flags, same default. Exercised against a simulated guest only |
 | Docker daemon inside the sandbox | yes | planned |
 | kits / declarative config | yes | planned |
 | account required | yes | **never** |
@@ -316,7 +336,8 @@ enforces — what matters most is watching it work against a real guest.
 3. The interactive dashboard that bare `boks` should open
 4. Clone mode, so guest writes do not land on the host by default
 5. Docker daemon inside the guest
-6. Port publishing, and the `PORTS` column that has nothing to show without it
+6. UDP port publishing, which needs the link filter to carry a datagram's return path without
+   becoming a general hole
 8. Kits / declarative configuration
 9. Windows — **investigated; the obstacle is one device driver, not the platform.** libkrun's
    Windows Hypervisor Platform backend is in progress upstream for libkrun 2.0, and nerdbox
