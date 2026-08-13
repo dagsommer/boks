@@ -1,0 +1,125 @@
+# containerd configuration for testing the EROFS snapshotter on Windows.
+#
+# Pass it explicitly, because containerd will not find it here:
+#
+#     containerd.exe --config C:\boks-test\config.toml --log-level debug
+#
+# Every setting below exists because a real Windows 11 run fell over without it.
+# Nothing here is tuning. If you are reading this to decide what to keep, keep it all.
+
+version = 3
+
+# ---------------------------------------------------------------------------------------
+# Where containerd keeps its state.
+#
+# The defaults are under C:\ProgramData\containerd, and creating that as a normal user
+# fails outright:
+#
+#     mkdir C:\ProgramData\containerd\root: Access is denied.
+#
+# You can run elevated instead — but then this daemon writes to the same directories a
+# Docker Sandboxes or Docker Desktop containerd installation uses, and you are debugging
+# two daemons. A directory you own, plus a pipe name nothing else answers on, keeps this
+# test entirely to itself. Create the directory first; containerd does not create the
+# parent.
+#
+#     mkdir C:\cdtest\root, C:\cdtest\state
+# ---------------------------------------------------------------------------------------
+root = 'C:\cdtest\root'
+state = 'C:\cdtest\state'
+
+# ---------------------------------------------------------------------------------------
+# Disable the cimfs plugins.
+#
+# Unelevated, the cimfs snapshotter dies at init:
+#
+#     failed to init base scratch VHD: ... A required privilege is not held by the client
+#
+# That would be survivable on its own, except io.containerd.metadata.v1.bolt requires
+# EVERY snapshotter. One snapshotter failing fails bolt, which fails the differs, the
+# services and the whole gRPC layer — about forty plugins, including the erofs differ,
+# which shows up as `error` in `ctr plugins ls` for a reason that has nothing to do with
+# erofs. Turning cimfs off is the entire fix.
+#
+# Both entries are needed: the differ is a separate plugin and is useless without its
+# snapshotter. If you are running elevated and want cimfs, delete this line and expect
+# the erofs test to be unaffected either way.
+# ---------------------------------------------------------------------------------------
+disabled_plugins = [
+  'io.containerd.snapshotter.v1.cimfs',
+  'io.containerd.differ.v1.cimfs',
+]
+
+# ---------------------------------------------------------------------------------------
+# A pipe name nothing else answers on. ctr must be told the same one:
+#
+#     ctr.exe --address \\.\pipe\boks-containerd ...
+# ---------------------------------------------------------------------------------------
+[grpc]
+  address = '\\.\pipe\boks-containerd'
+
+# ---------------------------------------------------------------------------------------
+# The diff-service order.
+#
+# THE BINARY IN THIS BUNDLE ALREADY DEFAULTS TO THIS — it is spelled out here so the file
+# also works with an unpatched containerd, and so that `containerd config dump` matching
+# what you expect is not a coincidence.
+#
+# Upstream's Windows default is ['windows', 'windows-lcow']. The erofs differ is not in
+# it, so the diff service never asks the erofs differ anything, no matter how healthy
+# `ctr plugins ls` looks. The walk reaches the windows differ, which rejects the erofs
+# snapshotter's mounts:
+#
+#     number of mounts should always be 1 for Windows layers
+#
+# erofs must come FIRST. It is the only differ here that declines politely: shown a mount
+# that is not an EROFS layer it returns ErrNotImplemented and the walk continues to the
+# windows differ. The windows differs fail hard instead, which ends the walk — so erofs
+# last is the same as erofs missing.
+# ---------------------------------------------------------------------------------------
+[plugins.'io.containerd.service.v1.diff-service']
+  default = ['erofs', 'windows', 'windows-lcow']
+
+# ---------------------------------------------------------------------------------------
+# The transfer service's unpack configuration.
+#
+# ALSO ALREADY THE DEFAULT IN THIS BUNDLE'S BINARY, and also spelled out for the same
+# reasons. Without it:
+#
+#     ctr: unable to initialize unpacker: no unpack platforms defined: invalid argument
+#     daemon: "Unpack configuration not supported, skipping" platform=linux/amd64 snapshotter=erofs
+#
+# Upstream's Windows default has exactly one entry — windows/amd64 on the windows
+# snapshotter — so `--platform linux/amd64 --snapshotter erofs` matches nothing and the
+# unpacker is built with no platforms at all. (`ctr --local` sidesteps this because it
+# never goes through the transfer service.)
+#
+# Setting unpack_config in TOML REPLACES the built-in list rather than adding to it, so
+# the windows entry has to be repeated here or Windows-container pulls stop working.
+#
+# optional = true on the erofs entry matters: without it, a host where mkfs.erofs.exe is
+# not on PATH — where the erofs differ skips itself — fails to start the transfer plugin
+# at all.
+# ---------------------------------------------------------------------------------------
+[plugins.'io.containerd.transfer.v1.local']
+
+  [[plugins.'io.containerd.transfer.v1.local'.unpack_config]]
+    platform = 'windows/amd64'
+    snapshotter = 'windows'
+    differ = 'windows'
+
+  [[plugins.'io.containerd.transfer.v1.local'.unpack_config]]
+    platform = 'linux/amd64'
+    snapshotter = 'erofs'
+    differ = 'erofs'
+    optional = true
+
+# ---------------------------------------------------------------------------------------
+# Optional: mkfs.erofs options.
+#
+# Not needed, and left commented out because they have not been tried on Windows.
+# --sort=none avoids a tar reordering pass and is a straight win on erofs-utils >= 1.8.2;
+# -T0 --mkfs-time makes layers reproducible.
+# ---------------------------------------------------------------------------------------
+# [plugins.'io.containerd.differ.v1.erofs']
+#   mkfs_options = ['-T0', '--mkfs-time', '--sort=none']
