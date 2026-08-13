@@ -1,0 +1,394 @@
+From ae42c27b5411ecb19a5145cec4e53e235910e624 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 21:52:18 +0200
+Subject: [PATCH 30/30] windows: stop telling the guest its APIC timer runs at
+ 1 kHz
+
+The first Linux boot on WHP came out with every one of its 78 console
+lines carrying the same printk timestamp, [0.190255], across 1.3s of host
+wall clock. That is the signature of a dead tick, not a dead clocksource:
+printk timestamps come from local_clock(), and on the unstable-sched-clock
+path sched_clock_local() clamps its result to scd->tick_gtod + TICK_NSEC.
+tick_gtod is only advanced by sched_clock_tick(), which only runs from the
+timer interrupt, so once the tick stops every later printk reports the
+same value -- one that is deliberately not tick-aligned.
+
+The tick stopped because of the crystal frequency in CPUID leaf 0x15.
+native_calibrate_tsc() (arch/x86/kernel/tsc.c) reads the leaf once and
+derives three things from it:
+
+    crystal_khz        = ECX / 1000
+    tsc_khz            = crystal_khz * EBX / EAX
+    lapic_timer_period = crystal_khz * 1000 / HZ
+
+Describing the crystal as 1 kHz (ECX=1000, EAX=1, EBX=tsc_hz/1000) makes
+the second line exact -- which is why the host log looked right and the
+guest's TSC really did run at the advertised rate -- and the third line
+degenerate: crystal_khz truncates to 1 and lapic_timer_period becomes
+1000/HZ, i.e. 4 counts at HZ=250. __setup_APIC_LVTT() then writes
+lapic_timer_period / APIC_DIVISOR == 0 to the APIC initial-count register,
+and a zero initial count stops the timer (SDM Vol. 3 11.5.4). No timer
+interrupt ever arrives: no jiffies, no sched_clock_tick(), no hrtimers,
+so every timeout and sleep in the guest hangs.
+
+The KVM backend never meets this because KvmIoapic::new creates an
+in-kernel i8254 and the guest calibrates against the PIT; hvf is aarch64
+and uses the architected timer. WHP has no PIT, no HPET and no PM timer,
+so CPUID is the guest's only source for both frequencies -- and the
+"already calibrated" shortcut in calibrate_APIC_clock() is the path we
+want it on, because the empirical fallback ends in a verification pass
+that counts jiffies a nonexistent PIT never delivers.
+
+So publish a real crystal frequency: ask WHP for its interrupt clock
+(WHvCapabilityCodeInterruptClockFrequency), fall back to the 100 MHz that
+crosvm's WHPX backend uses for a partition with WHP LAPIC emulation, and
+build EBX/EAX as the ratio that reproduces the measured TSC frequency
+against it. Linux computes crystal_khz * EBX in 32-bit arithmetic, so the
+denominator is sized to keep that product under 2^32 -- the real
+constraint, rather than the overflow in EBX alone the old comment worried
+about.
+
+UNVERIFIED: no Windows host was available. The arithmetic is tested
+against a transcription of the kernel's own formula, but whether WHP's
+emulated LAPIC really counts at the frequency it reports is undocumented,
+which is why both the reported and the used value are logged.
+---
+ src/vmm/src/windows/vstate.rs |   9 ++
+ src/whp/src/lib.rs            | 257 ++++++++++++++++++++++++++++++----
+ 2 files changed, 242 insertions(+), 24 deletions(-)
+
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+index 52077df..fcaf729 100644
+--- a/src/vmm/src/windows/vstate.rs
++++ b/src/vmm/src/windows/vstate.rs
+@@ -26,6 +26,15 @@
+ //!   `WHvPartitionPropertyCodeCpuidExitList`, which the partition setup does not
+ //!   request. CPU templates are therefore rejected rather than ignored — see
+ //!   [`Vcpu::configure_x86_64`].
++//! * **A PIT.** `KvmIoapic::new` asks KVM for an in-kernel i8254 alongside the
++//!   irqchip, and that PIT is what a Linux guest measures its TSC and its local
++//!   APIC timer against when CPUID cannot tell it those frequencies. Nothing
++//!   here emulates one — nor an HPET, nor an ACPI PM timer — so the guest has
++//!   no reference clock to calibrate from and everything it knows about time
++//!   has to arrive through CPUID. That is what `WhpVm::crystal_clock_cpuid`
++//!   exists for, and why the values it publishes are load-bearing rather than
++//!   cosmetic: get the crystal frequency wrong and the guest programs its APIC
++//!   timer with a count of zero, which stops the timer and with it the tick.
+ //! * **Exception injection.** `WHvRequestInterrupt` delivers external
+ //!   interrupts only. Injecting a `#GP` (which is what KVM does for an
+ //!   unhandled MSR by default) would need `WHvX64RegisterPendingEvent`; see
+diff --git a/src/whp/src/lib.rs b/src/whp/src/lib.rs
+index 69ec85d..cd5e6a6 100644
+--- a/src/whp/src/lib.rs
++++ b/src/whp/src/lib.rs
+@@ -21,14 +21,14 @@ use windows_sys::Win32::System::Hypervisor::{
+     WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT,
+     WHV_TRANSLATE_GVA_RESULT_CODE, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT,
+     WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
+-    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorFeaturesBanks,
+-    WHvCreatePartition, WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
+-    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
+-    WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
+-    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+-    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExtendedVmExits,
+-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
+-    WHvPartitionPropertyCodeProcessorFeaturesBanks,
++    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeInterruptClockFrequency,
++    WHvCapabilityCodeProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor,
++    WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator,
++    WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
++    WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
++    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList,
++    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
++    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
+     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+     WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRequestInterrupt, WHvRunVirtualProcessor,
+     WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
+@@ -42,6 +42,15 @@ use windows_sys::Win32::System::Hypervisor::{
+ };
+ use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+ 
++/// The rate the guest's local APIC timer is assumed to count at when WHP will
++/// not tell us, in Hz.
++///
++/// crosvm's WHPX backend uses this same value for a partition with WHP local
++/// APIC emulation enabled (`WHPX_LOCAL_APIC_EMULATION_APIC_FREQUENCY`), which is
++/// the configuration this backend runs. See [`WhpVm::detect_lapic_frequency`]
++/// for what the number is used for and what happens if it is wrong.
++const DEFAULT_LAPIC_FREQUENCY_HZ: u64 = 100_000_000;
++
+ #[derive(Debug)]
+ pub enum Error {
+     CheckCapability(i32),
+@@ -282,8 +291,9 @@ impl WhpVm {
+         };
+ 
+         let tsc_freq_hz = Self::detect_tsc_frequency();
++        let lapic_freq_hz = Self::detect_lapic_frequency();
+ 
+-        if let Err(e) = Self::configure_partition(handle, vcpu_count, tsc_freq_hz) {
++        if let Err(e) = Self::configure_partition(handle, vcpu_count, tsc_freq_hz, lapic_freq_hz) {
+             let _ = unsafe { WHvDeletePartition(handle) };
+             return Err(e);
+         }
+@@ -296,6 +306,7 @@ impl WhpVm {
+         handle: WHV_PARTITION_HANDLE,
+         vcpu_count: u32,
+         tsc_freq_hz: u64,
++        lapic_freq_hz: u64,
+     ) -> Result<(), Error> {
+         Self::set_property(handle, WHvPartitionPropertyCodeProcessorCount, |p| {
+             p.ProcessorCount = vcpu_count;
+@@ -458,25 +469,18 @@ impl WhpVm {
+         }
+ 
+         // Standard Intel CPUID leaves (Intel's SDM Vol. 2A)
+-        if tsc_freq_hz > 0 {
+-            debug!("Providing TSC frequency to guest: {} Hz", tsc_freq_hz);
+-
+-            // CPUID 0x15 — TSC / Core Crystal Clock (Intel SDM)
+-            // Formula: TSC Frequency = ECX (Crystal Hz) * EBX/EAX (Ratio)
+-            //
+-            // We use a 1 kHz crystal (ECX=1000, EAX=1) rather than a 1 Hz crystal.
+-            // This prevents a 32-bit overflow in EBX for CPUs clocked above 4.29 GHz,
+-            // while maintaining high precision (millisecond-level).
+-            // Max representable frequency: 1000 * (2^32 - 1) ≈ 4.29 THz.
+-            let crystal_khz: u32 = 1_000;
+-            let ebx_val = (tsc_freq_hz / crystal_khz as u64) as u32;
++        if let Some((eax, ebx, ecx)) = Self::crystal_clock_cpuid(tsc_freq_hz, lapic_freq_hz) {
++            debug!(
++                "Providing TSC frequency to guest: {} Hz (CPUID 0x15 ratio {}/{} of a {} Hz crystal)",
++                tsc_freq_hz, ebx, eax, ecx
++            );
+ 
+             cpuid_results.push(WHV_X64_CPUID_RESULT {
+                 Function: 0x15,
+                 Reserved: [0; 3],
+-                Eax: 1,
+-                Ebx: ebx_val,
+-                Ecx: crystal_khz,
++                Eax: eax,
++                Ebx: ebx,
++                Ecx: ecx,
+                 Edx: 0,
+             });
+         }
+@@ -612,6 +616,145 @@ impl WhpVm {
+         0
+     }
+ 
++    /// Detect the frequency, in Hz, at which the guest's local APIC timer
++    /// counts down.
++    ///
++    /// This is the number Linux calls the *core crystal clock*: on real
++    /// hardware the same crystal feeds the TSC and the local APIC timer, so
++    /// `native_calibrate_tsc()` (arch/x86/kernel/tsc.c) takes CPUID 0x15's ECX
++    /// and derives `lapic_timer_period` from it. The guest has no other way to
++    /// learn it — there is no PIT, no HPET and no ACPI PM timer on this
++    /// backend, so the empirical `calibrate_APIC_clock()` path that would
++    /// measure it cannot be reached safely (with `lapic_timer_period` unset the
++    /// kernel registers a nonexistent i8253 as `global_clock_event`, and the
++    /// verification pass that follows counts jiffies that never arrive).
++    ///
++    /// WHP reports the host's interrupt clock frequency as a capability; per
++    /// the `WHvGetCapability` docs the processor capabilities are "retrieved by
++    /// querying the corresponding properties of the root partition", which is
++    /// where the same value would come from for a Hyper-V partition's
++    /// `HV_X64_MSR_APIC_FREQUENCY`. UNVERIFIED: whether the LAPIC that WHP
++    /// emulates for a *child* partition counts at that rate is not documented,
++    /// and crosvm's WHPX backend hardcodes 100 MHz instead with a TODO saying
++    /// it "gives us better results than the frequency that WSL seems to use,
++    /// which is 500MHz". Both values are therefore logged: if the guest's tick
++    /// runs at the wrong rate, the ratio between wall-clock time and guest
++    /// uptime is the correction factor and this log line says what to correct.
++    fn detect_lapic_frequency() -> u64 {
++        let mut capability = MaybeUninit::<WHV_CAPABILITY>::uninit();
++        let mut written_size: u32 = 0;
++
++        let reported = unsafe {
++            let hr = WHvGetCapability(
++                WHvCapabilityCodeInterruptClockFrequency,
++                capability.as_mut_ptr().cast(),
++                mem::size_of::<WHV_CAPABILITY>() as u32,
++                &mut written_size,
++            );
++
++            if hr == S_OK {
++                capability.assume_init().InterruptClockFrequency
++            } else {
++                debug!("WHvCapabilityCodeInterruptClockFrequency unavailable: HRESULT 0x{hr:08x}");
++                0
++            }
++        };
++
++        // Anything outside this range is not a plausible APIC timer rate and is
++        // more likely to be a capability this build of WHP does not really
++        // implement. Falling back is safer than believing it: too low a
++        // frequency only makes the guest's timer interrupts arrive early (the
++        // kernel simply reprograms), while too high a one stretches every
++        // timeout the guest sets.
++        const MIN_LAPIC_FREQUENCY_HZ: u64 = 1_000_000;
++        const MAX_LAPIC_FREQUENCY_HZ: u64 = 4_000_000_000;
++
++        if (MIN_LAPIC_FREQUENCY_HZ..=MAX_LAPIC_FREQUENCY_HZ).contains(&reported) {
++            debug!("LAPIC timer frequency from WHP: {reported} Hz");
++            reported
++        } else {
++            debug!(
++                "WHP reported LAPIC timer frequency {reported} Hz; using the {} Hz default instead",
++                DEFAULT_LAPIC_FREQUENCY_HZ
++            );
++            DEFAULT_LAPIC_FREQUENCY_HZ
++        }
++    }
++
++    /// Builds the EAX/EBX/ECX of CPUID leaf 0x15 for a guest whose TSC runs at
++    /// `tsc_freq_hz` and whose local APIC timer counts at `lapic_freq_hz`.
++    ///
++    /// The leaf's documented meaning (Intel SDM Vol. 2A) is
++    ///
++    /// ```text
++    /// TSC frequency = ECX (core crystal Hz) * EBX / EAX
++    /// ```
++    ///
++    /// but ECX is not merely an input to that ratio. Linux reads the leaf once
++    /// and takes *three* numbers out of it:
++    ///
++    /// ```text
++    /// crystal_khz        = ECX / 1000
++    /// tsc_khz            = crystal_khz * EBX / EAX
++    /// lapic_timer_period = crystal_khz * 1000 / HZ
++    /// ```
++    ///
++    /// The last line is why this function exists. Describing the crystal as
++    /// 1 kHz (ECX = 1000, EAX = 1, EBX = tsc_hz / 1000) makes the TSC frequency
++    /// come out exactly right and the APIC timer period come out as
++    /// `1000 / HZ` — 4 counts at HZ=250. `__setup_APIC_LVTT()` then programs
++    /// the APIC initial-count register with `lapic_timer_period / 16`, which
++    /// truncates to 0, and a 0 initial count *stops* the APIC timer (SDM Vol. 3
++    /// §11.5.4). A guest with a stopped APIC timer takes no timer interrupt at
++    /// all: no jiffies, no `sched_clock_tick()`, no hrtimers, so every timeout
++    /// and every sleep hangs and printk timestamps freeze at the last tick.
++    ///
++    /// So ECX has to be a real crystal frequency and EBX/EAX the ratio that
++    /// goes with it. Two constraints shape the ratio:
++    ///
++    /// * Linux computes `crystal_khz * EBX` in 32-bit arithmetic, so that
++    ///   product — equivalently `tsc_khz * EAX` — must stay below 2^32 or the
++    ///   guest's TSC frequency wraps to nonsense. The denominator is capped
++    ///   accordingly, which is what limits the precision here rather than the
++    ///   older overflow concern about EBX alone.
++    /// * `crystal_khz` is `ECX / 1000` truncated, so the ratio is built against
++    ///   the truncated value, not against `lapic_freq_hz`, or the TSC frequency
++    ///   the guest computes would be off by the truncation.
++    ///
++    /// Returns `None` when no ratio can be represented, in which case the leaf
++    /// is left alone: a leaf 0x15 with a zero EAX or EBX makes
++    /// `native_calibrate_tsc()` bail out, which is worse than not overriding it.
++    fn crystal_clock_cpuid(tsc_freq_hz: u64, lapic_freq_hz: u64) -> Option<(u32, u32, u32)> {
++        let crystal_khz = lapic_freq_hz / 1000;
++        let tsc_khz = tsc_freq_hz / 1000;
++        if crystal_khz == 0 || tsc_khz == 0 {
++            return None;
++        }
++
++        // The largest denominator the 32-bit product allows, because the
++        // rounding error on the TSC frequency the guest computes is
++        // crystal_khz / (2 * denominator) kHz — about 12 ppm for a 100 MHz
++        // crystal here, comfortably below the error of the QPC measurement it
++        // is quantising.
++        let max_product = u64::from(u32::MAX);
++        let denominator = max_product / tsc_khz;
++        let mut numerator = (tsc_khz * denominator + crystal_khz / 2) / crystal_khz;
++        // Rounding up must not be what pushes the product over the limit.
++        if crystal_khz * numerator > max_product {
++            numerator -= 1;
++        }
++
++        if denominator == 0 || numerator == 0 {
++            return None;
++        }
++
++        // ECX is the *truncated* crystal, so that the guest's `ECX / 1000` is
++        // the same `crystal_khz` the ratio above was built against.
++        let ecx = u32::try_from(crystal_khz * 1000).ok()?;
++
++        Some((denominator as u32, numerator as u32, ecx))
++    }
++
+     /// Maps a host memory region into the guest physical address space.
+     ///
+     /// # Safety
+@@ -1182,3 +1325,69 @@ impl Drop for WhpVcpu {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The numbers Linux derives from CPUID leaf 0x15, transcribed from
++    /// `native_calibrate_tsc()` (arch/x86/kernel/tsc.c) — including the 32-bit
++    /// multiplications, which is where a ratio that is "obviously" fine in
++    /// 64-bit arithmetic turns into a wrapped TSC frequency.
++    fn linux_derived(eax: u32, ebx: u32, ecx: u32, hz: u32) -> (u32, u32) {
++        let crystal_khz = ecx / 1000;
++        let tsc_khz = crystal_khz.wrapping_mul(ebx) / eax;
++        let lapic_timer_period = crystal_khz.wrapping_mul(1000) / hz;
++        (tsc_khz, lapic_timer_period)
++    }
++
++    #[test]
++    fn leaf_15_keeps_the_apic_timer_running() {
++        for hz in [100u32, 250, 300, 1000] {
++            for tsc_hz in [
++                1_000_000_000u64,
++                2_793_442_500,
++                3_800_000_000,
++                5_500_000_000,
++            ] {
++                let (eax, ebx, ecx) =
++                    WhpVm::crystal_clock_cpuid(tsc_hz, DEFAULT_LAPIC_FREQUENCY_HZ)
++                        .expect("a ratio must exist for a plausible TSC/crystal pair");
++                let (tsc_khz, lapic_timer_period) = linux_derived(eax, ebx, ecx, hz);
++
++                let want_khz = (tsc_hz / 1000) as u32;
++                let error_ppm =
++                    u64::from(tsc_khz.abs_diff(want_khz)) * 1_000_000 / u64::from(want_khz);
++                assert!(
++                    error_ppm <= 100,
++                    "TSC frequency off by {error_ppm} ppm at {tsc_hz} Hz (guest sees {tsc_khz} kHz)"
++                );
++
++                // The point of the exercise: `__setup_APIC_LVTT()` writes
++                // `lapic_timer_period / APIC_DIVISOR` to the APIC initial-count
++                // register, and a zero initial count stops the timer.
++                assert!(
++                    lapic_timer_period / 16 > 0,
++                    "APIC initial count truncates to 0 at HZ={hz}, {tsc_hz} Hz"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn leaf_15_is_omitted_when_a_frequency_is_unknown() {
++        assert!(WhpVm::crystal_clock_cpuid(0, DEFAULT_LAPIC_FREQUENCY_HZ).is_none());
++        assert!(WhpVm::crystal_clock_cpuid(2_793_442_500, 0).is_none());
++    }
++
++    /// What this replaced: a "1 kHz crystal" reports the TSC frequency exactly
++    /// and still stops the guest's APIC timer dead. Kept as a test so the
++    /// regression is described rather than merely avoided.
++    #[test]
++    fn a_1khz_crystal_would_stop_the_apic_timer() {
++        let (tsc_khz, lapic_timer_period) = linux_derived(1, 2_793_442, 1000, 250);
++        assert_eq!(tsc_khz, 2_793_442, "the TSC frequency looked perfect");
++        assert_eq!(lapic_timer_period, 4);
++        assert_eq!(lapic_timer_period / 16, 0, "...and the tick never arrived");
++    }
++}
+-- 
+2.53.0
+
