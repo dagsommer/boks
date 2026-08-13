@@ -187,16 +187,34 @@ func (s *controlServer) handle(conn net.Conn) {
 		return
 	}
 
-	var req controlRequest
-	if err := json.NewDecoder(io.LimitReader(conn, maxControlRequest)).Decode(&req); err != nil {
+	req, err := readRequest(conn)
+	if err != nil {
 		_ = writeResponse(conn, controlResponse{Error: fmt.Sprintf("unreadable control request: %v", err)})
 		return
 	}
 	_ = writeResponse(conn, s.handler(req))
 }
 
-func writeResponse(w io.Writer, resp controlResponse) error {
-	data, err := json.Marshal(resp)
+// The four halves of the wire format. One JSON value in each direction, size-limited, so that
+// a client which connects and then sends nothing useful costs the supervisor a bounded amount
+// of memory and a bounded amount of time.
+func writeRequest(w io.Writer, req controlRequest) error    { return writeJSONLine(w, req) }
+func writeResponse(w io.Writer, resp controlResponse) error { return writeJSONLine(w, resp) }
+
+func readRequest(r io.Reader) (controlRequest, error) {
+	var req controlRequest
+	err := json.NewDecoder(io.LimitReader(r, maxControlRequest)).Decode(&req)
+	return req, err
+}
+
+func readResponse(r io.Reader) (controlResponse, error) {
+	var resp controlResponse
+	err := json.NewDecoder(io.LimitReader(r, maxControlRequest)).Decode(&resp)
+	return resp, err
+}
+
+func writeJSONLine(w io.Writer, v any) error {
+	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
@@ -269,16 +287,11 @@ func call(ctx context.Context, stateDir, sandbox string, req controlRequest) (co
 		_ = conn.SetDeadline(time.Now().Add(controlDeadline))
 	}
 
-	data, err := json.Marshal(req)
-	if err != nil {
-		return controlResponse{}, err
-	}
-	if _, err := conn.Write(append(data, '\n')); err != nil {
+	if err := writeRequest(conn, req); err != nil {
 		return controlResponse{}, fmt.Errorf("sending a request to the network of %s: %w", sandbox, err)
 	}
-
-	var resp controlResponse
-	if err := json.NewDecoder(io.LimitReader(conn, maxControlRequest)).Decode(&resp); err != nil {
+	resp, err := readResponse(conn)
+	if err != nil {
 		return controlResponse{}, fmt.Errorf("reading the reply from the network of %s: %w", sandbox, err)
 	}
 	if resp.Error != "" {
