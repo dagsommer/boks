@@ -1389,6 +1389,45 @@ standard exists to prevent.
 Linux and macOS behaviour is untouched. `gofmt`, `go vet`, `go test ./... -count=1` are clean,
 and `linux/amd64`, `darwin/arm64` and `windows/amd64` all build.
 
+### Host-side file permissions are not enforced on Windows
+
+This is a gap in the security model, not a porting detail, and it is written down here because
+the tests that used to make it visible no longer run on Windows.
+
+Boks keeps three things on the host that no other user of the machine should be able to read or
+rewrite: the encrypted secret store, the policy store, and files `boks cp` pulls out of a
+sandbox. On Unix the guarantee is a POSIX mode — `0600` on the files, `0700` on the directory —
+and three tests assert it: `TestStorePermissions` and the mode half of
+`TestFileStoreIsEncryptedAndPrivate` and `TestTarRoundTripDirectory`.
+
+None of that can be stated on Windows. Access control there lives in the file's DACL, and
+`os.FileMode` does not carry a DACL: Go synthesises the mode from `FILE_ATTRIBUTE_READONLY`
+alone, so `Stat` reports `0666` for every writable file whatever its ACL actually says. A
+`perm&0o077 == 0` assertion would therefore be measuring nothing, and `os.Chmod(path, 0o000)`
+does not make a file unreadable — it only sets the read-only attribute. The three assertions are
+guarded with `runtime.GOOS` and the reasoning is written at each one.
+
+**What that leaves.** On Windows these files get whatever ACL they inherit from their parent
+directory, which for `%LocalAppData%` is normally owner-and-administrators — usually adequate on
+a single-user machine, and not something Boks sets, checks, or promises. Boks does not call
+`SetNamedSecurityInfo`, does not create the state directory with an explicit DACL, and has no
+test that another account cannot read the secret store. Nothing about a file's readability by
+other local users is verified on Windows.
+
+**What still holds there.** The secret store's contents, which is the half that survives being
+copied off the machine: it is encrypted, the AEAD detects tampering, and even the *names* of the
+services a machine holds credentials for are inside the ciphertext. Those assertions run on
+Windows, which is why `TestFileStoreIsEncryptedAndPrivate` narrows one check rather than
+skipping the test. `TestUnopenableStoreFailsClosed` likewise reaches the fail-closed property —
+a policy store that is present but unreadable must stop the caller, never resolve to the
+defaults — through a mechanism both platforms have.
+
+**What closing it would take.** Creating the state directory with an explicit DACL granting only
+the current user, via `golang.org/x/sys/windows`, and a test that asserts the resulting DACL
+rather than a mode. That is a new dependency edge and code that can only be verified on a
+Windows machine, so it is deliberately not attempted before there is a Windows backend for it to
+protect.
+
 ---
 
 ## What is unknown
