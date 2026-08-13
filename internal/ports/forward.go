@@ -108,14 +108,29 @@ func (f *Forwarder) Publish(spec Spec) ([]Published, error) {
 		return nil, errors.New("ports: no sandbox port to forward to")
 	}
 
+	addrs := spec.Binds(f.hasIPv6)
+
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
 		return nil, errors.New("ports: this sandbox's network has been shut down")
 	}
+	// A port this sandbox already publishes is refused *before* the bind, so the user is
+	// told which sandbox has it rather than getting the operating system's message about
+	// an address in use. Only a named host port can be checked this early; an ephemeral
+	// one has no number yet, and is checked again after it is allocated.
+	if spec.HostPort != 0 {
+		for _, addr := range addrs {
+			k := key{host: addr.String(), port: spec.HostPort,
+				sandbox: spec.SandboxPort, udp: spec.Protocol.IsUDP()}
+			if e, exists := f.entries[k]; exists {
+				f.mu.Unlock()
+				return nil, fmt.Errorf("ports: %s is already published for this sandbox; "+
+					"unpublish it first", e.pub)
+			}
+		}
+	}
 	f.mu.Unlock()
-
-	addrs := spec.Binds(f.hasIPv6)
 	listeners := make([]net.Listener, 0, len(addrs))
 	published := make([]Published, 0, len(addrs))
 	port := spec.HostPort
