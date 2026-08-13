@@ -4,6 +4,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // The built-in set is sbx's, so that a habit formed there works here.
@@ -47,6 +49,84 @@ func TestRunnableAgentsPointAtBoksImages(t *testing.T) {
 		if len(a.Init) == 0 {
 			t.Errorf("agent %q has an image but no init prefix", a.Name)
 		}
+	}
+}
+
+// An agent's allowlist becomes a default allow in every sandbox running that agent, so this
+// is the test that guards what may go in one. Each entry has to parse, carry the reason it
+// is there, name a port, and not be a wildcard over somebody else's tenants.
+func TestAgentAllowlistsAreNarrowAndExplained(t *testing.T) {
+	// Domains where a wildcard would allow content someone else controls. Those are the
+	// wildcards worth refusing: `*.githubcopilot.com` is GitHub's own service domain and
+	// is fine, `*.githubusercontent.com` would be every user's repository content.
+	multiTenant := []string{
+		"githubusercontent.com", "googleapis.com", "amazonaws.com", "blob.core.windows.net",
+		"cloudfront.net", "s3.amazonaws.com", "pages.dev", "workers.dev",
+	}
+	// Telemetry endpoints seen while researching these lists. None of them belongs in a
+	// default allowlist: a run with one of them blocked was observed to break nothing.
+	telemetry := []string{
+		"statsig", "sentry", "datadog", "segment", "ab.chatgpt.com", "collector.github.com",
+		"exp-tas.com", "copilot-telemetry", "play.googleapis.com", "firebaselogging",
+		"clearcut", "amplitude", "posthog", "mixpanel",
+	}
+
+	for _, a := range Builtin().All() {
+		for _, d := range a.Allow {
+			rule, err := policy.ParseRule(policy.Allow, d.Spec)
+			if err != nil {
+				t.Errorf("agent %q: %q does not parse: %v", a.Name, d.Spec, err)
+				continue
+			}
+			if d.Why == "" {
+				t.Errorf("agent %q: %q has no reason attached", a.Name, d.Spec)
+			}
+			if rule.Ports.Any() {
+				t.Errorf("agent %q: %q allows every port; pin it to 443", a.Name, d.Spec)
+			}
+			if strings.HasPrefix(d.Spec, "*:") || d.Spec == "*" {
+				t.Errorf("agent %q: %q is a catch-all", a.Name, d.Spec)
+			}
+			for _, host := range multiTenant {
+				if strings.HasPrefix(d.Spec, "*.") && strings.Contains(d.Spec, host) {
+					t.Errorf("agent %q: %q wildcards a multi-tenant domain", a.Name, d.Spec)
+				}
+			}
+			for _, t9y := range telemetry {
+				if strings.Contains(d.Spec, t9y) {
+					t.Errorf("agent %q: %q looks like telemetry, which is not a default allow", a.Name, d.Spec)
+				}
+			}
+		}
+	}
+
+	// The one entry confirmed by a real run rather than by reading has to stay.
+	claude, _ := Builtin().Lookup("claude")
+	found := false
+	for _, d := range claude.Allow {
+		if d.Spec == "api.anthropic.com:443" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("claude no longer allows api.anthropic.com:443, which a real run needed")
+	}
+	if rules := claude.AllowRules(); len(rules) != len(claude.Allow) || rules[0].Action != policy.Allow {
+		t.Errorf("AllowRules did not render the allowlist as allow rules: %+v", rules)
+	}
+}
+
+// A definition that cannot produce a rule is caught when it is registered, not when someone
+// tries to run the agent — where the only choices left are refusing to run it or dropping the
+// rule, and dropping it would leave a policy with a hole nothing announced.
+func TestAnUnparseableAllowlistEntryIsRejected(t *testing.T) {
+	r := &Registry{}
+	err := r.Add(Agent{Name: "bad", Allow: []Destination{{Spec: "*.*.example.com", Why: "nonsense"}}})
+	if err == nil {
+		t.Fatal("an unparseable allowlist entry was registered")
+	}
+	if !strings.Contains(err.Error(), "example.com") {
+		t.Errorf("error %q does not name the offending destination", err)
 	}
 }
 
