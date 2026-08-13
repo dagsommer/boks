@@ -116,6 +116,19 @@ func TestAgentAllowlistsAreNarrowAndExplained(t *testing.T) {
 	}
 }
 
+// Every run began with three lines of tini warning that reads like a fault: tini is not PID 1
+// inside a microVM — the guest's own init is — so without -s it registers as no kind of
+// reaper and orphans go past it. The fix is to make the reaping work, not to hide the notice,
+// so the flag has to stay in the prefix and in the images' ENTRYPOINT.
+func TestTiniRegistersAsASubreaper(t *testing.T) {
+	if !slices.Contains(initArgv, "-s") {
+		t.Errorf("init prefix %v does not register tini as a subreaper", initArgv)
+	}
+	if initArgv[0] != "/usr/bin/tini" || initArgv[len(initArgv)-2] != "--" {
+		t.Errorf("init prefix %v is no longer tini with a separator before the entrypoint", initArgv)
+	}
+}
+
 // A definition that cannot produce a rule is caught when it is registered, not when someone
 // tries to run the agent — where the only choices left are refusing to run it or dropping the
 // rule, and dropping it would leave a policy with a hole nothing announced.
