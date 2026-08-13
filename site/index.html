@@ -5,24 +5,24 @@ layout: home
 {% comment %}
 The landing page.
 
-     Two rules govern what may be written here, and they are not in tension as often as they
-     look. The first is that nothing on this page may be a claim the documents do not already
-     support: no benchmark, no adjective standing in for a measurement, no "enterprise-grade".
-     The second is that the page may be as good-looking as it likes, because a design is not a
-     claim. Where the two meet — the platform table below — the design job is to make an
-     unflattering fact easy to read, not to make it smaller.
+     Two rules govern what is written here. The first is that nothing on this page may be a
+     claim the documents do not already support: no benchmark, no adjective standing in for
+     a measurement, no "enterprise-grade". The second is that every sentence is for a
+     visitor deciding whether to use Boks — what it is, whether it runs on their machine,
+     how to install it, what it does — never about how the project works internally. Where
+     the two meet — the platform cards below — the design job is to make an unflattering
+     fact easy to read, not to make it smaller.
 
-     What is deliberately absent: the provenance of any measurement. Hardware, dates and
-     host-versus-guest tables are a development record, and they live in docs/verification.md,
-     which every claim here links to. The conclusion belongs on a front page; the lab notebook
-     does not.
+     Provenance of the measurements (hardware, dates, host-versus-guest tables) lives in
+     docs/verification.md in the repository, which the claims here link to. The conclusion
+     belongs on a front page; the lab notebook does not.
 {% endcomment %}
 
 <section class="band">
   <div class="wrap">
     <h2 class="band-title">Where it runs</h2>
-    <p class="band-lede">Three answers, and only one of them is yes. Check this before you
-      spend an hour on the setup.</p>
+    <p class="band-lede">Check this first — it decides whether the rest of the site is worth
+      your evening.</p>
 
     <div class="platforms">
       <div class="platform yes">
@@ -36,44 +36,99 @@ The landing page.
         <p>Built and designed for. Nobody on this project has exercised it end to end, so you
           would be the first.</p>
       </div>
-      <div class="platform no">
-        <p class="platform-state">Does not run</p>
+      <div class="platform soon">
+        <p class="platform-state">In progress</p>
         <h3>Windows</h3>
-        <p>No native build. Inside WSL2 it should run unchanged — designed for, never
-          executed. <a href="{{ '/windows/' | relative_url }}">The whole analysis</a>.</p>
+        <p>A Windows hypervisor backend is being built and most of the VMM already compiles
+          in CI — but no sandbox has ever booted here. Until one does, the route is the Linux
+          build <a href="{{ '/install/' | relative_url }}#meanwhile-run-the-linux-build-inside-wsl2">inside WSL2</a>.</p>
       </div>
     </div>
   </div>
 </section>
 
 <section class="band alt">
+  <div class="wrap">
+    <h2 class="band-title">What you get</h2>
+    <p class="band-lede">A sandbox is its own virtual machine with its own kernel — and
+      everything else follows from taking that boundary seriously.</p>
+
+    <div class="features">
+      <div class="feature">
+        <h3>A VM, not a container</h3>
+        <p>Each sandbox boots its own Linux kernel under a hypervisor. The guest reports its
+          own kernel, its own uptime, its own memory — a shared-kernel container can produce
+          none of that.</p>
+        <p><a class="arrow-link" href="{{ '/security-model/' | relative_url }}">Security model</a></p>
+      </div>
+      <div class="feature">
+        <h3>Your directory, nothing above it</h3>
+        <p>The workspace appears in the guest at its exact host path. Writes reach your
+          files; parent directories are not exposed; a symlink pointing at
+          <code>~/.ssh</code> resolves inside the guest, not on your host.</p>
+        <p><a class="arrow-link" href="{{ '/usage/' | relative_url }}#workspaces">Workspaces</a></p>
+      </div>
+      <div class="feature">
+        <h3>A network you decide about</h3>
+        <p>Every TCP connection the guest opens is judged on the host, by address and port,
+          before anything is dialled — a guest that ignores the proxy is judged, not
+          unfiltered. <code>--net none</code> gives it nothing at all.</p>
+        <p><a class="arrow-link" href="{{ '/usage/' | relative_url }}#the-network-a-sandbox-gets">Network policy</a></p>
+      </div>
+      <div class="feature">
+        <h3>Keys that never enter the sandbox</h3>
+        <p>The guest holds a placeholder; the host attaches your real credential only on
+          requests to the hosts you named. <code>boks secret set anthropic</code> is the
+          whole configuration.</p>
+        <p><a class="arrow-link" href="{{ '/usage/' | relative_url }}#credentials-the-name-is-the-configuration">Credentials</a></p>
+      </div>
+      <div class="feature">
+        <h3>Sandboxes that persist</h3>
+        <p>Run the same agent in the same directory and you are back where you left off —
+          packages, caches and shell state intact — until <code>boks rm</code> deletes it
+          cleanly.</p>
+        <p><a class="arrow-link" href="{{ '/usage/' | relative_url }}#sandboxes-persist-and-the-name-is-the-identity">Lifecycle</a></p>
+      </div>
+      <div class="feature">
+        <h3>No account, no cloud, no telemetry</h3>
+        <p>Everything runs on your machine. Nothing is sent anywhere, there is nothing to
+          sign in to, and this page makes no third-party request either.</p>
+        <p><a class="arrow-link" href="{{ '/faq/' | relative_url }}">FAQ</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band">
   <div class="wrap split">
     <div class="split-copy">
       <h2 class="band-title">First run</h2>
       <p class="band-lede">An agent, in a directory, inside a microVM of its own. The agent
         comes first and decides what the sandbox contains; the workspaces follow and default
         to the current directory.</p>
-      <p><a class="arrow-link" href="{{ '/get-started/' | relative_url }}">Prerequisites and the first run</a></p>
-      <p><a class="arrow-link" href="{{ '/usage/' | relative_url }}">Lifecycle, policy, credentials, ports</a></p>
+      <p><a class="arrow-link" href="{{ '/install/' | relative_url }}">Install</a></p>
+      <p><a class="arrow-link" href="{{ '/walkthrough/' | relative_url }}">The full walkthrough</a></p>
+      <p><a class="arrow-link" href="{{ '/agents/' | relative_url }}">The ten agents</a></p>
     </div>
     <div class="split-code">
-      <pre><code><span class="c"># build it, then check the host</span>
-make build
-./bin/boks doctor
-
-<span class="c"># a shell in the current directory</span>
-./bin/boks run
+      <pre><code><span class="c"># check the host, then get a shell in a microVM</span>
+boks doctor
+boks run
 
 <span class="c"># Claude Code, in one directory, and nothing above it</span>
-./bin/boks run claude ~/src/foo
+boks run claude ~/src/foo
 
-<span class="c"># nothing it can reach at all</span>
-./bin/boks run --net none shell .</code></pre>
+<span class="c"># a policy that outlives the command that wrote it</span>
+boks policy init --preset locked
+boks policy allow github.com:443
+
+<span class="c"># or nothing it can reach at all</span>
+boks run --net none shell .</code></pre>
     </div>
   </div>
 </section>
 
-<section class="band">
+<section class="band alt">
   <div class="wrap">
     <h2 class="band-title">What a sandbox is</h2>
     <p class="band-lede">Boks is the orchestration layer, not a hypervisor. Everything below
@@ -115,42 +170,6 @@ make build
       boundary; in-guest permissions are not — the agent has root in the guest by design.
       <a href="{{ '/security-model/' | relative_url }}">Security model</a> ·
       <a href="{{ '/architecture/' | relative_url }}">Architecture</a></p>
-  </div>
-</section>
-
-<section class="band alt">
-  <div class="wrap">
-    <h2 class="band-title">How this project talks about itself</h2>
-    <p class="band-lede">The interesting thing about Boks is not the feature list. It is that
-      the claims were tested, and the tests that failed were published rather than quietly
-      fixed.</p>
-
-    <div class="tenets">
-      <div class="tenet">
-        <h3>Measured, or not claimed</h3>
-        <p>Every claim on this site is answerable to one document, which records what was
-          observed and what each observation does not establish.</p>
-        <p><a class="arrow-link" href="{{ '/verification/' | relative_url }}">Verification</a></p>
-      </div>
-      <div class="tenet">
-        <h3>The failures are in it</h3>
-        <p>The network policy was measured broken before it was measured fixed. Both
-          measurements are in the same document, in that order.</p>
-        <p><a class="arrow-link" href="{{ '/verification/' | relative_url }}">What failed, and what happened next</a></p>
-      </div>
-      <div class="tenet">
-        <h3>What is missing is written down</h3>
-        <p>Gaps somebody met and recorded, not empty cells in a feature grid. Two of them
-          exist because a measurement failed.</p>
-        <p><a class="arrow-link" href="{{ '/roadmap/' | relative_url }}">Roadmap</a></p>
-      </div>
-      <div class="tenet">
-        <h3>Nothing is sent anywhere</h3>
-        <p>No account, no cloud service, no telemetry. This page makes no third-party
-          request either, and a build check fails if one appears.</p>
-        <p><a class="arrow-link" href="{{ '/faq/' | relative_url }}">FAQ</a></p>
-      </div>
-    </div>
   </div>
 </section>
 
