@@ -719,6 +719,45 @@ calls succeeded while the real path faulted every time, which no theory about ha
 could explain and misalignment explains exactly, since the two differ only in stack frame
 offset.
 
+### The guest clock, fixed and measured, 2026-08-14
+
+The first Windows boot left the guest's clock frozen: 78 console lines, one distinct
+printk timestamp. The cause was not the clocksource but the **timer tick**. Linux derives
+three values from CPUID leaf `0x15`, and our encoding gave a correct TSC frequency
+alongside a crystal frequency of 1 kHz — so `lapic_timer_period` came out as 4,
+`__setup_APIC_LVTT` wrote **0** into the APIC initial-count register, and a zero initial
+count stops the local APIC timer. No timer interrupt ever fired.
+
+After publishing a real crystal frequency, the same probe on the same machine:
+
+| | round 6 | round 7 |
+| --- | --- | --- |
+| distinct printk timestamps | **1** | **48**, advancing monotonically |
+
+**The fallback constant was never used, and it would have been wrong.** The code queries
+`WHvGetCapability(WHvCapabilityCodeInterruptClockFrequency)` and falls back to 100 MHz —
+the value crosvm hardcodes for a WHP-emulated LAPIC. This machine's WHP answered
+**200 MHz**. Had the query been skipped in favour of the documented-by-nobody constant,
+the guest's clock would have run at half rate: a boot log that looks perfect and every
+timeout wrong by 2×.
+
+**The rate was not confirmed, and the measurement that looked like a confirmation was a
+trap.** Comparing guest uptime against console-arrival time gave a ratio of 0.216 — which
+reads as a badly wrong constant. Re-running with host logging at `ERROR` instead of
+`TRACE` gave 0.83 from the same build: the ratio was dominated by host-side logging
+overhead, not by the guest's clock. 0.83 is nowhere near the 0.5 or 2.0 a 100-vs-200 MHz
+error would produce, and it is an upper bound rather than a measurement — the host
+timestamp is pipe-arrival time and includes EROFS read latency over a 0.37 s window.
+A real correction factor needs an in-guest measurement.
+
+**A known gap, established rather than assumed.** Nothing before `brd: module loaded`
+reaches the console, in either round. It is not a late-attach problem: the pipe client was
+connected a full second before the first byte arrived. `hvc_console_print` buffers 16
+characters at a time — the first chunk is exactly 16 bytes in both runs — and the
+`CON_PRINTBUFFER` replay at `hvc0` registration is discarded before the virtio-console tx
+queue is live. There is no 8250 in libkrun's legacy device set, so there is no `earlycon`
+to recover them. Early boot is unobservable through this path by construction.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
