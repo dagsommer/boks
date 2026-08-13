@@ -75,20 +75,112 @@ What the guest can see of your disk:
   directories that hold the mount point;
 - the guest root filesystem, which comes from the image, not your host.
 
-Two real risks remain, both inherited from the "mount the live workspace" model:
+**There are two filesystem modes, and which one a sandbox is in decides what a compromised
+guest can do to your files.** `boks ls` has a `MODE` column and `boks inspect` records it,
+because this is not a fact anyone should have to go and look up.
 
-- **Live writes.** In direct mode the guest writes straight to your host files. Anything in
+| | direct (default) | clone (`--clone`) |
+|---|---|---|
+| the workspace | shared read-write at its host path | shared **read-only** at `/run/sandbox/source` |
+| where the agent works | your files | a git clone made inside the guest, at the workspace's path |
+| a guest write to the workspace | lands on your disk immediately | lands in the guest's own filesystem |
+| what the guest starts with | everything in the directory | committed history only |
+| getting work back | it is already there | `boks bundle`, then `git fetch` |
+
+- **Live writes (direct mode).** The guest writes straight to your host files. Anything in
   the workspace that the *host* later executes is a path back to you: Git hooks, `Makefile`,
-  `package.json` scripts, CI config, IDE tasks, `.envrc`, editor and agent config. **Review
-  diffs before running anything from a workspace a sandbox touched.** Docker documents this
-  same risk for direct mode; a clone mode that keeps writes inside the VM is the mitigation,
-  and Boks has not implemented it yet.
+  `package.json` scripts, CI config, IDE tasks, `.envrc`, editor and agent config. No exploit
+  is needed — just a modified `Makefile` you later run. **Review diffs before running
+  anything from a workspace a direct-mode sandbox touched.** Docker documents the same risk
+  for its direct mode.
+- **Clone mode is the mitigation, and it is implemented.** *(verified 2026-08-13 against a
+  real containerd, without a hypervisor — see "what clone mode has not been shown" below.)*
+  A guest that rewrote, deleted and added files in its clone and committed all of it left the
+  host tree **byte-identical**, asserted as a content digest over every path, mode, symlink
+  target and file body. Three separate writes to `/run/sandbox/source` — a new file, a
+  deletion, and an overwrite of `.git/HEAD` — were each refused with `Read-only file system`,
+  and none of them appeared on the host. A `git push` to `origin`, which is that same
+  read-only share, is refused; a `git fetch` from it works, so a guest can pick up commits
+  the host makes later without being able to send any back.
+- **The mode is fixed when a sandbox is created**, recorded in a versioned container label
+  (`dev.boks.filesystem`), and survives stop and start. It has to be: the mode *is* the OCI
+  mounts, which containerd writes once. `--clone` on a re-attach to a direct-mode sandbox is
+  refused as a no-op with a warning naming the directory the guest is about to write to,
+  rather than being silently applied. An absent or unparseable label reads as **direct**,
+  which is the reading that claims the least.
+- **Hardlinks were the non-obvious hole, and are closed.** A local `git clone` hardlinks
+  object files when source and destination are on one filesystem — measured on the host:
+  same inode, link count 2. The guest is root and can `chmod`, so the clone's objects would
+  have been a write channel into the host repository's object store, through the mode that
+  promises there is none. Boks clones with `--no-hardlinks`, and a test reads the link count
+  of every object in the guest's clone back and requires 1. Relying on the two paths landing
+  on different filesystems would have been a security property resting on a coincidence.
+- **Clone mode does not make the workspace safe to run afterwards.** It stops the guest
+  *writing* to your files; it does not stop you fetching its commits and running them. A
+  bundle from a compromised sandbox carries whatever that sandbox committed, `Makefile`
+  included. Review before you merge — the review moved, it did not disappear.
 - **Symlinks.** *(verified 2026-08-11, macOS host.)* A workspace symlink pointing outside
   the shared directory does **not** escape. Symlinks are resolved against the guest's own
   root, not the host's: a link to `/etc` read the guest's `/etc`, and links to
   `~/.ssh` and to a sibling file outside the workspace both failed with
   `No such file or directory`, because those paths do not exist in the guest. A link
   therefore reaches host data only if its target is itself inside a shared workspace.
+
+#### What clone mode refuses, and why
+
+Every refusal exists because the flag is asked for to keep guest writes off your disk, so the
+one answer Boks must never give is to quietly do something else. In particular **there is no
+fallback to direct mode**: that would turn a request for containment into a live share on the
+strength of a warning nobody reads.
+
+- **A workspace that is not a git repository** is refused. `--clone` names a git operation and
+  there is nothing to clone. Copying the directory instead would give the word a second
+  meaning and would carry `node_modules`, build output and `.env` files into the guest.
+- **A subdirectory of a repository** is refused, naming the root. Cloning the enclosing
+  repository would share a directory the user did not name — strictly *more* of the host than
+  direct mode exposes, from a feature whose purpose is to expose less.
+- **A linked worktree or a submodule** — a `.git` file rather than a directory — is refused,
+  naming the real git directory. That directory is outside the workspace and is not shared;
+  sharing it too would again widen the exposure.
+- **A bare repository** is refused: there is no working tree for an agent to work in.
+- **A second read-write workspace** is refused. One writable share anywhere would undo the
+  property, and a mode that holds "except for the second directory you passed" is not a mode
+  anyone can reason about. `:ro` extra workspaces are fine.
+- **Submodules and Git LFS** are *warned about*, not refused: a clone populates neither, both
+  are recoverable from inside the sandbox given network access, and refusing would make
+  `--clone` unusable for a large class of real projects to prevent a surprise a sentence
+  prevents instead.
+- **Uncommitted host work is not in the clone**, and the sandbox says so as it is created,
+  with a count. A clone carries committed history; `boks cp` is the way to bring specific
+  dirty files in.
+
+#### Two mechanics worth writing down
+
+- **The clone is made by root and handed over.** It lands at the workspace's absolute path,
+  and every directory leading to it is created by the runtime as root while the agent is
+  typically uid 1000. Measured: an unprivileged clone got `Permission denied` creating
+  `.git`. Boks clones as root and `chown`s the tree to the sandbox's own user before anything
+  else runs in it.
+- **git's dubious-ownership refusal is lifted in the guest's *system* config, and nothing
+  else works.** The source is owned by the host user and the clone runs as another uid, so
+  git refuses it outright. Both `git -c safe.directory=…` and the `GIT_CONFIG_COUNT` /
+  `GIT_CONFIG_KEY_n` environment form were tried against a real guest and **both failed**:
+  git 2.47 honours the setting only from system or global configuration, which is documented
+  and easy to get wrong. The exemption names `/run/sandbox/source` and its `.git`, never
+  `*`, and it is a statement about a mount the whole guest shares — which is also why the
+  agent's own `git fetch origin` works later without meeting the same refusal.
+
+#### What clone mode has not been shown
+
+- It has been exercised against a real containerd with the **runc** runtime, which is not an
+  isolation boundary. That says the mounts, the label, the clone and the refusals are right;
+  it says **nothing** about the hypervisor boundary, and the read-only share is only as strong
+  as the virtiofs mount under it. The same assertions have not been run behind libkrun.
+- The read-only property is enforced by the mount, not by Boks. A guest that escapes the VM
+  has the host's privileges and clone mode is irrelevant to it — this mitigates the *no
+  exploit needed* attack, not the escape.
+- LFS detection reads the top-level `.gitattributes` and `.git/lfs` only. A repository that
+  uses LFS solely through a nested `.gitattributes` gets no warning.
 
 ### Network
 
@@ -540,7 +632,11 @@ in the sandbox.)*
    least under our control.
 2. **nerdbox shim** — parses guest-influenced data and runs on the host with your privileges.
 3. **Workspace write-back** — the highest-probability *practical* attack: no exploit needed,
-   just a malicious `Makefile` you later run. Mitigated by review, and eventually clone mode.
+   just a malicious `Makefile` you later run. It is the default, and review is still the only
+   thing standing in front of it there. `--clone` removes the channel outright — verified, on
+   runc rather than behind a hypervisor — at the cost of a clone that starts from committed
+   history and commits that come back as a bundle. What it does not remove is the need to read
+   what you merge.
 4. **containerd configuration** — a misconfigured or over-privileged containerd undermines
    everything above it.
 5. **Network policy gaps** — the policy is in the datapath and enforced against a real
