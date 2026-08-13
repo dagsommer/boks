@@ -31,24 +31,66 @@ kramdown:
   auto_ids: true
   syntax_highlighter: rouge
 
+# The landing page at / is site/index.html, not a rendered document. What it says about the
+# project is quoted from the file named here — the lede, and the experimental warning — so
+# there is still no second copy of either, and the warning cannot be softened on the front
+# page without being softened in the README. If the warning is not found, the build fails.
+home_source: README.md
+
 # The nav, in order. `source` is a path relative to the repository root; `title` is read
 # from the document's own first heading unless given here; `nav` is the (usually shorter)
 # label in the sidebar. A source file that does not exist fails the build rather than
 # quietly disappearing from the site.
+#
+# An entry with only `section` is a heading in the sidebar and produces no page.
+#
+# The order is task-oriented, after the reference product's own documentation: what you do
+# first, then what you do next, then what you look up. The research documents — verification,
+# the parity matrix, the Windows spike — are reference rather than the front door, and are
+# grouped last. They are not diminished by that: Verification is what every claim on this
+# site is answerable to, and pages link into it wherever a reader could reasonably ask how
+# something is known.
 boks_docs:
-  - source: README.md
-    url: /
-    nav: Overview
-    title: Boks
-  - source: docs/verification.md
-    url: /verification/
-    nav: Verification
-  - source: docs/security-model.md
-    url: /security-model/
-    nav: Security model
+  - section: Guide
+  - source: docs/get-started.md
+    url: /get-started/
+    nav: Get started
+  - source: docs/usage.md
+    url: /usage/
+    nav: Usage
+  - source: docs/agents.md
+    url: /agents/
+    nav: Agents
+
+  - section: Reference
   - source: docs/architecture.md
     url: /architecture/
     nav: Architecture
+  - source: docs/security-model.md
+    url: /security-model/
+    nav: Security model
+  - source: docs/cli.md
+    url: /cli/
+    nav: CLI reference
+  - source: docs/troubleshooting.md
+    url: /troubleshooting/
+    nav: Troubleshooting
+  - source: docs/faq.md
+    url: /faq/
+    nav: FAQ
+
+  - section: Project
+  - source: docs/roadmap.md
+    url: /roadmap/
+    nav: Roadmap
+  - source: docs/release-notes.md
+    url: /release-notes/
+    nav: Release notes
+
+  - section: Evidence
+  - source: docs/verification.md
+    url: /verification/
+    nav: Verification
   - source: docs/docker-sandbox-parity.md
     url: /docker-sandbox-parity/
     nav: Docker Sandbox parity
