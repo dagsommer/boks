@@ -122,7 +122,7 @@ website documents.
 | `cp` | Copy between sandbox and host | `cp` |
 | `ports` | Manage port publishing | none |
 | `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | all ten, same spellings; rules are durable and scoped global or per-sandbox |
-| `secret` | Manage stored secrets | `secret set/import/ls/rm`; `import` reads an OAuth credential an agent already has |
+| `secret` | `set`, `import`, `ls`, `rm`, `set-custom`; **secrets are keyed by a known service name**, not a free-form label | `secret set/import/ls/rm/reset`, free-form names, `--inject` supplies the rule | P0 | partial | The service registry is the gap — see 5a. Our `import` also collides: sbx's reads host **environment variables**, ours reads a stored OAuth credential |
 | `kit` | (Experimental) Manage kit artifacts | none |
 | `template` | Manage sandbox templates (the image an agent runs in) | none; `-t, --template` flag only |
 | `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
@@ -395,6 +395,46 @@ hosts and no others — see
 | Placeholder replacement | Guest holds a placeholder | Existing header is overwritten, never appended | P0 | done | A surviving placeholder would be a silent auth failure at best |
 | Guest secret access | Guest never receives raw values | Same; no host API for the guest to query | P0 | done | The store's only consumer is the proxy's request path. Adding a lookup endpoint would end the guarantee |
 | Never logged | Not documented | Values redacted in every printed and serialised form | P1 | done | Enforced by the `Value` type and asserted by tests |
+### 5a. Secrets are keyed by service, and that is the whole UX
+
+Read from real `sbx secret --help` and `sbx secret set/import --help`.
+
+sbx does not ask the user how to inject a credential. It has a **fixed list of known
+services** — anthropic, cursor, droid, github, google, groq, mistral, nebius, openai,
+openrouter, xai — and the product already knows what each one means: which hosts it applies
+to, which header carries it, what shape its value has. So the whole ceremony is:
+
+```
+echo "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
+```
+
+Boks makes the user supply that knowledge instead:
+
+```
+boks secret set anth
+boks run claude --inject 'anth@api.anthropic.com=header:x-api-key:%s' \
+                --guest-credential 'anth=ANTHROPIC_API_KEY=sk-ant-placeholder'
+```
+
+Ours is strictly more expressive and much worse to use. Nobody should have to know Anthropic's
+header name to put a key in a sandbox. **A service registry mapping a name to its hosts,
+header, placeholder shape and OAuth endpoint is the missing piece**, and `internal/agent`
+already demonstrates the pattern — data, not code, with `Registry.Add` as the seam. `--inject`
+stays for anything not in the list.
+
+Three further findings from the same output:
+
+- **Two OAuth acquisition paths, neither of which is ours.** `sbx secret set -g openai --oauth`
+  runs the flow host-side; `sbx run claude … -- auth login` drives it through the agent inside
+  the sandbox. Boks imports a credential the host already has, which sbx does not appear to
+  do at all. Ours works from an existing login; theirs works on a fresh machine.
+- **OAuth takes precedence over an API key** for the same service at runtime, and `secret
+  import` deliberately skips a service that already has one rather than silently shadowing it.
+- **`import` means host environment variables**, offered interactively with a Y/n prompt and a
+  last-4 preview, with `--all`, `--force` and `--dry-run`. Boks uses the same verb for reading
+  a stored OAuth credential. One of the two has to be renamed, and it should be ours.
+
+| Registry secrets | `sbx secret set --registry ghcr.io --password-stdin`, with three scopes: host-only (template and kit pulls, never injected), global (injected by the proxy into every new sandbox's registry login), or one sandbox | None | P2 | none | A category Boks does not have at all. Note the property worth copying: the credential authenticates the pull **without entering the sandbox filesystem** |
 | `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set` | P1 | done | Reads from stdin by default; `--value` documented as visible in the process list |
 | Lost passphrase | Not applicable: sbx keeps credentials in an account-backed store | `boks secret reset --force` deletes the store without decrypting it | P1 | done | Every other subcommand has to decrypt, `rm` included, so the remedy for a forgotten passphrase used to be the command that had just failed. The failure now names the file, the cost and this command. `secret ls` still needs the passphrase: the names are inside the envelope, and a plaintext index of which services you hold credentials for is worth denying an attacker |
 | Git/GitHub credentials | Injected transparently for HTTPS Git; `gh` CLI shows logged-out but pushes work | Same approach | P1 | partial | The mechanism exists (basic auth with a username, over an intercepted flow); never exercised against a real Git host |
