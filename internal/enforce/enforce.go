@@ -49,6 +49,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -112,6 +113,17 @@ type Spec struct {
 	// ever appears in a command line or an environment variable, where every other
 	// process on the host could read it.
 	Secrets map[string]string `json:"secrets,omitempty"`
+	// OAuth carries this sandbox's OAuth credentials, keyed by service.
+	//
+	// Unlike Inject, these do not travel as the string the user typed: an OAuth credential's
+	// shape — token endpoint, sentinels, credential file — is a property of the credential
+	// that was imported, not of this run, and it lives in the encrypted store. The CLI reads
+	// the record out of the store, in the process that has the passphrase, and hands the
+	// whole thing over. The supervisor still never learns the passphrase.
+	//
+	// The records hold live tokens. Spec's String and GoString are redacted for that reason,
+	// and this field is why that matters.
+	OAuth map[string]secret.OAuthRecord `json:"oauth,omitempty"`
 	// Intercept permits terminating TLS for credential-bearing hosts. False means no CA
 	// is opened and HTTPS credential rules never fire.
 	Intercept bool `json:"intercept"`
@@ -129,8 +141,8 @@ type Spec struct {
 // MarshalJSON deliberately does not redact: the whole purpose of the JSON form is to hand
 // those values to the process that will attach them to requests.
 func (s Spec) String() string {
-	return fmt.Sprintf("enforce.Spec{sandbox:%s mode:%s socket:%s secrets:%d}",
-		s.Sandbox, s.Plan.Mode, s.Plan.Socket, len(s.Secrets))
+	return fmt.Sprintf("enforce.Spec{sandbox:%s mode:%s socket:%s secrets:%d oauth:%d}",
+		s.Sandbox, s.Plan.Mode, s.Plan.Socket, len(s.Secrets), len(s.OAuth))
 }
 
 // GoString covers %#v, which would otherwise print every field.
@@ -148,9 +160,26 @@ func (s Spec) Policy() (policy.Policy, error) {
 	return s.Resolution.Policy()
 }
 
-// Credentials assembles the credential rules.
+// Credentials assembles the credential rules: the header-injection ones from the strings the
+// user typed, and the OAuth ones from the records the CLI resolved.
 func (s Spec) Credentials() ([]secret.Credential, error) {
-	return secret.ParseCredentials(s.Inject, s.GuestCredentials)
+	credentials, err := secret.ParseCredentials(s.Inject, s.GuestCredentials)
+	if err != nil {
+		return nil, err
+	}
+	services := make([]string, 0, len(s.OAuth))
+	for name := range s.OAuth {
+		services = append(services, name)
+	}
+	sort.Strings(services) // a stable order, so a container spec does not churn
+	for _, name := range services {
+		c, err := s.OAuth[name].Credential()
+		if err != nil {
+			return nil, err
+		}
+		credentials = append(credentials, c)
+	}
+	return credentials, nil
 }
 
 // ProxyURL is what the guest is told to send HTTP through.
@@ -166,7 +195,12 @@ func (s Spec) proxyPort() int {
 }
 
 // intercepts reports whether this sandbox will terminate TLS for anything.
-func (s Spec) intercepts() bool { return s.Intercept && len(s.Inject) > 0 }
+//
+// An OAuth credential counts: its resource hosts are decrypted so a sentinel can become a
+// token, and its token endpoint is decrypted so a refresh can be answered rather than
+// relayed. Without a CA neither happens, which for an OAuth credential means the agent is
+// simply not logged in.
+func (s Spec) intercepts() bool { return s.Intercept && (len(s.Inject) > 0 || len(s.OAuth) > 0) }
 
 // certDir is the host directory shared into the guest as GuestCADir. It is per-sandbox and
 // contains public certificates only.
@@ -226,12 +260,106 @@ func (s Spec) Prepare() (Guest, error) {
 		g.Mounts = append(g.Mounts, mount)
 	}
 
+	credentials, err := s.Credentials()
+	if err != nil {
+		return Guest{}, err
+	}
+	fileEnv, fileMounts, err := s.writeCredentialFiles(credentials)
+	if err != nil {
+		return Guest{}, err
+	}
+	env = append(env, fileEnv...)
+	g.Mounts = append(g.Mounts, fileMounts...)
+
 	placeholders, err := s.placeholderEnv()
 	if err != nil {
 		return Guest{}, err
 	}
 	g.Env = append(env, placeholders...)
 	return g, nil
+}
+
+// credentialDir is the host directory holding this sandbox's rendered credential files. Like
+// certDir it is per-sandbox, and like certDir it holds nothing secret.
+func (s Spec) credentialDir(guestDir string) string {
+	return filepath.Join(s.StateDir, "credentials", sanitize(s.Sandbox), sanitize(guestDir))
+}
+
+// writeCredentialFiles materialises each OAuth credential file on the host and shares the
+// directory holding it into the guest, read-only.
+//
+// It is the CA mechanism, reused deliberately: a host-side directory mounted read-only, not
+// a file baked into an image. The properties that made it right there make it right here —
+// the content is regenerated every time the sandbox starts, nothing is left in a layer, and
+// the guest cannot modify it.
+//
+// Three things about this are worth stating rather than discovering:
+//
+//   - **The content is sentinels.** internal/secret renders these templates with a data
+//     struct that has no field a real token could occupy, so this function cannot write one
+//     even if a template asked for it.
+//   - **A directory, not a file.** internal/workspace refuses to share a single file, because
+//     the runtime implements a file bind mount by exposing its parent. So the whole directory
+//     named by the credential file's path is mounted, and the guest can write nothing else
+//     into it. That is why the shipped Claude Code profile puts its file in a directory of
+//     its own rather than in the agent's config directory.
+//   - **Read-only, and that is a design decision rather than an accident.** An agent that
+//     rotates its credential will try to write this file back. The write fails — and what it
+//     would have written is byte-for-byte what is already there, because a refresh answered
+//     by Boks returns the same sentinels. The model survives the failure.
+func (s Spec) writeCredentialFiles(credentials []secret.Credential) ([]string, []workspace.Workspace, error) {
+	files, err := secret.CredentialFiles(credentials)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(files) == 0 {
+		return nil, nil, nil
+	}
+
+	var (
+		env    []string
+		mounts []workspace.Workspace
+		seen   = map[string]bool{}
+	)
+	for _, f := range files {
+		guestDir := path.Dir(f.Path)
+		hostDir := s.credentialDir(guestDir)
+		if err := os.MkdirAll(hostDir, 0o755); err != nil {
+			return nil, nil, fmt.Errorf("enforce: creating %s: %w", hostDir, err)
+		}
+		// 0644 like the CA certificate, and for the same reason: it is read inside the
+		// guest by whatever user the image runs as, and it holds nothing secret.
+		if err := os.WriteFile(filepath.Join(hostDir, path.Base(f.Path)), f.Content, 0o644); err != nil {
+			return nil, nil, fmt.Errorf("enforce: writing the guest credential file: %w", err)
+		}
+		if !seen[guestDir] {
+			seen[guestDir] = true
+			mounts = append(mounts, workspace.Workspace{
+				HostPath:  hostDir,
+				GuestPath: guestDir,
+				Mode:      workspace.ModeReadOnly,
+			})
+		}
+		// Naming the file in the environment is what lets an image or an entrypoint put
+		// it where the agent actually looks, which Boks cannot do from here.
+		env = append(env, "BOKS_CREDENTIAL_FILE_"+envSuffix(f.Service)+"="+f.Path)
+	}
+	sort.Strings(env)
+	return env, mounts, nil
+}
+
+// envSuffix turns a service name into something usable in an environment variable name.
+func envSuffix(service string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(service) {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
 }
 
 // placeholderEnv gives the guest a stand-in for each credential the proxy supplies.
@@ -421,7 +549,21 @@ func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer)
 
 	var provider secret.Provider
 	if len(credentials) > 0 {
-		provider = secret.MapProvider(spec.Secrets)
+		// A store for this sandbox and nothing else, built from what arrived on the pipe.
+		// A refresh it performs is durable for the life of this process only — the
+		// supervisor has no passphrase and so cannot write to the encrypted store — and
+		// that is said in the decision log at the moment it happens rather than left for
+		// a user to deduce from a failed login tomorrow.
+		store := secret.NewMemoryStore(spec.Secrets, spec.OAuth)
+		store.OnRotate = func(service string) {
+			target, terr := policy.NewTarget(spec.OAuth[service].TokenHost, 443)
+			if terr != nil {
+				return
+			}
+			engine.Note(policy.StageRequest, target, policy.ModeForward,
+				"the oauth credential "+service+" was refreshed for this sandbox only; the copy on the host is now stale, so re-run 'boks secret import' when this sandbox ends")
+		}
+		provider = store
 	}
 	injector, err := secret.NewInjector(provider, credentials...)
 	if err != nil {
