@@ -151,8 +151,19 @@ func (s *Server) serveInspected(ctx context.Context, target policy.Target, clien
 			req.Header.Set("User-Agent", "")
 		}
 
-		// An OAuth token request is answered here and never forwarded. See answerTokenRequest.
+		// An OAuth token request goes down one of two paths, and which one is decided by the
+		// stored credential rather than by anything in the request. A credential that has no
+		// token yet is being *acquired*: the request is relayed and the response kept. Every
+		// other one is a refresh: the request is answered here and never forwarded. See
+		// relayTokenRequest and answerTokenRequest, and internal/secret/acquire.go for why
+		// they are opposites.
 		if credential, ok := s.cfg.Injector.TokenEndpointFor(target, req.URL.Path); ok && req.Method == http.MethodPost {
+			if s.cfg.Injector.NeedsAcquisition(ctx, credential) {
+				if !s.relayTokenRequest(ctx, target, credential, req, client, upstream, upstreamReader) {
+					return
+				}
+				continue
+			}
 			if !s.answerTokenRequest(ctx, target, credential, req, client) {
 				return
 			}
@@ -249,6 +260,99 @@ func (s *Server) answerTokenRequest(ctx context.Context, target policy.Target, c
 // hundred bytes; anything beyond this is not a refresh.
 const maxTokenRequestBody = 64 << 10
 
+// relayTokenRequest forwards a guest's token request and keeps the tokens that come back,
+// giving the guest sentinels in their place. It reports whether the connection may carry
+// another request.
+//
+// This is the one place in Boks where a guest-composed request reaches a token endpoint, and
+// the one place an origin's response body is buffered rather than streamed. Both are
+// exceptions to rules the inspected path otherwise keeps, and both exist for the same reason:
+// the credential is being *acquired*, so the thing that unlocks it — an authorization code
+// and a PKCE verifier from a redirect the guest received — exists only inside the guest, and
+// the thing that comes back is exactly what must not.
+//
+// The exceptions are bounded by the stored record, not by the request. The Injector permits
+// this path only for a credential with no token at all, and the first token it acquires closes
+// it: a guest cannot ask to be relayed, and cannot re-open the path once it has been used.
+//
+// Order of operations, which is not an implementation detail. The request is relayed
+// unchanged but for an Accept-Encoding that lets the answer be read; the whole response is
+// read, up to a cap, and anything larger or still encoded is refused; the tokens are taken
+// out, stored, and masked out of the body. Only then is the guest answered. Answering first
+// would mean a store failure left the guest with a sentinel, Boks with nothing, and an
+// authorization code that cannot be spent twice.
+func (s *Server) relayTokenRequest(ctx context.Context, target policy.Target, credential secret.Credential,
+	req *http.Request, client net.Conn, upstream *tls.Conn, upstreamReader *bufio.Reader) bool {
+
+	secret.PrepareRelay(req.Header)
+	err := req.Write(upstream)
+	req.Body.Close()
+	if err != nil {
+		s.logf("relaying an oauth token request for %s to %s failed", credential.Service, target)
+		writeStatus(client, http.StatusBadGateway, "boks: the login exchange could not be sent\n")
+		return false
+	}
+
+	_ = upstream.SetReadDeadline(time.Now().Add(inspectResponseTimeout))
+	resp, err := http.ReadResponse(upstreamReader, req)
+	_ = upstream.SetReadDeadline(time.Time{})
+	if err != nil {
+		// Same reasoning as the ordinary path: a malformed-response error quotes the
+		// origin's bytes, and on this endpoint those bytes are the token. Nothing derived
+		// from the response is logged here or below.
+		s.logf("oauth token request for %s on %s: the origin's response could not be read", credential.Service, target)
+		writeStatus(client, http.StatusBadGateway, "boks: the login exchange got no readable answer\n")
+		return false
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, secret.MaxTokenResponseBody+1))
+	resp.Body.Close()
+	if readErr != nil || len(body) > secret.MaxTokenResponseBody {
+		// Fail closed. A body Boks could not hold entire is a body it could not mask, and
+		// forwarding it would be handing over whatever is inside unread.
+		s.logf("oauth token request for %s on %s: the origin's response was too large to inspect", credential.Service, target)
+		writeStatus(client, http.StatusBadGateway, "boks: the login exchange returned more than boks will read\n")
+		return false
+	}
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		// Also fail closed, and for the same reason: the inspected path decodes nothing, so
+		// an encoded body cannot be masked. The request asked for identity; an origin that
+		// ignored that is not one whose answer can be forwarded.
+		s.logf("oauth token request for %s on %s: the origin answered with a content encoding boks cannot inspect", credential.Service, target)
+		writeStatus(client, http.StatusBadGateway, "boks: the login exchange returned an encoded body boks will not forward unread\n")
+		return false
+	}
+
+	acquired, err := s.cfg.Injector.AcquireToken(ctx, credential, resp.StatusCode, body)
+	if err != nil {
+		// Errors from internal/secret name the service and the kind of failure, never a
+		// value; the masking assertion in particular is written to say which token survived
+		// without saying what it was.
+		s.logf("acquiring the oauth credential %s on %s: %v", credential.Service, target, err)
+		writeStatus(client, http.StatusBadGateway, "boks: "+err.Error()+"\n")
+		return false
+	}
+
+	if acquired.Acquired {
+		s.cfg.Engine.Note(policy.StageRequest, target, policy.ModeForward,
+			"oauth login for "+credential.Service+" completed inside the sandbox; the tokens were kept on the host and the guest received sentinels")
+		s.logf("acquired the oauth credential %s from a login on %s (the guest received sentinels)",
+			credential.Service, target)
+	} else {
+		s.logf("an oauth login exchange for %s on %s returned no token (status %d); the origin's answer was passed through",
+			credential.Service, target, acquired.Status)
+	}
+
+	// The origin's own headers are not reused. They describe a body that no longer exists —
+	// its length, and possibly its encoding — and the two fields that matter are set here.
+	//
+	// The connection is closed with the answer. The agent's very next request is a refresh
+	// with the sentinel it has just been given, which the answering path serves on a fresh
+	// connection just as well; ending here means nothing downstream has to reason about a
+	// relayed response and a composed one sharing one keep-alive.
+	writeJSONClosing(client, acquired.Status, acquired.Body)
+	return false
+}
+
 // writeJSON sends a JSON response Boks composed itself on a connection with no
 // http.ResponseWriter. The body is built in internal/secret from sentinels, never from a
 // token and never from anything read off the wire.
@@ -258,6 +362,20 @@ func writeJSON(w io.Writer, status int, body []byte) {
 		"Cache-Control: no-store\r\n"+
 		"Content-Length: %d\r\n"+
 		"Boks-Policy: allow\r\n\r\n",
+		status, http.StatusText(status), len(body))
+	_, _ = w.Write(body)
+}
+
+// writeJSONClosing is writeJSON for an answer after which the connection ends. Saying so is
+// the difference between a client that opens a fresh connection and one that writes its next
+// request into a socket that is already going away.
+func writeJSONClosing(w io.Writer, status int, body []byte) {
+	fmt.Fprintf(w, "HTTP/1.1 %d %s\r\n"+
+		"Content-Type: application/json\r\n"+
+		"Cache-Control: no-store\r\n"+
+		"Content-Length: %d\r\n"+
+		"Boks-Policy: allow\r\n"+
+		"Connection: close\r\n\r\n",
 		status, http.StatusText(status), len(body))
 	_, _ = w.Write(body)
 }
