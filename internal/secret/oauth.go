@@ -237,6 +237,23 @@ type OAuth struct {
 	SubscriptionType string
 }
 
+// String describes an OAuth block without printing its sentinels.
+//
+// A sentinel is a fake by construction, so this is not protecting a secret. It is protecting
+// something else worth as much: a reader's ability to tell, by looking at a log, whether a
+// token-shaped string is real. If sentinels appear in logs then "sk-ant-oat01-…" in a log
+// line stops being alarming, and the day a real one leaks nobody notices. There is a test.
+func (o *OAuth) String() string {
+	if o == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("secret.OAuth{token:%s resources:%v headers:%v sentinels:%s}",
+		o.TokenEndpoint, o.Domains()[:len(o.ResourceHosts)], o.headers(), Redacted)
+}
+
+// GoString covers %#v, which would otherwise print every field including the sentinels.
+func (o *OAuth) GoString() string { return o.String() }
+
 // Validate rejects an OAuth block that could not work, or that could send a token somewhere
 // it does not belong.
 func (o *OAuth) Validate() error {
