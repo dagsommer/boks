@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
+	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 )
@@ -70,20 +72,49 @@ Presets:
 		Args: noArgs,
 	}
 	var (
-		flags   policyFlags
-		sandbox string
-		stored  bool
+		flags     policyFlags
+		sandbox   string
+		agentName string
+		stored    bool
 	)
 	flags.register(cmd.Flags())
 	cmd.Flags().StringVar(&sandbox, "sandbox", "",
 		"resolve as this sandbox, including rules scoped to it")
+	registerAgentFlag(cmd.Flags(), &agentName)
 	cmd.Flags().BoolVar(&stored, "stored", false,
 		"print only the stored rules, without resolving them")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if err := applyAgentFlag(&flags, agentName); err != nil {
+			return err
+		}
 		return policyLs(env, &flags, sandbox, stored)
 	}
 	return cmd
+}
+
+// registerAgentFlag adds --agent, which is how `policy ls` and `policy check` answer the
+// question a run answers by naming an agent positionally: what does *this* agent's own
+// allowlist add?
+//
+// It reads the registry rather than containerd, because these two commands contact nothing.
+func registerAgentFlag(fs *pflag.FlagSet, name *string) {
+	fs.StringVar(name, "agent", "",
+		"include the allowlist this agent's definition carries ("+strings.Join(agent.Builtin().Names(), ", ")+")")
+}
+
+// applyAgentFlag resolves the flag against the registry, refusing an unknown name rather
+// than resolving a policy that quietly has no agent layer in it.
+func applyAgentFlag(flags *policyFlags, name string) error {
+	if name == "" {
+		return nil
+	}
+	a, err := agent.Builtin().Resolve(name)
+	if err != nil {
+		return err
+	}
+	flags.forAgent(a)
+	return nil
 }
 
 func policyLs(env Env, flags *policyFlags, sandbox string, stored bool) error {

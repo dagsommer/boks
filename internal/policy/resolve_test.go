@@ -258,6 +258,150 @@ func TestDenyWinsWhicheverScopeItIsIn(t *testing.T) {
 	}
 }
 
+// agentRequest is a run of the claude-shaped agent: one destination its definition says it
+// cannot work without, on a machine whose stored policy is whatever the test sets up.
+func agentRequest(s *Store, host string) Request {
+	return Request{
+		Store:      s,
+		Sandbox:    "web",
+		Agent:      "claude",
+		AgentAllow: []RuleSpec{{Action: Allow, Spec: host + ":443", Note: "the agent's own API"}},
+	}
+}
+
+// TestAgentAllowlistIsItsOwnLayer: an agent's own destinations are permitted, and the verdict
+// names the agent rather than a preset — because "why can this sandbox reach that?" has to be
+// answerable, and "an agent I ran needs it" is a different answer from "I allowed it".
+func TestAgentAllowlistIsItsOwnLayer(t *testing.T) {
+	const host = "api.agent.test"
+	res, err := agentRequest(storeWith(t, PresetStandard, nil, nil), host).Resolve()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	p, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := p.Evaluate(target(t, host, 443))
+	if !v.Allowed {
+		t.Fatalf("the agent's own destination was denied: %s", v.Reason)
+	}
+	if v.Scope != "agent claude" {
+		t.Errorf("scope = %q, want %q", v.Scope, "agent claude")
+	}
+	// It has to be visible where a user looks for it, labelled and with its reason, or a
+	// default allowlist is just a hole nobody can audit.
+	out := res.Describe()
+	for _, want := range []string{"agent claude", host + ":443", "the agent's own API"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("describe output is missing %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(res.Name, "agent:claude") {
+		t.Errorf("policy name %q does not say the agent layer applied", res.Name)
+	}
+}
+
+// TestDenyBeatsAnAgentAllow is the property that makes a per-agent default safe to ship: the
+// agent layer is an allow like any other, so a deny written anywhere defeats it. If this ever
+// fails, an agent definition in this repository can overrule a user's own prohibition.
+func TestDenyBeatsAnAgentAllow(t *testing.T) {
+	const host = "api.agent.test"
+	cases := map[string]func(s *Store, req *Request){
+		"global": func(s *Store, _ *Request) { s.Global = append(s.Global, denyRule(host)) },
+		"sandbox": func(s *Store, _ *Request) {
+			s.Sandboxes = map[string][]RuleSpec{"web": {denyRule(host)}}
+		},
+		"profile": func(s *Store, req *Request) {
+			if err := s.AddProfile("ci", Profile{Preset: PresetStandard, Rules: []RuleSpec{denyRule(host)}}); err != nil {
+				t.Fatal(err)
+			}
+			req.Profile = "ci"
+		},
+		"flag --deny": func(_ *Store, req *Request) { req.Deny = append(req.Deny, host) },
+		"port-only deny": func(s *Store, _ *Request) {
+			// A deny that does not name the host at all still wins, because the
+			// engine tests every deny before any allow rather than the most specific.
+			s.Global = append(s.Global, denyRule("*:443"))
+		},
+	}
+	for name, place := range cases {
+		t.Run("deny in "+name, func(t *testing.T) {
+			s := storeWith(t, PresetStandard, nil, nil)
+			req := agentRequest(s, host)
+			place(s, &req)
+
+			res, err := req.Resolve()
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			p, err := res.Policy()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v := p.Evaluate(target(t, host, 443)); v.Allowed {
+				t.Fatalf("an agent's own allowlist defeated a deny in %s: %s", name, v.Reason)
+			}
+		})
+	}
+}
+
+// TestLockedDropsTheAgentLayer: "deny everything; every destination must be added with
+// --allow" has to stay true of the locked preset, or the one posture that promises nothing
+// gets out would quietly let an agent's own API out — the exact channel someone choosing
+// locked is trying to close.
+func TestLockedDropsTheAgentLayer(t *testing.T) {
+	const host = "api.agent.test"
+	res, err := agentRequest(storeWith(t, PresetLocked, nil, nil), host).Resolve()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	p, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := p.Evaluate(target(t, host, 443)); v.Allowed {
+		t.Fatalf("locked let the agent layer through: %s", v.Reason)
+	}
+	// Silently dropping it would be its own kind of confusing, so the layer is still
+	// listed, with the reason it contributed nothing.
+	out := res.Describe()
+	if !strings.Contains(out, "agent claude") || !strings.Contains(out, "not applied") {
+		t.Errorf("the dropped agent layer is not accounted for:\n%s", out)
+	}
+	if strings.Contains(res.Name, "agent:claude") {
+		t.Errorf("policy name %q claims an agent layer that did not apply", res.Name)
+	}
+}
+
+// TestAgentLayerCannotChangeTheDefault: an agent contributes allows and nothing else. It
+// cannot make a deny-by-default machine allow-by-default, whatever its definition says.
+func TestAgentLayerCannotChangeTheDefault(t *testing.T) {
+	req := agentRequest(storeWith(t, PresetStandard, nil, nil), "api.agent.test")
+	req.AgentAllow = append(req.AgentAllow, RuleSpec{Action: Allow, Spec: "*"})
+	res, err := req.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Default != Deny {
+		t.Errorf("default became %s; only the base preset may decide it", res.Default)
+	}
+	// A catch-all in an agent definition would be a bug in this repository, but even then
+	// it must not defeat a deny — the same guarantee every other allow gets.
+	req.Deny = []string{"blocked.test"}
+	res, err = req.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := p.Evaluate(target(t, "blocked.test", 443)); v.Allowed {
+		t.Errorf("a catch-all agent allow defeated a --deny: %s", v.Reason)
+	}
+}
+
 // TestNarrowerScopesCannotChangeTheDefault: the default action comes from the base and from
 // nowhere else, so no stored rule can turn a deny-by-default machine into an allow-by-default
 // one without someone changing the posture explicitly.

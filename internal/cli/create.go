@@ -56,6 +56,9 @@ Agents:
 			return fmt.Errorf("a sandbox named %q already exists; use 'boks run' to attach to it, "+
 				"or 'boks rm %s' first", inv.name, inv.name)
 		}
+		// The agent's own allowlist is part of the policy this sandbox will run under,
+		// exactly as it is for `run`.
+		netFlags.forAgent(inv.agent)
 
 		cfg, err := flags.config(inv, agentArgs)
 		if err != nil {
