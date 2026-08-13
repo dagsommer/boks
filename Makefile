@@ -15,7 +15,12 @@ AGENT_IMAGES := $(filter-out base,$(notdir $(wildcard images/*)))
 # `docker-agent version`, not `docker-agent --version`; everything else takes the flag.
 VERSION_ARG_docker-agent := version
 
-.PHONY: build test check integration vet fmt clean images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
+# The platforms a release ships. darwin/arm64 is the verified one; Linux builds and has
+# never booted a sandbox. There is no windows or darwin/amd64 target on purpose — see the
+# comment at the top of .github/workflows/release.yml.
+RELEASE_TARGETS := darwin/arm64 linux/amd64 linux/arm64
+
+.PHONY: build test check integration vet fmt clean dist images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/boks
@@ -37,7 +42,21 @@ fmt:
 	gofmt -l -w .
 
 clean:
-	rm -rf bin
+	rm -rf bin dist
+
+# --- release artifacts ------------------------------------------------------------
+#
+# The same scripts CI runs, run locally, because a release nobody can reproduce outside
+# GitHub Actions is not a verifiable artefact. Nothing in Boks uses cgo, so every target
+# cross-compiles from any host and the tarballs are byte-identical between runs of one
+# commit: build this twice and the checksums match.
+#
+# .deb and .rpm are not built here — they need dpkg-deb and rpmbuild, which not every host
+# has. Run scripts/package-linux.sh <arch> where they do.
+dist:
+	@for target in $(RELEASE_TARGETS); do \
+		scripts/build-release.sh "$${target%/*}" "$${target#*/}" || exit 1; \
+	done
 
 # --- agent images -----------------------------------------------------------------
 #
