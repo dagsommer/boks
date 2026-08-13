@@ -1,7 +1,7 @@
 From 767eb801fe3fc8b7673c31499eaea3c2e2ae4f5f Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:39:07 +0200
-Subject: [PATCH 11/26] windows: take a HANDLE, not a descriptor, as the
+Subject: [PATCH 11/28] windows: take a HANDLE, not a descriptor, as the
  krun_init_log target
 
 A CRT file descriptor is private to the CRT instance that created it, and
