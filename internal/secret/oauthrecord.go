@@ -142,8 +142,14 @@ func (r OAuthRecord) Credential() (Credential, error) {
 		Service:      r.Service,
 		EnvName:      r.EnvName,
 		ProxyManaged: true,
-		Placeholder:  r.AccessSentinel,
 		OAuth:        o,
+	}
+	if r.EnvName != "" {
+		// Placeholders() keys on the environment variable, falling back to the service
+		// name. A credential that asked for no variable must not acquire one named after
+		// the service, so the placeholder is set only when there is somewhere to put it —
+		// such a credential reaches the guest through its credential file instead.
+		c.Placeholder = r.AccessSentinel
 	}
 	return c, nil
 }
