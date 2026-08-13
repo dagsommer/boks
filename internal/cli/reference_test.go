@@ -80,6 +80,34 @@ func TestReferenceDescribesTheWholeTree(t *testing.T) {
 	}
 }
 
+// The reference must be the same on every machine, or the check above fails for everyone
+// except whoever generated it last. It failed exactly this way the first time it ran in CI:
+// two defaults are derived from the environment, and a runner's home directory is not a
+// contributor's. Both the generic path and the reader's benefit point the same way — nobody
+// needs to know the generator's home directory.
+func TestReferenceIsTheSameOnEveryMachine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)         // Unix
+	t.Setenv("USERPROFILE", home)  // Windows
+	t.Setenv("XDG_STATE_HOME", "") // an unset XDG variable and a set one
+	elsewhere := Reference()       // must both come out the same
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	if Reference() != elsewhere {
+		t.Error("the reference changes when XDG_STATE_HOME does; a path from the " +
+			"generator's environment has reached the document")
+	}
+
+	for _, leak := range []string{home, "/home/", "/Users/", "/root/"} {
+		if strings.Contains(elsewhere, leak) {
+			t.Errorf("the reference contains %q, which is a path from the machine that "+
+				"generated it rather than one a reader has", leak)
+		}
+	}
+	if !strings.Contains(elsewhere, "~/.local/state/boks/") {
+		t.Error("the decision log's default is no longer written as a path under ~")
+	}
+}
+
 // A table cell that contains an unescaped pipe eats the rest of the row, which turns a flag
 // table into a wrong flag table rather than a broken-looking one.
 func TestReferenceTableCellsAreIntact(t *testing.T) {
