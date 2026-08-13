@@ -28,7 +28,16 @@ func TestParseCopyArgs(t *testing.T) {
 		{
 			// A colon inside a host path is legal on Unix and must not be read
 			// as a sandbox name.
-			"colon in host path", "/tmp/a:b", "web:/tmp/x", "web", true, "/tmp/a:b", "/tmp/x",
+			//
+			// The expectation goes through abs() like every other case rather than
+			// naming the path literally. On Unix that is the same string — Abs of an
+			// absolute path is itself — so this asserts exactly what it did before. On
+			// Windows "/tmp/a:b" is rooted but has no volume, so Abs prefixes the
+			// working directory's drive; hard-coding the literal would have been
+			// asserting that hostPath does *not* absolutise, which is not the property
+			// this row is about. What it is about is the split: "/tmp/a" is not a
+			// sandbox name, and that is decided by parseCopyEnd on any platform.
+			"colon in host path", "/tmp/a:b", "web:/tmp/x", "web", true, abs("/tmp/a:b"), "/tmp/x",
 		},
 		{"relative host path with colon", "./a:b", "web:/x", "web", true, abs("./a:b"), "/x"},
 		{"derived sandbox name", "boks-1a2b3c:/etc/hosts", "./hosts", "boks-1a2b3c", false, abs("./hosts"), "/etc/hosts"},
