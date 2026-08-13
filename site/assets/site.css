@@ -185,6 +185,18 @@ a:hover { text-decoration-thickness: 2px; }
 .nav-item > a:hover { background: var(--bg-raised); text-decoration: underline; }
 .nav-item.current > a { font-weight: 600; color: var(--accent); background: var(--bg-raised); }
 
+/* Fourteen documents in one list is a wall. The groups say what kind of page each is:
+   what you do, what you look up, and the evidence behind both. */
+.nav-section {
+  margin: 1.1rem 0 0.3rem;
+  padding: 0 0.5rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+.nav-section:first-child { margin-top: 0.5rem; }
+
 .toc { margin: 0.25rem 0 0.75rem 0.5rem; border-left: 1px solid var(--border); }
 .toc li a {
   display: block; padding: 0.15rem 0.5rem;
@@ -403,4 +415,401 @@ a:hover { text-decoration-thickness: 2px; }
 
 @media (prefers-reduced-motion: no-preference) {
   html { scroll-behavior: smooth; }
+}
+
+/* ========================================================================
+   The landing page
+   ========================================================================
+
+   Everything here is hand-written CSS over the same tokens the documents
+   use, so the page follows the reader's theme in all three states and adds
+   no request of its own. No font is loaded, no image is fetched, and the
+   only picture on the page — the stack diagram — is boxes and rules.
+
+   Two colours are added for it and nothing else: a cyan that reads as
+   "inside the boundary" and a slate that reads as "outside it". They are
+   decoration and carry no meaning a reader has to decode; the diagram is
+   labelled in words. */
+
+:root {
+  --accent-2: #0e7c86;
+  --glow-a: rgba(31, 95, 168, 0.10);
+  --glow-b: rgba(14, 124, 134, 0.10);
+  --hairline: rgba(22, 25, 29, 0.07);
+  --state-yes: #1a6b45;
+  --state-yes-bg: #edf7f1;
+  --state-maybe: #8a5a00;
+  --state-maybe-bg: #fdf6e7;
+  --state-no: #b3352c;
+  --state-no-bg: #fdf0ef;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --accent-2: #5ecfd8;
+    --glow-a: rgba(121, 176, 236, 0.10);
+    --glow-b: rgba(94, 207, 216, 0.09);
+    --hairline: rgba(223, 227, 232, 0.06);
+    --state-yes: #86cfa8;
+    --state-yes-bg: #16261e;
+    --state-maybe: #d9b26a;
+    --state-maybe-bg: #262013;
+    --state-no: #f0918a;
+    --state-no-bg: #2c1917;
+  }
+}
+
+:root[data-theme="dark"] {
+  --accent-2: #5ecfd8;
+  --glow-a: rgba(121, 176, 236, 0.10);
+  --glow-b: rgba(94, 207, 216, 0.09);
+  --hairline: rgba(223, 227, 232, 0.06);
+  --state-yes: #86cfa8;
+  --state-yes-bg: #16261e;
+  --state-maybe: #d9b26a;
+  --state-maybe-bg: #262013;
+  --state-no: #f0918a;
+  --state-no-bg: #2c1917;
+}
+
+.home .wrap { max-width: 68rem; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 2rem); }
+
+/* Hero ------------------------------------------------------------------- */
+
+.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--border); }
+
+/* Two soft lights and a hairline grid. A microVM is a box; the page can say so
+   quietly without a background image to download. */
+.hero-grid {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(60rem 30rem at 15% -10%, var(--glow-a), transparent 65%),
+    radial-gradient(45rem 28rem at 92% 8%, var(--glow-b), transparent 65%),
+    linear-gradient(var(--hairline) 1px, transparent 1px) 0 0 / 100% 2.5rem,
+    linear-gradient(90deg, var(--hairline) 1px, transparent 1px) 0 0 / 2.5rem 100%;
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
+  pointer-events: none;
+}
+
+.hero-inner {
+  position: relative;
+  max-width: 68rem;
+  margin: 0 auto;
+  padding: clamp(2.5rem, 8vw, 5.5rem) clamp(1rem, 4vw, 2rem) clamp(2rem, 5vw, 3.5rem);
+}
+
+.eyebrow {
+  margin: 0 0 0.75rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+/* A short rule before the eyebrow, drawn rather than fetched. */
+.eyebrow::before {
+  content: "";
+  display: inline-block;
+  width: 1.75rem;
+  height: 1px;
+  margin-right: 0.6rem;
+  vertical-align: 0.25em;
+  background: var(--accent-2);
+}
+
+.hero-title {
+  margin: 0;
+  font-size: clamp(3.2rem, 13vw, 6.5rem);
+  line-height: 0.95;
+  letter-spacing: -0.04em;
+  font-weight: 700;
+}
+
+.hero-copy { max-width: 44rem; }
+.hero-copy p { margin: 1rem 0 0; }
+/* The first quoted paragraph is the project's one-sentence description, and is set as
+   one. The rest is body copy. */
+.hero-copy p:first-child {
+  font-size: clamp(1.15rem, 2.6vw, 1.5rem);
+  line-height: 1.4;
+  color: var(--fg);
+  letter-spacing: -0.01em;
+}
+.hero-copy p + p { color: var(--fg-muted); font-size: 1rem; }
+.hero-copy code {
+  background: var(--code-bg); color: var(--code-fg);
+  padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.88em;
+}
+
+.cta { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 1.75rem 0 0; }
+.button {
+  display: inline-block;
+  padding: 0.55rem 1.1rem;
+  border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-raised);
+  color: var(--fg);
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+.button:hover { border-color: var(--accent); text-decoration: none; }
+.button.primary {
+  background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
+}
+.button.primary:hover { filter: brightness(1.08); }
+.button.ghost { background: transparent; border-color: var(--border); color: var(--fg-muted); }
+.button.ghost:hover { color: var(--fg); }
+
+/* The warning. It is in the hero, immediately under the buttons, and there is nowhere
+   further down for it to be pushed to — the markup has no slot for it elsewhere. It uses
+   the same .alert styling every warning in the documentation uses. */
+.hero-warning { margin: 2rem 0 0; max-width: 46rem; }
+.hero-warning blockquote.alert { margin: 0; }
+
+/* Bands ------------------------------------------------------------------ */
+
+.band { padding: clamp(2.5rem, 7vw, 4.5rem) 0; border-bottom: 1px solid var(--border); }
+.band.alt { background: var(--bg-sunken); }
+
+.band-title {
+  margin: 0;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.band-lede {
+  margin: 0.75rem 0 0;
+  max-width: 46rem;
+  color: var(--fg-muted);
+  font-size: 1.02rem;
+}
+.band-note {
+  margin: 1.75rem 0 0;
+  max-width: 46rem;
+  color: var(--fg-muted);
+  font-size: 0.92rem;
+}
+
+.arrow-link { text-decoration: none; font-weight: 500; }
+.arrow-link:hover { text-decoration: underline; }
+.arrow-link::after { content: " \2192"; }
+
+/* Platforms -------------------------------------------------------------- */
+
+.platforms {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+}
+.platform {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-raised);
+  padding: 1.1rem 1.2rem 1.3rem;
+}
+.platform h3 { margin: 0.5rem 0 0.4rem; font-size: 1.05rem; }
+.platform p:last-child { margin: 0; color: var(--fg-muted); font-size: 0.92rem; }
+.platform code { font-size: 0.9em; }
+
+.platform-state {
+  margin: 0;
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+}
+.platform.yes { border-color: var(--state-yes); }
+.platform.yes .platform-state { color: var(--state-yes); background: var(--state-yes-bg); }
+.platform.maybe .platform-state { color: var(--state-maybe); background: var(--state-maybe-bg); }
+.platform.no .platform-state { color: var(--state-no); background: var(--state-no-bg); }
+
+/* Split: prose beside a terminal ---------------------------------------- */
+
+.split { display: grid; gap: 2rem; align-items: start; }
+@media (min-width: 60rem) {
+  .split { grid-template-columns: 1fr 1.15fr; gap: 3rem; }
+}
+.split-copy p { max-width: 34rem; }
+.split-code pre {
+  margin: 0;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.1rem 1.2rem;
+  overflow-x: auto;
+  font-size: 0.86rem;
+  line-height: 1.65;
+}
+.split-code .c { color: var(--fg-faint); }
+
+/* The stack diagram ------------------------------------------------------ */
+
+.stack {
+  margin-top: 2rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--bg-raised);
+}
+.stack-host, .stack-guest { padding: 1.25rem clamp(1rem, 3vw, 1.75rem) 1.5rem; }
+.stack-guest { background: var(--bg-sunken); }
+.stack-label {
+  margin: 0 0 0.9rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.chain { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.node {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  font-size: 0.82rem;
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg);
+  white-space: nowrap;
+}
+/* The arrows between stages: a rule and a chevron, drawn in CSS. */
+.link {
+  flex: 0 0 1.6rem;
+  height: 1px;
+  background: var(--border-strong);
+  position: relative;
+}
+.link::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: -3px;
+  width: 6px;
+  height: 6px;
+  border-top: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
+  transform: rotate(45deg);
+}
+
+.boundary { display: flex; align-items: center; gap: 0.75rem; padding: 0 clamp(1rem, 3vw, 1.75rem); }
+.boundary-rule {
+  flex: 1 1 auto;
+  height: 0;
+  border-top: 2px dashed var(--accent-2);
+  opacity: 0.75;
+}
+.boundary-label {
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.guest-items { margin: 0; padding: 0; list-style: none; }
+.guest-items li {
+  position: relative;
+  padding-left: 1.5rem;
+  margin: 0.35rem 0;
+  color: var(--fg-muted);
+  font-size: 0.94rem;
+}
+.guest-items li::before {
+  content: "";
+  position: absolute;
+  left: 0.3rem;
+  top: 0.65em;
+  width: 0.7rem;
+  height: 1px;
+  background: var(--accent-2);
+}
+
+/* One piece of motion on the page: the boundary breathes, slowly, and only for a reader
+   who has not asked for less. It is a decoration on a rule, not an animation of anything
+   that happens. */
+@media (prefers-reduced-motion: no-preference) {
+  .boundary-rule { animation: boundary-pulse 6s ease-in-out infinite; }
+}
+@keyframes boundary-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 0.9; }
+}
+
+/* Tenets ----------------------------------------------------------------- */
+
+.tenets {
+  display: grid;
+  gap: 1.25rem 2rem;
+  margin-top: 2rem;
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+}
+.tenet { border-top: 2px solid var(--accent-2); padding-top: 0.9rem; }
+.tenet h3 { margin: 0 0 0.5rem; font-size: 1.02rem; }
+.tenet p { margin: 0 0 0.6rem; color: var(--fg-muted); font-size: 0.94rem; }
+.tenet p:last-child { margin: 0; }
+
+/* Documentation cards ---------------------------------------------------- */
+
+.cards {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+}
+.card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.1rem 1.1rem;
+  background: var(--bg-raised);
+}
+.card-section {
+  margin: 0 0 0.6rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+.card a { display: block; padding: 0.2rem 0; text-decoration: none; font-size: 0.95rem; }
+.card a:hover { text-decoration: underline; }
+
+/* Footer ----------------------------------------------------------------- */
+
+.site-footer {
+  max-width: 68rem;
+  margin: 0 auto;
+  padding: 2rem clamp(1rem, 4vw, 2rem) 3.5rem;
+  color: var(--fg-faint);
+  font-size: 0.84rem;
+}
+.site-footer p { margin: 0.35rem 0; }
+
+/* Narrow screens --------------------------------------------------------- */
+
+@media (max-width: 60rem) {
+  .home .topbar .brand-note { display: none; }
+  .chain { gap: 0.4rem; }
+  /* The chain stacks rather than scrolls: a diagram you have to drag is not a diagram.
+     The connectors turn from horizontal arrows into vertical ones. */
+  .node { white-space: normal; }
+  .link { flex: 0 0 100%; height: 0.9rem; width: 1px; background: none; margin-left: 0.9rem; }
+  .link::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    border-left: 1px solid var(--border-strong);
+  }
+  .link::after { left: -3px; right: auto; top: auto; bottom: 0; transform: rotate(135deg); }
+  .chain { flex-direction: column; align-items: stretch; }
+  .node { text-align: left; }
+  .boundary-label { font-size: 0.62rem; letter-spacing: 0.1em; }
 }
