@@ -167,7 +167,8 @@ func (s *FileStore) load() (map[string]string, error) {
 	plain, err := aead.Open(nil, env.Nonce, env.Data, nil)
 	if err != nil {
 		// GCM cannot tell a wrong key from a damaged file, and neither can we.
-		return nil, fmt.Errorf("cannot decrypt %s: wrong passphrase, or the file has been modified", s.path)
+		return nil, fmt.Errorf("%w: cannot decrypt %s: wrong passphrase, or the file has been modified",
+			ErrWrongPassphrase, s.path)
 	}
 	m := map[string]string{}
 	if err := json.Unmarshal(plain, &m); err != nil {
