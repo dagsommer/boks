@@ -638,13 +638,34 @@ func Placeholders(credentials []Credential) map[string]string {
 	return out
 }
 
+// Flow says whether the request the caller is about to write is protected in transit.
+//
+// It is a parameter rather than an assumption because the guest chooses the scheme. A
+// request to http://api.example.com goes out in the clear, and a credential attached to it
+// is readable by everything on the path — so the decision "may this credential travel on
+// this flow" has to be taken with the flow in hand.
+type Flow int
+
+const (
+	// FlowPlaintext is an unencrypted HTTP request.
+	FlowPlaintext Flow = iota
+	// FlowTLS is a request written into a TLS session Boks terminated and re-originated.
+	FlowTLS
+)
+
 // Apply sets the credential headers for t on h, and reports the services whose secrets it
 // used so the caller can log *that* an injection happened without logging what.
 //
 // Existing headers are overwritten. That is the point: the guest holds a placeholder, and
 // a placeholder that survived to the wire would be a silent authentication failure at best
 // and a leaked placeholder at worst.
-func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header) ([]string, error) {
+//
+// An OAuth access token is never substituted onto a plaintext flow. A subscription token is
+// the whole account, its blast radius is far larger than a scoped API key's, and the guest
+// picks the scheme — so `http://` to a resource host must not be a way to have one written
+// out in the clear. The request is forwarded carrying the sentinel, which fails at the
+// origin, visibly and harmlessly.
+func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header, flow Flow) ([]string, error) {
 	if i == nil || len(i.credentials) == 0 {
 		return nil, nil
 	}
@@ -676,7 +697,7 @@ func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header) ([
 		// The OAuth half: on a resource host, and nowhere else, a sentinel in a permitted
 		// header becomes the real access token. Substitution rather than assignment — a
 		// request that carries no sentinel is left exactly as the guest wrote it.
-		if c.OAuth.MatchesResource(t) {
+		if c.OAuth.MatchesResource(t) && flow == FlowTLS {
 			tokens, err := i.accessToken(ctx, c)
 			if err != nil {
 				return nil, err
