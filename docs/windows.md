@@ -892,17 +892,42 @@ registered driver or service belonging to sbx. `sbx diagnose` reports 8 checks p
 user-level, with no admin requirement. Network enforcement on Windows is entirely user-mode,
 so nothing about it is closed to an open-source project.
 
-**It ships the same components Boks does.** The install contains `sbx.exe`,
-**`containerd-shim-nerdbox-v1.exe`**, `sailor.dll` (a libkrun-ABI VMM), `mkfs.erofs.exe` and
-`mkfs.ext4.exe`. That is Boks' own stack: containerd's nerdbox shim, a libkrun-compatible
-VMM, and EROFS tooling. The Windows shim is not theoretical — it is in production.
+**It ships the same components Boks does, except the one that matters.** The install
+contains `sbx.exe`, **`containerd-shim-nerdbox-v1.exe`**, `sailor.dll`, `mkfs.erofs.exe` and
+`mkfs.ext4.exe` — containerd's nerdbox shim and EROFS tooling, which is Boks' own stack. The
+Windows shim is not theoretical; it is in production.
+
+**But the VMM is not libkrun, and never was.** An earlier draft of this section called
+`sailor.dll` "a libkrun-ABI VMM" on the strength of upstream nerdbox loading `krun.dll` on
+Windows. That inference was wrong, and correcting it changes what sbx's Windows build is
+evidence *of*. Measured on 2026-08-13 from the shipped MSI:
+
+| Evidence | Reading |
+| --- | --- |
+| `containerd-shim-nerdbox-v1.exe` contains `github.com/docker/sailor/go/sailor` and the names `libsailor-`, `sailor.dll` | Docker's shim links a Docker-internal VMM wrapper, resolving `libsailor` on Unix and `sailor.dll` on Windows |
+| The MSI installs the payload as `sailor.dll` v0.104.0.0 under a `LibSailor` directory — there is no `krun.dll` | The shim is Docker's build, not upstream nerdbox 0.2.3, which looks only for `krun.dll` |
+| Both the macOS and Windows shim SBOMs name the *same* `docker/sailor` version and contain the string `libkrun` **zero** times | Sailor is not a Windows stopgap; it is the VMM on every platform |
+| `sailor.dll` is 83 MB with `@sailkrnl` and `@sailksrc` sections, and the MSI ships no kernel file | The guest kernel is linked into the VMM, which is why nothing on disk resembles `libkrunfw` |
+
+So the answer to "how does sbx run natively on Windows" is not a technique Boks is missing.
+**Docker wrote their own VMM.** Sailor is closed source, so there is nothing to port, vendor
+or learn from — only a binary that proves the platform allows it.
+
+*(Caveat, stated because it is load-bearing: the SBOMs attest the shim's Go module graph, and
+a `dlopen`ed native library would not appear in one. The macOS install was not opened
+directly. What is proven is that Docker's own VMM wrapper is present on both platforms and
+that no libkrun ships on Windows; "no libkrun on macOS either" rests on the shared Sailor
+version and the absent module.)*
 
 **virtio-net works on Windows today.** The guest's `/sys/bus/virtio/devices/*/modalias`
 decodes to: `d00000001` = **net** (one), `d00000002` = block (four), `d0000001A` = virtio-fs
 (four), balloon, console, and vsock. A userspace VMM on this machine is emulating virtio-net
-right now. Whatever upstream libkrun's WHP backend lacks, the device is demonstrably
-achievable on the platform — this is the single most useful fact for the upstream
-contribution, because it converts "this ought to work" into "the reference product ships it".
+right now. The device is therefore demonstrably achievable on Windows in user mode, with no
+driver and no elevation — which is what the upstream contribution needs to know. It is worth
+being precise about how much this proves, given the correction above: a *proprietary* VMM
+emulates virtio-net on WHP, so this is evidence about the **platform**, not about libkrun's
+port. It converts "the OS may not permit this" into "the OS permits it"; it says nothing
+about how far libkrun's own backend has to go.
 
 **No Hyper-V worker process.** Neither `vmwp.exe` nor `vmmem` is present; the long-running
 process holding the VM is `containerd-shim-nerdbox-v1.exe` itself. Consistent with a
