@@ -72,8 +72,8 @@ class Boks < Formula
 
       2. The nerdbox guest kernel and root filesystem are not installed.
 
-         `brew info nerdbox` explains why and how to build them. `boks doctor` does NOT
-         check for them, so it can report ready while a sandbox still fails at boot.
+         `brew info nerdbox` explains why and how to build them, and `boks doctor`
+         reports them as `guest image`.
 
       Full instructions, including what has and has not been verified on this platform:
       https://github.com/dagsommer/boks/blob/main/docs/install.md
