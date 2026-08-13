@@ -16,14 +16,20 @@
 # changing anything here. They explain the patch, the pins, what is known not to work on
 # Windows, and the exact commands to test the result.
 #
-# WHAT THIS WORKFLOW PROVES, AND WHAT IT DOES NOT. It proves the containerd patch still applies
+# WHAT THIS WORKFLOW PROVES, AND WHAT IT DOES NOT. It proves the containerd patches still apply
 # to the pinned release, that the erofs plugin packages still cross-compile for Windows and are
-# genuinely linked into the binary, and that the go-erofs recipe still produces a PE32+
-# mkfs.erofs.exe whose help text advertises tar mode.
+# genuinely linked into the binary, that the diff-service default order in the built PE really
+# names erofs first (read out of .data, because `strings` cannot tell that from three unrelated
+# words), that mkfs.erofs.exe carries no hardcoded "/tmp", and that the go-erofs recipe still
+# produces a PE32+ binary whose help text advertises tar mode.
 #
-# It proves NOTHING about whether any of it runs. No Windows binary is executed here — this is a
-# Linux runner. The failure this whole effort most expects, the erofs differ skipping itself at
-# init, is invisible to a compiler by construction. Download the bundle and run the commands in
+# It runs exactly one thing: the Go tests for the diff service and the transfer plugin, on
+# Linux, because that code is platform-neutral. Everything else is inspection.
+#
+# It proves NOTHING about whether the Windows binaries run. No Windows binary is executed here —
+# this is a Linux runner. Registering a plugin, linking it in, and naming it in a default list
+# are all necessary and none of them is sufficient; the first real Windows run needed four
+# separate fixes past "the plugins load". Download the bundle and run the commands in
 # packaging/containerd-windows/README.md to learn anything at all about whether it works.
 name: containerd-windows
 
@@ -376,6 +382,32 @@ jobs:
           strings _out/amd64/containerd.exe | grep -q 'plugins/snapshots/windows' \
             || { echo "the windows snapshotter went missing" >&2; exit 1; }
           echo "  linked: plugins/snapshots/windows (unchanged)"
+
+      # Linking the differ in is not the same as the diff service consulting it, and the
+      # difference is invisible to `strings`: 'erofs', 'windows' and 'windows-lcow' all
+      # appear in an unpatched binary as unrelated strings. This reads the actual slice
+      # out of .data. See the script's docstring for how, and for what it does not prove.
+      - name: Assert the diff-service default order actually names erofs
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            python3 ../boks/packaging/containerd-windows/assert-diff-order.py \
+              "_out/$arch/containerd.exe" erofs windows windows-lcow
+          done
+
+      # The only claim in this whole workflow that is checked by running something rather
+      # than by looking at bytes. Dropping a skipped differ from the order is what keeps a
+      # host with no mkfs.erofs.exe from losing its diff service — and with it bolt, and
+      # every service that depends on bolt — now that erofs is a default order entry.
+      - name: Run the diff-service and transfer plugin tests
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          go test ./plugins/services/diff/... ./plugins/transfer/... -count=1
+          # The Windows-only assertions cannot run here, but they can at least be
+          # type-checked, so a rename in the patched code fails in CI and not on a desktop.
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet ./plugins/services/diff/... ./plugins/transfer/...
 
       # Two import lines cannot plausibly break Linux, which is exactly why it costs nothing
       # to assert instead of assume.
