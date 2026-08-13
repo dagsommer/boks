@@ -17,7 +17,9 @@ that work against a real guest on more than one platform.
 2. **Policy over names for raw flows**, so that `--allow example.com` can authorise a direct
    connection to the address it resolves to rather than denying it.
 3. **The interactive dashboard** that bare `boks` should open.
-4. **Clone mode**, so guest writes do not land on the host by default.
+4. **Clone mode measured behind a hypervisor.** `--clone` is built and verified against runc,
+   where the read-only source share is a bind mount rather than virtiofs; nothing about it
+   has been measured behind a VM boundary yet.
 5. **Docker daemon inside the guest.**
 6. **UDP port publishing**, which needs the link filter to carry a datagram's return path
    without becoming a general hole.
@@ -34,13 +36,14 @@ would sell.
 
 - **Linux is untested in practice.** The boundary was verified on macOS on Apple silicon; the
   Linux/KVM path is designed for but has not been exercised end to end.
-- **Windows does not run Boks natively** — and the obstacle is one device driver, not the
-  platform. libkrun's Windows Hypervisor Platform backend is in progress upstream for
-  libkrun 2.0, and nerdbox already builds a Windows shim for it. **`virtio-net` is the single
-  device not yet ported**, which is exactly the one Boks' enforcement depends on. In the
-  meantime Boks should run **inside WSL2** with nested virtualisation: unchanged, with
-  workspace paths preserved exactly. Untested, but every ingredient is there — see
-  [Windows](windows.md).
+- **Native Windows support is in progress, and no sandbox has ever booted on Windows.** The
+  obstacle is narrow: a Windows Hypervisor Platform backend for libkrun is being built in
+  this repository's [patch series](../packaging/libkrun-windows/) — most of the VMM now
+  compiles for Windows in CI — and nerdbox already builds a Windows shim for it. What
+  remains is the `krun.dll` C API layer and **`virtio-net`, the single device not yet
+  ported**, which is exactly the one Boks' enforcement depends on. In the meantime Boks
+  should run **inside WSL2** with nested virtualisation: unchanged, with workspace paths
+  preserved exactly. Untested, but every ingredient is there — see [Windows](windows.md).
 
 ### Network
 
@@ -92,8 +95,9 @@ would sell.
 
 ### CLI
 
-- **No terminal dashboard** for bare `boks`, and no `--clone` or `--kit`. See the CLI surface
-  section of the [parity matrix](docker-sandbox-parity.md).
+- **No terminal dashboard** for bare `boks`, and no `--kit`. See the CLI surface section of
+  the [parity matrix](docker-sandbox-parity.md). `--clone` exists, and has only been
+  exercised against runc — see item 4 above.
 - **No nested Docker** and no kits.
 - **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather than
   exiting 130 silently.
@@ -105,13 +109,9 @@ would sell.
 - **Telemetry of any kind**, opt-out or otherwise.
 - **An account.**
 
-## How this list stays honest
-
-Everything above is a gap somebody wrote down after meeting it, not a feature grid with empty
-cells. Two of the entries — the crashed supervisor and the raw-socket bypass — exist because
-the behaviour was *measured* and the measurement failed;
-[Verification](verification.md) records both, including the one that was later measured fixed.
+---
 
 If you find something on this page that is no longer true, that is a bug in the page. The
-feature-by-feature comparison with the reference implementation, with priorities, is the
-[Docker Sandbox parity matrix](docker-sandbox-parity.md).
+feature-by-feature comparison with the reference implementation is the
+[Docker Sandbox parity matrix](docker-sandbox-parity.md), and the evidence behind every
+"verified" above is in [Verification](verification.md).

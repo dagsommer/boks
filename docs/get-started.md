@@ -18,10 +18,10 @@ worth your time.
 | Platform | State |
 |---|---|
 | **macOS on Apple silicon** | **Works.** This is the platform the VM boundary and the network policy were measured on. |
-| **Linux with `/dev/kvm`** | **Supported but not verified.** The KVM path is designed for and built, and has not been exercised end to end by anyone on this project. Expect to be the first. |
-| **macOS on Intel** | No. There is no supported VM backend. |
-| **Windows, natively** | **No.** Not "unsupported" — it does not run. libkrun's Windows Hypervisor Platform backend is in progress upstream, and `virtio-net`, the one device Boks' enforcement depends on, is not ported yet. |
-| **Windows via WSL2** | **Designed for, never run.** Every ingredient is present in a stock WSL2 and `boks doctor` diagnoses the two things that go wrong, but nobody on this project has executed it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2). |
+| **Linux with `/dev/kvm`** | **Built, not yet verified.** The KVM path is designed for and built, and has not been exercised end to end by anyone on this project. Expect to be the first. |
+| **macOS on Intel** | No. There is no VM backend for it, and none is planned. |
+| **Windows, natively** | **In progress.** A Windows Hypervisor Platform backend for libkrun is being built — most of the VMM now compiles for Windows in this project's CI — but `virtio-net`, the device Boks' enforcement depends on, is not ported yet, and no sandbox has ever booted on Windows. See [Windows](windows.md). |
+| **Windows via WSL2** | **Designed for, not yet run.** Every ingredient is present in a stock WSL2 and `boks doctor` diagnoses the two things that go wrong, but nobody on this project has executed it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2). |
 
 "Verified" here means a specific thing, and [Verification](verification.md) is where the
 evidence is: what was observed, on what hardware, on what date, and what each observation
@@ -49,11 +49,18 @@ the shim has to be codesigned with the `com.apple.security.hypervisor` entitleme
 
 ## Install
 
+[Installing](install.md) covers every route — Homebrew, `.deb`/`.rpm`, winget, and building
+from source — with the honest status of each. The short version: nothing has been released
+yet, so today the working route is building from source:
+
 ```bash
 git clone https://github.com/dagsommer/boks
 cd boks
 make build          # builds ./bin/boks
 ```
+
+The commands below use `./bin/boks`; once an installed `boks` is on your `PATH`, drop the
+prefix.
 
 ## Check the host
 
@@ -95,6 +102,8 @@ Two things are happening in that command, and both are worth knowing before the 
 
 ## What to read next
 
+- **[Walkthrough](walkthrough.md)** — a longer first session: prove the sandbox is a VM,
+  keep it, give it a policy and a credential, publish a port, clean up.
 - **[Usage](usage.md)** — the sandbox lifecycle, workspaces, network policy, credentials and
   ports. If you read one more page, read that one.
 - **[Agents](agents.md)** — the ten agents, which have prepared images, and what each one is

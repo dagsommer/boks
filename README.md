@@ -129,14 +129,9 @@ What is **not** done:
   `docker run`, which proves each CLI is installed and starts — and nothing about isolation.
   `kiro` has no image (see [images/README.md](images/README.md) for why), and there is still
   no way to define an agent in a file rather than in code.
-<<<<<<< HEAD
-- **No terminal dashboard** for bare `boks`, and no `--clone` or `--kit`. See the CLI surface
-  section of the parity matrix.
-=======
-- **No terminal dashboard** for bare `boks`, no `--kit`, `--profile` or `--publish`. See the
-  CLI surface section of the parity matrix. `--clone` exists, but has only been exercised
-  against runc, so nothing about it has been measured behind a hypervisor.
->>>>>>> worktree-agent-ae95ff2a9c8ada764
+- **No terminal dashboard** for bare `boks`, and no `--kit`. See the CLI surface section of
+  the parity matrix. `--clone` exists, but has only been exercised against runc, so nothing
+  about it has been measured behind a hypervisor.
 - **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather
   than exiting 130 silently.
 - **A crashed network supervisor is unrecoverable without a restart.** The running VM does
