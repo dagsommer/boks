@@ -67,13 +67,25 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 		if err != nil {
 			return err
 		}
-		rules, err := flags.credentialRules()
+		// The credential set is the flags plus whatever the store already holds under a
+		// service name; `boks proxy` and `boks run` resolve it identically, because a
+		// user debugging a credential with the standalone proxy is debugging the one
+		// their sandbox will get.
+		// The records are re-read below, from the store this command opens for itself:
+		// `boks proxy` keeps the store rather than handing values to another process, so
+		// it has no use for the copy resolveCredentials made.
+		plan, _, err := flags.resolveCredentials(cmd.Context(), env.Stderr)
 		if err != nil {
 			return err
 		}
+		rules, err := secret.ParseCredentials(plan.inject, plan.guest)
+		if err != nil {
+			return err
+		}
+		plan.describe(env.Stderr)
 
 		var provider secret.Provider
-		if len(rules) > 0 || len(flags.oauth) > 0 {
+		if len(rules) > 0 || len(plan.oauth) > 0 {
 			// The file store is the provider for both kinds. For OAuth that matters
 			// beyond convenience: it is also the OAuthSaver, so a refresh performed
 			// here is written back durably. A sandbox's supervisor has no passphrase
@@ -82,7 +94,7 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 			if err != nil {
 				return err
 			}
-			oauthRules, err := oauthCredentials(cmd.Context(), fileStore, flags.oauth)
+			oauthRules, err := oauthCredentials(cmd.Context(), fileStore, plan.oauth)
 			if err != nil {
 				return err
 			}
