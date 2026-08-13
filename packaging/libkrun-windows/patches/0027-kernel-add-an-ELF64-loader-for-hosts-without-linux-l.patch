@@ -1,0 +1,674 @@
+From 9d0b8af7c8fbf02d6b1a317154479631ebe9a17a Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Thu, 13 Aug 2026 17:33:41 +0200
+Subject: [PATCH 27/28] kernel: add an ELF64 loader for hosts without
+ linux-loader
+
+Every libkrun host loads a caller-supplied vmlinux with linux-loader.
+That crate declares its vm-memory dependency with default features, and
+vm-memory's default `rawfd` feature is a `compile_error!` on Windows
+targets, so a Windows build cannot contain linux-loader at all -- Cargo
+unifies features across the whole graph. Windows therefore has no way to
+load an external kernel.
+
+Add the one piece of linux-loader that libkrun's ELF path actually
+exercises: copy the PT_LOAD segments to the physical addresses the image
+asks for and report e_entry. Nothing else in `Elf::load` is used --
+kernel_offset is always None here, so the loader always places segments
+at p_paddr, and the returned setup_header and kernel_end are dropped by
+both callers.
+
+Two deliberate differences from linux-loader:
+
+  * Every segment is checked against guest memory before it is copied,
+    and so is e_entry. linux-loader lets an out-of-range segment fail
+    late inside the memory write and does not look at e_entry at all
+    when highmem_start_address is None. On a kernel loader a bad address
+    surfaces as a triple fault with no diagnostic, so it is worth naming
+    the segment that does not fit.
+
+  * The PVH ELF note is not parsed. The caller decides which boot
+    protocol to use, and the only caller that needs this loader cannot
+    use PVH.
+
+The gap between p_filesz and p_memsz is left alone rather than zeroed,
+exactly as linux-loader leaves it: every GuestMemoryMmap backend hands
+out zeroed pages (mmap(MAP_ANONYMOUS) on Unix, VirtualAlloc with
+MEM_COMMIT on Windows), and zeroing here would risk erasing a segment
+copied earlier if two ever overlapped -- a real vmlinux has a trailing
+bss segment whose p_offset points back into the text segment.
+
+The module is built on every platform, not just the one that needs it,
+so that the Linux test suite covers it. The tests load hand-built images
+with both this loader and linux-loader and require identical guest
+memory and identical entry points; linux-loader is a dev-dependency
+only, and only on the platforms that can build it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Cargo.lock                   |   1 +
+ src/kernel/Cargo.toml        |   7 +
+ src/kernel/src/loader/elf.rs | 504 +++++++++++++++++++++++++++++++++++
+ src/kernel/src/loader/mod.rs |  47 ++--
+ 4 files changed, 541 insertions(+), 18 deletions(-)
+ create mode 100644 src/kernel/src/loader/elf.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index ae03132..84c1767 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -816,6 +816,7 @@ name = "krun-kernel"
+ version = "0.1.0-2.0.0-dev"
+ dependencies = [
+  "krun-utils",
++ "linux-loader",
+  "vm-memory",
+ ]
+ 
+diff --git a/src/kernel/Cargo.toml b/src/kernel/Cargo.toml
+index 4c73eff..2484b72 100644
+--- a/src/kernel/Cargo.toml
++++ b/src/kernel/Cargo.toml
+@@ -10,3 +10,10 @@ repository = "https://github.com/containers/libkrun"
+ vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
+ 
+ utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
++
++# `loader::elf` exists because linux-loader cannot be built for Windows (see the module docs).
++# The tests check it against linux-loader, which restricts the dependency to the platforms that
++# can build linux-loader in the first place: it pulls in vm-memory with default features, and
++# vm-memory's default `rawfd` feature is a `compile_error!` on Windows.
++[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
++linux-loader = { version = "0.13.2", features = ["elf"] }
+diff --git a/src/kernel/src/loader/elf.rs b/src/kernel/src/loader/elf.rs
+new file mode 100644
+index 0000000..7d503df
+--- /dev/null
++++ b/src/kernel/src/loader/elf.rs
+@@ -0,0 +1,504 @@
++// Copyright 2026 Red Hat, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++//! A minimal loader for 64-bit little-endian ELF kernel images (`vmlinux`).
++//!
++//! Every other host platform loads an external kernel with `linux-loader`. That crate declares
++//! its `vm-memory` dependency with default features on, `vm-memory`'s default `rawfd` feature
++//! raises a `compile_error!` on Windows targets, and Cargo unifies features across the whole
++//! dependency graph -- so `linux-loader` cannot be part of a Windows build. See the dependency
++//! notes in `src/vmm/Cargo.toml`.
++//!
++//! This module reimplements the one thing libkrun needs from
++//! `linux_loader::loader::elf::Elf::load`: copy every `PT_LOAD` segment to the physical address
++//! the image asks for, and report `e_entry`. The behaviour is deliberately identical to
++//! `linux-loader` called with `kernel_offset: None` and `highmem_start_address: None` -- which is
++//! how `builder.rs` calls it -- plus range checks against guest memory that `linux-loader` does
++//! not perform.
++//!
++//! It is built on every platform, not just Windows, so that the Linux test suite covers it; the
++//! tests at the bottom of this file check it against `linux-loader` itself.
++
++use std::cmp::min;
++use std::io::{Read, Seek, SeekFrom};
++
++use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
++
++use super::{Error, Result};
++
++const EHDR64_SIZE: usize = 64;
++const PHDR64_SIZE: usize = 56;
++
++const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
++const EI_CLASS: usize = 4;
++const EI_DATA: usize = 5;
++const ELFCLASS64: u8 = 2;
++const ELFDATA2LSB: u8 = 1;
++
++const PT_LOAD: u32 = 1;
++
++/// Bounds a single read/write pass, so that loading a segment does not need a host buffer as
++/// large as the segment.
++const COPY_CHUNK: usize = 1 << 20;
++
++fn u16_at(buf: &[u8], offset: usize) -> u16 {
++    u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())
++}
++
++fn u32_at(buf: &[u8], offset: usize) -> u32 {
++    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
++}
++
++fn u64_at(buf: &[u8], offset: usize) -> u64 {
++    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
++}
++
++/// The fields of `Elf64_Ehdr` this loader uses, at their offsets from the ELF specification.
++struct ElfHeader {
++    entry: u64,
++    phoff: u64,
++    phnum: u16,
++}
++
++impl ElfHeader {
++    fn parse(buf: &[u8; EHDR64_SIZE]) -> Result<Self> {
++        if buf[..4] != ELF_MAGIC {
++            return Err(Error::InvalidElfMagicNumber);
++        }
++        if buf[EI_CLASS] != ELFCLASS64 {
++            return Err(Error::InvalidElfClass);
++        }
++        if buf[EI_DATA] != ELFDATA2LSB {
++            return Err(Error::BigEndianElfOnLittle);
++        }
++        if u16_at(buf, 54) as usize != PHDR64_SIZE {
++            return Err(Error::InvalidProgramHeaderSize);
++        }
++        let phoff = u64_at(buf, 32);
++        if (phoff as usize) < EHDR64_SIZE {
++            return Err(Error::InvalidProgramHeaderOffset);
++        }
++        Ok(Self {
++            entry: u64_at(buf, 24),
++            phoff,
++            phnum: u16_at(buf, 56),
++        })
++    }
++}
++
++/// The fields of `Elf64_Phdr` this loader uses, at their offsets from the ELF specification.
++struct ProgramHeader {
++    p_type: u32,
++    offset: u64,
++    /// The *physical* address the segment is linked for. A `vmlinux` carries the kernel's
++    /// virtual address in `p_vaddr` (0xffff_ffff_8100_0000 and up) and the address a loader is
++    /// meant to place it at in `p_paddr`, so `p_vaddr` is deliberately not read here.
++    paddr: u64,
++    filesz: u64,
++    memsz: u64,
++}
++
++impl ProgramHeader {
++    fn parse(buf: &[u8]) -> Self {
++        Self {
++            p_type: u32_at(buf, 0),
++            offset: u64_at(buf, 8),
++            paddr: u64_at(buf, 24),
++            filesz: u64_at(buf, 32),
++            memsz: u64_at(buf, 40),
++        }
++    }
++}
++
++/// Copies the `PT_LOAD` segments of an ELF64 kernel image into guest memory, and returns
++/// `e_entry`.
++///
++/// The area between `p_filesz` and `p_memsz` (`.bss` and the kernel's `.brk`) is left alone
++/// rather than explicitly zeroed, exactly as `linux-loader` leaves it: every `GuestMemoryMmap`
++/// backend hands out freshly zeroed pages (`mmap(MAP_ANONYMOUS)` on Unix, `VirtualAlloc` with
++/// `MEM_COMMIT` on Windows), and zeroing here would instead risk erasing a segment already
++/// copied, were two segments ever to overlap.
++pub fn load_elf<F: Read + Seek>(
++    guest_mem: &GuestMemoryMmap,
++    kernel_image: &mut F,
++) -> Result<GuestAddress> {
++    kernel_image.rewind().map_err(|_| Error::SeekKernelImage)?;
++
++    let mut ehdr_buf = [0u8; EHDR64_SIZE];
++    kernel_image
++        .read_exact(&mut ehdr_buf)
++        .map_err(|_| Error::ReadKernelDataStruct("Failed to read ELF header"))?;
++    let ehdr = ElfHeader::parse(&ehdr_buf)?;
++
++    if guest_mem.check_address(GuestAddress(ehdr.entry)).is_none() {
++        return Err(Error::InvalidEntryAddress);
++    }
++
++    kernel_image
++        .seek(SeekFrom::Start(ehdr.phoff))
++        .map_err(|_| Error::SeekProgramHeader)?;
++    let mut phdr_table = vec![0u8; PHDR64_SIZE * ehdr.phnum as usize];
++    kernel_image
++        .read_exact(&mut phdr_table)
++        .map_err(|_| Error::ReadKernelDataStruct("Failed to read ELF program headers"))?;
++
++    for phdr in phdr_table
++        .chunks_exact(PHDR64_SIZE)
++        .map(ProgramHeader::parse)
++    {
++        if phdr.p_type != PT_LOAD {
++            continue;
++        }
++        if phdr.filesz > phdr.memsz {
++            return Err(Error::InvalidSegmentSize);
++        }
++
++        if phdr.paddr.checked_add(phdr.memsz).is_none() {
++            return Err(Error::InvalidProgramHeaderAddress);
++        }
++        if !guest_mem.check_range(GuestAddress(phdr.paddr), phdr.memsz as usize) {
++            return Err(Error::SegmentNotInGuestMemory(phdr.paddr, phdr.memsz));
++        }
++
++        if phdr.filesz == 0 {
++            continue;
++        }
++        kernel_image
++            .seek(SeekFrom::Start(phdr.offset))
++            .map_err(|_| Error::SeekKernelStart)?;
++
++        let mut buf = vec![0u8; min(phdr.filesz as usize, COPY_CHUNK)];
++        let mut addr = GuestAddress(phdr.paddr);
++        let mut left = phdr.filesz;
++        while left > 0 {
++            let chunk = min(left, buf.len() as u64) as usize;
++            kernel_image
++                .read_exact(&mut buf[..chunk])
++                .map_err(|_| Error::ReadKernelDataStruct("Failed to read an ELF segment"))?;
++            guest_mem
++                .write_slice(&buf[..chunk], addr)
++                .map_err(|_| Error::ReadKernelImage)?;
++            addr = addr.unchecked_add(chunk as u64);
++            left -= chunk as u64;
++        }
++    }
++
++    Ok(GuestAddress(ehdr.entry))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Cursor;
++
++    const MEM_SIZE: usize = 0x40_0000;
++    const ENTRY: u64 = 0x10_0000;
++
++    fn create_guest_mem() -> GuestMemoryMmap {
++        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap()
++    }
++
++    struct Segment {
++        p_type: u32,
++        paddr: u64,
++        memsz: u64,
++        data: Vec<u8>,
++    }
++
++    fn load_segment(paddr: u64, data: &[u8], memsz: u64) -> Segment {
++        Segment {
++            p_type: PT_LOAD,
++            paddr,
++            memsz,
++            data: data.to_vec(),
++        }
++    }
++
++    /// Assembles an ELF64 image: header, program header table, then the segment payloads laid
++    /// out back to back.
++    fn build_elf(entry: u64, segments: &[Segment]) -> Vec<u8> {
++        let mut ehdr = vec![0u8; EHDR64_SIZE];
++        ehdr[..4].copy_from_slice(&ELF_MAGIC);
++        ehdr[EI_CLASS] = ELFCLASS64;
++        ehdr[EI_DATA] = ELFDATA2LSB;
++        ehdr[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
++        ehdr[18..20].copy_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
++        ehdr[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
++        ehdr[24..32].copy_from_slice(&entry.to_le_bytes());
++        ehdr[32..40].copy_from_slice(&(EHDR64_SIZE as u64).to_le_bytes()); // e_phoff
++        ehdr[52..54].copy_from_slice(&(EHDR64_SIZE as u16).to_le_bytes()); // e_ehsize
++        ehdr[54..56].copy_from_slice(&(PHDR64_SIZE as u16).to_le_bytes()); // e_phentsize
++        ehdr[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes()); // e_phnum
++
++        let mut phdrs = Vec::new();
++        let mut payload = Vec::new();
++        let mut offset = (EHDR64_SIZE + PHDR64_SIZE * segments.len()) as u64;
++        for seg in segments {
++            let mut phdr = vec![0u8; PHDR64_SIZE];
++            phdr[0..4].copy_from_slice(&seg.p_type.to_le_bytes());
++            phdr[4..8].copy_from_slice(&7u32.to_le_bytes()); // p_flags = RWX
++            phdr[8..16].copy_from_slice(&offset.to_le_bytes());
++            phdr[16..24].copy_from_slice(&(0xffff_ffff_8000_0000u64 + seg.paddr).to_le_bytes());
++            phdr[24..32].copy_from_slice(&seg.paddr.to_le_bytes());
++            phdr[32..40].copy_from_slice(&(seg.data.len() as u64).to_le_bytes());
++            phdr[40..48].copy_from_slice(&seg.memsz.to_le_bytes());
++            phdr[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
++            phdrs.extend_from_slice(&phdr);
++            payload.extend_from_slice(&seg.data);
++            offset += seg.data.len() as u64;
++        }
++
++        [ehdr, phdrs, payload].concat()
++    }
++
++    fn read_guest(gm: &GuestMemoryMmap, addr: u64, len: usize) -> Vec<u8> {
++        let mut out = vec![0u8; len];
++        gm.read_slice(&mut out, GuestAddress(addr)).unwrap();
++        out
++    }
++
++    #[test]
++    fn loads_segments_at_their_physical_addresses() {
++        let gm = create_guest_mem();
++        let image = build_elf(
++            ENTRY,
++            &[
++                load_segment(ENTRY, &[0xaa; 0x100], 0x100),
++                load_segment(0x20_0000, &[0xbb; 0x80], 0x1000),
++            ],
++        );
++
++        let entry = load_elf(&gm, &mut Cursor::new(image)).unwrap();
++
++        assert_eq!(entry, GuestAddress(ENTRY));
++        assert_eq!(read_guest(&gm, ENTRY, 0x100), vec![0xaa; 0x100]);
++        assert_eq!(read_guest(&gm, 0x20_0000, 0x80), vec![0xbb; 0x80]);
++    }
++
++    #[test]
++    fn leaves_the_gap_between_filesz_and_memsz_zeroed() {
++        let gm = create_guest_mem();
++        gm.write_slice(&[0xff; 0x1000], GuestAddress(0x20_0000))
++            .unwrap();
++        // Undo the poisoning only where the segment's file-backed part lands, so that a loader
++        // which failed to zero the .bss would be caught.
++        gm.write_slice(&[0x00; 0x80], GuestAddress(0x20_0000))
++            .unwrap();
++
++        let image = build_elf(ENTRY, &[load_segment(0x20_0000, &[0xbb; 0x80], 0x1000)]);
++        load_elf(&gm, &mut Cursor::new(image)).unwrap();
++
++        assert_eq!(read_guest(&gm, 0x20_0000, 0x80), vec![0xbb; 0x80]);
++        assert_eq!(
++            read_guest(&gm, 0x20_0080, 0x80),
++            vec![0xff; 0x80],
++            "the .bss gap must be left exactly as the memory backend handed it over"
++        );
++    }
++
++    #[test]
++    fn skips_segments_that_are_not_pt_load() {
++        let gm = create_guest_mem();
++        let note = Segment {
++            p_type: 4, // PT_NOTE
++            paddr: 0x30_0000,
++            memsz: 0x10,
++            data: vec![0xcc; 0x10],
++        };
++        let image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x10], 0x10), note]);
++
++        load_elf(&gm, &mut Cursor::new(image)).unwrap();
++
++        assert_eq!(read_guest(&gm, 0x30_0000, 0x10), vec![0x00; 0x10]);
++    }
++
++    #[test]
++    fn accepts_a_bss_only_segment() {
++        let gm = create_guest_mem();
++        let image = build_elf(
++            ENTRY,
++            &[
++                load_segment(ENTRY, &[0xaa; 0x10], 0x10),
++                load_segment(0x30_0000, &[], 0x2000),
++            ],
++        );
++
++        load_elf(&gm, &mut Cursor::new(image)).unwrap();
++
++        assert_eq!(read_guest(&gm, 0x30_0000, 0x2000), vec![0x00; 0x2000]);
++    }
++
++    #[test]
++    fn rejects_a_non_elf_image() {
++        let gm = create_guest_mem();
++        let mut image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x10], 0x10)]);
++        image[1] = b'X';
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::InvalidElfMagicNumber
++        );
++    }
++
++    #[test]
++    fn rejects_a_32bit_image() {
++        let gm = create_guest_mem();
++        let mut image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x10], 0x10)]);
++        image[EI_CLASS] = 1; // ELFCLASS32
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::InvalidElfClass
++        );
++    }
++
++    #[test]
++    fn rejects_a_big_endian_image() {
++        let gm = create_guest_mem();
++        let mut image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x10], 0x10)]);
++        image[EI_DATA] = 2; // ELFDATA2MSB
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::BigEndianElfOnLittle
++        );
++    }
++
++    #[test]
++    fn rejects_a_foreign_program_header_size() {
++        let gm = create_guest_mem();
++        let mut image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x10], 0x10)]);
++        image[54..56].copy_from_slice(&32u16.to_le_bytes());
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::InvalidProgramHeaderSize
++        );
++    }
++
++    #[test]
++    fn rejects_a_program_header_table_inside_the_elf_header() {
++        let gm = create_guest_mem();
++        let mut image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x10], 0x10)]);
++        image[32..40].copy_from_slice(&16u64.to_le_bytes());
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::InvalidProgramHeaderOffset
++        );
++    }
++
++    #[test]
++    fn rejects_an_entry_point_outside_guest_memory() {
++        let gm = create_guest_mem();
++        let image = build_elf(
++            MEM_SIZE as u64 + 0x1000,
++            &[load_segment(ENTRY, &[0xaa; 0x10], 0x10)],
++        );
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::InvalidEntryAddress
++        );
++    }
++
++    #[test]
++    fn rejects_a_segment_that_does_not_fit_in_guest_memory() {
++        let gm = create_guest_mem();
++        let image = build_elf(
++            ENTRY,
++            &[load_segment(MEM_SIZE as u64 - 0x10, &[0xaa; 0x10], 0x1000)],
++        );
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::SegmentNotInGuestMemory(MEM_SIZE as u64 - 0x10, 0x1000)
++        );
++    }
++
++    #[test]
++    fn rejects_a_segment_larger_on_disk_than_in_memory() {
++        let gm = create_guest_mem();
++        let image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x100], 0x10)]);
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::InvalidSegmentSize
++        );
++    }
++
++    #[test]
++    fn rejects_a_truncated_image() {
++        let gm = create_guest_mem();
++        let mut image = build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x100], 0x100)]);
++        image.truncate(image.len() - 1);
++
++        assert_eq!(
++            load_elf(&gm, &mut Cursor::new(image)).unwrap_err(),
++            Error::ReadKernelDataStruct("Failed to read an ELF segment")
++        );
++    }
++
++    #[test]
++    fn copies_a_segment_larger_than_the_copy_chunk() {
++        let gm = create_guest_mem();
++        let data: Vec<u8> = (0..COPY_CHUNK + 0x1000).map(|i| (i % 251) as u8).collect();
++        let image = build_elf(ENTRY, &[load_segment(ENTRY, &data, data.len() as u64)]);
++
++        load_elf(&gm, &mut Cursor::new(image)).unwrap();
++
++        assert_eq!(read_guest(&gm, ENTRY, data.len()), data);
++    }
++
++    /// The reference implementation is `linux-loader`, which is what every non-Windows build of
++    /// libkrun calls. Load the same images with both and require identical guest memory and
++    /// identical entry points. `linux-loader`'s ELF module only exists for x86 targets.
++    #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
++    #[test]
++    fn agrees_with_linux_loader() {
++        use linux_loader::loader::{KernelLoader, elf::Elf};
++
++        let images = [
++            build_elf(ENTRY, &[load_segment(ENTRY, &[0xaa; 0x100], 0x100)]),
++            build_elf(
++                ENTRY,
++                &[
++                    load_segment(ENTRY, &[0xaa; 0x2000], 0x4000),
++                    load_segment(0x20_0000, &[0x5a; 0x37], 0x37),
++                    load_segment(0x30_0000, &[], 0x1000),
++                ],
++            ),
++            build_elf(
++                0x20_0000,
++                &[
++                    load_segment(
++                        0x20_0000,
++                        &(0..=255u8).cycle().take(0x11000).collect::<Vec<_>>(),
++                        0x12000,
++                    ),
++                    Segment {
++                        p_type: 4, // PT_NOTE
++                        paddr: 0x30_0000,
++                        memsz: 0x10,
++                        data: vec![0xcc; 0x10],
++                    },
++                ],
++            ),
++        ];
++
++        for image in images {
++            let ours = create_guest_mem();
++            let theirs = create_guest_mem();
++
++            let our_entry = load_elf(&ours, &mut Cursor::new(image.clone())).unwrap();
++            let their_result =
++                Elf::load(&theirs, None, &mut Cursor::new(image.clone()), None).unwrap();
++
++            assert_eq!(our_entry, their_result.kernel_load);
++            assert_eq!(
++                read_guest(&ours, 0, MEM_SIZE),
++                read_guest(&theirs, 0, MEM_SIZE)
++            );
++        }
++    }
++}
+diff --git a/src/kernel/src/loader/mod.rs b/src/kernel/src/loader/mod.rs
+index 416fa5d..b1b90dd 100644
+--- a/src/kernel/src/loader/mod.rs
++++ b/src/kernel/src/loader/mod.rs
+@@ -11,45 +11,56 @@ use std;
+ use std::ffi::CString;
+ use std::fmt;
+ 
++pub mod elf;
++
+ use super::cmdline::Error as CmdlineError;
+ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+ 
+ #[derive(Debug, Eq, PartialEq)]
+ pub enum Error {
+     BigEndianElfOnLittle,
++    InvalidElfClass,
+     InvalidElfMagicNumber,
+     InvalidEntryAddress,
+     InvalidProgramHeaderSize,
+     InvalidProgramHeaderOffset,
+     InvalidProgramHeaderAddress,
++    InvalidSegmentSize,
+     ReadKernelDataStruct(&'static str),
+     ReadKernelImage,
+     SeekKernelStart,
+     SeekKernelImage,
+     SeekProgramHeader,
++    SegmentNotInGuestMemory(u64, u64),
+ }
+ 
+ impl fmt::Display for Error {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        write!(
+-            f,
+-            "{}",
+-            match *self {
+-                Error::BigEndianElfOnLittle => "Unsupported ELF File byte order",
+-                Error::InvalidElfMagicNumber => "Invalid ELF magic number",
+-                Error::InvalidEntryAddress => "Invalid entry address found in ELF header",
+-                Error::InvalidProgramHeaderSize => "Invalid ELF program header size",
+-                Error::InvalidProgramHeaderOffset => "Invalid ELF program header offset",
+-                Error::InvalidProgramHeaderAddress => "Invalid ELF program header address",
+-                Error::ReadKernelDataStruct(e) => e,
+-                Error::ReadKernelImage => "Failed to write kernel image to guest memory",
+-                Error::SeekKernelStart => {
+-                    "Failed to seek to file offset as pointed by the ELF program header"
+-                }
+-                Error::SeekKernelImage => "Failed to seek to offset of kernel image",
+-                Error::SeekProgramHeader => "Failed to seek to ELF program header",
++        match *self {
++            Error::BigEndianElfOnLittle => write!(f, "Unsupported ELF File byte order"),
++            Error::InvalidElfClass => write!(f, "Unsupported ELF class, expected 64-bit"),
++            Error::InvalidElfMagicNumber => write!(f, "Invalid ELF magic number"),
++            Error::InvalidEntryAddress => write!(f, "Invalid entry address found in ELF header"),
++            Error::InvalidProgramHeaderSize => write!(f, "Invalid ELF program header size"),
++            Error::InvalidProgramHeaderOffset => write!(f, "Invalid ELF program header offset"),
++            Error::InvalidProgramHeaderAddress => write!(f, "Invalid ELF program header address"),
++            Error::InvalidSegmentSize => {
++                write!(f, "ELF segment is larger on disk than in memory")
+             }
+-        )
++            Error::ReadKernelDataStruct(e) => write!(f, "{e}"),
++            Error::ReadKernelImage => write!(f, "Failed to write kernel image to guest memory"),
++            Error::SeekKernelStart => write!(
++                f,
++                "Failed to seek to file offset as pointed by the ELF program header"
++            ),
++            Error::SeekKernelImage => write!(f, "Failed to seek to offset of kernel image"),
++            Error::SeekProgramHeader => write!(f, "Failed to seek to ELF program header"),
++            Error::SegmentNotInGuestMemory(addr, size) => write!(
++                f,
++                "ELF segment [{addr:#x}, {:#x}) does not fit in guest memory",
++                addr.wrapping_add(size)
++            ),
++        }
+     }
+ }
+ 
+-- 
+2.53.0
+
