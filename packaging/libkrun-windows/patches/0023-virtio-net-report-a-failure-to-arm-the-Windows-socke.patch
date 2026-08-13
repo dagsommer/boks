@@ -1,7 +1,7 @@
 From c3116f07f8a2186de68d9e5312ab38b8680cc448 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:32:05 +0200
-Subject: [PATCH 23/29] virtio/net: report a failure to arm the Windows socket
+Subject: [PATCH 23/30] virtio/net: report a failure to arm the Windows socket
  as its own error
 
 WSACreateEvent()/WSAEventSelect() failing was reported as
