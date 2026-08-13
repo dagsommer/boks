@@ -1,0 +1,143 @@
+From a1afa3f9e555cddec3c84484754287c1efe45c62 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 00:02:43 +0200
+Subject: [PATCH 2/2] transfer: add an optional Linux/erofs unpack config on
+ Windows
+
+`ctr images pull --platform linux/amd64 --snapshotter erofs` fails on Windows
+before it fetches anything:
+
+    ctr: unable to initialize unpacker: no unpack platforms defined: invalid argument
+    daemon: "Unpack configuration not supported, skipping" platform=linux/amd64 snapshotter=erofs
+
+The Windows default unpack configuration has exactly one entry -- the default
+platform with the windows snapshotter and the windows differ -- so a request
+for a Linux platform on the erofs snapshotter matches nothing, the unpacker is
+built with an empty platform list, and the pull is over. `ctr --local` works
+because it does not go through the transfer service at all.
+
+Linux has had the corresponding entry since the erofs snapshotter landed. This
+is the Windows equivalent, with the platform pinned to linux/<arch>: an EROFS
+layer only means anything to a Linux consumer, which on Windows is a guest.
+
+Optional, exactly like the Linux entry: when mkfs.erofs is not on PATH the
+erofs differ returns ErrSkipPlugin, and this entry then drops out silently
+instead of failing the transfer plugin on every Windows host that has no
+interest in EROFS.
+
+Signed-off-by: Dag Sommer <dagaleks@gmail.com>
+---
+ plugins/transfer/plugin_defaults_windows.go | 29 +++++++++++
+ plugins/transfer/plugin_windows_test.go     | 55 +++++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+ create mode 100644 plugins/transfer/plugin_windows_test.go
+
+diff --git a/plugins/transfer/plugin_defaults_windows.go b/plugins/transfer/plugin_defaults_windows.go
+index 74946bb..3724309 100644
+--- a/plugins/transfer/plugin_defaults_windows.go
++++ b/plugins/transfer/plugin_defaults_windows.go
+@@ -19,8 +19,20 @@ package transfer
+ import (
+ 	"github.com/containerd/containerd/v2/defaults"
+ 	"github.com/containerd/platforms"
++
++	specs "github.com/opencontainers/image-spec/specs-go/v1"
+ )
+ 
++// erofsPlatformSpec is the platform the erofs snapshotter unpacks for: Linux,
++// on this machine's architecture. Not windows/amd64 -- an EROFS layer is only
++// useful to a Linux consumer, and the caller asks for it with
++// `--platform linux/amd64`.
++func erofsPlatformSpec() specs.Platform {
++	p := platforms.DefaultSpec()
++	p.OS = "linux"
++	return p
++}
++
+ func defaultUnpackConfig() []unpackConfiguration {
+ 	return []unpackConfiguration{
+ 		{
+@@ -28,5 +40,22 @@ func defaultUnpackConfig() []unpackConfiguration {
+ 			Snapshotter: defaults.DefaultSnapshotter,
+ 			Differ:      defaults.DefaultDiffer,
+ 		},
++
++		// Without this entry the transfer service has nothing that matches
++		// `--platform linux/amd64 --snapshotter erofs`: it logs "Unpack
++		// configuration not supported, skipping", builds an unpacker with no
++		// platforms, and the pull dies with "no unpack platforms defined".
++		// `ctr --local` did not hit it because it never goes through the
++		// transfer service.
++		//
++		// Optional, like the erofs entry in the Linux defaults: when
++		// mkfs.erofs is missing the differ skips itself and this entry
++		// quietly disappears rather than failing the transfer plugin.
++		{
++			Platform:    platforms.Format(erofsPlatformSpec()),
++			Snapshotter: "erofs",
++			Differ:      "erofs",
++			Optional:    true,
++		},
+ 	}
+ }
+diff --git a/plugins/transfer/plugin_windows_test.go b/plugins/transfer/plugin_windows_test.go
+new file mode 100644
+index 0000000..141d954
+--- /dev/null
++++ b/plugins/transfer/plugin_windows_test.go
+@@ -0,0 +1,55 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package transfer
++
++import (
++	"testing"
++
++	"github.com/containerd/platforms"
++)
++
++// A pull of a Linux image through the erofs snapshotter has to find a matching
++// unpack configuration or the transfer service builds an unpacker with no
++// platforms and the pull fails with "no unpack platforms defined".
++func TestDefaultUnpackConfigHasLinuxErofsEntry(t *testing.T) {
++	var found bool
++	for _, uc := range defaultUnpackConfig() {
++		if uc.Snapshotter != "erofs" {
++			continue
++		}
++		found = true
++		p, err := platforms.Parse(uc.Platform)
++		if err != nil {
++			t.Fatalf("erofs unpack platform %q does not parse: %v", uc.Platform, err)
++		}
++		if p.OS != "linux" {
++			t.Errorf("erofs unpack platform is %q, want a linux one", uc.Platform)
++		}
++		if uc.Differ != "erofs" {
++			t.Errorf("erofs unpack config uses differ %q, want erofs", uc.Differ)
++		}
++		// Without Optional, a host that has no mkfs.erofs.exe -- where the
++		// erofs differ returns ErrSkipPlugin -- would fail to start the
++		// transfer plugin at all.
++		if !uc.Optional {
++			t.Error("erofs unpack config must be optional")
++		}
++	}
++	if !found {
++		t.Fatal("no erofs entry in the default unpack configuration")
++	}
++}

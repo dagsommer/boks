@@ -1,0 +1,267 @@
+From 4f4bcf028e98f1ac524b66977d4d5a9979849d14 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 00:02:43 +0200
+Subject: [PATCH 1/2] diff: put the erofs differ in the Windows default order
+
+The erofs differ registers and reports `ok` in `ctr plugins ls`, but the diff
+service never asks it anything: on Windows its default order is
+["windows", "windows-lcow"], and neither name is erofs. A pull through the
+erofs snapshotter therefore reaches the windows differ, which rejects the
+erofs snapshotter's mounts with
+
+    number of mounts should always be 1 for Windows layers
+
+and the walk ends there. `ok` in `plugins ls` means "this plugin initialised",
+not "this plugin is reachable", which is what made this hard to see.
+
+erofs goes first because it is the only differ in the list that can decline:
+for any mount that is not an EROFS-snapshotter layer, MountsToLayer returns
+ErrNotImplemented and the loop moves on. The windows and windows-lcow differs
+fail hard instead, ending the walk, so erofs anywhere but first is erofs never.
+
+Naming a differ in the order has so far made it mandatory -- a missing one
+fails the diff service, which the metadata plugin depends on, which every
+service depends on; one skipped snapshotter has been observed taking out about
+forty plugins. The erofs differ is explicitly not mandatory: it returns
+ErrSkipPlugin when mkfs.erofs is absent from PATH. So a differ that registered
+and then skipped itself is now dropped from the order with a warning, while a
+name that was never registered at all -- a typo in config.toml -- stays fatal,
+and an order left with nothing in it is fatal too.
+
+Signed-off-by: Dag Sommer <dagaleks@gmail.com>
+---
+ plugins/services/diff/local.go           |  29 ++++-
+ plugins/services/diff/local_test.go      | 145 +++++++++++++++++++++++
+ plugins/services/diff/service_windows.go |  12 +-
+ 3 files changed, 182 insertions(+), 4 deletions(-)
+ create mode 100644 plugins/services/diff/local_test.go
+
+diff --git a/plugins/services/diff/local.go b/plugins/services/diff/local.go
+index 6149f46..58ce17b 100644
+--- a/plugins/services/diff/local.go
++++ b/plugins/services/diff/local.go
+@@ -23,6 +23,7 @@ import (
+ 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
+ 	"github.com/containerd/errdefs"
+ 	"github.com/containerd/errdefs/pkg/errgrpc"
++	"github.com/containerd/log"
+ 	"github.com/containerd/plugin"
+ 	"github.com/containerd/plugin/registry"
+ 	"github.com/containerd/typeurl/v2"
+@@ -70,17 +71,39 @@ func init() {
+ 			}
+ 			syncFs := ic.Config.(*config).SyncFs
+ 			orderedNames := ic.Config.(*config).Order
+-			ordered := make([]differ, len(orderedNames))
+-			for i, n := range orderedNames {
++			ordered := make([]differ, 0, len(orderedNames))
++			for _, n := range orderedNames {
+ 				d, ok := differs[n]
+ 				if !ok {
++					// A differ that registered itself and then returned
++					// ErrSkipPlugin is unavailable on this host by its own
++					// account -- the erofs differ does exactly that when
++					// mkfs.erofs is not on PATH. Dropping it from the order
++					// keeps the diff service working with the rest, instead
++					// of failing init and cascading through the metadata
++					// plugin into every service that depends on it.
++					//
++					// A name that was never registered at all is still a hard
++					// error: that is a typo in the configuration, and silently
++					// ignoring it would leave the daemon running with a diff
++					// order nobody asked for.
++					if p := ic.Plugins().Get(plugins.DiffPlugin, n); p != nil {
++						if err := p.Err(); plugin.IsSkipPlugin(err) {
++							log.G(ic.Context).WithError(err).Warnf("differ %q is registered but unavailable, dropping it from the diff order", n)
++							continue
++						}
++					}
+ 					return nil, fmt.Errorf("needed differ not loaded: %s", n)
+ 				}
+ 
+-				ordered[i], ok = d.(differ)
++				od, ok := d.(differ)
+ 				if !ok {
+ 					return nil, fmt.Errorf("differ does not implement Comparer and Applier interface: %s", n)
+ 				}
++				ordered = append(ordered, od)
++			}
++			if len(ordered) == 0 {
++				return nil, fmt.Errorf("no differ from %v is available", orderedNames)
+ 			}
+ 
+ 			return &local{
+diff --git a/plugins/services/diff/local_test.go b/plugins/services/diff/local_test.go
+new file mode 100644
+index 0000000..6395977
+--- /dev/null
++++ b/plugins/services/diff/local_test.go
+@@ -0,0 +1,145 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package diff
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/containerd/plugin"
++	"github.com/containerd/plugin/registry"
++	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
++
++	"github.com/containerd/containerd/v2/core/diff"
++	"github.com/containerd/containerd/v2/core/mount"
++	"github.com/containerd/containerd/v2/plugins"
++	"github.com/containerd/containerd/v2/plugins/services"
++)
++
++type testDiffer struct {
++	id string
++}
++
++func (testDiffer) Apply(context.Context, ocispec.Descriptor, []mount.Mount, ...diff.ApplyOpt) (ocispec.Descriptor, error) {
++	return ocispec.Descriptor{}, nil
++}
++
++func (testDiffer) Compare(context.Context, []mount.Mount, []mount.Mount, ...diff.Opt) (ocispec.Descriptor, error) {
++	return ocispec.Descriptor{}, nil
++}
++
++// initDiffService runs the diff service plugin's InitFn against a plugin set
++// built from the given differs, mirroring how the daemon initialises it.
++func initDiffService(t *testing.T, order []string, differs map[string]error) (*local, error) {
++	t.Helper()
++
++	ps := plugin.NewPluginSet()
++	for id, initErr := range differs {
++		reg := &plugin.Registration{
++			Type: plugins.DiffPlugin,
++			ID:   id,
++			InitFn: func(*plugin.InitContext) (any, error) {
++				if initErr != nil {
++					return nil, initErr
++				}
++				return testDiffer{id: id}, nil
++			},
++		}
++		if err := ps.Add(reg.Init(plugin.NewContext(t.Context(), ps, nil))); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	ic := plugin.NewContext(t.Context(), ps, nil)
++	ic.Config = &config{Order: order}
++
++	// Use the registration this package's init() made, so the test exercises
++	// the real InitFn rather than a copy of it.
++	var initFn func(*plugin.InitContext) (any, error)
++	for _, r := range registry.Graph(func(*plugin.Registration) bool { return false }) {
++		if r.Type == plugins.ServicePlugin && r.ID == services.DiffService {
++			initFn = r.InitFn
++		}
++	}
++	if initFn == nil {
++		t.Fatal("diff service plugin is not registered")
++	}
++	inst, err := initFn(ic)
++	if err != nil {
++		return nil, err
++	}
++	return inst.(*local), nil
++}
++
++func TestDiffOrderDropsSkippedDiffer(t *testing.T) {
++	// The erofs differ returns ErrSkipPlugin when mkfs.erofs is not on PATH.
++	// It is in the default order on Windows, and it must not take the whole
++	// diff service -- and with it bolt and every dependent plugin -- down.
++	l, err := initDiffService(t, []string{"erofs", "windows"}, map[string]error{
++		"erofs":   plugin.ErrSkipPlugin,
++		"windows": nil,
++	})
++	if err != nil {
++		t.Fatalf("diff service failed to init with a skipped differ: %v", err)
++	}
++	if len(l.differs) != 1 {
++		t.Fatalf("expected 1 differ, got %d", len(l.differs))
++	}
++	if got := l.differs[0].(testDiffer).id; got != "windows" {
++		t.Fatalf("expected the windows differ to remain, got %q", got)
++	}
++}
++
++func TestDiffOrderKeepsAvailableDiffersInOrder(t *testing.T) {
++	l, err := initDiffService(t, []string{"erofs", "windows"}, map[string]error{
++		"erofs":   nil,
++		"windows": nil,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(l.differs) != 2 {
++		t.Fatalf("expected 2 differs, got %d", len(l.differs))
++	}
++	if got := l.differs[0].(testDiffer).id; got != "erofs" {
++		t.Fatalf("expected erofs first, got %q", got)
++	}
++}
++
++func TestDiffOrderRejectsUnknownDiffer(t *testing.T) {
++	// A name that was never registered is a configuration typo, not an
++	// unavailable plugin, and must still be fatal.
++	_, err := initDiffService(t, []string{"typo"}, map[string]error{"windows": nil})
++	if err == nil || !strings.Contains(err.Error(), "needed differ not loaded") {
++		t.Fatalf("expected a needed-differ-not-loaded error, got %v", err)
++	}
++}
++
++func TestDiffOrderRejectsWhenEveryOrderedDifferSkipped(t *testing.T) {
++	// Dropping skipped differs must not leave an empty order: a diff service
++	// with no differs would accept Apply calls and silently do nothing.
++	// "walking" here is loaded but not in the order, so GetByType succeeds and
++	// the emptiness check is what has to catch this.
++	_, err := initDiffService(t, []string{"erofs"}, map[string]error{
++		"erofs":   plugin.ErrSkipPlugin,
++		"walking": nil,
++	})
++	if err == nil || !strings.Contains(err.Error(), "is available") {
++		t.Fatalf("expected an all-differs-unavailable error, got %v", err)
++	}
++}
+diff --git a/plugins/services/diff/service_windows.go b/plugins/services/diff/service_windows.go
+index d6f1e5a..f45ac42 100644
+--- a/plugins/services/diff/service_windows.go
++++ b/plugins/services/diff/service_windows.go
+@@ -16,7 +16,17 @@
+ 
+ package diff
+ 
++// The erofs differ comes first because it is the only entry that can decline a
++// job: for anything that is not an EROFS-snapshotter layer it returns
++// ErrNotImplemented and the walk continues. The windows and windows-lcow
++// differs do the opposite -- handed the erofs snapshotter's mounts they fail
++// hard with "number of mounts should always be 1 for Windows layers", which
++// ends the walk. So erofs last is the same as erofs absent.
++//
++// Listing a differ here normally makes it mandatory, and the erofs differ is
++// not: it returns ErrSkipPlugin when mkfs.erofs is missing from PATH. See the
++// skip handling in local.go, added in the same series.
+ var defaultDifferConfig = &config{
+-	Order:  []string{"windows", "windows-lcow"},
++	Order:  []string{"erofs", "windows", "windows-lcow"},
+ 	SyncFs: false,
+ }
