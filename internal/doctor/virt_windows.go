@@ -81,15 +81,21 @@ func hypervisorLibrarySearchPaths() []string { return nerdboxSearchPaths() }
 // shim never consults the loader's search path on Windows, so a krun.dll this check cannot
 // find is one the shim cannot find either — subject to containerd's PATH not being ours.
 //
-// Where to get one is the honest hard part, and the remedy must not pretend otherwise.
-// Upstream libkrun does not build a Windows cdylib yet (it is targeted at libkrun 2.0), and
-// packaging/libkrun-windows/ in this repository compile-checks patches towards that — it
-// ships nothing. Anything exporting libkrun's C ABI under this name loads.
+// Where to get one takes care to state, because the true answer changed recently and is
+// easy to overclaim in either direction. packaging/libkrun-windows/ now carries a patch
+// series that builds a real krun.dll: CI links it on a windows-latest runner with virtio-net,
+// and all nineteen symbols nerdbox resolves at load are exported. But no VM has ever booted
+// on Windows, and a boot attempt on real hardware got as far as kernel loading and stopped
+// there. So the remedy says a DLL can be built and declines to say it will start a sandbox.
+// Anything exporting libkrun's C ABI under this name loads.
 func hypervisorLibraryHint() string {
 	return "Searched PATH and LIBKRUN_PATH, which is the shim's whole search on Windows:\n" +
 		"it loads the resolved path directly and never consults the loader's search path.\n" +
 		"Note that containerd's PATH is the daemon's, not your shell's.\n" +
-		"Upstream libkrun has no Windows build to install yet — the WHP port is targeted at\n" +
-		"libkrun 2.0, and packaging/libkrun-windows/ only compile-checks patches towards it.\n" +
-		"Boks cannot start a sandbox on Windows regardless; see the platform check."
+		"There is no krun.dll to install from upstream libkrun: its Windows port is targeted\n" +
+		"at libkrun 2.0. This repository builds one — apply packaging/libkrun-windows/patches/\n" +
+		"to the pinned revision in that directory and build with --features blk,net.\n" +
+		"Having one is not enough to start a sandbox: no VM has ever booted on Windows, and\n" +
+		"the furthest a real attempt reached was loading the guest kernel. See the platform\n" +
+		"check."
 }
