@@ -1,8 +1,10 @@
 # Boks on Windows
 
-Status: **feasibility spike, no implementation.** Nothing in this document has been executed.
-No machine on this project has Windows or a hypervisor for it, and none of the findings below
-were obtained by running anything on Windows. They are read from the source of
+Status: **feasibility spike.** One decision from it has since been implemented — the workspace
+path mapping in section 4, which is pure path arithmetic and needs no Windows to be correct —
+and nothing else. No machine on this project has Windows or a hypervisor for it, nothing here
+has been executed on Windows, and none of the findings below were obtained by running anything
+there. They are read from the source of
 `microsoft/hcsshim`, `containerd` and `gvisor-tap-vsock`, from Microsoft's documentation, from
 the CI configuration those projects ship, and — for the section that matters most — from the
 shipped Windows binaries of the reference product. Every claim is labelled **verified** (traced
@@ -639,12 +641,56 @@ Rules that follow, and should be decided up front rather than discovered:
 - The existing symlink resolution stays: Boks resolves the host path first, then maps.
 - Sandbox naming is unaffected — it uses the workspace's base name, which survives the mapping.
 
+### What was implemented, and what was not
+
+`internal/workspace/guestpath.go` implements the recommendation above. It is the **only** place
+in Boks that knows a host path may need translating: `guestPath(host, style)` takes the path
+grammar as an argument rather than reading `runtime.GOOS`, so the Windows rules are ordinary
+table-driven tests on a Linux machine, and so no other package grows a platform branch.
+
+Decided while implementing, beyond the rules above:
+
+- **Forward-slash spellings are accepted.** `C:/Users/dag` is what Go, PowerShell and git all
+  take, and two spellings of one directory must not become two shares.
+- **`\\?\C:\...` is unwrapped.** The extended-length prefix comes from Windows itself —
+  `filepath.EvalSymlinks` returns it for paths over `MAX_PATH` and for some reparse points —
+  and names the same file. `\\?\UNC\server\share` is routed back to the UNC refusal.
+- **Device paths (`\\.\...`) are refused** with UNC, for the same reason and with the same
+  message.
+- **Drive-relative paths (`C:foo`) are refused rather than rooted.** They depend on a
+  per-drive current directory that has no guest equivalent, and callers resolve with
+  `filepath.Abs` first, so one arriving here means the resolution step was skipped. Guessing
+  `C:\foo` would share a directory nobody named.
+- **Case below the drive letter is preserved and is not this function's problem.**
+  `filepath.EvalSymlinks` on Windows is documented to return a unique spelling and its
+  implementation replaces each component with its on-disk case (`toNorm`/`normBase` in
+  `path/filepath/symlink_windows.go`), so `C:\Users\Dag\Repo` and `c:\users\dag\repo` are
+  already one string before the mapping runs. The mapping folds the drive letter and nothing
+  else — lowercasing components would produce a path the case-sensitive guest cannot open.
+- **A guest workspace path can never shadow a guest system directory.** Its first component is
+  always a single lowercase letter, so no host path maps onto `/etc`, `/run` or `/usr`. That
+  falls out of the convention rather than being checked, and there is a test asserting it
+  stays true.
+- **The `:ro` suffix does not collide with the drive separator.** A colon at index 1 of a
+  Windows path is always the drive letter's, so `C:ro` stays a drive-relative path to
+  something called `ro` rather than becoming drive C shared read-only.
+
+Not implemented, deliberately:
+
+- **The `/mnt/c` compatibility symlink.** It lives inside the guest image, not in path
+  handling, and there is no Windows guest to put it in yet.
+- **A host↔guest inverse for `boks cp`.** `cp` takes the guest path from the user directly
+  (`SANDBOX:/abs/path`) and never derives one from a host path, so it has nothing to invert
+  today. The mapping is reversible when it does.
+- **Anything that would run.** There is no VMM, so none of this has been executed on Windows
+  and none of it is on a path a user can reach.
+
 ### The consequences, stated as costs
 
 - **`Workspace.GuestPath != Workspace.HostPath` on Windows.** Every statement in
   `docs/architecture.md`, `docs/docker-sandbox-parity.md` and `internal/workspace`'s package
-  comment about exact-path mounting becomes platform-conditional. Those documents would need
-  editing, not a footnote.
+  comment about exact-path mounting becomes platform-conditional. Those documents needed
+  editing, not a footnote, and got it when the mapping landed.
 - **Absolute paths generated inside the sandbox stop being valid on the host.** This is the
   concrete user-visible loss and it is the whole reason the property exists. A binary compiled
   in the sandbox with embedded debug paths, a `compile_commands.json`, a `.pyc`, a generated
