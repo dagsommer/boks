@@ -363,6 +363,76 @@ func TestIntegrationCloneSurvivesAStopAndStart(t *testing.T) {
 	}
 }
 
+// Clone mode is only usable if work can leave the sandbox, and a sandbox has no inbound
+// network to serve a git remote from. This is the whole path, end to end: commit in the
+// guest, bundle inside it, copy the bundle out over the same channel `boks cp` uses, and
+// fetch it into a host repository that has never seen those commits.
+func TestIntegrationCloneWorkLeavesAsABundle(t *testing.T) {
+	ws := hostRepo(t)
+	before := treeDigest(t, ws.HostPath)
+	cfg := newCloneSandbox(t, ws)
+
+	code, _, err := execIn(t, cfg, "/bin/sh", "-c", `set -e
+cd `+ws.GuestPath+`
+echo "written in the sandbox" > FEATURE.md
+git -c user.email=g@t -c user.name=g add -A
+git -c user.email=g@t -c user.name=g commit -qm "the guest's work"
+git bundle create /tmp/work.bundle --all HEAD`)
+	if err != nil || code != 0 {
+		t.Fatalf("bundling in the guest: code=%d err=%v", code, err)
+	}
+
+	hostBundle := filepath.Join(t.TempDir(), "work.bundle")
+	if err := sandbox.Copy(context.Background(), sandbox.CopyConfig{
+		Address:   cfg.Address,
+		Name:      cfg.Name,
+		GuestPath: "/tmp/work.bundle",
+		HostPath:  hostBundle,
+	}); err != nil {
+		t.Fatalf("copying the bundle out: %v", err)
+	}
+
+	// The host repository must not have the commit before the fetch, or the test would
+	// prove nothing.
+	if strings.Contains(hostGit(t, ws.HostPath, "log", "--all", "--oneline"), "the guest's work") {
+		t.Fatal("the host already has the guest's commit; the fixture is wrong")
+	}
+	hostGit(t, ws.HostPath, "fetch", hostBundle, "refs/heads/*:refs/sandboxes/test/*")
+	refs := hostGit(t, ws.HostPath, "log", "--oneline", "--all", "--glob=refs/sandboxes/test/*")
+	if !strings.Contains(refs, "the guest's work") {
+		t.Errorf("the fetched refs do not carry the guest's commit: %q", refs)
+	}
+	if got := hostGit(t, ws.HostPath, "show", "refs/sandboxes/test/main:FEATURE.md"); !strings.Contains(got, "written in the sandbox") {
+		t.Errorf("the fetched commit does not carry the guest's file: %q", got)
+	}
+
+	// A fetch writes refs and objects under .git, which is exactly what it is for. The
+	// working tree — the user's actual files — must be untouched by any of this.
+	for _, name := range []string{"Makefile", "README.md", "untracked.txt"} {
+		if _, err := os.Stat(filepath.Join(ws.HostPath, name)); err != nil {
+			t.Errorf("the bundle round trip disturbed %s: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(ws.HostPath, "FEATURE.md")); err == nil {
+		t.Error("fetching a bundle checked the guest's file out into the host working tree")
+	}
+	if before == treeDigest(t, ws.HostPath) {
+		t.Log("note: the digest is unchanged, so the fetch wrote nothing under .git either")
+	}
+}
+
+// hostGit runs git against the fixture repository with a pristine configuration.
+func hostGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
 // Direct mode has to keep doing what it did: the write-back test in integration_test.go
 // covers the shared workspace, and this covers the record that now describes it.
 func TestIntegrationDirectModeIsRecordedAsDirect(t *testing.T) {
