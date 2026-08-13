@@ -98,7 +98,45 @@ module BoksDocs
     end
   end
 
+  # The landing page quotes two things out of README.md — the lede and the experimental
+  # warning — rather than keeping a second copy of either. The words on the front page are
+  # therefore the README's words, and cannot be softened in one place and not the other.
+  #
+  # Both are located structurally: everything between the first `# ` heading and the first
+  # alert is the lede; the first `> [!WARNING]` block is the warning. If either cannot be
+  # found the build fails, because a landing page that has quietly lost its warning is
+  # exactly the failure the CI assertions exist to catch, and failing here names the cause.
+  def self.home_excerpts(markdown, source_path)
+    unless (heading = markdown.match(/^#\s+.+$/))
+      raise Jekyll::Errors::FatalException,
+            "site: #{source_path} has no '# ' heading, so the landing page has no lede to quote."
+    end
+    rest = markdown[(heading.end(0))..] || ""
+
+    unless (warning = rest.match(/^> \[!WARNING\]\n(?:^>.*\n?)+/))
+      raise Jekyll::Errors::FatalException,
+            "site: #{source_path} has no '> [!WARNING]' block. The landing page quotes it, " \
+            "and a landing page without the experimental warning must not be published. " \
+            "Restore the warning, or change site/_plugins/boks_docs.rb deliberately."
+    end
+
+    lede = rest[0...warning.begin(0)].strip
+    if lede.empty?
+      raise Jekyll::Errors::FatalException,
+            "site: #{source_path} has nothing between its heading and its warning, so the " \
+            "landing page has no lede to quote."
+    end
+
+    { "lede" => lede, "warning" => warning[0] }
+  end
+
   def self.resolve(target, source_path, urls, repo, branch)
+    # A bare fragment in text quoted onto the landing page would point at a section of a
+    # page the reader is not on. It resolves to that section of the source document on
+    # GitHub instead, which is the section the link names.
+    if target.start_with?("#") && source_path == "README.md"
+      return "#{repo}/blob/#{branch}/#{source_path}#{target}"
+    end
     return target if target.match?(%r{\A([a-z][a-z0-9+.-]*:|//|#)})
 
     path, _, frag = target.partition("#")
@@ -167,12 +205,18 @@ class BoksDocsGenerator < Jekyll::Generator
     repo = site.config["repo"]
     branch = site.config["repo_branch"]
 
-    urls = entries.to_h { |e| [e["source"], e["url"]] }
+    urls = entries.reject { |e| e["section"] }.to_h { |e| [e["source"], e["url"]] }
 
     converter = site.find_converter_instance(Jekyll::Converters::Markdown)
     index = []
 
     nav = entries.map do |entry|
+      # A heading in the sidebar, so that fourteen documents read as four groups. It names
+      # no file and produces no page.
+      if entry["section"]
+        next { "section" => entry["section"] }
+      end
+
       source = entry["source"]
       path = File.join(root, source)
       unless File.file?(path)
@@ -206,12 +250,29 @@ class BoksDocsGenerator < Jekyll::Generator
 
     site.config["nav"] = nav
 
+    # The landing page's lede and warning, quoted from the document named by `home_source`
+    # rather than written again under site/. Rendered through the same pipeline as every
+    # other page, so an alert is an alert and a link between documents still resolves.
+    home_source = site.config["home_source"]
+    if home_source
+      path = File.join(root, home_source)
+      unless File.file?(path)
+        raise Jekyll::Errors::FatalException,
+              "site: home_source names #{home_source}, which does not exist."
+      end
+      excerpts = BoksDocs.home_excerpts(File.read(path), home_source)
+      site.config["home"] = excerpts.transform_values do |markdown|
+        converter.convert(BoksDocs.transform(markdown, home_source, urls, repo, branch))
+      end.merge("source" => home_source)
+    end
+
     search = Jekyll::PageWithoutAFile.new(site, site.source, "", "search-index.json")
     search.content = JSON.generate(index)
     search.data["layout"] = nil
     search.data["sitemap"] = false
     site.pages << search
 
-    Jekyll.logger.info "Boks docs:", "#{nav.length} pages, #{index.length} search sections"
+    pages = nav.count { |item| item["url"] }
+    Jekyll.logger.info "Boks docs:", "#{pages} pages, #{index.length} search sections"
   end
 end

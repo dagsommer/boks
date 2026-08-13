@@ -15,7 +15,7 @@ AGENT_IMAGES := $(filter-out base,$(notdir $(wildcard images/*)))
 # `docker-agent version`, not `docker-agent --version`; everything else takes the flag.
 VERSION_ARG_docker-agent := version
 
-.PHONY: build test check integration vet fmt clean images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
+.PHONY: build test check integration vet fmt clean docs docs-check release-notes images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/boks
@@ -38,6 +38,29 @@ fmt:
 
 clean:
 	rm -rf bin
+
+# --- generated documentation ------------------------------------------------------
+#
+# docs/cli.md is rendered from the cobra command tree, so it describes the CLI that exists
+# rather than the one somebody wrote about. Run this after changing a command, a flag or a
+# help string; `make test` fails until you have, which is what stops the page from ageing.
+
+docs:
+	go run ./cmd/gen-docs
+
+docs-check:
+	go run ./cmd/gen-docs -check
+
+# Release notes for a tag, from the conventional commits since the previous one. Prints to
+# stdout so you can read it before it lands; add --insert to write it into
+# docs/release-notes.md. See the top of the script, and docs/release-notes.md, for how a
+# release is cut and why the first entry is hand-written.
+#
+#   make release-notes TAG=v0.1.1
+#   make release-notes TAG=v0.1.1 INSERT=--insert
+release-notes:
+	@test -n "$(TAG)" || { echo "usage: make release-notes TAG=vX.Y.Z [INSERT=--insert]" >&2; exit 2; }
+	./scripts/release-notes.sh $(INSERT) $(TAG)
 
 # --- agent images -----------------------------------------------------------------
 #
