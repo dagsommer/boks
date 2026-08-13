@@ -42,6 +42,47 @@ of truth that goes stale the first time upstream fixes one, and we would not not
 
 At `52cc42c` the recipe is erofs-utils **v1.9.1** against **lz4 1.10.0**.
 
+## `patches/` — the one thing here that *is* ours
+
+`patches/` holds Boks patches applied **after** go-erofs's series, for bugs that go-erofs's
+patches leave in place. The rule above still holds: nothing in `patches/` duplicates anything
+upstream maintains. Each one is a fix that belongs in erofs-utils and is here because the Windows
+port of `mkfs.erofs` does not exist upstream to receive it.
+
+### `0001-windows-create-temporary-files-where-Windows-keeps-t.patch`
+
+On a Windows 11 machine with 61 GB free, `mkfs.erofs.exe --tar=f` on a 3 KB tar fails:
+
+```
+<E> erofs: main() Line[1940] failed to initialize diskbuf: No space left on device
+```
+
+Creating `C:\tmp` and changing nothing else makes it succeed. `TMP` and `TEMP` were set correctly
+and made no difference.
+
+Two bugs, in `lib/diskbuf.c`:
+
+- **`erofs_tmpfile()` hardcodes `/tmp`.** It builds `"%s/tmp.XXXXXXXXXX"` from
+  `getenv("TMPDIR") ?: "/tmp"` — `TMPDIR` only, never `TMP` or `TEMP`. mingw's CRT resolves a
+  rooted path with no drive letter against the current drive, so the fallback silently means
+  `C:\tmp`, which no stock Windows install has. The patch asks Windows instead, via
+  `GetTempPathW` (which honours `TMP`, then `TEMP`, then `USERPROFILE`, then the Windows
+  directory, and always returns a directory that exists), still checking `TMPDIR` first so the
+  POSIX knob keeps working.
+
+- **`erofs_diskbuf_init()` reports `-ENOSPC` for every failure.** `erofs_tmpfile()` returns
+  `-errno` — `ENOENT` here — and the caller throws it away and substitutes "no space left on
+  device", which is why the message sends people to check disk space for a missing directory.
+  The patch propagates the real errno. That half is a bug on every platform.
+
+The Windows implementation also fixes a leak the POSIX one cannot avoid there: the original
+unlinks the temp file while still holding it open, which Windows refuses, so every run left its
+temporary file behind. `FILE_FLAG_DELETE_ON_CLOSE` is the equivalent that works — the file goes
+away when the last handle closes, including if the process is killed.
+
+The CI job asserts both halves landed: the built `mkfs.erofs.exe` must contain no `/tmp` string
+and must import `GetTempPathW` and `GetTempFileNameW`.
+
 ## The recipe
 
 Straight out of `.github/workflows/ci.yml` in `erofs/go-erofs`, job
@@ -62,6 +103,8 @@ Straight out of `.github/workflows/ci.yml` in `erofs/go-erofs`, job
    | `003-windows-pipe-lseek.patch` | `lseek` on a pipe, which Windows does not allow |
    | `004-windows-gzran-zlib-guard.patch` | guards gzran behind zlib, which we build without |
    | `005-windows-tar-uid-gid.patch` | uid/gid handling on the tar path |
+
+   …then `patches/*.patch` from this directory, on top. See above.
 
 5. `./autogen.sh`, then `./configure --host=x86_64-w64-mingw32 --disable-shared --enable-lz4`
    plus `--without-{zlib,libzstd,selinux,uuid,openssl}` and `--disable-{lzma,fuse,debug}`.
@@ -88,21 +131,25 @@ when GitHub moves the label. We pin the concrete image so our build breaks when 
 there is no `mkfs.erofs.exe` for Windows on ARM. On an arm64 Windows host the erofs differ will
 skip itself — see `packaging/containerd-windows/README.md`, which is where that matters.
 
-## Verified here, on Linux, 2026-08-13
+## Status
 
-Built with the recipe above in a container; the resulting binary was inspected, **not run** —
-this is a Linux machine.
+The binary this recipe produces **has run on Windows 11**, and successfully formatted EROFS
+layers through containerd's erofs differ — once `C:\tmp` existed. That is the run `patches/0001`
+is here to make unnecessary. The patched binary has *not* been run; it has been cross-compiled
+and inspected.
 
-| Check | Result |
+No sizes or checksums are quoted here on purpose. They depend on the mingw-w64 build in the
+runner image and change without anything in this repo changing; a number in a README that does
+not match the artifact teaches people to distrust the README. The workflow prints the real
+`sha256sum` and byte count of every build into its job summary — read it there.
+
+### What the workflow checks, on Linux, and what it cannot
+
+| Check | Why it is there |
 | --- | --- |
-| `head -c2` | `MZ` |
-| `objdump -f` | `file format pei-x86-64`, `architecture: i386:x86-64` — PE32+ |
-| `objdump -p` imports | `KERNEL32.dll`, `msvcrt.dll` — and nothing else |
-| size | 550,912 bytes, stripped |
-| `strings` | contains `--tar=X   generate a full or index-only image from a tarball(-ish) source` |
+| `head -c2` is `MZ`, `objdump -f` says `pei-x86-64` | a cross-build that fell back to the host compiler would produce a working-looking ELF named `.exe` |
+| `strings` contains `--tar=` | the differ's init greps `mkfs.erofs --help` for exactly this literal; without it the plugin returns `ErrSkipPlugin` and vanishes silently |
+| `strings` contains **no** `/tmp` | the `patches/0001` symptom: the hardcoded fallback that mingw turns into `C:\tmp` |
+| imports `GetTempPathW`, `GetTempFileNameW` | `patches/0001` actually reached the binary |
 
-That last row is the one that matters for containerd. The differ's plugin init runs
-`mkfs.erofs --help` and greps the output for the literal `--tar=`; if the grep fails the plugin
-returns `ErrSkipPlugin` and vanishes. The string is present in the binary's help text, so the
-grep should succeed — **should**, because nobody has executed this binary. It has never run on
-Windows, or anywhere.
+None of this executes anything. It is a Linux runner, and the binary is a Windows PE.

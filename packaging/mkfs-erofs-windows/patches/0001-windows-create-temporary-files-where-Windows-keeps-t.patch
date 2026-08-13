@@ -1,0 +1,168 @@
+From: Dag Sommer <dagaleks@gmail.com>
+Subject: [PATCH] windows: create temporary files where Windows keeps them
+
+erofs_tmpfile() builds "$TMPDIR/tmp.XXXXXXXXXX" and falls back to the literal
+"/tmp".  Windows has no /tmp, and mingw's CRT resolves a rooted path with no
+drive letter against the current drive, so mkfs.erofs.exe silently required
+C:\tmp to exist.  TMP and TEMP -- which is what Windows actually sets, and what
+a user who reads "no space left on device" will not think to check -- were
+never consulted, because only TMPDIR was.
+
+On a machine without C:\tmp this is what `mkfs.erofs --tar=f` does, with 61 GB
+free:
+
+    <E> erofs: main() Line[1940] failed to initialize diskbuf: No space left on device
+
+Two bugs in one line.  The path is wrong, and the error is wrong: mkstemp()
+failed with ENOENT, but erofs_diskbuf_init() throws that away and reports
+-ENOSPC for every possible failure, sending people to check disk space for a
+missing directory.  Creating C:\tmp by hand and changing nothing else makes the
+same command succeed.
+
+GetTempPathW is the documented way to ask Windows where temporary files go: it
+honours TMP, then TEMP, then USERPROFILE, then the Windows directory, and the
+result always exists.  TMPDIR is still checked first, so the POSIX-facing knob
+keeps working for callers that set it.
+
+The POSIX implementation also relies on unlinking a file it still has open,
+which Windows refuses, so every mkfs.erofs.exe run left its temporary file
+behind.  FILE_FLAG_DELETE_ON_CLOSE is the equivalent that works there: the file
+goes away when the last handle closes, including if the process is killed.
+
+The POSIX path is untouched apart from the -ENOSPC fix, which is a bug on every
+platform.
+
+This belongs upstream in erofs-utils; it lives in Boks because the Windows port
+of mkfs.erofs does not exist upstream yet either.
+
+diff --git a/lib/diskbuf.c b/lib/diskbuf.c
+index 316bf78..d0037bf 100644
+--- a/lib/diskbuf.c
++++ b/lib/diskbuf.c
+@@ -7,6 +7,12 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <stdlib.h>
++#ifdef _WIN32
++#include <windows.h>
++#include <io.h>
++#include <fcntl.h>
++#include <wchar.h>
++#endif
+ 
+ /* A simple approach to avoid creating too many temporary files */
+ static struct erofs_diskbufstrm {
+@@ -66,6 +72,90 @@ void erofs_diskbuf_close(struct erofs_diskbuf *db)
+ 	db->sp = NULL;
+ }
+ 
++#ifdef _WIN32
++static int erofs_win32_errno(DWORD err)
++{
++	switch (err) {
++	case ERROR_ACCESS_DENIED:
++	case ERROR_SHARING_VIOLATION:
++		return EACCES;
++	case ERROR_FILE_NOT_FOUND:
++	case ERROR_PATH_NOT_FOUND:
++	case ERROR_INVALID_DRIVE:
++		return ENOENT;
++	case ERROR_DISK_FULL:
++	case ERROR_HANDLE_DISK_FULL:
++		return ENOSPC;
++	case ERROR_TOO_MANY_OPEN_FILES:
++		return EMFILE;
++	case ERROR_NOT_ENOUGH_MEMORY:
++	case ERROR_OUTOFMEMORY:
++		return ENOMEM;
++	default:
++		return EIO;
++	}
++}
++
++/*
++ * Windows has no /tmp, and the CRT resolves a bare "/tmp/..." against the
++ * current drive, so the POSIX path above silently means "C:\tmp" -- a
++ * directory that does not exist on a stock install.  TMP and TEMP, which are
++ * what Windows actually sets, were never consulted at all.
++ *
++ * GetTempPathW is the documented way to ask: it honours TMP, then TEMP, then
++ * USERPROFILE, then the Windows directory, and always yields a directory that
++ * exists.  TMPDIR is checked first so the POSIX-facing knob keeps working for
++ * callers that set it (containerd's erofs differ inherits its environment).
++ *
++ * unlink() on an open file fails on Windows, so mkstemp()+unlink() would leak
++ * the temporary file for the lifetime of the process and beyond.
++ * FILE_FLAG_DELETE_ON_CLOSE is the equivalent that works: the file is removed
++ * when the last handle closes, including when the process dies abnormally.
++ */
++int erofs_tmpfile(void)
++{
++	wchar_t dir[MAX_PATH + 1], path[MAX_PATH + 1];
++	const wchar_t *tmpdir;
++	HANDLE h;
++	DWORD n;
++	int fd;
++
++	tmpdir = _wgetenv(L"TMPDIR");
++	if (tmpdir && *tmpdir && wcslen(tmpdir) <= MAX_PATH) {
++		wcscpy(dir, tmpdir);
++	} else {
++		n = GetTempPathW(MAX_PATH + 1, dir);
++		if (!n || n > MAX_PATH)
++			return -erofs_win32_errno(GetLastError());
++	}
++
++	if (!GetTempFileNameW(dir, L"ero", 0, path))
++		return -erofs_win32_errno(GetLastError());
++
++	/*
++	 * GetTempFileNameW has already created (and closed) the file, so
++	 * reopening it with CREATE_ALWAYS just claims the reserved name.
++	 */
++	h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
++			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++			NULL, CREATE_ALWAYS,
++			FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
++			NULL);
++	if (h == INVALID_HANDLE_VALUE) {
++		int err = erofs_win32_errno(GetLastError());
++
++		DeleteFileW(path);
++		return -err;
++	}
++
++	fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
++	if (fd < 0) {
++		CloseHandle(h);
++		return -EBADF;
++	}
++	return fd;
++}
++#else
+ int erofs_tmpfile(void)
+ {
+ #define	TRAILER		"tmp.XXXXXXXXXX"
+@@ -86,6 +176,7 @@ int erofs_tmpfile(void)
+ 	(void)fchmod(fd, 0666 & ~u);
+ 	return fd;
+ }
++#endif
+ 
+ int erofs_diskbuf_init(unsigned int nstrms)
+ {
+@@ -111,7 +202,13 @@ int erofs_diskbuf_init(unsigned int nstrms)
+ 		strm->devpos = 0;
+ 		strm->fd = erofs_tmpfile();
+ 		if (strm->fd < 0)
+-			return -ENOSPC;
++			/*
++			 * erofs_tmpfile() already returns -errno.  Reporting
++			 * -ENOSPC unconditionally sent every temp-file failure
++			 * -- a missing directory, a denied ACL -- to the user
++			 * as "No space left on device".
++			 */
++			return strm->fd;
+ setupone:
+ 		strm->tailoffset = 0;
+ 		erofs_atomic_set(&strm->count, 1);
