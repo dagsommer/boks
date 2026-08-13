@@ -3,11 +3,12 @@
 //
 // # What it is, and what it is not
 //
-// The fake guest is a second gvisor stack on the far end of the same SOCK_DGRAM UNIX socket
-// a VM would use, configured the way the container is configured by Boks' annotations: one
-// address in the sandbox's subnet, and a default route through the gateway. Everything
-// between the two stacks is real: Ethernet frames over the real link, ARP, a real TCP
-// handshake, and real traffic to whatever the connection reaches.
+// The fake guest is a second gvisor stack on the far end of the same AF_UNIX SOCK_STREAM
+// socket a VM would use, connecting to it the way libkrun's unixstream backend connects and
+// speaking the same length-prefixed framing, and configured the way the container is
+// configured by Boks' annotations: one address in the sandbox's subnet, and a default route
+// through the gateway. Everything between the two stacks is real: Ethernet frames over the
+// real link, ARP, a real TCP handshake, and real traffic to whatever the connection reaches.
 //
 // That makes two different things testable, and they are worth separating:
 //
@@ -32,8 +33,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -73,9 +72,8 @@ type Config struct {
 type Guest struct {
 	stack  *stack.Stack
 	sw     *tap.Switch
-	conn   *net.UnixConn
+	conn   net.Conn
 	cancel context.CancelFunc
-	socket string
 	// addr is the guest's own address, which Listen binds.
 	addr net.IP
 	// gateway is the host-side stack's address, which Announce reaches for.
@@ -103,11 +101,6 @@ func Attach(cfg Config) (*Guest, error) {
 		return nil, fmt.Errorf("vnettest: subnet %q: %w", cfg.Subnet, err)
 	}
 	ones, _ := subnet.Mask.Size()
-
-	// The guest end binds its own socket, exactly as the VMM does: the host learns where
-	// to send replies from the source address of the first datagram it receives.
-	guestSocket := filepath.Join(filepath.Dir(cfg.Socket), "guest.sock")
-	_ = os.Remove(guestSocket)
 
 	link, err := tap.NewLinkEndpoint(false, uint32(cfg.MTU), cfg.MAC, cfg.GuestIP, nil)
 	if err != nil {
@@ -152,29 +145,37 @@ func Attach(cfg Config) (*Guest, error) {
 		{Destination: header.IPv4EmptySubnet, Gateway: tcpip.AddrFrom4Slice(gatewayIP), NIC: 1},
 	})
 
-	conn, err := net.DialUnix("unixgram",
-		&net.UnixAddr{Name: guestSocket, Net: "unixgram"},
-		&net.UnixAddr{Name: cfg.Socket, Net: "unixgram"})
+	// The VMM connects; nothing on the guest side binds. That is what the stream link
+	// changed here, and it is worth a fixture that does it the same way round, because the
+	// order things attach in is exactly what a late or repeated connection tests.
+	conn, err := net.Dial("unix", cfg.Socket)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("vnettest: connecting to the link socket %s: %w", cfg.Socket, err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	g := &Guest{stack: s, sw: sw, conn: conn, cancel: cancel, socket: guestSocket,
+	g := &Guest{stack: s, sw: sw, conn: conn, cancel: cancel,
 		addr: guestIP, gateway: gatewayIP}
 	go func() {
 		// Ends when the context is cancelled or either side closes the link.
-		_ = sw.Accept(ctx, conn, types.VfkitProtocol)
+		//
+		// QemuProtocol is the framing libkrun's unixstream backend writes: a 4-byte
+		// big-endian length in front of each Ethernet frame. The fake guest speaks it
+		// unguarded, deliberately — the host side is the one that has to survive a peer
+		// that lies about a length, and internal/network's tests are where that is
+		// checked.
+		_ = sw.Accept(ctx, conn, types.QemuProtocol)
 	}()
 	return g, nil
 }
 
 // Dial opens a TCP connection from the fake guest, with no proxy involved at all.
 //
-// The first connection also carries the link's ARP exchange, and the host side does not bind
-// its return path until it has seen a datagram from us, so early attempts can fail while
-// nothing is wrong. Retrying is part of the fixture rather than of every test.
+// The first connection also carries the link's ARP exchange, and the host side cannot send
+// anything to this guest until it has seen a frame from it and learned its MAC, so early
+// attempts can fail while nothing is wrong. Retrying is part of the fixture rather than of
+// every test.
 //
 // A refusal is *not* retried. When the host stack denies a destination it answers with a
 // RST, and that is a final answer about a policy, not a symptom of a link that is still
@@ -318,11 +319,11 @@ func (g *Guest) RawHTTPClient() *http.Client {
 	}
 }
 
-// Close detaches the fake guest.
+// Close detaches the fake guest. The host side sees the connection end, and is expected to
+// go back to accepting: a VMM that restarts must not leave the sandbox with a dead link.
 func (g *Guest) Close() error {
 	g.cancel()
 	err := g.conn.Close()
 	g.stack.Close()
-	_ = os.Remove(g.socket)
 	return err
 }
