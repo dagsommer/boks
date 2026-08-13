@@ -170,6 +170,24 @@ jobs:
             echo "::endgroup::"
           done
 
+          # Then Boks' own patches, on top, in the same order. These are ours because
+          # nobody upstream has a Windows mkfs.erofs to be bothered by them yet — see
+          # packaging/mkfs-erofs-windows/README.md for why each one exists and where it
+          # is meant to end up. They are generated against the go-erofs-patched tree, so
+          # they must come after that loop, and no fuzz: if the pin moves and a hunk
+          # drifts, that must fail here rather than silently on a Windows desktop.
+          shopt -s nullglob
+          boks_patches=("${GITHUB_WORKSPACE}/boks/packaging/mkfs-erofs-windows/patches"/*.patch)
+          if [ ${#boks_patches[@]} -eq 0 ]; then
+            echo "no patches in packaging/mkfs-erofs-windows/patches/ — the C:\\tmp fix is missing" >&2
+            exit 1
+          fi
+          for p in "${boks_patches[@]}"; do
+            echo "::group::boks $(basename "$p")"
+            patch -p1 --no-backup-if-mismatch -F0 <"$p"
+            echo "::endgroup::"
+          done
+
           ./autogen.sh
           PKG_CONFIG_PATH=/usr/${MINGW_HOST}/lib/pkgconfig \
           ./configure \
@@ -198,6 +216,13 @@ jobs:
       # `mkfs.erofs --help` and grepping the output for exactly this literal. A build that
       # dropped tar support would produce a perfectly good mkfs.erofs.exe that makes the erofs
       # differ vanish at init with no error anyone would connect to this job.
+      #
+      # No "/tmp", and the two Win32 temp-path imports: the shipped v1.9.1 hardcodes a
+      # "/tmp" fallback that mingw's CRT turns into C:\tmp, and mkfs.erofs.exe then refuses
+      # to run on any machine that does not happen to have that directory — reporting "no
+      # space left on device" while it does so. These two checks are how we know
+      # packaging/mkfs-erofs-windows/patches/ actually reached this binary, since the
+      # symptom is invisible until someone runs it on Windows.
       - name: Assert mkfs.erofs.exe is a PE32+ binary that supports tar mode
         run: |
           set -euo pipefail
@@ -208,7 +233,15 @@ jobs:
             || { echo "$f is not PE32+ x86-64" >&2; objdump -f "$f" >&2; exit 1; }
           strings "$f" | grep -q -- '--tar=' \
             || { echo "$f help text has no '--tar=' — containerd's differ would skip itself" >&2; exit 1; }
-          echo "  PE32+ x86-64, $(wc -c <"$f") bytes, advertises --tar="
+          if strings "$f" | grep -qx '/tmp'; then
+            echo "$f still contains the hardcoded '/tmp' temp path — it will need C:\\tmp to exist" >&2
+            exit 1
+          fi
+          for sym in GetTempPathW GetTempFileNameW; do
+            objdump -p "$f" | grep -qi "$sym" \
+              || { echo "$f does not import $sym — the temp-path patch did not take" >&2; exit 1; }
+          done
+          echo "  PE32+ x86-64, $(wc -c <"$f") bytes, advertises --tar=, no '/tmp', imports GetTempPathW"
           objdump -p "$f" | grep -i 'DLL Name'
 
       - uses: actions/upload-artifact@v4
