@@ -148,7 +148,7 @@ func TestOAuthCredentialsAreCredentialHosts(t *testing.T) {
 		t.Fatalf("Credentials: %v", err)
 	}
 	hosts := secret.CredentialHosts(credentials)
-	want := map[string]bool{"api.anthropic.com": true, "console.anthropic.com": true}
+	want := map[string]bool{"api.anthropic.com": true, "platform.claude.com": true}
 	if len(hosts) != len(want) {
 		t.Fatalf("credential hosts = %v, want exactly %v", hosts, want)
 	}
