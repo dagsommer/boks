@@ -1,0 +1,197 @@
+# Keep the Go tree building for Windows.
+#
+# Boks does not run on Windows and this workflow does not claim it does. What it defends is
+# narrower and worth defending on its own: **the Go tree currently compiles for
+# `windows/amd64` and `windows/arm64`, including every test binary.** That is a real property,
+# it was expensive to reach, and nothing was watching it — before this workflow there was no
+# Go CI at all, on any platform, so `go build` and `go test` ran nowhere but a developer's
+# laptop. The first `syscall.Mount` typed into a file without a build tag would have silently
+# taken it away.
+#
+# The split between the two jobs is the honesty line, and it is the reason this file is
+# shaped the way it is:
+#
+#   `cross` is the part we can stand behind. Cross-compiling is deterministic, it was run
+#   locally before this workflow was written, and it passed for both Windows architectures.
+#   It is a required check.
+#
+#   `native` is the part we cannot. A binary that links is not a binary that works, and
+#   `go test ./...` on a real Windows host exercises code that has never executed there.
+#   Its test step is `continue-on-error` — see the comment on that step for exactly what has
+#   to land before the marker comes off. It is deliberately NOT deleted or narrowed to a
+#   passing subset: a red step that tells the truth is worth more than a green one that does
+#   not.
+#
+# See docs/windows.md for why Windows is being pursued at all, and what is still missing.
+name: windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded push has nothing to say. Unlike `pages`, nothing here publishes, so an
+# interrupted run leaves nothing half-done.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The cheap guard, and the one whose result was reproduced locally before this file was
+  # committed. It runs on Linux because `GOOS=windows go build` needs no Windows machine:
+  # roughly thirty seconds on a runner that costs a tenth of what `windows-latest` does.
+  #
+  # It also covers `windows/arm64`, which the `native` job cannot — GitHub's Windows runners
+  # are amd64, so without this job the arm64 build would go unchecked, and nerdbox ships a
+  # `windows/arm64` shim.
+  #
+  # `go vet` rather than `go build` alone is deliberate: `go build ./...` does not look at
+  # `_test.go` files, so a test file that stops compiling for Windows would slip past it.
+  # `go vet` type-checks the test files too, which is the property we actually want.
+  cross:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build every package for windows/${{ matrix.goarch }}
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+
+      - name: Vet every package, test files included, for windows/${{ matrix.goarch }}
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+        run: go vet ./...
+
+  # The real thing: a Windows host, a native toolchain, and the tests actually executed.
+  #
+  # This job is what turns "it compiles" into "it runs", and today it only gets halfway.
+  # That is the point of running it.
+  native:
+    runs-on: windows-latest
+    defaults:
+      run:
+        # Git Bash, which `windows-latest` ships. The scripts below are then the same shell
+        # as everywhere else in this repository rather than PowerShell dialect.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Not `go build ./...`: this is the artifact a Windows user would be handed, built the
+      # way the Makefile builds it, so a linker problem that only shows up when producing an
+      # executable shows up here.
+      - name: Build the CLI
+        run: go build -o boks.exe ./cmd/boks
+
+      # It has to at least start and know its own name. This is a low bar on purpose — it is
+      # the one runtime assertion in this job that is expected to hold today.
+      - name: The binary runs
+        run: ./boks.exe --version
+
+      - name: Vet
+        run: go vet ./...
+
+      # ---------------------------------------------------------------------------------
+      # EXPECTED TO FAIL. Do not delete this step, and do not narrow it to the packages that
+      # pass — either would convert a known gap into a silent one.
+      #
+      # Every package compiles for Windows; six do not yet *run* there. The list below was
+      # read out of the source rather than observed on a Windows machine — nobody on this
+      # project has one — so treat it as the expectation this step exists to confirm or
+      # correct, not as a result.
+      #
+      # Two of them are the port itself, and are not test bugs:
+      #
+      #   internal/network, internal/enforce
+      #       checkSocketPath in internal/network/network.go refuses outright on Windows
+      #       ("the VM runtime does not support Windows yet"), so every test that builds a
+      #       Plan fails, and internal/enforce's shared testSpec helper builds one. This is
+      #       correct behaviour for today and the tests are simply ahead of the port. They go
+      #       green when the guest link moves from unixgram to unixstream — see
+      #       internal/network/gateway_windows.go, which explains why that is the one change
+      #       that matters, and docs/windows.md section 8.
+      #
+      # Four are ordinary test-portability bugs, fixable now, with no bearing on the port:
+      #
+      #   internal/policy    store_test.go guards a POSIX-mode assertion with
+      #                      os.Getenv("GOOS"), which is never set in a test binary's
+      #                      environment — it means runtime.GOOS. The guard has never fired
+      #                      anywhere. TestUnreadableStoreFailsClosed also assumes mode 0o000
+      #                      denies reads, which on Windows only sets FILE_ATTRIBUTE_READONLY.
+      #   internal/secret    secret_test.go asserts perm&0o077 == 0 with no Windows guard;
+      #                      Windows reports 0666 for any writable file.
+      #   internal/sandbox   copy_test.go calls os.Symlink unguarded (needs Developer Mode or
+      #                      elevation) and asserts an extracted file is exactly 0o600.
+      #   internal/cli       cp_test.go expects filepath.Abs("/tmp/a:b") to be a no-op, and
+      #                      reference_test.go compares docs/cli.md against a reference whose
+      #                      default log path is %LocalAppData%-derived on Windows.
+      #
+      # internal/ca, internal/runtimecfg and internal/workspace already guard correctly with
+      # runtime.GOOS — copy that pattern rather than inventing another.
+      #
+      # REMOVE `continue-on-error` WHEN: `go test ./...` passes on this runner unassisted.
+      # The four test-portability bugs can be fixed today; the two network packages need
+      # either the unixstream transport or //go:build !windows on their test files. When that
+      # is done, delete this comment block and the marker together.
+      #
+      # Until then the step still runs, still reports, and still shows up in the log — it
+      # just does not block the merge of unrelated work.
+      # ---------------------------------------------------------------------------------
+      - name: Test (expected to fail — see the comment above this step)
+        id: test
+        continue-on-error: true
+        run: go test ./... 2>&1 | tee test-output.txt
+
+      # Puts the verdict on the run's summary page rather than leaving it buried in a log
+      # that people stop opening once they learn the step is allowed to fail. If this ever
+      # reports success, the marker above is ready to come off.
+      - name: Record what the tests did
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## \`go test ./...\` on windows-latest"
+            echo
+            if [ "${{ steps.test.outcome }}" = success ]; then
+              echo "**Passed.** This job no longer needs \`continue-on-error\` — remove it"
+              echo "from the test step, along with the comment block above it."
+            else
+              echo "**Failed, as expected.** Boks' tests carry Unix assumptions; see the"
+              echo "comment above the test step in \`.github/workflows/windows.yml\` for what"
+              echo "must land before this is required to pass."
+              echo
+              echo "Packages that failed:"
+              echo
+              echo '```'
+              grep -E '^(FAIL|--- FAIL|ok  |\?   )' test-output.txt | grep -v '^ok  ' || true
+              echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
