@@ -326,7 +326,7 @@ destinations, because the stack was the library's and its forwarder dialled anyt
 and the fix has since been exercised **only against a simulated guest** on the real link
 socket. No VM has ever been refused a destination by Boks. See
 [security-model.md](security-model.md#network) and
-[verification.md](verification.md#re-run-check-6).
+[verification.md](verification.md#check-6-re-run-and-passed).
 
 | Feature | Docker behavior | Boks target | Prio | Status | Notes |
 |---|---|---|---|---|---|
