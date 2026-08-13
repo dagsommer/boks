@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Build the nerdbox guest kernel and root filesystem — the two files a Homebrew formula
-# cannot produce, and the difference between a machine where `boks doctor` passes and one
-# where a sandbox actually boots.
+# cannot produce, and the two a microVM boots. `boks doctor` fails its `guest image` check
+# without them.
 #
 #   scripts/build-nerdbox-guest.sh [arch] [outdir]
 #
@@ -102,6 +102,6 @@ Install them where the shim looks. On Apple silicon with Homebrew that is:
 Any directory on containerd's PATH, or on LIBKRUN_PATH, works equally well — the shim
 scans both. Note that containerd's PATH is the daemon's, not your shell's.
 
-'boks doctor' does not check for these two files. It will report ready without them, and
-the sandbox will fail at boot with 'nerdbox-kernel not found in PATH or LIBKRUN_PATH'.
+'boks doctor' reports these two as 'guest image', scanning the same PATH and LIBKRUN_PATH
+the shim does. Without them it fails that line rather than reporting the host ready.
 EOF

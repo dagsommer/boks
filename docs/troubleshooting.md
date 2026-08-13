@@ -10,7 +10,7 @@ boks doctor
 
 Checks run in this order, and the first failure is usually the only real one: `platform`,
 `virtualization`, `containerd`, `snapshotter`, `snapshotter tools`, `vm runtime`,
-`hypervisor library`, and on macOS `runtime entitlement`.
+`hypervisor library`, `guest image`, and on macOS `runtime entitlement`.
 
 `ok`, `warn`, `fail`, `skip` mean what they say: **warn** is "Boks can run but something is
 degraded or unverified", **fail** is "sandboxes cannot start until this is fixed".
@@ -64,7 +64,26 @@ catches almost everyone once.
 
 That directory must also contain the guest kernel and rootfs: the shim locates
 `nerdbox-kernel-<arch>` and `nerdbox-rootfs.erofs` by scanning `PATH` (or `LIBKRUN_PATH`),
-not by looking next to itself.
+not by looking next to itself. That is the `guest image` check below.
+
+### `guest image`: `nerdbox-kernel-<arch> ... not found`
+
+These are the two files a microVM boots, and nothing packages them: nerdbox's releases
+carry no assets, and building them is a Linux kernel build driven by `docker buildx bake`.
+
+```bash
+scripts/build-nerdbox-guest.sh          # needs Docker with buildx; on Windows, under WSL2
+```
+
+Copy both into a directory on containerd's `PATH` or on `LIBKRUN_PATH` —
+`$(brew --prefix)/lib` on Apple silicon is already one. `docker` and the machine that runs
+the sandbox need not be the same host: these are guest artefacts, so build once per
+architecture and copy. [Installation](install.md) has the detail.
+
+The shim accepts `nerdbox-rootfs-<arch>.erofs` as well as the unsuffixed
+`nerdbox-rootfs.erofs`; there is no unsuffixed kernel name. `doctor` scans the same places
+in the same order, with one caveat it cannot do anything about: it scans *your* `PATH`, and
+the one that decides is the containerd daemon's.
 
 ### A pull fails partway through with an exec error
 

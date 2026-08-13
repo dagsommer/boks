@@ -149,3 +149,10 @@ func hypervisorLibrarySearchPaths() []string {
 	}
 	return paths
 }
+
+// hypervisorLibraryHint explains what a miss on macOS does and does not mean: the shim asks
+// dlopen for the library, so a copy elsewhere on the loader's search path still works.
+func hypervisorLibraryHint() string {
+	return "If it is installed elsewhere on the loader's search path this warning\n" +
+		"is harmless; Boks does not parse the dynamic loader configuration."
+}

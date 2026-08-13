@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -187,29 +188,154 @@ func hypervisorLibraryCheck() Check {
 	return Check{
 		Name: "hypervisor library",
 		Run: func(ctx context.Context, env Env) Result {
-			names := hypervisorLibraryNames()
-			if len(names) == 0 {
-				return Result{Status: StatusSkip, Detail: "not applicable on this platform"}
-			}
-			for _, dir := range hypervisorLibrarySearchPaths() {
-				for _, name := range names {
-					candidate := filepath.Join(dir, name)
-					if _, err := os.Stat(candidate); err == nil {
-						return Result{Status: StatusOK, Detail: candidate}
-					}
-				}
-			}
-			return Result{
-				Status: StatusWarn,
-				Detail: names[0] + " not found",
-				Remedy: fmt.Sprintf("Could not find %s in the usual locations.\n"+
-					"The VM runtime links against libkrun (>= 1.18) to boot microVMs.\n"+
-					"If it is installed elsewhere on the loader's search path this warning\n"+
-					"is harmless; Boks does not parse the dynamic loader configuration.",
-					strings.Join(names, " or ")),
-			}
+			return hypervisorLibraryResult(hypervisorLibraryNames(), hypervisorLibrarySearchPaths())
 		},
 	}
+}
+
+// hypervisorLibraryResult is separated from the check so that a test can hand it a temporary
+// directory: the platform hooks read the environment and the host's real prefixes, which a
+// test must not depend on.
+func hypervisorLibraryResult(names, dirs []string) Result {
+	if len(names) == 0 {
+		return Result{Status: StatusSkip, Detail: "not applicable on this platform"}
+	}
+	if found := findInDirs(dirs, names); found != "" {
+		return Result{Status: StatusOK, Detail: found}
+	}
+	return Result{
+		Status: StatusWarn,
+		Detail: names[0] + " not found",
+		Remedy: fmt.Sprintf("Could not find %s in the usual locations.\n"+
+			"The VM runtime links against libkrun (>= 1.18) to boot microVMs.\n"+
+			"%s",
+			strings.Join(names, " or "), hypervisorLibraryHint()),
+	}
+}
+
+// guestImageCheck looks for the two files the microVM actually boots: nerdbox's guest kernel
+// and its erofs root filesystem.
+//
+// Neither is part of the shim, and nothing installs them — nerdbox's releases carry no assets
+// and building them needs Docker, so they are the pieces most likely to be missing on a host
+// where everything else is in place. Without them the shim aborts in NewInstance with
+// "nerdbox-kernel not found in PATH or LIBKRUN_PATH", after doctor has said the host is ready:
+// exactly the opaque, late failure this command exists to convert into a named one.
+func guestImageCheck() Check {
+	return Check{
+		Name: "guest image",
+		Run: func(ctx context.Context, env Env) Result {
+			return guestImageResult(nerdboxSearchPaths())
+		},
+	}
+}
+
+// guestImageResult takes the directories to scan so tests can point it at a temporary tree
+// rather than requiring a machine that has a real guest image installed.
+func guestImageResult(dirs []string) Result {
+	kernelName := guestKernelName()
+	rootfsNames := guestRootfsNames()
+
+	kernel := findInDirs(dirs, []string{kernelName})
+	rootfs := findInDirs(dirs, rootfsNames)
+	if kernel != "" && rootfs != "" {
+		return Result{Status: StatusOK, Detail: kernel + ", " + rootfs}
+	}
+
+	var missing []string
+	if kernel == "" {
+		missing = append(missing, kernelName)
+	}
+	if rootfs == "" {
+		// The unsuffixed name is what nerdbox's own build produces, so it is the one to
+		// print; the remedy names the arch-suffixed alternative it also accepts.
+		missing = append(missing, rootfsNames[len(rootfsNames)-1])
+	}
+	return Result{
+		Status: StatusFail,
+		Detail: strings.Join(missing, " and ") + " not found",
+		Remedy: fmt.Sprintf("A sandbox boots nerdbox's guest kernel and erofs root filesystem. The shim\n"+
+			"finds them by scanning containerd's PATH and LIBKRUN_PATH — the same scan it\n"+
+			"uses for libkrun, not a look next to its own binary — and without them a VM\n"+
+			"dies at boot with 'nerdbox-kernel not found in PATH or LIBKRUN_PATH'.\n"+
+			"The names it accepts are:\n"+
+			"  %s\n"+
+			"  %s\n"+
+			"Nothing packages these: nerdbox's GitHub releases carry no assets, and building\n"+
+			"them is a Linux kernel build driven by 'docker buildx bake'. Run\n"+
+			"scripts/build-nerdbox-guest.sh, which needs Docker with buildx and takes a\n"+
+			"while; on Windows, run it under WSL2. They are guest artefacts, so building\n"+
+			"them once on any Docker host and copying the two files over is fine.\n"+
+			"Put both in a directory on containerd's PATH or on LIBKRUN_PATH — on Apple\n"+
+			"silicon, $(brew --prefix)/lib is already one. See docs/install.md.\n"+
+			"Note that containerd's PATH is the daemon's, not your shell's.",
+			kernelName, strings.Join(rootfsNames, " or ")),
+	}
+}
+
+// guestArch is the architecture spelling nerdbox puts in the guest filenames, which is not
+// Go's: its kernelArch() maps amd64 to x86_64 and passes everything else through.
+func guestArch() string {
+	if runtime.GOARCH == "amd64" {
+		return "x86_64"
+	}
+	return runtime.GOARCH
+}
+
+// guestKernelName is the only kernel filename the shim looks for. There is no unsuffixed
+// fallback, unlike the rootfs.
+func guestKernelName() string { return "nerdbox-kernel-" + guestArch() }
+
+// guestRootfsNames are the rootfs filenames the shim accepts, in the order it tries them:
+// an arch-suffixed image first, then the unsuffixed name its own bake produces.
+func guestRootfsNames() []string {
+	return []string{"nerdbox-rootfs-" + guestArch() + ".erofs", "nerdbox-rootfs.erofs"}
+}
+
+// nerdboxSearchPaths returns the directories the shim scans for everything it loads at VM
+// start — libkrun, the guest kernel, the guest rootfs — in the order it scans them.
+//
+// This mirrors NewInstance in nerdbox's internal/vm/libkrun/instance.go rather than
+// approximating it. A check that looks in different places than the code it is checking for
+// reports misses that are not misses and passes hosts that will fail, which is worse than not
+// checking. The shim resolves an absolute path from this list and loads that path directly
+// (syscall.LoadLibrary on Windows, dlopen on Unix), so for the guest files this list is the
+// entire search.
+func nerdboxSearchPaths() []string {
+	dirs := filepath.SplitList(os.Getenv("PATH"))
+	extra := filepath.SplitList(os.Getenv("LIBKRUN_PATH"))
+	if runtime.GOOS != "windows" && len(extra) == 0 {
+		// The shim's fallback when LIBKRUN_PATH is unset. Note it replaces the list rather
+		// than extending it: exporting LIBKRUN_PATH loses these four directories.
+		extra = []string{"/usr/local/lib", "/usr/local/lib64", "/usr/lib", "/lib"}
+	}
+	if runtime.GOOS == "darwin" {
+		extra = append(extra, "/opt/homebrew/lib")
+	}
+
+	out := make([]string, 0, len(dirs)+len(extra))
+	for _, dir := range append(dirs, extra...) {
+		if dir == "" {
+			// Unix shell semantics, which the shim implements: an empty element is ".".
+			dir = "."
+		}
+		out = append(out, dir)
+	}
+	return out
+}
+
+// findInDirs returns the first of names present in dirs, scanning a whole directory before
+// moving on — the shim's own order, which decides which file wins when several exist.
+func findInDirs(dirs, names []string) string {
+	for _, dir := range dirs {
+		for _, name := range names {
+			candidate := filepath.Join(dir, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+	return ""
 }
 
 // splitList splits a PATH-style list, dropping empty entries.

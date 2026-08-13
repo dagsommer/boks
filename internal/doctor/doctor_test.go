@@ -2,6 +2,8 @@ package doctor
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -120,11 +122,175 @@ func TestChecksAreWellFormed(t *testing.T) {
 		}
 		seen[c.Name] = true
 	}
-	for _, required := range []string{"platform", "virtualization", "containerd", "vm runtime"} {
+	for _, required := range []string{"platform", "virtualization", "containerd", "vm runtime", "guest image"} {
 		if !seen[required] {
 			t.Errorf("check %q is missing", required)
 		}
 	}
+}
+
+// The guest image checks below drive guestImageResult with directories the test creates, not
+// the host's search path: the point of the check is to report a machine that lacks the real
+// files, so a test that needed them present could only ever run on a machine it cannot assume.
+
+func TestGuestImageResultFindsKernelAndRootfs(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, guestKernelName()))
+	writeFile(t, filepath.Join(dir, "nerdbox-rootfs.erofs"))
+
+	res := guestImageResult([]string{dir})
+	if res.Status != StatusOK {
+		t.Fatalf("Status = %v (%s), want ok with both files present", res.Status, res.Detail)
+	}
+	for _, want := range []string{guestKernelName(), "nerdbox-rootfs.erofs"} {
+		if !strings.Contains(res.Detail, want) {
+			t.Errorf("Detail = %q, want it to name %s", res.Detail, want)
+		}
+	}
+}
+
+// The shim tries an arch-suffixed rootfs before the unsuffixed one, so both must satisfy the
+// check; accepting only the name nerdbox's own bake writes would fail a working host.
+func TestGuestImageResultAcceptsArchSuffixedRootfs(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, guestKernelName()))
+	writeFile(t, filepath.Join(dir, "nerdbox-rootfs-"+guestArch()+".erofs"))
+
+	if res := guestImageResult([]string{dir}); res.Status != StatusOK {
+		t.Fatalf("Status = %v (%s), want ok for an arch-suffixed rootfs", res.Status, res.Detail)
+	}
+}
+
+func TestGuestImageResultNamesWhatIsMissing(t *testing.T) {
+	empty := t.TempDir()
+	withKernel := t.TempDir()
+	writeFile(t, filepath.Join(withKernel, guestKernelName()))
+
+	for _, tc := range []struct {
+		name    string
+		dirs    []string
+		missing []string
+		present []string
+	}{
+		{name: "neither", dirs: []string{empty}, missing: []string{guestKernelName(), "nerdbox-rootfs.erofs"}},
+		{
+			name:    "rootfs only",
+			dirs:    []string{withKernel},
+			missing: []string{"nerdbox-rootfs.erofs"},
+			present: []string{guestKernelName()},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := guestImageResult(tc.dirs)
+			if res.Status != StatusFail {
+				t.Fatalf("Status = %v, want fail: the VM cannot boot without these", res.Status)
+			}
+			for _, want := range tc.missing {
+				if !strings.Contains(res.Detail, want) {
+					t.Errorf("Detail = %q, want it to name the missing %s", res.Detail, want)
+				}
+			}
+			// A file that is present must not be reported as missing, or the user goes
+			// looking for something they already have.
+			for _, unwanted := range tc.present {
+				if strings.Contains(res.Detail, unwanted) {
+					t.Errorf("Detail = %q reports %s missing, but it is present", res.Detail, unwanted)
+				}
+			}
+			if res.Remedy == "" {
+				t.Fatal("no remedy offered for a missing guest image")
+			}
+			// The remedy is only actionable if it says how to obtain the files and where
+			// to put them; both are non-obvious and neither is packaged anywhere.
+			for _, want := range []string{"scripts/build-nerdbox-guest.sh", "LIBKRUN_PATH"} {
+				if !strings.Contains(res.Remedy, want) {
+					t.Errorf("remedy does not mention %q:\n%s", want, res.Remedy)
+				}
+			}
+		})
+	}
+}
+
+// The search must be the shim's, since a check that looks elsewhere reports on a machine that
+// does not exist. nerdbox scans PATH first, then LIBKRUN_PATH.
+func TestNerdboxSearchPathsScansPATHThenLIBKRUNPATH(t *testing.T) {
+	onPath := t.TempDir()
+	onLibkrunPath := t.TempDir()
+	t.Setenv("PATH", onPath)
+	t.Setenv("LIBKRUN_PATH", onLibkrunPath)
+
+	dirs := nerdboxSearchPaths()
+	pathIdx, libkrunIdx := indexOfDir(dirs, onPath), indexOfDir(dirs, onLibkrunPath)
+	if pathIdx < 0 {
+		t.Errorf("PATH entry %q missing from the search: %v", onPath, dirs)
+	}
+	if libkrunIdx < 0 {
+		t.Errorf("LIBKRUN_PATH entry %q missing from the search: %v", onLibkrunPath, dirs)
+	}
+	if pathIdx >= 0 && libkrunIdx >= 0 && pathIdx > libkrunIdx {
+		t.Errorf("LIBKRUN_PATH is searched before PATH; the shim does the opposite: %v", dirs)
+	}
+}
+
+// An empty PATH element means "." to the shim, which is how a guest image in the working
+// directory is found at all. Dropping it, as splitList does, would hide that.
+func TestNerdboxSearchPathsMapsEmptyElementToDot(t *testing.T) {
+	t.Setenv("PATH", string(os.PathListSeparator)+t.TempDir())
+	t.Setenv("LIBKRUN_PATH", t.TempDir())
+
+	if indexOfDir(nerdboxSearchPaths(), ".") < 0 {
+		t.Errorf("an empty PATH element was not searched as \".\": %v", nerdboxSearchPaths())
+	}
+}
+
+// hypervisorLibraryResult is exercised with the Windows filename because that is the case
+// that used to report "not applicable". The Windows wiring in virt_windows.go is only
+// compile-checked here (GOOS=windows go vet): this project has no Windows machine.
+func TestHypervisorLibraryResultFindsALibrary(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "krun.dll"))
+
+	res := hypervisorLibraryResult([]string{"krun.dll"}, []string{dir})
+	if res.Status != StatusOK {
+		t.Fatalf("Status = %v (%s), want ok with krun.dll in the searched directory", res.Status, res.Detail)
+	}
+	if want := filepath.Join(dir, "krun.dll"); res.Detail != want {
+		t.Errorf("Detail = %q, want the resolved path %q", res.Detail, want)
+	}
+}
+
+func TestHypervisorLibraryResultWarnsWhenAbsent(t *testing.T) {
+	res := hypervisorLibraryResult([]string{"krun.dll"}, []string{t.TempDir()})
+	if res.Status != StatusWarn {
+		t.Fatalf("Status = %v, want warn: Boks does not know every place a library may live", res.Status)
+	}
+	if !strings.Contains(res.Detail, "krun.dll") || res.Remedy == "" {
+		t.Errorf("a miss must name the library and explain itself: %+v", res)
+	}
+}
+
+// A platform with no library to look for keeps skipping rather than warning about a file it
+// has no name for.
+func TestHypervisorLibraryResultSkipsWithoutNames(t *testing.T) {
+	if res := hypervisorLibraryResult(nil, nil); res.Status != StatusSkip {
+		t.Errorf("Status = %v, want skip when the platform names no library", res.Status)
+	}
+}
+
+func writeFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("test fixture"), 0o644); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
+	}
+}
+
+func indexOfDir(haystack []string, needle string) int {
+	for i, s := range haystack {
+		if s == needle {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestStatusString(t *testing.T) {
