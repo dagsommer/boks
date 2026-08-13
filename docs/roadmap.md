@@ -38,8 +38,8 @@ would sell.
   Linux/KVM path is designed for but has not been exercised end to end.
 - **Native Windows support is in progress, and no sandbox has ever booted on Windows.** The
   obstacle is narrow: a Windows Hypervisor Platform backend for libkrun is being built in
-  this repository's [patch series](../packaging/libkrun-windows/) — most of the VMM now
-  compiles for Windows in CI — and nerdbox already builds a Windows shim for it. What
+  this repository's [patch series](../packaging/libkrun-windows/) — every libkrun crate now
+  compiles for Windows, and `krun.dll` links on a real Windows runner in CI — and nerdbox already builds a Windows shim for it. What
   remains is the `krun.dll` C API layer and **`virtio-net`, the single device not yet
   ported**, which is exactly the one Boks' enforcement depends on. In the meantime Boks
   should run **inside WSL2** with nested virtualisation: unchanged, with workspace paths

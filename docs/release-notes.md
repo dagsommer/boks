@@ -113,9 +113,10 @@ nothing about isolation.
 macOS on Apple silicon is the platform everything above was measured on. Linux with KVM is
 built and designed for and has not been exercised end to end. Native Windows support is in
 progress and no sandbox has yet booted there: a Windows Hypervisor Platform backend for
-libkrun is being built in this repository's patch series, and `virtio-net` — the one device
-Boks' enforcement depends on — is not ported yet. Running inside WSL2 should work unchanged
-and nobody has tried it.
+libkrun is being built in this repository's patch series, and every libkrun crate — including
+`virtio-net`, the device Boks' enforcement depends on — now compiles for Windows, with
+`krun.dll` linking on a real Windows runner in CI. That is the artifact existing, not the
+artifact working. Running inside WSL2 should work unchanged and nobody has tried it.
 
 ### Known at the time of writing
 
