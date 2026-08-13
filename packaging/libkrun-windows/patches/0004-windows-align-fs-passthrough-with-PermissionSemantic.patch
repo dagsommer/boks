@@ -1,7 +1,7 @@
 From 2555b7b44640d21112152d0be154b86b8539ba4f Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 13:39:51 +0200
-Subject: [PATCH 04/28] windows: align fs passthrough with PermissionSemantics,
+Subject: [PATCH 04/29] windows: align fs passthrough with PermissionSemantics,
  poll serial input by HANDLE
 
 The in-tree Windows virtio-fs passthrough predates the PermissionSemantics
