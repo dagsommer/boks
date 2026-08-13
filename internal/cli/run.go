@@ -24,6 +24,12 @@ workspace is shared into the guest at the same absolute path it has on the host,
 first one is the process's working directory. Nothing above them is exposed. A workspace
 may carry a ':ro' suffix for a read-only share.
 
+By default the guest writes straight to those directories. --clone changes that: the
+workspace must be a git repository, it is shared read-only at /run/sandbox/source, and the
+agent works on a clone made inside the guest, so nothing it writes reaches your disk. The
+clone carries committed history only, the mode is fixed when the sandbox is created, and
+'boks bundle' is how commits come back out.
+
 The sandbox is named <agent>-<workspace directory> and persists. Running the same agent in
 the same directory re-attaches to it, so packages installed and files written inside it are
 still there; remove it with 'boks rm'. Pass --rm for a sandbox destroyed when the command
@@ -37,6 +43,7 @@ Agents:
 		Example: `  boks run                              # a shell in the current directory
   boks run shell . -- uname -a
   boks run shell ~/src/foo ~/src/lib:ro
+  boks run --clone claude ~/src/foo     # the agent works on a clone; your files are read-only
   boks run --name claude-boks           # re-attach by name, from anywhere`,
 		Args: cobra.ArbitraryArgs,
 	}
@@ -116,6 +123,11 @@ Agents:
 
 		cfg, err := flags.config(inv, agentArgs)
 		if err != nil {
+			return err
+		}
+		// Decided before anything is pulled or started, so that a --clone against a
+		// directory Boks will not clone costs a message rather than a sandbox.
+		if err := applyCloneMode(flags, inv, &cfg, env); err != nil {
 			return err
 		}
 
