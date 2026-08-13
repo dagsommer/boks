@@ -18,6 +18,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // Default is the agent used when none is named. A shell is the one agent Boks can supply
@@ -65,6 +67,44 @@ type Agent struct {
 	// Env are environment variables the agent needs, in KEY=VALUE form. Nothing is
 	// inherited from the host: an agent gets exactly what its definition asks for.
 	Env []string
+	// Allow are the destinations this agent cannot work without — its own API, and its
+	// sign-in endpoint where the vendor documents one.
+	//
+	// It belongs here, beside the image and the command, because it is the same kind of
+	// fact: part of what "this agent" means. Without it `boks run claude` starts an agent
+	// that cannot reach Anthropic, and the user's first experience of the policy is
+	// discovering `api.anthropic.com` in a log and typing it back in on every run.
+	//
+	// These become an *allow* layer of their own during resolution, labelled with the
+	// agent's name in `boks policy ls`, and they change no precedence at all: a deny in
+	// any scope still beats them, so an agent's definition can never widen access past
+	// what a user has forbidden. See internal/policy/resolve.go.
+	Allow []Destination
+}
+
+// Destination is one network destination an agent needs, with the reason it is here.
+//
+// Spec is the syntax `boks policy allow` takes — "host", "host:ports", a CIDR. Why is shown
+// beside the rule in `boks policy ls`, because a default allowlist nobody can audit is worth
+// very little: the reason has to travel with the rule to the place the rule is displayed.
+type Destination struct {
+	Spec string
+	Why  string
+}
+
+// AllowRules renders the agent's allowlist in the form the policy resolver takes.
+//
+// The conversion is here rather than in the command layer so that every caller — a run, a
+// `boks policy ls --agent`, a test — turns the same definition into the same rules.
+func (a Agent) AllowRules() []policy.RuleSpec {
+	if len(a.Allow) == 0 {
+		return nil
+	}
+	out := make([]policy.RuleSpec, 0, len(a.Allow))
+	for _, d := range a.Allow {
+		out = append(out, policy.RuleSpec{Action: policy.Allow, Spec: d.Spec, Note: d.Why})
+	}
+	return out
 }
 
 // Runnable reports whether Boks can start this agent without being told an image.
@@ -116,6 +156,14 @@ func (r *Registry) Add(a Agent) error {
 	}
 	if a.Args == "" {
 		a.Args = ArgsAppend
+	}
+	// A destination that does not parse is caught here rather than at the moment a
+	// sandbox starts, where the alternatives are refusing to run the agent or dropping
+	// the rule. Dropping it would be a policy with a hole in it that nothing announced.
+	for _, d := range a.Allow {
+		if _, err := policy.ParseRule(policy.Allow, d.Spec); err != nil {
+			return fmt.Errorf("agent %q: allow %q: %w", a.Name, d.Spec, err)
+		}
 	}
 	for i, existing := range r.agents {
 		if existing.Name == a.Name {
@@ -223,6 +271,28 @@ var initArgv = []string{"/usr/bin/tini", "--", "/usr/local/bin/boks-entrypoint"}
 // The names are sbx's, so that a habit formed there works here. Nine of the ten have an
 // image; `kiro` does not, and is registered anyway so that asking for it says "no image yet"
 // rather than "unknown agent" — which is also the shape a user-defined agent overrides.
+//
+// # The rule for what goes in an Allow list
+//
+// Each entry is a default allow in every sandbox running that agent, so the bar is evidence,
+// not plausibility. Two things qualify:
+//
+//   - a destination *observed* to be needed on a real run, or
+//   - a destination the vendor's own documentation names as required.
+//
+// Anything else is left out. An agent with an empty list is one nobody has produced that
+// evidence for yet; its user adds what they need with `boks policy allow`, having seen it
+// denied in `boks policy log`, which is a nuisance. A domain guessed into this file is a hole
+// in every user's policy, which is worse, and it is invisible in exactly the way the nuisance
+// is not.
+//
+// Telemetry is deliberately absent. Analytics, feature-flag and error-reporting endpoints —
+// Statsig, Sentry, Datadog, Segment — are not what an agent needs to do the work, and a run
+// with Datadog's intake blocked was observed to break nothing and to draw no complaint from
+// the agent. They stay denied by default; a user who wants them can allow them by name.
+//
+// Ports are pinned to 443 for the same reason the standard preset pins them: allowing port 80
+// to the same host adds a plaintext downgrade path nobody asked for.
 func Builtin() *Registry {
 	r := &Registry{}
 	for _, a := range []Agent{
@@ -235,7 +305,17 @@ func Builtin() *Registry {
 			Command: []string{"/bin/bash"},
 			Args:    ArgsCommand,
 		},
-		{Name: "claude", Summary: "Claude Code", Image: Image("claude"), Command: []string{"claude"}},
+		{
+			Name: "claude", Summary: "Claude Code", Image: Image("claude"),
+			Command: []string{"claude"},
+			Allow: []Destination{
+				// Observed: a real `boks run claude` under the standard preset was
+				// refused here, and the agent could not start work until it was
+				// allowed. This is the one entry in this file confirmed by a run
+				// rather than by reading.
+				{Spec: "api.anthropic.com:443", Why: "the Claude API; the agent cannot work without it"},
+			},
+		},
 		{Name: "codex", Summary: "OpenAI Codex", Image: Image("codex"), Command: []string{"codex"}},
 		{Name: "copilot", Summary: "GitHub Copilot CLI", Image: Image("copilot"), Command: []string{"copilot"}},
 		{Name: "cursor", Summary: "Cursor CLI", Image: Image("cursor"), Command: []string{"cursor-agent"}},
