@@ -316,12 +316,80 @@ func Builtin() *Registry {
 				{Spec: "api.anthropic.com:443", Why: "the Claude API; the agent cannot work without it"},
 			},
 		},
-		{Name: "codex", Summary: "OpenAI Codex", Image: Image("codex"), Command: []string{"codex"}},
-		{Name: "copilot", Summary: "GitHub Copilot CLI", Image: Image("copilot"), Command: []string{"copilot"}},
-		{Name: "cursor", Summary: "Cursor CLI", Image: Image("cursor"), Command: []string{"cursor-agent"}},
+		{
+			Name: "codex", Summary: "OpenAI Codex", Image: Image("codex"),
+			Command: []string{"codex"},
+			Allow: []Destination{
+				// openai/codex ships its own firewall for a sandboxed dev
+				// container: .devcontainer/init-firewall.sh allows
+				// api.openai.com and fails the build if it cannot be reached,
+				// and devcontainer.secure.json lists api.openai.com and
+				// auth.openai.com as the CLI's allowed domains.
+				{Spec: "api.openai.com:443", Why: "the OpenAI API (vendor's own devcontainer firewall)"},
+				{Spec: "auth.openai.com:443", Why: "sign-in issuer for 'codex login' (vendor's own devcontainer firewall)"},
+				// The ChatGPT-plan path talks to chatgpt.com/backend-api, which
+				// is codex's own configured default. Exactly this host and
+				// never *.chatgpt.com: the Statsig telemetry endpoint
+				// ab.chatgpt.com lives under that wildcard, so widening here
+				// would readmit precisely what is being left out.
+				{Spec: "chatgpt.com:443", Why: "model API on a ChatGPT plan; exact host, never *.chatgpt.com"},
+			},
+		},
+		{
+			Name: "copilot", Summary: "GitHub Copilot CLI", Image: Image("copilot"),
+			Command: []string{"copilot"},
+			Allow: []Destination{
+				// GitHub publishes an allowlist reference for Copilot. The
+				// wildcard is theirs and is kept as written: githubcopilot.com
+				// is GitHub's own service domain with no user-content tenancy,
+				// which is what makes a wildcard dangerous elsewhere — and the
+				// telemetry hosts GitHub lists (collector.github.com,
+				// copilot-telemetry.githubusercontent.com, default.exp-tas.com)
+				// are on other domains, so none of them creeps back in here.
+				{Spec: "*.githubcopilot.com:443", Why: "Copilot API (docs.github.com allowlist reference)"},
+				{Spec: "github.com:443", Why: "the device-flow sign-in Copilot CLI uses"},
+				{Spec: "api.github.com:443", Why: "Copilot user management (docs.github.com allowlist reference)"},
+			},
+		},
+		{
+			Name: "cursor", Summary: "Cursor CLI", Image: Image("cursor"),
+			Command: []string{"cursor-agent"},
+			Allow: []Destination{
+				// cursor.com's enterprise network-configuration page names each
+				// of these and what it is for. Its CLI page names the broader
+				// *.cursor.sh and *.cursorapi.com; the concrete hosts are used
+				// instead, because they are documented individually and a
+				// wildcard would add whatever else the vendor puts there later.
+				{Spec: "api2.cursor.sh:443", Why: "most Cursor API requests (cursor.com network configuration)"},
+				{Spec: "api5.cursor.sh:443", Why: "Cursor agent requests (cursor.com network configuration)"},
+				{Spec: "authentication.cursor.sh:443", Why: "sign-in (cursor.com network configuration)"},
+				{Spec: "prod.authentication.cursor.sh:443", Why: "production token issuer (cursor.com network configuration)"},
+				{Spec: "authenticate.cursor.sh:443", Why: "authorisation endpoint (cursor.com network configuration)"},
+			},
+		},
+		// docker-agent, droid and opencode carry no allowlist: no vendor page
+		// naming the destinations their CLIs require has been found. The empty
+		// list is the honest state — their users will see the denial in
+		// `boks policy log` and write the rule — and it is a cheap thing to fill
+		// in the day someone produces the evidence.
 		{Name: "docker-agent", Summary: "Docker Agent", Image: Image("docker-agent"), Command: []string{"docker-agent"}},
 		{Name: "droid", Summary: "Factory Droid", Image: Image("droid"), Command: []string{"droid"}},
-		{Name: "gemini", Summary: "Google Gemini CLI", Image: Image("gemini"), Command: []string{"gemini"}},
+		{
+			Name: "gemini", Summary: "Google Gemini CLI", Image: Image("gemini"),
+			Command: []string{"gemini"},
+			Allow: []Destination{
+				// Google's Code Assist network-access page names the endpoint
+				// and says, in as many words, not to use a wildcard for it.
+				{Spec: "cloudcode-pa.googleapis.com:443", Why: "Gemini Code Assist endpoint (Google's network-access page)"},
+				{Spec: "oauth2.googleapis.com:443", Why: "Google sign-in and token refresh (Google's set-up page)"},
+				{Spec: "generativelanguage.googleapis.com:443", Why: "the Gemini API on the API-key path"},
+				// Google's published list is written for the IDE plugins and
+				// names several endpoints the CLI never calls; those are left
+				// out rather than adopted wholesale. The Vertex path
+				// (aiplatform.googleapis.com) is a deployment choice rather
+				// than a default, so it is a --allow when someone makes it.
+			},
+		},
 		// Kiro is the one name here Boks ships nothing for. Its CLI is distributed as a
 		// ~500 MB archive per architecture, which would roughly triple the size of an
 		// agent image, and its installer resolves the download through a "latest"

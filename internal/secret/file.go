@@ -59,6 +59,13 @@ const (
 // ErrNoPassphrase reports that the store cannot be opened because no passphrase was given.
 var ErrNoPassphrase = errors.New("no passphrase for the secret store")
 
+// ErrWrongPassphrase reports that the store did not decrypt.
+//
+// GCM cannot tell a wrong key from a damaged file, so neither can this — the two are one
+// error on purpose. It is a sentinel so that the command layer can recognise the one failure
+// every subcommand shares and offer the way out, rather than matching on the message text.
+var ErrWrongPassphrase = errors.New("the secret store did not decrypt")
+
 // PassphraseEnv is the environment variable the CLI reads the passphrase from.
 const PassphraseEnv = "BOKS_SECRETS_PASSPHRASE"
 
