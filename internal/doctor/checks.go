@@ -262,10 +262,14 @@ func guestImageResult(dirs []string) Result {
 			"  %s\n"+
 			"  %s\n"+
 			"Nothing packages these: nerdbox's GitHub releases carry no assets, and building\n"+
-			"them is a Linux kernel build driven by 'docker buildx bake'. Run\n"+
-			"scripts/build-nerdbox-guest.sh, which needs Docker with buildx and takes a\n"+
-			"while; on Windows, run it under WSL2. They are guest artefacts, so building\n"+
-			"them once on any Docker host and copying the two files over is fine.\n"+
+			"them is a Linux kernel build driven by 'docker buildx bake'.\n"+
+			"Two routes. Download them from the newest successful run of the guest-image\n"+
+			"workflow, which builds both on a Linux runner and attaches them with their\n"+
+			"checksums — this needs no Docker and is the only practical route on Windows:\n"+
+			"  https://github.com/dagsommer/boks/actions/workflows/guest-image.yml\n"+
+			"Or build them yourself with scripts/build-nerdbox-guest.sh, which needs Docker\n"+
+			"with buildx and takes a while. They are guest artefacts, so building them once\n"+
+			"on any Docker host and copying the two files over is fine.\n"+
 			"Put both in a directory on containerd's PATH or on LIBKRUN_PATH — on Apple\n"+
 			"silicon, $(brew --prefix)/lib is already one. See docs/install.md.\n"+
 			"Note that containerd's PATH is the daemon's, not your shell's.",
