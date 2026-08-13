@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    rect { fill: none; stroke: #16191d; stroke-width: 2.5; }
+    .inner { fill: #16191d; stroke: none; }
+    @media (prefers-color-scheme: dark) {
+      rect { stroke: #dfe3e8; }
+      .inner { fill: #dfe3e8; }
+    }
+  </style>
+  <rect x="3.5" y="6.5" width="25" height="19" rx="2.5"/>
+  <rect class="inner" x="8" y="11" width="12" height="2.5"/>
+  <rect class="inner" x="8" y="16" width="8" height="2.5"/>
+</svg>
