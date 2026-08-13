@@ -153,7 +153,15 @@ convert files already on disk. Confirm and fix:
 
 ```powershell
 git ls-files --eol docs/cli.md      # `w/crlf` is the problem; `w/lf` is correct
-git add --renormalize .             # rewrites the working tree to match
+```
+
+`git add --renormalize .` is the obvious fix and it **does not work here**: it normalises what
+git *stores*, and the index was already LF — so it stages nothing and changes no file on disk.
+Delete the affected files and check them out again, which is what applies the `eol=lf` filter:
+
+```powershell
+git rm --cached -r . ; git checkout -- .    # or simply re-clone
+git ls-files --eol docs/cli.md              # now w/lf
 ```
 
 Reported from a real Windows machine on 2026-08-13, along with the detail that makes it
