@@ -1,7 +1,7 @@
 From 4bec79c47d1342db6a5aece5b08270cea5d6f3ff Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:11:42 +0200
-Subject: [PATCH 16/31] vsock: separate TSI from the guest-IPC half of the
+Subject: [PATCH 16/32] vsock: separate TSI from the guest-IPC half of the
  device
 
 virtio-vsock in this tree carries two unrelated things. TSI hijacks the guest's

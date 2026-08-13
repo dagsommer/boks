@@ -1,7 +1,7 @@
 From 86ef0f06d69c3ab4b8b789a3afe2088f4ba01ed4 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:29:14 +0200
-Subject: [PATCH 19/31] virtio/net: name the backend's error and handle types
+Subject: [PATCH 19/32] virtio/net: name the backend's error and handle types
  per platform
 
 The three error enums in the net backend carry `nix::Error`, and the trait
