@@ -78,23 +78,29 @@ func publishedPorts() map[string]string {
 	return out
 }
 
-// writeTable renders the listing with sbx's columns.
+// writeTable renders the listing with sbx's columns, plus one Boks adds.
 //
 // PORTS shows what each sandbox publishes right now, in Docker's and sbx's
 // `127.0.0.1:8080->3000/tcp` notation. A sandbox that publishes nothing gets a dash rather
 // than a blank, for the same reason every other column does: "none" and "not applicable"
 // should not look the same. Image, creation time and the rest are in --json and
 // 'boks inspect', which is where detail belongs.
+//
+// MODE is the addition, and it earns a column rather than a detail view because it answers
+// the one question a listing should not make anybody go and look up: whether the thing in
+// that row writes to the files on this machine. It sits next to WORKSPACE, which is the
+// directory the answer is about.
 func writeTable(w io.Writer, infos []sandbox.Info, published map[string]string) {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(tw, "SANDBOX\tAGENT\tSTATUS\tPORTS\tWORKSPACE")
+	fmt.Fprintln(tw, "SANDBOX\tAGENT\tSTATUS\tPORTS\tMODE\tWORKSPACE")
 	for _, info := range infos {
 		status := info.Status
 		if info.Ephemeral {
 			status += " (ephemeral)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			info.Name, dash(info.Agent), status, dash(published[info.Name]), dash(info.Workspace()))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			info.Name, dash(info.Agent), status, dash(published[info.Name]),
+			info.Filesystem.Mode, dash(info.Workspace()))
 	}
 	_ = tw.Flush()
 }

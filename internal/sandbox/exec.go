@@ -67,7 +67,7 @@ func Exec(ctx context.Context, cfg ExecConfig) (int, error) {
 	// a step that existed only because Boks made the user aware of it: the sandbox has
 	// to be running for the command to run, and there is no other answer the user could
 	// give. sbx starts it too. Only a sandbox that cannot be started is an error.
-	task, err := ensureRunning(ctx, container)
+	task, err := ensureRunning(ctx, container, cfg.Stderr)
 	if err != nil {
 		return 1, err
 	}

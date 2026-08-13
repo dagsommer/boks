@@ -97,7 +97,7 @@ func TestIntegrationLifecycle(t *testing.T) {
 		t.Error("creation time is zero")
 	}
 
-	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if info, _ := find(t, cfg.Address, cfg.Name); info.Status != sandbox.StatusRunning {
@@ -117,7 +117,7 @@ func TestIntegrationLifecycle(t *testing.T) {
 		t.Errorf("status after Stop = %q, want %q", info.Status, sandbox.StatusStopped)
 	}
 
-	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start after Stop: %v", err)
 	}
 	code, out, err := execIn(t, cfg, "cat", "/root/state.txt")
@@ -201,7 +201,7 @@ func TestIntegrationExecExitCode(t *testing.T) {
 	if _, err := sandbox.Create(context.Background(), cfg); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := sandbox.Start(context.Background(), cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(context.Background(), cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -222,7 +222,7 @@ func TestIntegrationExecUsesWorkspace(t *testing.T) {
 	if _, err := sandbox.Create(context.Background(), cfg); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := sandbox.Start(context.Background(), cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(context.Background(), cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -334,7 +334,7 @@ func TestIntegrationOperationsOnMissingSandbox(t *testing.T) {
 		call func() error
 	}{
 		{"inspect", func() error { _, err := sandbox.Inspect(context.Background(), cfg.Address, missing); return err }},
-		{"start", func() error { return sandbox.Start(context.Background(), cfg.Address, missing) }},
+		{"start", func() error { return sandbox.Start(context.Background(), cfg.Address, missing, os.Stderr) }},
 		{"stop", func() error { return sandbox.Stop(context.Background(), cfg.Address, missing) }},
 		{"rm", func() error { return sandbox.Remove(context.Background(), cfg.Address, missing, false) }},
 	} {
@@ -356,7 +356,7 @@ func TestIntegrationRemoveRunningRequiresForce(t *testing.T) {
 	if _, err := sandbox.Create(context.Background(), cfg); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := sandbox.Start(context.Background(), cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(context.Background(), cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -383,7 +383,7 @@ func TestIntegrationCopy(t *testing.T) {
 	if _, err := sandbox.Create(ctx, cfg); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -473,7 +473,7 @@ func TestIntegrationStopSignalsProcessesInTheSandbox(t *testing.T) {
 	if _, err := sandbox.Create(ctx, cfg); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -488,7 +488,7 @@ func TestIntegrationStopSignalsProcessesInTheSandbox(t *testing.T) {
 	if err := sandbox.Stop(ctx, cfg.Address, cfg.Name); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	if err := sandbox.Start(ctx, cfg.Address, cfg.Name); err != nil {
+	if err := sandbox.Start(ctx, cfg.Address, cfg.Name, os.Stderr); err != nil {
 		t.Fatalf("Start after Stop: %v", err)
 	}
 	code, out, err := execIn(t, cfg, "cat", "/root/signal")
