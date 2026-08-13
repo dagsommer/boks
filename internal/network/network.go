@@ -19,12 +19,15 @@
 // stack logs frames from the VM's MAC, and the guest's resolv.conf switches from a copy of
 // the host's to the gateway this package configures.)*
 //
-// **That spike ran over the datagram link, and the link is a stream now** — `mode=unixstream`
-// rather than `mode=unixgram`, gvisor-tap-vsock's qemu framing rather than vfkit's. What it
-// established is unchanged: a virtio-net NIC exists, TSI is off, and the guest's frames
-// arrive here. What it no longer covers is the transport itself, because it is not the same
-// transport. Nothing on this project has attached a real VMM to the stream link. See link.go
-// for why the change was made, and docs/verification.md.
+// **The link is a stream now** — `mode=unixstream` rather than `mode=unixgram`,
+// gvisor-tap-vsock's qemu framing rather than vfkit's — and the check was re-run against a
+// real guest on 2026-08-13 over that transport, on macOS/Apple silicon. Denied destinations
+// are refused before anything is dialled, two explicitly allowed addresses reach the origin
+// carrying Cloudflare's own certificate, host loopback is unreachable, and every refusal
+// appears in the log as `transparent`. The stream parser moved 5.8 MB byte-identical to a
+// host reference and served 30 concurrent flows without interleaving. See link.go for why the
+// change was made, and docs/verification.md for the full procedure and its limits — chiefly
+// that this is one OS on one architecture, and that no VM has ever booted on Windows.
 //
 // # What this package now enforces
 //
