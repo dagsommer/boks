@@ -3,36 +3,35 @@
 What has shipped, newest first.
 
 **Nothing has been released yet.** There are no tags and no published binaries. Everything
-below describes the state of `main`, and the section headed *Before 0.1.0* is the hand-written
-entry that stands in for a history the generator would only make a mess of.
+below describes the state of `main`, and the section headed *Before 0.1.0* is the
+hand-written entry that stands in for a history from before the first tag.
 
-## How an entry gets here
+<!--
+  Contributors: how an entry gets here.
 
-From 0.1.1 onward each entry is generated from the conventional commits since the previous
-tag:
+  From 0.1.1 onward each entry is generated from the conventional commits since the previous
+  tag:
 
-```bash
-make release-notes TAG=v0.1.1                  # print it, and read it
-make release-notes TAG=v0.1.1 INSERT=--insert  # write it into this file
-```
+      make release-notes TAG=v0.1.1                  # print it, and read it
+      make release-notes TAG=v0.1.1 INSERT=--insert  # write it into this file
 
-`feat:`, `fix:`, `docs:` and `test:` are bucketed; everything else keeps its subject verbatim
-under *Other changes*, so no commit is ever dropped for failing to match a regular expression.
-Merge commits are skipped, because a merge's subject describes a branch whose commits are
-already listed. The generated text is a first draft, and editing the prose is expected —
-what must not change is a claim.
+  feat:, fix:, docs: and test: are bucketed; everything else keeps its subject verbatim under
+  "Other changes", so no commit is ever dropped for failing to match a regular expression.
+  Merge commits are skipped, because a merge's subject describes a branch whose commits are
+  already listed. The generated text is a first draft, and editing the prose is expected —
+  what must not change is a claim.
 
-**Before 0.1.0 is written by hand, once, and that is deliberate.** The 157 commits leading up
-to it are mostly prefixed, but with this project's own vocabulary — `cli:`, `policy:`,
-`enforce:`, `ports:` beside `feat:` and `fix:` — and the merges are prose. Run over that
-range the generator produces a list that is complete and unreadable, so it is not run over
-that range.
+  "Before 0.1.0" is written by hand, once, and that is deliberate. The 157 commits leading up
+  to it are mostly prefixed, but with this project's own vocabulary — cli:, policy:,
+  enforce:, ports: beside feat: and fix: — and the merges are prose. Run over that range the
+  generator produces a list that is complete and unreadable, so it is not run over that
+  range.
 
-Cutting a release, in full, is documented at the top of
-[`scripts/release-notes.sh`](https://github.com/dagsommer/boks/blob/main/scripts/release-notes.sh).
-The short version: move `ImageTag` in `internal/agent/agent.go`, which is the one place the
-version is spelled and which `.github/workflows/images.yml` refuses to publish against a
-mismatched tag; `make check && make docs`; generate the notes; read them; commit; tag.
+  Cutting a release, in full, is documented at the top of scripts/release-notes.sh. The
+  short version: move ImageTag in internal/agent/agent.go, which is the one place the
+  version is spelled and which .github/workflows/images.yml refuses to publish against a
+  mismatched tag; make check && make docs; generate the notes; read them; commit; tag.
+-->
 
 <!-- release-notes: generated entries are inserted directly below this line -->
 
@@ -112,10 +111,11 @@ nothing about isolation.
 ### Platforms
 
 macOS on Apple silicon is the platform everything above was measured on. Linux with KVM is
-built and designed for and has not been exercised end to end. Windows does not run Boks: the
-obstacle is `virtio-net`, the one libkrun device not yet ported to the Windows Hypervisor
-Platform, which is exactly the one Boks' enforcement depends on. Running inside WSL2 should
-work unchanged and nobody has tried it.
+built and designed for and has not been exercised end to end. Native Windows support is in
+progress and no sandbox has yet booted there: a Windows Hypervisor Platform backend for
+libkrun is being built in this repository's patch series, and `virtio-net` — the one device
+Boks' enforcement depends on — is not ported yet. Running inside WSL2 should work unchanged
+and nobody has tried it.
 
 ### Known at the time of writing
 
