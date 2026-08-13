@@ -158,7 +158,17 @@ it — see 'boks proxy --help'.`,
 		if record.FilePath != "" {
 			fmt.Fprintf(env.Stdout, "  and a credential file at %s, read-only\n", record.FilePath)
 		}
-		fmt.Fprintf(env.Stdout, "\nUse it with: boks run --oauth %s ...\n", name)
+		// The allow rules are spelled out rather than left to be discovered. Naming a host
+		// for a credential says where a token may go; it does not make the host reachable,
+		// and the default preset does not allow these — so a run without them fails at the
+		// network layer with no hint that a credential was ever involved.
+		var allows strings.Builder
+		for _, h := range append(append([]string{}, record.ResourceHosts...), record.TokenHost) {
+			fmt.Fprintf(&allows, " --allow %s", h)
+		}
+		fmt.Fprintf(env.Stdout, "\nUse it with:\n  boks run --oauth %s%s ...\n", name, allows.String())
+		fmt.Fprint(env.Stdout, "\nThe --allow rules are separate on purpose: a credential rule says where a token may\n"+
+			"go, not what is reachable. Without them the default policy denies these hosts.\n")
 		return nil
 	}
 	return cmd
