@@ -261,6 +261,10 @@ Identical decisions are collapsed into one row with a count, because a single de
 install produces hundreds of them and the one denial that explains a failure should not be
 buried. Use --raw for the unaggregated form.
 
+The log is one file for the whole machine, so a run you are debugging is mixed in with every
+other sandbox and with this morning. --sandbox and --since narrow it: --since takes a
+duration (30m, 2h) or a time (2026-08-13, 2026-08-13T09:30:00Z).
+
 The PROXY column is the part to read when you care about confidentiality:
 
   forward          boks handled this at the HTTP level and could read it — plaintext
@@ -272,15 +276,25 @@ The PROXY column is the part to read when you care about confidentiality:
 		Args: noArgs,
 	}
 	var (
-		limit int
-		path  string
-		raw   bool
+		limit   int
+		path    string
+		raw     bool
+		sandbox string
+		since   string
 	)
-	cmd.Flags().IntVarP(&limit, "limit", "n", 500, "read at most this many decisions (0 for all)")
+	cmd.Flags().IntVarP(&limit, "limit", "n", 500, "show at most this many decisions (0 for all)")
 	cmd.Flags().StringVar(&path, "file", policy.DefaultLogPath(), "decision log file")
 	cmd.Flags().BoolVar(&raw, "raw", false, "one line per decision instead of one per destination")
+	cmd.Flags().StringVar(&sandbox, "sandbox", "", "only decisions from this sandbox")
+	cmd.Flags().StringVar(&since, "since", "", "only decisions this recent: a duration (30m, 2h) or a time")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		filter := policy.Filter{Sandbox: sandbox}
+		var err error
+		if filter.Since, err = policy.ParseSince(since, time.Now()); err != nil {
+			return usagef("--since %s: %w", since, err)
+		}
+
 		f, err := os.Open(path)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -292,12 +306,20 @@ The PROXY column is the part to read when you care about confidentiality:
 		}
 		defer f.Close()
 
-		decisions, err := policy.ReadDecisions(f, limit)
+		// The whole file is read and then narrowed, rather than tailing first: the
+		// interesting decision for one sandbox may be a thousand lines back behind
+		// another sandbox's dependency install, and a --limit that had already thrown
+		// it away would make the filter look like it found nothing.
+		all, err := policy.ReadDecisions(f, 0)
 		if err != nil {
 			return err
 		}
+		decisions := tail(filter.Apply(all), limit)
 		if len(decisions) == 0 {
-			fmt.Fprintf(env.Stdout, "no decisions recorded in %s\n", path)
+			fmt.Fprintf(env.Stdout, "no decisions recorded in %s%s\n", path, describeFilter(filter))
+			if !filter.Empty() && len(all) > 0 {
+				fmt.Fprintf(env.Stdout, "%d decision(s) are recorded that the filter excluded.\n", len(all))
+			}
 			return nil
 		}
 		if raw {
@@ -310,6 +332,30 @@ The PROXY column is the part to read when you care about confidentiality:
 		return nil
 	}
 	return cmd
+}
+
+// tail keeps the last n decisions, which are the recent ones. n <= 0 keeps everything.
+func tail(decisions []policy.Decision, n int) []policy.Decision {
+	if n > 0 && len(decisions) > n {
+		return decisions[len(decisions)-n:]
+	}
+	return decisions
+}
+
+// describeFilter says what was asked for, so that "no decisions" cannot be misread as "no
+// decisions at all" when it means "none from that sandbox in that window".
+func describeFilter(f policy.Filter) string {
+	var parts []string
+	if f.Sandbox != "" {
+		parts = append(parts, "for sandbox "+f.Sandbox)
+	}
+	if !f.Since.IsZero() {
+		parts = append(parts, "since "+f.Since.Format(time.RFC3339))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " " + strings.Join(parts, " ")
 }
 
 // writeDecisionTable prints aggregated decisions, blocked first.
