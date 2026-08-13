@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -71,11 +73,21 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 		}
 
 		var provider secret.Provider
-		if len(rules) > 0 {
-			provider, err = openSecretStore(store)
+		if len(rules) > 0 || len(flags.oauth) > 0 {
+			// The file store is the provider for both kinds. For OAuth that matters
+			// beyond convenience: it is also the OAuthSaver, so a refresh performed
+			// here is written back durably. A sandbox's supervisor has no passphrase
+			// and cannot do that — see internal/secret's MemoryStore.
+			fileStore, err := openSecretStore(store)
 			if err != nil {
 				return err
 			}
+			oauthRules, err := oauthCredentials(cmd.Context(), fileStore, flags.oauth)
+			if err != nil {
+				return err
+			}
+			rules = append(rules, oauthRules...)
+			provider = fileStore
 		}
 		injector, err := secret.NewInjector(provider, rules...)
 		if err != nil {
@@ -153,6 +165,52 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 type stderrSink struct{ w io.Writer }
 
 func (s stderrSink) Record(d policy.Decision) { fmt.Fprintln(s.w, d) }
+
+// oauthCredentials reads the named OAuth credentials out of the store and turns them into
+// credentials the injector can run from.
+//
+// The shape — token endpoint, sentinels, resource hosts, credential file — comes from the
+// stored record rather than from a flag, because it is a property of the credential that was
+// imported and not of this run. `--oauth NAME` is therefore all a user has to type, and two
+// commands cannot disagree about what a credential means.
+func oauthCredentials(ctx context.Context, store *secret.FileStore, names []string) ([]secret.Credential, error) {
+	var out []secret.Credential
+	for _, name := range names {
+		record, err := store.LookupOAuthRecord(ctx, name)
+		if err != nil {
+			if errors.Is(err, secret.ErrNotFound) {
+				return nil, fmt.Errorf("no oauth credential named %q; import one with 'boks secret import %s'", name, name)
+			}
+			return nil, err
+		}
+		c, err := record.Credential()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// oauthRecords reads the named OAuth credentials out of the store whole — tokens included —
+// for handing to a sandbox's network supervisor. Nothing prints its result.
+func oauthRecords(ctx context.Context, store *secret.FileStore, names []string) (map[string]secret.OAuthRecord, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]secret.OAuthRecord, len(names))
+	for _, name := range names {
+		record, err := store.LookupOAuthRecord(ctx, name)
+		if err != nil {
+			if errors.Is(err, secret.ErrNotFound) {
+				return nil, fmt.Errorf("no oauth credential named %q; import one with 'boks secret import %s'", name, name)
+			}
+			return nil, err
+		}
+		out[name] = record
+	}
+	return out, nil
+}
 
 // openSecretStore opens the encrypted store, reporting clearly when the passphrase is
 // missing rather than failing later inside a request.

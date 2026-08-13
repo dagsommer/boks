@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -221,11 +222,26 @@ var profiles = map[string]OAuthProfile{
 		AccessPrefix:   "sk-ant-oat01-",
 		RefreshPrefix:  "sk-ant-ort01-",
 		SentinelLength: 108,
-		DefaultSource: func() CredentialSource {
-			return KeychainSource{Service: ClaudeCodeKeychainService}
-		},
-		Parse: parseClaudeCode,
+		DefaultSource:  claudeCodeDefaultSource,
+		Parse:          parseClaudeCode,
 	},
+}
+
+// claudeCodeDefaultSource is where Claude Code's credential lives on this machine.
+//
+// macOS keeps it in the Keychain; everywhere else it is a file in the agent's own
+// directory. The split matters for what can be tested: the file is ordinary bytes this
+// project reads and parses under test, and the Keychain is the one branch that has never
+// run here.
+func claudeCodeDefaultSource() CredentialSource {
+	if runtime.GOOS == "darwin" {
+		return KeychainSource{Service: ClaudeCodeKeychainService}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return KeychainSource{Service: ClaudeCodeKeychainService}
+	}
+	return FileSource{Path: filepath.Join(home, ".claude", ".credentials.json")}
 }
 
 // Profile returns a provider profile by name.
