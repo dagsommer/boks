@@ -6,9 +6,10 @@ package policy
 //
 //	1. base       a preset, or a stored profile — the default action and its rules
 //	2. profile    the selected profile's own rules
-//	3. global     stored rules that apply to every sandbox on this machine
-//	4. sandbox    stored rules for this sandbox only
-//	5. flags      --allow / --deny on this invocation (a Boks addition, not sbx parity)
+//	3. agent      what the agent being run cannot work without, from its own definition
+//	4. global     stored rules that apply to every sandbox on this machine
+//	5. sandbox    stored rules for this sandbox only
+//	6. flags      --allow / --deny on this invocation (a Boks addition, not sbx parity)
 //
 // # Precedence, and why it is this way
 //
@@ -35,6 +36,22 @@ package policy
 //
 // The asymmetry is deliberate and is the whole design: the thing a run can change is the
 // posture it starts from; the thing it cannot change is any prohibition someone wrote down.
+//
+// # The agent layer
+//
+// The agent layer is where "`boks run claude` works out of the box" lives: an agent's own
+// definition names the destinations it cannot work without, and they are added as allows
+// labelled with the agent's name. It is subject to every rule above and gets no exemption
+// from any of them — in particular **a deny in any scope beats an agent's own allow**, so
+// `boks policy deny api.anthropic.com` denies it for the claude agent too, and there is a
+// test that says so.
+//
+// It is skipped under the locked preset, and that is the one place a layer is conditional.
+// `locked` is documented as "deny everything; every destination must be added with --allow",
+// and a user who reaches for it is usually trying to stop an agent phoning anywhere at all —
+// an agent's own API being quietly exempt would defeat exactly the thing they asked for. The
+// layer still appears in `boks policy ls`, with a count of zero and the reason, because a
+// rule that silently did not apply is as confusing as one that silently did.
 
 import (
 	"fmt"
@@ -81,6 +98,8 @@ type Resolution struct {
 	Profile string `json:"profile,omitempty"`
 	// Sandbox is the sandbox the resolution was made for, if any.
 	Sandbox string `json:"sandbox,omitempty"`
+	// Agent is the agent whose own allowlist contributed a layer, if any.
+	Agent string `json:"agent,omitempty"`
 }
 
 // Policy compiles the resolution into the matchable form the engine takes.
@@ -115,6 +134,14 @@ type Request struct {
 	// Allow and Deny are this run's own rules (`--allow`, `--deny`).
 	Allow []string
 	Deny  []string
+	// Agent names the agent this sandbox runs, and AgentAllow are the destinations its
+	// definition says it cannot work without. They are separate from Allow because they
+	// are not this run's choice: they come from the agent record, are labelled with its
+	// name in `boks policy ls`, and are re-derived from the registry every time rather
+	// than recorded on the sandbox — so an entry removed from a later Boks stops applying
+	// to sandboxes that already exist.
+	Agent      string
+	AgentAllow []RuleSpec
 }
 
 // Resolve assembles the effective policy.
@@ -123,7 +150,7 @@ type Request struct {
 // preset, a rule that does not parse. None of them fall back to a default, because a caller
 // that received a policy it did not ask for would enforce the wrong one.
 func (req Request) Resolve() (Resolution, error) {
-	res := Resolution{Version: StoreVersion, Sandbox: req.Sandbox, Profile: req.Profile}
+	res := Resolution{Version: StoreVersion, Sandbox: req.Sandbox, Profile: req.Profile, Agent: req.Agent}
 
 	base, baseName, err := req.base()
 	if err != nil {
@@ -159,6 +186,29 @@ func (req Request) Resolve() (Resolution, error) {
 				Count:  len(profile.Rules),
 			})
 			names = append(names, "profile:"+req.Profile)
+		}
+	}
+
+	if req.Agent != "" {
+		scope := "agent " + req.Agent
+		switch {
+		case base.Name == PresetLocked:
+			// Locked means locked. See the package comment above: the layer is
+			// still shown, so that its absence is a statement rather than a gap.
+			res.Layers = append(res.Layers, Layer{
+				Source: scope,
+				Detail: "not applied: preset locked allows only what you write",
+			})
+		default:
+			res.Rules = appendScoped(res.Rules, req.AgentAllow, scope)
+			res.Layers = append(res.Layers, Layer{
+				Source: scope,
+				Detail: "what this agent cannot work without; a deny in any scope still wins",
+				Count:  len(req.AgentAllow),
+			})
+			if len(req.AgentAllow) > 0 {
+				names = append(names, "agent:"+req.Agent)
+			}
 		}
 	}
 

@@ -391,7 +391,19 @@ On a host with hardware virtualisation (bare metal Linux with KVM, or Apple sili
    boks doctor
    ```
 
-   Every check must be `ok`. In particular `virtualization` and `vm runtime`.
+   Nothing may be `fail`. `vm runtime` in particular must be `ok`.
+
+   On macOS, exactly one check warns on a healthy host, and always will: `virtualization`
+   reports `warn` with "Hypervisor.framework assumed available", because there is no
+   user-space probe for it — nothing short of booting a VM establishes that one will boot,
+   so the check reports architecture support and says so. Everything else on a correctly
+   set-up macOS host is `ok`, `runtime entitlement` included.
+
+   Two other checks can warn without the host being wrong, and both name their reason:
+   `hypervisor library`, when libkrun is installed somewhere other than the two prefixes
+   Boks looks in (it does not parse the dynamic loader's configuration), and
+   `runtime entitlement`, when `codesign` cannot be run at all. On Linux, `virtualization`
+   is a real probe of `/dev/kvm` and is `ok` or `fail`, never `warn`.
 
 2. **Record the host's identity.**
 
