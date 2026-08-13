@@ -199,7 +199,7 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 		}
 	}
 
-	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode, record)
+	spec, err := flags.enforceSpec(ctx, inv.name, cfg.Address, mode, record, env.Stderr)
 	if err != nil {
 		return false, err
 	}
@@ -297,8 +297,12 @@ func orphanedStackWarning(name string) string {
 // The record is what the sandbox remembers about its own policy, or nil for a sandbox that
 // does not exist yet. Passing it here rather than reading it inside is what makes `start`,
 // `exec` and `run` produce the same policy for the same sandbox.
+//
+// The credential set is the flags plus whatever the store already holds under a service
+// name — see credentialPlan for why a stored credential applies without being named again,
+// and for the two things that keeps it from being a quiet expansion.
 func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mode network.Mode,
-	record *policy.SandboxPolicy) (enforce.Spec, error) {
+	record *policy.SandboxPolicy, stderr io.Writer) (enforce.Spec, error) {
 
 	plan, err := f.planFor(name, mode)
 	if err != nil {
@@ -308,29 +312,28 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 	if err != nil {
 		return enforce.Spec{}, err
 	}
-	credentials, err := f.credentialRules()
+	credentials, oauth, err := f.resolveCredentials(ctx, stderr)
 	if err != nil {
 		return enforce.Spec{}, err
 	}
+	services, err := credentials.services()
+	if err != nil {
+		return enforce.Spec{}, err
+	}
+	credentials.describe(stderr)
 
 	secrets := map[string]string{}
-	var oauth map[string]secret.OAuthRecord
-	if len(credentials) > 0 || len(f.oauth) > 0 {
+	if len(services) > 0 {
 		store, err := openSecretStore("")
 		if err != nil {
 			return enforce.Spec{}, err
 		}
-		for _, c := range credentials {
-			value, err := store.Lookup(ctx, c.Service)
+		for _, service := range services {
+			value, err := store.Lookup(ctx, service)
 			if err != nil {
-				return enforce.Spec{}, fmt.Errorf("credential %q: %w\nStore it first: boks secret set %s", c.Service, err, c.Service)
+				return enforce.Spec{}, fmt.Errorf("credential %q: %w\nStore it first: boks secret set %s", service, err, service)
 			}
-			secrets[c.Service] = value.Reveal()
-		}
-		// OAuth credentials travel whole rather than as a value, because their shape
-		// lives with them in the store; see enforce.Spec.
-		if oauth, err = oauthRecords(ctx, store, f.oauth); err != nil {
-			return enforce.Spec{}, err
+			secrets[service] = value.Reveal()
 		}
 	}
 
@@ -338,8 +341,8 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 		Sandbox:          name,
 		Plan:             plan,
 		Resolution:       &resolution,
-		Inject:           f.inject,
-		GuestCredentials: f.guest,
+		Inject:           credentials.inject,
+		GuestCredentials: credentials.guest,
 		Secrets:          secrets,
 		OAuth:            oauth,
 		Intercept:        true,
