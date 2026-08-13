@@ -1,5 +1,3 @@
-//go:build !windows
-
 package network
 
 // The host-side network stack, assembled here rather than taken whole from
@@ -49,6 +47,12 @@ package network
 // (internal/network/vnettest), which proves that the *stack* refuses a flow the policy
 // denies. A real VM reaches this stack through libkrun's virtio-net device, which no machine
 // in this project has been able to run. See docs/verification.md.
+//
+// Nothing in this file is platform-specific, and it no longer pretends to be: the only Unix
+// dependency this stack ever had was the SOCK_DGRAM link socket underneath it, and the link
+// is a stream now (see link.go). What still stops a sandbox from running on Windows is the
+// absence of a VMM to put frames on that link — see vmm_windows.go, which is where the
+// refusal now lives.
 
 import (
 	"context"
@@ -301,8 +305,12 @@ func (h *hostStack) startDHCP(cfg *types.Configuration, pool *tap.IPPool) error 
 }
 
 // accept serves the link until the context is cancelled or the VM disconnects.
+//
+// types.QemuProtocol is the framing libkrun's unixstream backend writes — a 4-byte
+// big-endian length in front of each Ethernet frame — and linkConn is what makes it safe to
+// parse a length a peer chose. See link.go.
 func (h *hostStack) accept(ctx context.Context, conn net.Conn) error {
-	return h.sw.Accept(ctx, conn, types.VfkitProtocol)
+	return h.sw.Accept(ctx, newLinkConn(conn), types.QemuProtocol)
 }
 
 // forwardTCP is the enforcement point: one call per connection the guest opens to something

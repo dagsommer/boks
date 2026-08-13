@@ -511,12 +511,25 @@ confirmed against a booted VM:
 - Ctrl-C exits `130` for SIGINT and prints nothing. Observed tearing down a real VM: the
   sandbox, its container, its task and its network supervisor were all gone afterwards.
 
+**One of those results has since been undercut, deliberately, and it is the first one.** That
+run reached the guest over the datagram link (`mode=unixgram`, gvisor-tap-vsock's `vfkit`
+protocol). The link is now a stream (`mode=unixstream`, the `qemu` protocol) so that the host
+stack has no Unix-only dependency left — Windows' AF_UNIX has no datagram socket, and that
+single dependency was what kept the stack behind a `!windows` build tag. Everything above the
+link is the same code, judging the same flows, and the framing is covered by tests against
+`tap.Switch` itself and by the simulated guest below, which speaks the real protocol over the
+real socket. But **no VM has been booted onto the stream link**, so "the policy is enforced
+against a real guest" is a statement about a transport Boks no longer asks for. Re-running the
+check-6 procedure on a machine with a hypervisor is what would restore it, and it should be the
+first thing done there.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
 shown to do, and it was shown against a **simulated** guest: a second gvisor stack on the far
-end of the same `SOCK_DGRAM` link socket a VM would use, with its own address in the sandbox's
-subnet and a default route through the gateway, speaking real Ethernet, ARP and TCP.
+end of the same link socket a VM would use — since the transport change, an `AF_UNIX`
+`SOCK_STREAM` socket it connects to exactly as libkrun would — with its own address in the
+sandbox's subnet and a default route through the gateway, speaking real Ethernet, ARP and TCP.
 
 Driven through the real CLI — `boks net serve` holding the stack, `boks policy log` reading
 the decisions — under `--policy locked` with one allowed destination:

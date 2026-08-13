@@ -19,6 +19,13 @@
 // stack logs frames from the VM's MAC, and the guest's resolv.conf switches from a copy of
 // the host's to the gateway this package configures.)*
 //
+// **That spike ran over the datagram link, and the link is a stream now** — `mode=unixstream`
+// rather than `mode=unixgram`, gvisor-tap-vsock's qemu framing rather than vfkit's. What it
+// established is unchanged: a virtio-net NIC exists, TSI is off, and the guest's frames
+// arrive here. What it no longer covers is the transport itself, because it is not the same
+// transport. Nothing on this project has attached a real VMM to the stream link. See link.go
+// for why the change was made, and docs/verification.md.
+//
 // # What this package now enforces
 //
 // The stack it runs is assembled here rather than taken whole from gvisor-tap-vsock, and the
@@ -26,12 +33,13 @@
 // address the guest puts in a SYN, with no policy consulted. Boks installs its own, which
 // asks the policy engine first, refuses what is denied, and records both outcomes. UDP and
 // ICMP are dropped at the link, apart from DNS to the gateway's own resolver. See
-// stack_unix.go for the assembly and the reasoning.
+// stack.go for the assembly and the reasoning.
 //
-// **Nothing in this package has yet enforced a policy against a real guest.** The transport
-// change is verified against a real VM; the enforcement built on it is verified only against
-// a simulated guest on the real link socket (internal/network/vnettest). "The stack refuses
-// it" is proven. "A real VM was refused" is not. Do not describe it as such.
+// The enforcement is verified against a simulated guest on the real link socket
+// (internal/network/vnettest), speaking the real framing over the real socket. "The stack
+// refuses it" is proven that way. "A real VM was refused over *this* link" is not: the run
+// that saw a real guest refused used the datagram transport this package no longer asks for.
+// Do not describe it as such.
 //
 // # The two annotations
 //
@@ -42,9 +50,13 @@
 //
 //	io.containerd.nerdbox.network.N       attaches a NIC to the VM
 //	    socket= (required)  host UNIX socket carrying the link
-//	    mode=   (required)  unixgram for gvisor-tap-vsock, unixstream for passt
+//	    mode=   (required)  unixgram (SOCK_DGRAM, one frame per datagram) or
+//	                        unixstream (SOCK_STREAM, each frame length-prefixed).
+//	                        Boks asks for unixstream; see link.go for why.
 //	    mac=    (required)  unicast MAC; the multicast bit must be clear
 //	    addr=   (optional)  CIDR, at most once per address family
+//	    vfkit=, vnet_hdr=, features=  (optional) — all deliberately unset, see
+//	                        Plan.Annotations
 //
 //	io.containerd.nerdbox.ctr.network.N   wires the container to that NIC
 //	    vmmac=  (required)  identifies which VM NIC this is
@@ -69,7 +81,6 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -269,7 +280,14 @@ func NewPlan(cfg Config) (Plan, error) {
 func (p Plan) Annotations() map[string]string {
 	vm := []string{
 		"socket=" + p.Socket,
-		"mode=unixgram", // gvisor-tap-vsock's vfkit transport is SOCK_DGRAM
+		// unixstream is libkrun's stream backend: an AF_UNIX SOCK_STREAM socket it
+		// connects to, with each Ethernet frame prefixed by a 4-byte big-endian
+		// length. That framing is gvisor-tap-vsock's qemu protocol, which is what the
+		// host stack reads. The two other flags nerdbox accepts here are deliberately
+		// absent: `vfkit=true` would make libkrun send a magic sequence this protocol
+		// does not expect, and `vnet_hdr=true` would put a virtio-net header in front
+		// of every frame, which the switch would parse as Ethernet.
+		"mode=unixstream",
 		"mac=" + p.VMMAC,
 	}
 	out := map[string]string{
@@ -316,16 +334,19 @@ func randomMAC() (string, error) {
 //
 // A UNIX socket path is a fixed-size field, and overflowing it fails at bind time with an
 // error that says nothing useful about which path was too long. macOS is the tighter of the
-// two limits, so it is the one enforced everywhere: a sandbox that works on Linux and fails
-// on macOS for this reason would be a miserable bug to chase.
+// three limits, so it is the one enforced everywhere: a sandbox that works on Linux and
+// fails on macOS for this reason would be a miserable bug to chase. Windows' AF_UNIX has the
+// same fixed field and a comparable limit, so the same check applies there.
+//
+// This used to refuse on Windows outright, because the link was a SOCK_DGRAM socket and
+// Windows' AF_UNIX has never had one. The link is a stream now, so a socket path is just a
+// socket path here; what Windows still lacks is a VMM to connect to it, which is refused
+// where it is true — see vmm_windows.go.
 func checkSocketPath(path string) error {
 	if len(path) >= unixPathMaxDarwin {
 		return fmt.Errorf("network: the link socket path is %d characters, over the %d-byte limit "+
 			"for UNIX sockets: %s\nUse a shorter sandbox name or set a shorter runtime directory",
 			len(path), unixPathMaxDarwin, path)
-	}
-	if runtime.GOOS == "windows" {
-		return fmt.Errorf("network: the VM runtime does not support Windows yet")
 	}
 	return nil
 }

@@ -2,13 +2,14 @@
 
 Boks enforces network policy at the virtio-net boundary. Upstream libkrun cannot provide
 that boundary on Windows, which is why `boks run` cannot work there — see
-`internal/network/gateway_windows.go`, which says so and fails early.
+`internal/network/vmm_windows.go`, which says so and fails early.
 
 Not because it is impossible: a shipping product drives a virtio NIC on Windows through
 libkrun's own ABI today (below). Because upstream has no virtio-net backend for it.
 
 This document records the upstream change that closes the libkrun half of that gap, and
-what Boks would have to do once it lands.
+what Boks had to do to meet it. The Boks half is done — the link is a stream on every
+platform now — and untested against any VMM.
 
 ## Status
 
@@ -68,26 +69,41 @@ event must be acknowledged with `WSAEnumNetworkEvents` before it re-signals); an
 `WSAEventSelect` forces the socket non-blocking, so the `MSG_WAITALL` receive that completes
 a partial frame on Unix is emulated with `WSAPoll`.
 
-## What Boks would have to change
+## What Boks had to change — done, on the Linux path
 
-**The protocol switch is the known one: vfkit/unixgram → qemu/unixstream.**
+**The protocol switch is the known one: vfkit/unixgram → qemu/unixstream.** It has been
+made, on every platform rather than only on Windows, for the reason noted at the bottom of
+this section: a transport that only Windows uses is a transport nothing tests.
 
-- `internal/network/gateway_unix.go` uses `transport.ListenUnixgram` +
-  `transport.AcceptVfkit`. The Windows path needs the stream equivalent — a listening
-  `AF_UNIX` `SOCK_STREAM` socket, with gvisor-tap-vsock's `qemu` protocol framing: each
-  frame prefixed by its length as a 4-byte big-endian `uint32`. That is exactly what the
-  ported libkrun backend speaks.
-- `Plan.Annotations()` in `internal/network/network.go` hardcodes `mode=unixgram`. It would
-  become `mode=unixstream` on Windows, which in turn requires the shim to call
-  `krun_add_net_unixstream()` rather than `krun_add_net_unixgram()`.
-- `internal/network/gateway_windows.go` currently exists only to fail with a sentence. It
-  would grow a real implementation, and `stack_unix.go` would need a Windows counterpart
-  or a build-tag widening — the host stack itself has no Unix-specific dependency beyond
-  the transport.
+- `internal/network/gateway.go` (was `gateway_unix.go`) listens on an `AF_UNIX`
+  `SOCK_STREAM` socket instead of binding a datagram one, and libkrun connects to it — which
+  is the direction `krun_add_net_unixstream` works in, confirmed against nerdbox 0.2.3's
+  `internal/shim/task/networking.go`, where the `vfkit` flag is "the VFKIT magic sequence
+  libkrun must send **after connecting to the socket**".
+- `Plan.Annotations()` in `internal/network/network.go` emits `mode=unixstream`, and
+  deliberately emits none of `vfkit`, `vnet_hdr` or `features`: the first two change what is
+  on the wire, and the third would negotiate segmentation offload the stack has no reason to
+  want.
+- `internal/network/stack.go` (was `stack_unix.go`) passes `types.QemuProtocol` and has lost
+  its `!windows` tag. `gateway_windows.go` is gone; the Windows refusal moved to
+  `vmm_windows.go`, where it is about the missing VMM rather than the socket type, and it is
+  raised from `Network.Start`.
+- `internal/network/link.go` is new, and is the part that was not "one constant and a
+  listener". A datagram carried its own length; on a stream the length in front of each frame
+  is a number the peer writes, and `tap.Switch` acts on it twice before anything has checked
+  it — it allocates a buffer of exactly that size, then reads six bytes of MAC out of the
+  front of it. So a 4 GiB claim is a 4 GiB allocation, and a 4-byte claim panics inside the
+  switch *while it holds `camLock`*, which deadlocks the deferred disconnect rather than
+  crashing cleanly (observed). The wrapper bounds the length before the switch sees it,
+  refuses one below an Ethernet header, and reports a failed write in a form the switch's
+  ENOBUFS retry cannot match — retrying a partially written frame would desynchronise every
+  frame after it.
 
-Note that the framing change is not Windows-only work we can hide: gvisor-tap-vsock
-implements the `qemu` protocol on all platforms, so the stream path could be developed and
-tested on Linux first, and only then pointed at Windows.
+**None of this has run against a real VMM**, on any platform. The framing, the reconnect
+handling and the refusals are tested against `tap.Switch` itself and against a simulated
+guest on a real socket; the datagram link they replace is the one a booted VM was seen to
+use. That is the risk this change carries, and it is deliberate: the alternative was a
+Windows-only transport that no test on this project would ever exercise.
 
 ## What this does *not* unblock
 
@@ -104,17 +120,18 @@ libkrun's virtio-net is necessary, not sufficient. Still outstanding for Windows
   consume builds and runs on Windows has not been checked. That is the next thing to find
   out, and it is cheap to.
 - **containerd on Windows** running Linux guests the way the Boks stack assumes.
-- **Our own Windows path**: `gateway_windows.go`, a Windows counterpart to `stack_unix.go`,
-  and the stream transport described above.
+- **Our own Windows path**: nothing in `internal/network` any more — the stream transport is
+  in, `stack.go` and `gateway.go` build for `windows/amd64`, and the only Windows-specific
+  file left is `vmm_windows.go`, whose job is to refuse. What is untested is everything: no
+  frame has crossed this link on Windows, and none can until the VMM exists.
 
 So the realistic reading is: this removes one blocker of several. Its value is that the
 blocker is now a patch in front of libkrun's maintainers rather than an unasked question,
 and that we know the layers underneath it are not the obstacle.
 
-The comment in `gateway_windows.go` and `gateway_unix.go` saying "nerdbox does not support
-Windows either" should be softened when someone next touches it — a shipping Windows shim
-binary exists, so the accurate statement is that *we* have no Windows path, not that none
-is possible.
+(The comment that used to say "nerdbox does not support Windows either" is gone with those
+files: a shipping Windows shim binary exists, so the accurate statement is that *we* have no
+Windows VMM, not that none is possible.)
 
 ## Verification, honestly
 
