@@ -29,18 +29,22 @@ func newProxyCommand(env Env) *cobra.Command {
 		Use:   "proxy [flags]",
 		Short: "Run the host forward proxy on its own, outside any sandbox",
 		Long: `Runs the host forward proxy: HTTP and HTTPS (via CONNECT) are filtered against a network
-policy, and credentials configured with --inject are attached to requests for the hosts
-they name, without the value ever existing inside a sandbox.
+policy, and credentials are attached to requests for the hosts they name, without the value
+ever existing inside a sandbox.
 
-Hosts named by an --inject rule are the only ones whose TLS is terminated: for those, and
-only those, the proxy presents a certificate from the local boks CA, verifies the origin
-itself, and can read the traffic. Every other destination is tunnelled untouched, with
-the origin's own certificate chain intact. 'boks policy log' shows which was which.
+The credentials are the ones in the store — anything stored under a service boks knows is
+attached with no flag at all, exactly as it would be in a sandbox — plus whatever --inject
+names. --no-secrets leaves the store out.
+
+Hosts a credential names are the only ones whose TLS is terminated: for those, and only
+those, the proxy presents a certificate from the local boks CA, verifies the origin itself,
+and can read the traffic. Every other destination is tunnelled untouched, with the origin's
+own certificate chain intact. 'boks policy log' shows which was which.
 
 Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks run'.`,
 		Example: `  boks proxy --policy standard
   boks proxy --policy locked --allow api.example.com:443 -v
-  boks proxy --inject 'anthropic@api.anthropic.com=header:x-api-key'`,
+  boks proxy --inject 'my-api@api.example.com=header:x-api-key'`,
 		Args: noArgs,
 	}
 	var (
