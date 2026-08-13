@@ -104,6 +104,11 @@ Agents:
 		if err != nil {
 			return err
 		}
+		// Decided before anything is pulled or started, so that a --clone against a
+		// directory Boks will not clone costs a message rather than a sandbox.
+		if err := applyCloneMode(flags, inv, &cfg, env); err != nil {
+			return err
+		}
 
 		// The network is decided, described and started before the sandbox: its
 		// annotations have to be on the container when it is created, and the host-side

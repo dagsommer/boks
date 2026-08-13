@@ -30,7 +30,7 @@ a sandbox that is already running does nothing.`,
 				if err := ensureNetworkForExisting(cmd.Context(), name, dev.address, env.Stderr); err != nil {
 					return err
 				}
-				return sandbox.Start(cmd.Context(), dev.address, name)
+				return sandbox.Start(cmd.Context(), dev.address, name, env.Stderr)
 			})
 		},
 	}
