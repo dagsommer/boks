@@ -1,0 +1,66 @@
+# Configuration for the documentation site published at https://dagsommer.github.io/boks/.
+#
+# The site does not contain any documentation of its own. Every page is generated at build
+# time from Markdown that already lives in the repository — README.md and docs/*.md — by
+# _plugins/boks_docs.rb. Nothing here is a copy, so nothing here can drift from the file a
+# contributor edits.
+#
+# To add a document to the site: write it in docs/, then add an entry to `boks_docs` below.
+
+title: Boks
+description: >-
+  Run coding agents and other untrusted developer tooling inside isolated microVMs, on your
+  own machine.
+
+# Project pages live under /boks/. Build with `--baseurl ''` to preview from a local server
+# rooted at /.
+url: https://dagsommer.github.io
+baseurl: /boks
+
+# Where a link that leaves the site points. Used for links to files the site does not
+# publish (LICENSE, images/, the source of each page) and for the "edit this page" link.
+repo: https://github.com/dagsommer/boks
+repo_branch: main
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  # The documents are hard-wrapped at ~90 columns. GFM's default of turning every newline
+  # into a <br> would put a line break in the middle of most sentences.
+  hard_wrap: false
+  auto_ids: true
+  syntax_highlighter: rouge
+
+# The nav, in order. `source` is a path relative to the repository root; `title` is read
+# from the document's own first heading unless given here; `nav` is the (usually shorter)
+# label in the sidebar. A source file that does not exist fails the build rather than
+# quietly disappearing from the site.
+boks_docs:
+  - source: README.md
+    url: /
+    nav: Overview
+    title: Boks
+  - source: docs/verification.md
+    url: /verification/
+    nav: Verification
+  - source: docs/security-model.md
+    url: /security-model/
+    nav: Security model
+  - source: docs/architecture.md
+    url: /architecture/
+    nav: Architecture
+  - source: docs/docker-sandbox-parity.md
+    url: /docker-sandbox-parity/
+    nav: Docker Sandbox parity
+  - source: docs/windows.md
+    url: /windows/
+    nav: Windows
+  - source: docs/upstream-libkrun-virtio-net.md
+    url: /upstream-libkrun-virtio-net/
+    nav: libkrun virtio-net
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - README.md

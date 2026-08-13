@@ -19,6 +19,12 @@ coverage.*
 *.local.yml
 secrets/
 
+# Documentation site build output (site/ itself is source; see docs/README.md)
+/site/_site/
+/site/.jekyll-cache/
+/site/.jekyll-metadata
+/site/vendor/
+
 # Editor and OS noise
 .DS_Store
 *.swp

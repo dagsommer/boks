@@ -1,0 +1,140 @@
+# Build the documentation site from docs/ and README.md, and publish it to
+# https://dagsommer.github.io/boks/.
+#
+# The three-job split is the same decision as in images.yml, for the same reason: the job
+# that runs other people's code is not the job that holds the credential. Jekyll and its
+# dependencies are third-party Ruby that executes during `build`, so `build` gets nothing
+# but `contents: read`. `pages: write` lives in the two jobs that run no project code —
+# `enable`, which turns the feature on, and `deploy`, which hands GitHub an artifact that
+# already exists. Do not merge them for tidiness.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "docs/**"
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  # A documentation change can break the site — a renamed file that site/_config.yml still
+  # lists fails the build on purpose — so pull requests build it without publishing.
+  pull_request:
+    paths:
+      - "README.md"
+      - "docs/**"
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish, rather than only building"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One deployment at a time, and never cancel one half-done: an interrupted publish would
+# leave the site serving a mixture of two builds.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # Turns Pages on if it is off, and reports the base path the site will be served under
+  # (`/boks` today; empty if the repository ever gets a custom domain). Runs no project
+  # code — it does not even check the repository out — which is why it is allowed to hold
+  # `pages: write`.
+  enable:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    outputs:
+      base_path: ${{ steps.pages.outputs.base_path }}
+    steps:
+      - id: pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+  # The job that runs third-party code: bundler resolves and installs gems, and Jekyll and
+  # kramdown then execute over the repository's Markdown. It holds no credential beyond
+  # read access to this repository's contents, so the worst a poisoned gem can do here is
+  # produce a bad artifact — which is bad, but it cannot publish it.
+  build:
+    runs-on: ubuntu-24.04
+    needs: [enable]
+    # `enable` is skipped on pull requests; build the site anyway, with the default base
+    # path from site/_config.yml.
+    if: always() && (needs.enable.result == 'success' || needs.enable.result == 'skipped')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: site
+
+      - name: Build
+        working-directory: site
+        env:
+          # Empty on a pull request, where `enable` did not run; Jekyll then falls back to
+          # the baseurl in _config.yml.
+          BASE_PATH: ${{ needs.enable.outputs.base_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_PATH" ]; then
+            bundle exec jekyll build --baseurl "$BASE_PATH"
+          else
+            bundle exec jekyll build
+          fi
+
+      # A site that builds but publishes nothing readable is a silent failure. These are the
+      # properties the site exists for: every document present, the warnings still rendered
+      # as warnings, and the wide tables still wrapped in something that scrolls.
+      - name: Check the output says what the documents say
+        working-directory: site
+        run: |
+          set -euo pipefail
+          for page in index verification/index security-model/index architecture/index \
+                      docker-sandbox-parity/index windows/index \
+                      upstream-libkrun-virtio-net/index; do
+            test -s "_site/${page}.html" || { echo "missing _site/${page}.html" >&2; exit 1; }
+          done
+          test -s _site/search-index.json
+          grep -q 'alert alert-warning' _site/index.html \
+            || { echo "the README's warning is not rendered as one" >&2; exit 1; }
+          grep -q 'Boks is experimental' _site/index.html \
+            || { echo "the status warning is missing from the landing page" >&2; exit 1; }
+          grep -q 'alert alert-caution' _site/verification/index.html \
+            || { echo "verification.md's caution is not rendered as one" >&2; exit 1; }
+          grep -q 'table-wrap' _site/docker-sandbox-parity/index.html \
+            || { echo "the parity matrix tables are not wrapped for scrolling" >&2; exit 1; }
+          ! grep -rq '\[!WARNING\]\|\[!CAUTION\]\|\[!IMPORTANT\]' _site \
+            || { echo "an alert marker was published as literal text" >&2; exit 1; }
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/_site
+
+  # The job that holds the publishing credential. It runs no project code at all: it takes
+  # the artifact the build produced and tells Pages to serve it.
+  deploy:
+    needs: [enable, build]
+    if: github.ref == 'refs/heads/main' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
