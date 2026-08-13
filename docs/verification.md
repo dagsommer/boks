@@ -636,17 +636,45 @@ confirmed against a booted VM:
 - Ctrl-C exits `130` for SIGINT and prints nothing. Observed tearing down a real VM: the
   sandbox, its container, its task and its network supervisor were all gone afterwards.
 
-**One of those results has since been undercut, deliberately, and it is the first one.** That
-run reached the guest over the datagram link (`mode=unixgram`, gvisor-tap-vsock's `vfkit`
-protocol). The link is now a stream (`mode=unixstream`, the `qemu` protocol) so that the host
-stack has no Unix-only dependency left — Windows' AF_UNIX has no datagram socket, and that
-single dependency was what kept the stack behind a `!windows` build tag. Everything above the
-link is the same code, judging the same flows, and the framing is covered by tests against
-`tap.Switch` itself and by the simulated guest below, which speaks the real protocol over the
-real socket. But **no VM has been booted onto the stream link**, so "the policy is enforced
-against a real guest" is a statement about a transport Boks no longer asks for. Re-running the
-check-6 procedure on a machine with a hypervisor is what would restore it, and it should be the
-first thing done there.
+**That result was undercut by the transport change, and has since been restored.** The
+original run reached the guest over the datagram link (`mode=unixgram`, gvisor-tap-vsock's
+`vfkit` protocol). The link is now a stream (`mode=unixstream`, the `qemu` protocol) so that
+the host stack has no Unix-only dependency left — Windows' AF_UNIX has no datagram socket, and
+that single dependency was what kept the stack behind a `!windows` build tag. For a period the
+strongest claim this project makes rested on a transport it no longer asked for.
+
+**Re-measured against a real guest on 2026-08-13, on macOS/Apple silicon, and it passes.** The
+transport was confirmed before anything was measured — the running container's annotation reads
+`mode=unixstream` — and then the whole check-6 procedure was re-run in one sandbox:
+
+| Probe | Result |
+| --- | --- |
+| Denied host, all four proxy variables unset | `http=000`, curl rc=7 |
+| Raw socket + real TLS to `1.1.1.1:443` | `ConnectionRefusedError` |
+| UDP to `8.8.8.8:53` | `TimeoutError`, and now **logged** with a reason |
+| **Positive control**: two explicitly allowed addresses | `HTTP/1.1 200 OK`, issuer `Cloudflare TLS Issuing ECC CA 3`, subject `example.com` |
+| Host loopback, with a server confirmed serving on the host | unreachable, curl rc=7 |
+| `boks policy log` | every refusal present, mode `transparent` |
+
+The positive control is the part that matters. A denial in the same Python process moments
+after a genuine end-to-end connection carrying **Cloudflare's** certificate is something a
+blanket drop cannot produce, and mistaking one for the other is exactly how check 6 was
+originally scored as a pass when it was not.
+
+The new stream parser was exercised beyond policy: a 5.8 MB tarball came through the guest
+**byte-identical** to a host reference (same sha256, `gzip -t` clean, ~16 MB/s), and 30
+concurrent TLS flows on raw sockets returned 30/30 with a single distinct body digest — no
+interleaving, no cross-flow contamination, no stalls.
+
+Two things changed that were not asked for. **UDP denials are now logged** rather than dropped
+mutely, closing a gap recorded on 2026-08-12: `8.8.8.8:53` now carries `udp is not carried;
+only DNS to the sandbox's own resolver is`. And **host loopback is refused without a log entry**
+— correctly, because a packet to `127.0.0.0/8` arriving on a non-loopback NIC is a martian and
+is discarded at the IP layer before the forwarder ever sees it. That refusal is stronger than a
+policy decision, not a missing one.
+
+**This measurement covers macOS on Apple silicon only.** The change was made for Windows, and
+nothing here says anything about Linux or about Windows, where no VM has ever booted.
 
 ### What was proven on the machine with no hypervisor
 
