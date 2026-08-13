@@ -10,7 +10,7 @@ import (
 // A supervisor exists to hold one sandbox's link socket and run the netstack behind it. On
 // Windows there is no such link, because Boks has no VMM that speaks the Windows Hypervisor
 // Platform and therefore nothing that emits a guest's frames onto a host socket (see
-// internal/network/gateway_windows.go and docs/windows.md). The design is sound there — the
+// internal/network/vmm_windows.go and docs/windows.md). The design is sound there — the
 // reference product runs the same shape on Windows — it simply has no VM under it. These
 // stubs therefore refuse rather than pretending.
 //

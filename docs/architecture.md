@@ -212,7 +212,7 @@ and rejects anything that is not CIDR.
 
 | Annotation | Effect | Required fields |
 |---|---|---|
-| `io.containerd.nerdbox.network.N` | attaches a NIC to the **VM** | `socket`, `mode` (`unixgram` for gvisor-tap-vsock), `mac` (unicast) |
+| `io.containerd.nerdbox.network.N` | attaches a NIC to the **VM** | `socket`, `mode` (`unixstream` — see below), `mac` (unicast) |
 | `io.containerd.nerdbox.ctr.network.N` | wires the **container** to that NIC | `vmmac`; plus `addr` (CIDR), `gw`, `ifname` |
 | `io.containerd.nerdbox.ctr.dns` | writes the container's `/etc/resolv.conf` | `key=value` pairs, one line each |
 
@@ -222,6 +222,14 @@ after parsing, so they never reach the guest.
 
 Consequences Boks' design has to carry:
 
+- **The link is a stream, and Boks does the framing checks.** `mode=unixstream` makes libkrun
+  connect to an `AF_UNIX` `SOCK_STREAM` socket Boks listens on and write each Ethernet frame
+  behind a 4-byte big-endian length — gvisor-tap-vsock's `qemu` protocol. The datagram mode
+  it replaced kept frame boundaries in the kernel; a stream keeps them in a number the peer
+  writes, so `internal/network/link.go` bounds that number before the switch allocates on it
+  and refuses one too small to be a frame, which would otherwise index past the buffer the
+  switch just allocated. It is also what removes the last platform dependency from the host
+  stack: Windows' AF_UNIX has no datagram socket, and a stream one it has.
 - **One stack per sandbox.** A second VM on the same socket gets a duplicate address; a
   third fails to attach. `internal/network` therefore creates a unique socket directory per
   sandbox and ties the stack's lifetime to the sandbox's.
@@ -469,15 +477,16 @@ libkrun's WHP backend has been landing upstream through 2026 for libkrun 2.0. **
 not yet ported is virtio-net** — precisely the one Boks' enforcement depends on. That is the
 whole gap, and it is narrow.
 
-Two things are true there regardless of how it is closed: the exact-path workspace property is
+One thing is true there regardless of how it is closed: the exact-path workspace property is
 impossible, because `C:\Users\dag\src\foo` is not a Linux path (both Boks and the reference
-product would map it to `/c/Users/dag/src/foo`), and the `unixgram` link would need a different
-socket type, because Windows' AF_UNIX is stream-only.
+product would map it to `/c/Users/dag/src/foo`). The link socket is no longer on that list —
+it used to be, because Windows' AF_UNIX is stream-only and the link was a datagram socket, and
+the link is a stream now on every platform.
 
 Until a VMM exists, the Windows answer is **WSL2 with nested virtualisation**, where Boks is
 just a Linux program: `/dev/kvm` and EROFS are both in the inbox kernel, the link is a normal
-`unixgram` socket inside the distro, and workspace paths are Linux paths so exact-path mounting
-holds unchanged. Untested, and not a port.
+AF_UNIX stream socket inside the distro, and workspace paths are Linux paths so exact-path
+mounting holds unchanged. Untested, and not a port.
 
 Code that touches platform specifics is kept behind build tags and interfaces, and `doctor`
 is structured as a list of checks each of which knows whether it applies to the current
