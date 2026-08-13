@@ -146,12 +146,21 @@ func (i *Injector) AcquireToken(ctx context.Context, c Credential, status int, b
 
 	tokens, err := ParseTokenResponse(body, c.OAuth.ResponseFields, i.now())
 	if err != nil {
-		// Not an error for the caller. An origin that named no access token issued none —
-		// a spent code, a bad verifier, a rejected client — and the agent is the thing that
-		// can explain that to the user, so its answer is passed through untouched. There is
-		// no token in it to mask: ParseTokenResponse fails on exactly the two cases, a body
-		// that is not a JSON object and a body with no access token, and neither can hold a
-		// credential Boks was supposed to keep.
+		// A **failed** login is passed through untouched, and it has to be: the agent is
+		// the only thing that can tell the user their code was spent or their client was
+		// rejected, and it can only do that if it sees the answer. There is no token in
+		// such a body to mask.
+		//
+		// A **successful** status that Boks could not read is the opposite case and is
+		// refused. That is the shape a token in a form Boks does not recognise would take —
+		// a different field name, an encoding, a document that is not JSON at all — and
+		// forwarding it would be handing over a credential precisely because it was not
+		// understood. Failing a login is recoverable; that is not.
+		if status >= 200 && status < 300 {
+			return TokenAcquisition{}, fmt.Errorf(
+				"the token endpoint answered the login for %q with %d and a body boks could not read as a token response; refusing to pass it to the sandbox unread",
+				c.Service, status)
+		}
 		return out, nil
 	}
 
@@ -265,23 +274,18 @@ func findLeak(body []byte, access, refresh string) string {
 	return ""
 }
 
-// StripForRelay removes the headers that would stop Boks from reading a token response, and
-// reports which it removed.
+// PrepareRelay makes the one change Boks makes to a relayed token request: it asks for an
+// identity encoding.
 //
-// Only one matters in practice: a guest that advertises `Accept-Encoding: gzip` gets a
-// compressed body, and a compressed body is one Boks cannot mask. Rather than teach the
-// inspected path to decompress — it decodes nothing else, deliberately — the request is asked
-// for an identity encoding. That is the single modification Boks makes to a relayed request,
-// it applies to this one request on this one path, and the alternative is a token reaching the
-// guest inside bytes nobody looked at.
-func StripForRelay(h http.Header) []string {
-	var removed []string
-	for _, name := range []string{"Accept-Encoding", "Range", "If-None-Match", "If-Modified-Since"} {
-		if h.Get(name) != "" {
-			h.Del(name)
-			removed = append(removed, name)
-		}
-	}
+// A guest that advertises `Accept-Encoding: gzip` — the real Claude Code advertises four —
+// gets a compressed body back, and a compressed body is one Boks cannot mask. Rather than
+// teach the inspected path to decompress, which it deliberately does nothing of the kind
+// anywhere else, the request asks for bytes that can be read. Everything else the guest wrote
+// goes out untouched, including the authorization code and the verifier, which is the whole
+// point of relaying rather than composing.
+//
+// An origin that ignores this still does not get a token to the guest: the caller refuses a
+// response it cannot read rather than passing it on.
+func PrepareRelay(h http.Header) {
 	h.Set("Accept-Encoding", "identity")
-	return removed
 }

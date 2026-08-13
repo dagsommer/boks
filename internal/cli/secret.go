@@ -956,9 +956,12 @@ useful to somebody who cannot read the credentials themselves.`,
 				where = strings.Join(record.ResourceHosts, ", ") +
 					"  (refreshed at " + record.TokenHost + ", on the host)"
 				if record.Pending {
-					kind = "oauth*"
+					// Not a value it could print instead: there is none. Saying so is the
+					// point — an armed credential looks exactly like a working one in
+					// every other listing, and a run that quietly does nothing is the
+					// failure this line exists to prevent.
 					where = strings.Join(record.ResourceHosts, ", ") +
-						"  (awaiting a login; run 'boks run claude -- auth login')"
+						"  (awaiting a login: 'boks run claude -- auth login')"
 				}
 			default:
 				if service, ok := knownServices.Lookup(e.Name); ok && service.Configured() {
