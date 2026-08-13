@@ -8,6 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dagsommer/boks/internal/enforce"
+	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
@@ -46,7 +48,7 @@ stopped ones keep their filesystem and are listed too.`,
 			}
 			return nil
 		default:
-			writeTable(env.Stdout, infos)
+			writeTable(env.Stdout, infos, publishedPorts())
 			return nil
 		}
 	}
@@ -59,13 +61,31 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
+// publishedPorts reads what every running sandbox network is publishing.
+//
+// It reads the supervisors' state files rather than asking each one over its control socket,
+// deliberately. A listing must not be something one wedged background process can hang, and
+// `ls` is the command people run when something is already wrong. The state file is rewritten
+// by the supervisor after every change, so it is as current as anything short of a round
+// trip; `boks ports` is the authoritative view of one sandbox.
+func publishedPorts() map[string]string {
+	out := map[string]string{}
+	for _, st := range enforce.List(policy.StateDir()) {
+		if column := portsColumn(st.Ports); column != "" {
+			out[st.Sandbox] = column
+		}
+	}
+	return out
+}
+
 // writeTable renders the listing with sbx's columns.
 //
-// PORTS is empty because nothing publishes ports yet. The column is still there: a listing
-// whose shape changes when a feature lands is a listing nobody can write a script against,
-// and an empty column says "none" where a missing one says nothing at all. Image, creation
-// time and the rest are in --json and 'boks inspect', which is where detail belongs.
-func writeTable(w io.Writer, infos []sandbox.Info) {
+// PORTS shows what each sandbox publishes right now, in Docker's and sbx's
+// `127.0.0.1:8080->3000/tcp` notation. A sandbox that publishes nothing gets a dash rather
+// than a blank, for the same reason every other column does: "none" and "not applicable"
+// should not look the same. Image, creation time and the rest are in --json and
+// 'boks inspect', which is where detail belongs.
+func writeTable(w io.Writer, infos []sandbox.Info, published map[string]string) {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(tw, "SANDBOX\tAGENT\tSTATUS\tPORTS\tWORKSPACE")
 	for _, info := range infos {
@@ -74,7 +94,7 @@ func writeTable(w io.Writer, infos []sandbox.Info) {
 			status += " (ephemeral)"
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			info.Name, dash(info.Agent), status, "", dash(info.Workspace()))
+			info.Name, dash(info.Agent), status, dash(published[info.Name]), dash(info.Workspace()))
 	}
 	_ = tw.Flush()
 }

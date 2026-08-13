@@ -85,6 +85,9 @@ Agents:
 		if _, err := netFlags.networkPlan(sandboxNameFor(flags.name)); err != nil {
 			return err
 		}
+		if err := netFlags.checkPublish(); err != nil {
+			return err
+		}
 
 		ctx := cmd.Context()
 		inv, err := flags.resolve(ctx, agents, positional, env)

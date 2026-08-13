@@ -310,7 +310,7 @@ func TestWriteTable(t *testing.T) {
 		Status:     sandbox.StatusRunning,
 		Image:      "docker.io/library/alpine:latest",
 		Workspaces: []sandbox.WorkspaceRef{{HostPath: "/home/alice/src/foo"}},
-	}})
+	}}, map[string]string{"claude-boks": "127.0.0.1:8080->3000/tcp"})
 
 	got := out.String()
 	header := strings.SplitN(got, "\n", 2)[0]
@@ -322,7 +322,7 @@ func TestWriteTable(t *testing.T) {
 	if strings.Contains(header, "IMAGE") {
 		t.Errorf("header = %q, want sbx's columns only", header)
 	}
-	for _, want := range []string{"claude-boks", "claude", "running", "/home/alice/src/foo"} {
+	for _, want := range []string{"claude-boks", "claude", "running", "127.0.0.1:8080->3000/tcp", "/home/alice/src/foo"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("table = %q, want it to contain %q", got, want)
 		}
@@ -333,7 +333,7 @@ func TestWriteTable(t *testing.T) {
 // still have to render a row.
 func TestWriteTableWithoutAgentOrWorkspace(t *testing.T) {
 	var out bytes.Buffer
-	writeTable(&out, []sandbox.Info{{Name: "bare", Status: sandbox.StatusStopped}})
+	writeTable(&out, []sandbox.Info{{Name: "bare", Status: sandbox.StatusStopped}}, nil)
 	if !strings.Contains(out.String(), "bare") {
 		t.Errorf("table = %q, want a row for the sandbox", out.String())
 	}
