@@ -161,7 +161,9 @@ a:hover { text-decoration-thickness: 2px; }
   padding: 1.5rem clamp(1rem, 4vw, 3rem) 5rem;
 }
 
-.doc { max-width: 50rem; }
+/* Long inline code — module paths, digests, URLs in windows.md — breaks rather than
+   pushing the page sideways on a phone. */
+.doc { max-width: 50rem; overflow-wrap: break-word; }
 
 /* Navigation ------------------------------------------------------------- */
 
