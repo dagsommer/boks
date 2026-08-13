@@ -145,8 +145,16 @@ git config --system --replace-all safe.directory "$boks_src"
 git config --system --add safe.directory "$boks_src/.git"
 mkdir -p "$boks_dst"
 echo "boks: cloning the host repository into $boks_dst (nothing written here reaches the host)" >&2
-git clone --no-hardlinks -- "$boks_src" "$boks_dst" >&2
-chown -R "$boks_owner" "$boks_dst"
+if ! { git clone --no-hardlinks -- "$boks_src" "$boks_dst" >&2 &&
+	chown -R "$boks_owner" "$boks_dst"; }; then
+	# Leave nothing half-made. The check at the top of this script reads an existing
+	# .git as "already cloned", so a partial clone — or one the agent cannot write to,
+	# because the chown failed — would be adopted by the next start and never repaired.
+	rm -rf "$boks_dst/.git"
+	echo "boks: the clone failed, and the partial one was removed rather than left to be" >&2
+	echo "      mistaken for a finished one on the next start." >&2
+	exit 1
+fi
 boks_dirty=$(git --no-optional-locks -C "$boks_src" status --porcelain 2>/dev/null | wc -l)
 if [ "${boks_dirty:-0}" -gt 0 ]; then
 	echo "boks: the host tree has $boks_dirty uncommitted change(s), and a clone carries committed" >&2
