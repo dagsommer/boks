@@ -39,6 +39,7 @@ Agents:
 	// on the runtime's default transport, which is the one that reaches host loopback.
 	var netFlags policyFlags
 	netFlags.register(cmd.Flags())
+	netFlags.registerPublish(cmd.Flags())
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
