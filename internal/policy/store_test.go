@@ -78,7 +78,18 @@ func TestStoreIsWrittenAsText(t *testing.T) {
 // policy other users can rewrite is not a policy.
 func TestStorePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("POSIX permissions")
+		// Not "this does not matter on Windows" — it matters exactly as much. It is that
+		// the property cannot be *stated* this way there. Windows access control lives in
+		// the file's DACL, which os.FileMode does not carry: Go synthesises the mode from
+		// FILE_ATTRIBUTE_READONLY alone, so Stat reports 0666 for every writable file
+		// whatever its ACL says, and the 0o077 test below would pass or fail for reasons
+		// unrelated to who can read the store.
+		//
+		// So on Windows nothing here is verified. Whether another user on the machine can
+		// read or rewrite the policy store is decided by the ACL inherited from
+		// %LocalAppData%, which Boks neither sets nor checks. That is an open gap in the
+		// security model, not something this skip closes — see docs/windows.md.
+		t.Skip("os.FileMode does not carry Windows ACLs; this property cannot be asserted here")
 	}
 	s := tempStore(t)
 	if err := s.Save(); err != nil {
@@ -172,6 +183,16 @@ func TestCorruptStoreFailsClosed(t *testing.T) {
 // there, and this user cannot read it. Falling back to the defaults would be the wrong
 // direction to fail in.
 func TestUnreadableStoreFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Mode 0o000 is not a way to make a file unreadable on Windows. Go maps the
+		// permission argument to FILE_ATTRIBUTE_READONLY and nothing else, so this file
+		// would be created perfectly readable and LoadStore would succeed — the test would
+		// fail while the code under test behaved correctly.
+		//
+		// The property itself is not skipped: TestUnopenableStoreFailsClosed below reaches
+		// it with a mechanism both platforms have.
+		t.Skip("mode 0o000 only sets FILE_ATTRIBUTE_READONLY on Windows; it does not deny reads")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root reads everything")
 	}
@@ -181,6 +202,27 @@ func TestUnreadableStoreFailsClosed(t *testing.T) {
 	}
 	if _, err := LoadStore(path); err == nil {
 		t.Fatal("an unreadable store was accepted")
+	}
+}
+
+// TestUnopenableStoreFailsClosed is the same property as above — a store that is present
+// but cannot be read must stop the caller rather than resolve to the defaults — reached
+// without POSIX permissions, so that it is checked on every platform Boks builds for.
+//
+// A directory where the store should be is the portable way to be unopenable: every
+// operating system refuses to read one as a file, and it is a state a real machine can
+// reach, by a botched install or a mount left in the way.
+func TestUnopenableStoreFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.json")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadStore(path)
+	if err == nil {
+		t.Fatalf("a store that could not be read was accepted and resolved to %+v", s)
+	}
+	if s != nil {
+		t.Error("an unreadable store must not also return a usable store")
 	}
 }
 
