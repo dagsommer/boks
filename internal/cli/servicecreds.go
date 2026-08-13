@@ -180,11 +180,14 @@ func (p credentialPlan) services() ([]string, error) {
 }
 
 // describe prints what the plan did on the user's behalf, and nothing about any value.
+//
+// The adoption line is one line, on every run, for the same reason the steady-state policy
+// line is: what a sandbox carries is worth restating rather than mentioning once. The loud
+// part — a host whose TLS is about to be terminated for the first time — is printed by
+// describeNetwork, which knows what this sandbox has already been told.
 func (p credentialPlan) describe(w io.Writer) {
 	if len(p.adopted) > 0 {
-		fmt.Fprintf(w, "credentials: attaching %s from the credential store.\n"+
-			"             Stored under a service name, so no --inject is needed. Run with\n"+
-			"             --no-secrets to leave them out of this sandbox.\n",
+		fmt.Fprintf(w, "credentials: %s, from the store · --no-secrets leaves them out\n",
 			strings.Join(p.adopted, ", "))
 	}
 	for _, name := range p.shadowed {
