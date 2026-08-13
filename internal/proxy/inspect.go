@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dagsommer/boks/internal/policy"
+	"github.com/dagsommer/boks/internal/secret"
 )
 
 const (
@@ -150,7 +151,15 @@ func (s *Server) serveInspected(ctx context.Context, target policy.Target, clien
 			req.Header.Set("User-Agent", "")
 		}
 
-		used, err := s.cfg.Injector.Apply(ctx, target, req.Header)
+		// An OAuth token request is answered here and never forwarded. See answerTokenRequest.
+		if credential, ok := s.cfg.Injector.TokenEndpointFor(target, req.URL.Path); ok && req.Method == http.MethodPost {
+			if !s.answerTokenRequest(ctx, target, credential, req, client) {
+				return
+			}
+			continue
+		}
+
+		used, err := s.cfg.Injector.Apply(ctx, target, req.Header, secret.FlowTLS)
 		if err != nil {
 			// The error names secrets, never values; see internal/secret.
 			writeStatus(client, http.StatusBadGateway, "boks: credential injection failed: "+err.Error()+"\n")
@@ -194,6 +203,63 @@ func (s *Server) serveInspected(ctx context.Context, target policy.Target, clien
 			return
 		}
 	}
+}
+
+// answerTokenRequest answers a guest's OAuth token request from the host, without
+// forwarding it, and reports whether the connection may carry another request.
+//
+// This is the refresh decision made concrete. The guest's bytes stop here: they are drained
+// and discarded, never parsed for parameters and never relayed, so no request a guest can
+// compose reaches the token endpoint carrying the real refresh token. What goes back is a
+// response Boks composed — the same sentinels the guest already holds, and a lifetime that
+// says the expiry is not its concern. An agent that persists what a refresh returned
+// therefore writes back exactly what it had, which is the property that makes this survive a
+// guest rewriting its own credential file.
+//
+// The real exchange, when one is needed, happens on the host inside ExchangeToken: a
+// separate HTTPS request from this process, composed here, that no guest input touches.
+func (s *Server) answerTokenRequest(ctx context.Context, target policy.Target, credential secret.Credential,
+	req *http.Request, client net.Conn) bool {
+
+	// The body has to be consumed for the connection to stay framed, and it is discarded
+	// unread: a guest's refresh parameters are not input to anything Boks does.
+	_, drainErr := io.Copy(io.Discard, io.LimitReader(req.Body, maxTokenRequestBody))
+	req.Body.Close()
+
+	exchange, err := s.cfg.Injector.ExchangeToken(ctx, credential)
+	if err != nil {
+		// Errors here name the service and never a token; see internal/secret.
+		s.logf("oauth token request for %s on %s: %v", credential.Service, target, err)
+		writeStatus(client, http.StatusBadGateway, "boks: "+err.Error()+"\n")
+		return false
+	}
+	s.cfg.Engine.Note(policy.StageRequest, target, policy.ModeForward,
+		"oauth token request for "+credential.Service+" answered on the host; the guest keeps its sentinels")
+	s.logf("answered an oauth token request for %s on %s (host-side refresh: %v)",
+		credential.Service, target, exchange.Refreshed)
+
+	writeJSON(client, exchange.Status, exchange.Body)
+	// A body larger than the cap means the framing is no longer trustworthy, so this
+	// connection ends after the answer rather than risking the next request being read out
+	// of the middle of this one.
+	return drainErr == nil
+}
+
+// maxTokenRequestBody bounds what is drained from a token request. A real one is a few
+// hundred bytes; anything beyond this is not a refresh.
+const maxTokenRequestBody = 64 << 10
+
+// writeJSON sends a JSON response Boks composed itself on a connection with no
+// http.ResponseWriter. The body is built in internal/secret from sentinels, never from a
+// token and never from anything read off the wire.
+func writeJSON(w io.Writer, status int, body []byte) {
+	fmt.Fprintf(w, "HTTP/1.1 %d %s\r\n"+
+		"Content-Type: application/json\r\n"+
+		"Cache-Control: no-store\r\n"+
+		"Content-Length: %d\r\n"+
+		"Boks-Policy: allow\r\n\r\n",
+		status, http.StatusText(status), len(body))
+	_, _ = w.Write(body)
 }
 
 // handshake runs a TLS handshake under the dial timeout.
