@@ -38,10 +38,16 @@ that a sandbox's first minute is not spent on `npm install`.
 
 Two things about it are load-bearing:
 
-- **`tini` is PID 1.** A sandbox that lives for hours needs something to reap orphans; a real
-  Docker Sandboxes guest was observed running `tini` for the same reason.
+- **`tini -s` is the init.** A sandbox that lives for hours needs something to reap orphans;
+  a real Docker Sandboxes guest was observed running `tini` for the same reason.
   `sandbox.keeperCommand` cannot supply one, because it has to work in an arbitrary image —
   so it belongs here.
+
+  `-s` registers tini as a child subreaper. Under `docker run` tini is PID 1 and would reap
+  without it, but inside a microVM the guest's own init is PID 1 — so tini is not, orphans
+  are re-parented past it, and it printed three lines of warning saying exactly that before
+  every single `boks run`. It looked like a fault and was not, but it was not spurious
+  either: `-s` is tini's own remedy and makes the reaping real in both places.
 - **uid/gid 1000, home `/home/agent`.** This matches the kit convention (`setup.startup`
   defaults to user `"1000"`) and what a real sbx guest runs as.
 
@@ -70,7 +76,7 @@ Boks CA to it in place when one is.
 
 A sandbox does **not** use the image's `ENTRYPOINT`: the OCI spec is built with containerd's
 `WithProcessArgs`, which replaces the whole argv. `agent.Agent.Init` carries the same
-`tini -- boks-entrypoint` prefix so every path through `Argv` keeps it. Two paths still miss
+`tini -s -- boks-entrypoint` prefix so every path through `Argv` keeps it. Two paths still miss
 it, and they are listed as gaps in `docs/docker-sandbox-parity.md`: a persistent sandbox runs
 an idle keeper as its container process, and `boks exec` runs the command it was given.
 `boks exec <sandbox> boks-install-ca` covers both — the write persists in the snapshot.
