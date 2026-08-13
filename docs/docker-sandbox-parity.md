@@ -120,7 +120,7 @@ website documents.
 | `cp` | Copy between sandbox and host | `cp` |
 | `ports` | Manage port publishing | none |
 | `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | all ten, same spellings; rules are durable and scoped global or per-sandbox |
-| `secret` | Manage stored secrets | `secret set/ls/rm` |
+| `secret` | Manage stored secrets | `secret set/import/ls/rm`; `import` reads an OAuth credential an agent already has |
 | `kit` | (Experimental) Manage kit artifacts | none |
 | `template` | Manage sandbox templates (the image an agent runs in) | none; `-t, --template` flag only |
 | `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
@@ -377,7 +377,13 @@ hosts and no others — see
 | Credential grammar | v2 `credentials[]`: one service owns many `inject` rules, each with a domain, a header and a `format` or `scheme`, plus `proxyManaged` and an env var name | Same two-level shape | P1 | done | `--inject service@host[,host]=bearer\|basic[:user]\|header[:format]`; several hosts share one stored secret |
 | Schemes | `format` (`Bearer %s`) or `scheme` (`bearer`/`basic` with `username`), mutually exclusive | Same, with the same exclusivity enforced | P0 | done | A format string covers every vendor; basic auth keeps a username field because its value is base64(user:secret) |
 | Placeholder shape | A realistic fake (`gho_sbxproxymanaged000…`) so client-side format checks pass | Placeholder belongs to the credential, not a constant | P1 | done | `--guest-credential service=ENV=placeholder` sets it in the sandbox's environment; a test drives a canary secret through and asserts only the placeholder arrives |
-| OAuth credentials | v2 `oauth`: sentinel access and refresh tokens in a guest credential file, swapped by the proxy for `resourceHosts` | Not implemented | P2 | none | The model leaves room for it: a credential is not assumed to be a single header |
+| OAuth credentials | v2 `oauth`: sentinel access and refresh tokens in a guest credential file, swapped by the proxy for `resourceHosts` | Same shape: `oauth` beside `inject` on a credential | P0 | done | Raised from P2 to P0: a Claude.ai subscription user has no API key, so this is the only route their credential can take. Demonstrated against a local HTTPS origin — guest sent a sentinel, origin received the real token |
+| OAuth sentinels | `sentinels.{accessToken,refreshToken}` the guest holds | Same, derived per credential with the provider's real prefix and length | P0 | done | Shape is functional: Claude Code refuses a token that is not `sk-ant-oat01-…` before any request is made. Substitution is restricted to the credential's own headers, so an origin echoing an arbitrary header cannot leak the token back |
+| OAuth token endpoint | `tokenEndpoint.{host,path}` where tokens are refreshed | Same; the flow is terminated and the request **answered**, never forwarded | P0 | done | Boks refreshes on the host and replies with the sentinels the guest already holds. A guest-composed request never reaches the endpoint carrying the real refresh token, and no origin response body has to be buffered or rewritten |
+| OAuth credential file | `credentialFile.{path,template}`, a Go template rendered into the guest | Same, rendered on the host and shared read-only, as the CA is | P1 | done | The template is executed with a data struct that has no field a real token could occupy. Read-only is safe because a refresh answered by boks returns the same sentinels, so an agent rewriting the file writes back what is there |
+| OAuth response fields / passthrough | `responseFields` overrides, `passthrough` skips masking | `responseFields` equivalent; no `passthrough` | P2 | partial | Masking is unnecessary here: no response carrying a real token ever travels toward the guest, because the refresh is answered rather than relayed |
+| OAuth import | Not documented; sbx obtains it by logging in inside the sandbox | `boks secret import`, reading what the agent already wrote | P0 | partial | macOS Keychain via the `security` CLI, `~/.claude/.credentials.json` elsewhere, or a document on stdin. The Keychain read is **unexecuted** — written on Linux |
+| OAuth refresh durability | Not documented | Durable through `boks proxy`; in-sandbox rotation is not | P1 | partial | The network supervisor never learns the store passphrase, so a refresh it performs lasts as long as the sandbox. With a provider that rotates refresh tokens the stored copy then goes stale and must be re-imported |
 | HTTPS injection | Supported | Supported, by terminating TLS for the configured hosts only | P0 | done | Demonstrated: origin received the real secret, client had sent only a placeholder. Every other host stays a blind tunnel |
 | Interception CA | Self-signed proxy CA installed in the guest and exposed as an env var | Local CA under the state dir; `boks ca show/export/env/regenerate` | P0 | done | Private key never leaves the host; leaves minted from the policy target, never from the guest's ClientHello |
 | Secret storage | OS keychain; Linux uses desktop keyring or an encrypted file | Encrypted local file first, keychains later | P1 | partial | AES-256-GCM, PBKDF2-HMAC-SHA256 over `BOKS_SECRETS_PASSPHRASE`; names encrypted too |
@@ -500,7 +506,17 @@ hosts and no others — see
    denies them.
 6. **Kit loading.** The credential model now matches the v2 `credentials[]` shape — one
    service, many injection rules — so a loader can be added without reworking it. Nothing
-   parses YAML today, and `oauth` is modelled only to the extent of not designing it out.
+   parses YAML today. `oauth` is no longer merely designed-for: the block is implemented,
+   with the same field names, so a loader has somewhere to put it.
+8. **Where a credential file goes.** The reference format's `credentialFile.path` puts the
+   file where the agent looks, which for Claude Code is `~/.claude/.credentials.json`. Boks
+   shares *directories* (a file bind mount exposes its parent, so `internal/workspace`
+   refuses one), and mounting `~/.claude` read-only would break everything else the agent
+   keeps there. So the file is rendered into a directory of its own and named in the
+   environment, and putting it where the agent looks needs a copy at start-up — which belongs
+   to the image. **The environment variable route works today without any of that**: Claude
+   Code reads `CLAUDE_CODE_OAUTH_TOKEN`, so the sentinel reaches it directly and the proxy
+   substitutes on the way out.
 7. ~~**TSI vs external network provider.**~~ **Answered 2026-08-11.** The external provider
    displaces TSI: with it attached the guest has `eth0` and a host loopback probe that TSI
    answered is refused. Two annotations are needed (`io.containerd.nerdbox.network.N` for
