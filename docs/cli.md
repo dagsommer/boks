@@ -653,7 +653,7 @@ The PROXY column is the part to read when you care about confidentiality:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--file string` | `/home/agent/.local/state/boks/policy-log.jsonl` | decision log file |
+| `--file string` | `~/.local/state/boks/policy-log.jsonl` | decision log file |
 | `-n`, `--limit int` | `500` | show at most this many decisions (0 for all) |
 | `--raw` |  | one line per decision instead of one per destination |
 | `--sandbox string` |  | only decisions from this sandbox |
@@ -892,7 +892,7 @@ boks proxy --policy standard
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
 | `--listen string` | `127.0.0.1:0` | address to listen on |
-| `--log string` | `/home/agent/.local/state/boks/policy-log.jsonl` | append decisions to this file |
+| `--log string` | `~/.local/state/boks/policy-log.jsonl` | append decisions to this file |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-intercept` |  | never terminate TLS; credential rules then apply to plaintext HTTP only |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |

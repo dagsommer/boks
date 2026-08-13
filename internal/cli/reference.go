@@ -26,6 +26,8 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -76,7 +78,44 @@ func Reference() string {
 		writeFlags(&b, root.PersistentFlags())
 	}
 
-	return b.String()
+	return generalisePaths(b.String())
+}
+
+// generalisePaths turns the machine the generator ran on back into a machine.
+//
+// Several defaults are absolute paths derived from the environment — the decision log is
+// under XDG_STATE_HOME or ~/.local/state — so a reference generated on a laptop would say
+// /Users/someone/... and a reference generated on a CI runner would say /home/runner/...,
+// and the check that keeps the file current would fail for everyone who is not the last
+// person to have run it. This was found by CI disagreeing with a clean local run, which is
+// the cheapest possible way to find it.
+//
+// Rewriting them is not only a fix for determinism. `~/.local/state/boks/policy-log.jsonl`
+// is what a reader needs; the generator's home directory is noise that happens to be true.
+//
+// Order matters: the XDG directories are usually under the home directory, so they are
+// replaced first, or the home substitution would get there first and leave `~/state`.
+func generalisePaths(s string) string {
+	home, err := os.UserHomeDir()
+
+	for _, sub := range []struct{ env, generic string }{
+		{"XDG_STATE_HOME", "~/.local/state"},
+		{"XDG_DATA_HOME", "~/.local/share"},
+		{"XDG_CONFIG_HOME", "~/.config"},
+		{"XDG_CACHE_HOME", "~/.cache"},
+	} {
+		if v := strings.TrimRight(os.Getenv(sub.env), "/"); v != "" {
+			s = strings.ReplaceAll(s, v, sub.generic)
+		} else if err == nil {
+			// Unset: the default the CLI computed is the generic path already, and it is
+			// spelled with the real home directory.
+			s = strings.ReplaceAll(s, filepath.Join(home, strings.TrimPrefix(sub.generic, "~/")), sub.generic)
+		}
+	}
+	if err == nil && home != "" && home != "/" {
+		s = strings.ReplaceAll(s, home, "~")
+	}
+	return s
 }
 
 func writeCommands(b *strings.Builder, cmds []*cobra.Command, level int) {
