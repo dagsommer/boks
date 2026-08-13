@@ -24,6 +24,9 @@ The arguments are the same as 'boks run': the agent first, then the workspaces, 
 default to the current directory. Anything after '--' is recorded as the agent's arguments,
 and is what 'boks run' executes when it is given none of its own.
 
+--clone belongs here too, and only here: the mode lives in the sandbox's mounts, so it is
+fixed when the sandbox is created and cannot be changed afterwards.
+
 Agents:
 %s`, agentList(agents)),
 		Example: `  boks create shell .

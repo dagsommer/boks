@@ -70,7 +70,8 @@ output, plus a live `sbx ls`.
 | Detached run | `-d, --detached` prints the sandbox and exits without an interactive session | Same | P1 | done |
 | Interactive by default | `sbx run` attaches an interactive session | Boks allocates a pty when stdin *and* stdout are terminals, and none when either is a pipe. There is no `-t` for it: `-t` is the template flag | P1 | done |
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
-| `--clone`, `--kit`, `-p/--publish` | Run flags for clone mode, kits and port publishing | Not implemented; nothing in the current design blocks them | P1 | none |
+| `--clone` | Run flag for clone mode | `--clone` on `run` and `create`, with the same shape: read-only host repo at `/run/sandbox/source`, a guest-local clone, fixed at creation, a no-op with a message on re-attach | P1 | done |
+| `--kit`, `-p/--publish` | Run flags for kits and port publishing | Not implemented; nothing in the current design blocks them | P1 | none |
 | `--profile` | "Governance profile to assign to the sandbox" | `-profile NAME` on `run` and `create`, selecting a stored profile — a named preset plus rules. Local rules still apply on top of it, and a deny in any scope still wins | P1 | done |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
@@ -304,8 +305,10 @@ and a typed resource, leaving formatting and aggregation to the display layer.
 | Only workspace exposed | Parent directories are not shared | Same; parents exist as empty guest dirs | P0 | done | Verified: intermediate dirs auto-created, each holding only the next path component |
 | Multiple workspaces | Extra paths mount alongside the primary one | Extra `PATH` positionals, each optionally `:ro` | P1 | partial | Implemented; covered by an integration test but not yet run behind a VM. A `--mount` flag that duplicated this was removed when the CLI moved to cobra |
 | Read-only mounts | `path:ro` suffix | Same suffix | P1 | done | Verified: guest writes rejected, nothing reaches the host |
-| Clone mode | `--clone` makes an in-VM Git clone; host repo read-only at `/run/sandbox/source`; fixed at creation | Equivalent planned; keep the read-only host mount idea | P1 | none | Good default for hostile code |
-| Live host writes | Direct mode changes are immediately live on the host | Same, and documented as a real risk | P0 | done | See security-model.md |
+| Clone mode | `--clone` makes an in-VM Git clone; host repo read-only at `/run/sandbox/source`; fixed at creation | Same, at the same path. Recorded in a versioned label, shown as a `MODE` column by `boks ls`, and clones with `--no-hardlinks` so the clone's objects cannot share inodes with the host's | P1 | done | Verified on runc, not behind a hypervisor: guest rewrites left the host tree byte-identical and three writes to the source share were refused |
+| Clone mode refusals | Not documented | Boks refuses a non-repository, a subdirectory of one, a linked worktree, a bare repo and a second writable workspace; it warns about submodules, LFS and uncommitted host work. There is deliberately no fallback to direct mode | — | done | Boks addition. See security-model.md |
+| Getting work out of a clone | A git daemon is served from the sandbox; the host runs `git fetch sandbox-<name>` | `boks bundle SANDBOX` writes a git bundle to the host over the `cp` channel and prints the `git fetch` for it | P1 | partial | A sandbox has no inbound network, and opening one so work can leave would be a hole through the boundary clone mode exists to provide |
+| Live host writes | Direct mode changes are immediately live on the host | Same in direct mode, which is still the default, and documented as a real risk. `--clone` is the way out | P0 | done | See security-model.md |
 | Large-repo slowness | `git status` etc. can be slow over passthrough | Expected; measure before optimizing | P2 | none | |
 | `cp` to/from sandbox | `sbx cp` with `SANDBOX:PATH` on one side; no sandbox-to-sandbox | `boks cp`, same restriction | P2 | partial | Tar stream through `exec`; needs a running sandbox and `tar` in the image |
 | Root disk size | 20 GB default | Configurable | P2 | none | |
