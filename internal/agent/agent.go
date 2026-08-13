@@ -18,6 +18,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // Default is the agent used when none is named. A shell is the one agent Boks can supply
@@ -65,6 +67,44 @@ type Agent struct {
 	// Env are environment variables the agent needs, in KEY=VALUE form. Nothing is
 	// inherited from the host: an agent gets exactly what its definition asks for.
 	Env []string
+	// Allow are the destinations this agent cannot work without — its own API, and its
+	// sign-in endpoint where the vendor documents one.
+	//
+	// It belongs here, beside the image and the command, because it is the same kind of
+	// fact: part of what "this agent" means. Without it `boks run claude` starts an agent
+	// that cannot reach Anthropic, and the user's first experience of the policy is
+	// discovering `api.anthropic.com` in a log and typing it back in on every run.
+	//
+	// These become an *allow* layer of their own during resolution, labelled with the
+	// agent's name in `boks policy ls`, and they change no precedence at all: a deny in
+	// any scope still beats them, so an agent's definition can never widen access past
+	// what a user has forbidden. See internal/policy/resolve.go.
+	Allow []Destination
+}
+
+// Destination is one network destination an agent needs, with the reason it is here.
+//
+// Spec is the syntax `boks policy allow` takes — "host", "host:ports", a CIDR. Why is shown
+// beside the rule in `boks policy ls`, because a default allowlist nobody can audit is worth
+// very little: the reason has to travel with the rule to the place the rule is displayed.
+type Destination struct {
+	Spec string
+	Why  string
+}
+
+// AllowRules renders the agent's allowlist in the form the policy resolver takes.
+//
+// The conversion is here rather than in the command layer so that every caller — a run, a
+// `boks policy ls --agent`, a test — turns the same definition into the same rules.
+func (a Agent) AllowRules() []policy.RuleSpec {
+	if len(a.Allow) == 0 {
+		return nil
+	}
+	out := make([]policy.RuleSpec, 0, len(a.Allow))
+	for _, d := range a.Allow {
+		out = append(out, policy.RuleSpec{Action: policy.Allow, Spec: d.Spec, Note: d.Why})
+	}
+	return out
 }
 
 // Runnable reports whether Boks can start this agent without being told an image.
@@ -116,6 +156,14 @@ func (r *Registry) Add(a Agent) error {
 	}
 	if a.Args == "" {
 		a.Args = ArgsAppend
+	}
+	// A destination that does not parse is caught here rather than at the moment a
+	// sandbox starts, where the alternatives are refusing to run the agent or dropping
+	// the rule. Dropping it would be a policy with a hole in it that nothing announced.
+	for _, d := range a.Allow {
+		if _, err := policy.ParseRule(policy.Allow, d.Spec); err != nil {
+			return fmt.Errorf("agent %q: allow %q: %w", a.Name, d.Spec, err)
+		}
 	}
 	for i, existing := range r.agents {
 		if existing.Name == a.Name {
@@ -209,20 +257,55 @@ func Image(name string) string { return ImageRepo + "/" + name + ":" + ImageTag 
 
 // initArgv is what every Boks agent image expects in front of the agent's own command.
 //
-// tini is there to be PID 1: a sandbox that lives for hours accumulates zombies without one,
-// and a real Docker Sandboxes guest was observed running tini as PID 1 for the same reason.
-// boks-entrypoint installs the Boks CA — see internal/ca — when BOKS_CA_CERT_B64 is in the
-// environment, and execs straight through when it is not.
+// tini reaps: a sandbox that lives for hours accumulates zombies without an init, and a real
+// Docker Sandboxes guest was observed running tini for the same reason. boks-entrypoint
+// installs the Boks CA — see internal/ca — when BOKS_CA_CERT_B64 is in the environment, and
+// execs straight through when it is not.
+//
+// `-s` is not cosmetic. Without it every run began with three lines of tini warning:
+//
+//	[WARN  tini (7)] Tini is not running as PID 1 and isn't registered as a child subreaper.
+//	Zombie processes will not be re-parented to Tini, so zombie reaping won't work.
+//	To fix the problem, use the -s option or set the environment variable TINI_SUBREAPER …
+//
+// which reads like a fault before the user's own output and is not one — but it was also not
+// spurious. Inside the microVM the guest's own init is PID 1, so tini is not, and a
+// non-subreaper tini that is not PID 1 really does reap nothing: an orphan is re-parented
+// past it to PID 1. `-s` registers tini as a child subreaper (PR_SET_CHILD_SUBREAPER), which
+// makes orphans come back to tini and makes the reaping this prefix exists for actually
+// happen. The warning goes because the condition it warned about is gone.
 //
 // This is a property of the images in images/, so an agent pointed at some other image with
 // -template gets whatever that image does instead.
-var initArgv = []string{"/usr/bin/tini", "--", "/usr/local/bin/boks-entrypoint"}
+var initArgv = []string{"/usr/bin/tini", "-s", "--", "/usr/local/bin/boks-entrypoint"}
 
 // Builtin returns the agents Boks knows about.
 //
 // The names are sbx's, so that a habit formed there works here. Nine of the ten have an
 // image; `kiro` does not, and is registered anyway so that asking for it says "no image yet"
 // rather than "unknown agent" — which is also the shape a user-defined agent overrides.
+//
+// # The rule for what goes in an Allow list
+//
+// Each entry is a default allow in every sandbox running that agent, so the bar is evidence,
+// not plausibility. Two things qualify:
+//
+//   - a destination *observed* to be needed on a real run, or
+//   - a destination the vendor's own documentation names as required.
+//
+// Anything else is left out. An agent with an empty list is one nobody has produced that
+// evidence for yet; its user adds what they need with `boks policy allow`, having seen it
+// denied in `boks policy log`, which is a nuisance. A domain guessed into this file is a hole
+// in every user's policy, which is worse, and it is invisible in exactly the way the nuisance
+// is not.
+//
+// Telemetry is deliberately absent. Analytics, feature-flag and error-reporting endpoints —
+// Statsig, Sentry, Datadog, Segment — are not what an agent needs to do the work, and a run
+// with Datadog's intake blocked was observed to break nothing and to draw no complaint from
+// the agent. They stay denied by default; a user who wants them can allow them by name.
+//
+// Ports are pinned to 443 for the same reason the standard preset pins them: allowing port 80
+// to the same host adds a plaintext downgrade path nobody asked for.
 func Builtin() *Registry {
 	r := &Registry{}
 	for _, a := range []Agent{
@@ -235,13 +318,91 @@ func Builtin() *Registry {
 			Command: []string{"/bin/bash"},
 			Args:    ArgsCommand,
 		},
-		{Name: "claude", Summary: "Claude Code", Image: Image("claude"), Command: []string{"claude"}},
-		{Name: "codex", Summary: "OpenAI Codex", Image: Image("codex"), Command: []string{"codex"}},
-		{Name: "copilot", Summary: "GitHub Copilot CLI", Image: Image("copilot"), Command: []string{"copilot"}},
-		{Name: "cursor", Summary: "Cursor CLI", Image: Image("cursor"), Command: []string{"cursor-agent"}},
+		{
+			Name: "claude", Summary: "Claude Code", Image: Image("claude"),
+			Command: []string{"claude"},
+			Allow: []Destination{
+				// Observed: a real `boks run claude` under the standard preset was
+				// refused here, and the agent could not start work until it was
+				// allowed. This is the one entry in this file confirmed by a run
+				// rather than by reading.
+				{Spec: "api.anthropic.com:443", Why: "the Claude API; the agent cannot work without it"},
+			},
+		},
+		{
+			Name: "codex", Summary: "OpenAI Codex", Image: Image("codex"),
+			Command: []string{"codex"},
+			Allow: []Destination{
+				// openai/codex ships its own firewall for a sandboxed dev
+				// container: .devcontainer/init-firewall.sh allows
+				// api.openai.com and fails the build if it cannot be reached,
+				// and devcontainer.secure.json lists api.openai.com and
+				// auth.openai.com as the CLI's allowed domains.
+				{Spec: "api.openai.com:443", Why: "the OpenAI API (vendor's own devcontainer firewall)"},
+				{Spec: "auth.openai.com:443", Why: "sign-in issuer for 'codex login' (vendor's own devcontainer firewall)"},
+				// The ChatGPT-plan path talks to chatgpt.com/backend-api, which
+				// is codex's own configured default. Exactly this host and
+				// never *.chatgpt.com: the Statsig telemetry endpoint
+				// ab.chatgpt.com lives under that wildcard, so widening here
+				// would readmit precisely what is being left out.
+				{Spec: "chatgpt.com:443", Why: "model API on a ChatGPT plan; exact host, never *.chatgpt.com"},
+			},
+		},
+		{
+			Name: "copilot", Summary: "GitHub Copilot CLI", Image: Image("copilot"),
+			Command: []string{"copilot"},
+			Allow: []Destination{
+				// GitHub publishes an allowlist reference for Copilot. The
+				// wildcard is theirs and is kept as written: githubcopilot.com
+				// is GitHub's own service domain with no user-content tenancy,
+				// which is what makes a wildcard dangerous elsewhere — and the
+				// telemetry hosts GitHub lists (collector.github.com,
+				// copilot-telemetry.githubusercontent.com, default.exp-tas.com)
+				// are on other domains, so none of them creeps back in here.
+				{Spec: "*.githubcopilot.com:443", Why: "Copilot API (docs.github.com allowlist reference)"},
+				{Spec: "github.com:443", Why: "the device-flow sign-in Copilot CLI uses"},
+				{Spec: "api.github.com:443", Why: "Copilot user management (docs.github.com allowlist reference)"},
+			},
+		},
+		{
+			Name: "cursor", Summary: "Cursor CLI", Image: Image("cursor"),
+			Command: []string{"cursor-agent"},
+			Allow: []Destination{
+				// cursor.com's enterprise network-configuration page names each
+				// of these and what it is for. Its CLI page names the broader
+				// *.cursor.sh and *.cursorapi.com; the concrete hosts are used
+				// instead, because they are documented individually and a
+				// wildcard would add whatever else the vendor puts there later.
+				{Spec: "api2.cursor.sh:443", Why: "most Cursor API requests (cursor.com network configuration)"},
+				{Spec: "api5.cursor.sh:443", Why: "Cursor agent requests (cursor.com network configuration)"},
+				{Spec: "authentication.cursor.sh:443", Why: "sign-in (cursor.com network configuration)"},
+				{Spec: "prod.authentication.cursor.sh:443", Why: "production token issuer (cursor.com network configuration)"},
+				{Spec: "authenticate.cursor.sh:443", Why: "authorisation endpoint (cursor.com network configuration)"},
+			},
+		},
+		// docker-agent, droid and opencode carry no allowlist: no vendor page
+		// naming the destinations their CLIs require has been found. The empty
+		// list is the honest state — their users will see the denial in
+		// `boks policy log` and write the rule — and it is a cheap thing to fill
+		// in the day someone produces the evidence.
 		{Name: "docker-agent", Summary: "Docker Agent", Image: Image("docker-agent"), Command: []string{"docker-agent"}},
 		{Name: "droid", Summary: "Factory Droid", Image: Image("droid"), Command: []string{"droid"}},
-		{Name: "gemini", Summary: "Google Gemini CLI", Image: Image("gemini"), Command: []string{"gemini"}},
+		{
+			Name: "gemini", Summary: "Google Gemini CLI", Image: Image("gemini"),
+			Command: []string{"gemini"},
+			Allow: []Destination{
+				// Google's Code Assist network-access page names the endpoint
+				// and says, in as many words, not to use a wildcard for it.
+				{Spec: "cloudcode-pa.googleapis.com:443", Why: "Gemini Code Assist endpoint (Google's network-access page)"},
+				{Spec: "oauth2.googleapis.com:443", Why: "Google sign-in and token refresh (Google's set-up page)"},
+				{Spec: "generativelanguage.googleapis.com:443", Why: "the Gemini API on the API-key path"},
+				// Google's published list is written for the IDE plugins and
+				// names several endpoints the CLI never calls; those are left
+				// out rather than adopted wholesale. The Vertex path
+				// (aiplatform.googleapis.com) is a deployment choice rather
+				// than a default, so it is a --allow when someone makes it.
+			},
+		},
 		// Kiro is the one name here Boks ships nothing for. Its CLI is distributed as a
 		// ~500 MB archive per architecture, which would roughly triple the size of an
 		// agent image, and its installer resolves the download through a "latest"
