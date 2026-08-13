@@ -1,7 +1,7 @@
 From 329f62433566287f73074ddc57485210a45bf231 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 13:25:16 +0200
-Subject: [PATCH 1/3] windows: unblock the build wall (vm-memory rawfd, unsafe
+Subject: [PATCH 1/5] windows: unblock the build wall (vm-memory rawfd, unsafe
  extern, Wdk features)
 
 ---
@@ -54,3 +54,6 @@ index c61857a..965e88b 100644
      pub fn NtCreateWaitCompletionPacket(
          WaitCompletionPacketHandle: *mut HANDLE,
          DesiredAccess: u32,
+-- 
+2.53.0
+
