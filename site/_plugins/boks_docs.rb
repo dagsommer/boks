@@ -205,13 +205,18 @@ class BoksDocsGenerator < Jekyll::Generator
     repo = site.config["repo"]
     branch = site.config["repo_branch"]
 
-    urls = entries.reject { |e| e["section"] }.to_h { |e| [e["source"], e["url"]] }
+    # Links between documents are written into the page as plain hrefs, not through Liquid,
+    # so the site's base path has to be part of the URL here. Without it every cross-document
+    # link (and every search hit) resolves to the domain root and 404s on a project-pages
+    # site served under /boks/.
+    base = site.config["baseurl"].to_s.chomp("/")
+    urls = entries.reject { |e| e["section"] }.to_h { |e| [e["source"], base + e["url"]] }
 
     converter = site.find_converter_instance(Jekyll::Converters::Markdown)
     index = []
 
     nav = entries.map do |entry|
-      # A heading in the sidebar, so that fourteen documents read as four groups. It names
+      # A heading in the sidebar, so that a dozen documents read as three groups. It names
       # no file and produces no page.
       if entry["section"]
         next { "section" => entry["section"] }
@@ -231,7 +236,7 @@ class BoksDocsGenerator < Jekyll::Generator
         converter.convert(BoksDocs.transform(markdown, source, urls, repo, branch)),
       )
 
-      index.concat(BoksDocs.search_entries(html, title, entry["url"]))
+      index.concat(BoksDocs.search_entries(html, title, base + entry["url"]))
 
       page = Jekyll::PageWithoutAFile.new(site, site.source, entry["url"], "index.html")
       page.content = html
