@@ -75,6 +75,11 @@ const (
 
 	// GuestCADir is where a sandbox's copy of the CA certificate is mounted. It holds
 	// the public half only; the signing key never leaves the host.
+	//
+	// Paths under it are joined with path.Join, never filepath.Join: these name files
+	// inside a Linux guest, and filepath follows the *host's* separator, which on a
+	// Windows host would put backslashes into an environment variable a guest runtime has
+	// to open.
 	GuestCADir = "/etc/boks"
 
 	certFile   = "ca.pem"
@@ -422,8 +427,8 @@ func (s Spec) writeGuestCA(authority *ca.Authority) ([]string, workspace.Workspa
 
 	env := []string{
 		ca.CertEnvVar + "=" + authority.CertBase64(),
-		"BOKS_CA_CERT=" + filepath.Join(GuestCADir, certFile),
-		"NODE_EXTRA_CA_CERTS=" + filepath.Join(GuestCADir, certFile),
+		"BOKS_CA_CERT=" + path.Join(GuestCADir, certFile),
+		"NODE_EXTRA_CA_CERTS=" + path.Join(GuestCADir, certFile),
 	}
 
 	if roots, ok := hostRoots(); ok {
@@ -431,7 +436,7 @@ func (s Spec) writeGuestCA(authority *ca.Authority) ([]string, workspace.Workspa
 		if err := os.WriteFile(filepath.Join(dir, bundleFile), bundle, 0o644); err != nil {
 			return nil, workspace.Workspace{}, fmt.Errorf("enforce: writing the guest CA bundle: %w", err)
 		}
-		guestBundle := filepath.Join(GuestCADir, bundleFile)
+		guestBundle := path.Join(GuestCADir, bundleFile)
 		env = append(env,
 			"SSL_CERT_FILE="+guestBundle,
 			"REQUESTS_CA_BUNDLE="+guestBundle,
