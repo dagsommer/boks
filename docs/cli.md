@@ -34,7 +34,7 @@ The private key never leaves this machine and is never written into a guest. Ins
 certificate in a sandbox, never in your host trust store: in a sandbox its reach is that
 sandbox, in your login keychain it is every TLS connection you make.
 
-'boks ca env' prints BOKS_CA_CERT_B64=<base64 certificate>, for runtimes with their own
+'boks ca env' prints BOKS_CA_CERT_B64=&lt;base64 certificate&gt;, for runtimes with their own
 trust store (Node, Python) that ignore the system one.
 
 ### boks ca env
@@ -310,7 +310,7 @@ boks create shell .
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
-| `--name string` |  | sandbox name (default: <agent>-<workspace directory>) |
+| `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
@@ -931,7 +931,7 @@ workspace is shared into the guest at the same absolute path it has on the host,
 first one is the process's working directory. Nothing above them is exposed. A workspace
 may carry a ':ro' suffix for a read-only share.
 
-The sandbox is named <agent>-<workspace directory> and persists. Running the same agent in
+The sandbox is named &lt;agent&gt;-&lt;workspace directory&gt; and persists. Running the same agent in
 the same directory re-attaches to it, so packages installed and files written inside it are
 still there; remove it with 'boks rm'. Pass --rm for a sandbox destroyed when the command
 exits, or --name to reach a sandbox from anywhere.
@@ -971,7 +971,7 @@ boks run                              # a shell in the current directory
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
-| `--name string` |  | sandbox name (default: <agent>-<workspace directory>) |
+| `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
