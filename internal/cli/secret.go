@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -383,9 +384,50 @@ rule says where it goes.`,
 		}
 		fmt.Fprintf(env.Stdout, "stored %q in %s\n", name, store.Path())
 		describeStoredService(env.Stdout, name)
+		noteAnOverlappingLogin(cmd.Context(), env.Stdout, store, name)
 		return nil
 	}
 	return cmd
+}
+
+// noteAnOverlappingLogin covers the case refuseToShadowOAuth cannot: a login stored under a
+// *different* name that already reaches every host this key would.
+//
+// Refusing would be wrong — the two names are two credentials, and the user may want the key
+// for something else — but staying silent would leave them with a key that is stored, listed,
+// and never used, and no way to find out why. So it is stored, and said.
+func noteAnOverlappingLogin(ctx context.Context, w io.Writer, store *secret.FileStore, name string) {
+	service, ok := knownServices.Lookup(name)
+	if !ok || !service.Configured() {
+		return
+	}
+	entries, err := store.Entries()
+	if err != nil {
+		return
+	}
+	key, err := service.Credential()
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.OAuth {
+			continue
+		}
+		record, err := store.LookupOAuthRecord(ctx, e.Name)
+		if err != nil {
+			continue
+		}
+		login, err := record.Credential()
+		if err != nil {
+			continue
+		}
+		if _, dropped := secret.PreferOAuth([]secret.Credential{key, login}); len(dropped) > 0 {
+			fmt.Fprintf(w, "\nNote: %q is an OAuth credential covering the same hosts, and a login takes\n"+
+				"precedence over a key — so this key is stored but will not be attached. Remove the\n"+
+				"login with 'boks secret rm %s' if you meant to use the key.\n", e.Name, e.Name)
+			return
+		}
+	}
 }
 
 // refuseToShadowOAuth stops an API key from being stored over a service that already has an
