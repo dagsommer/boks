@@ -64,44 +64,8 @@ func virtualizationCheck() Check {
 
 // extraChecks adds no Windows-only requirements, deliberately — see the comment above on why
 // this does not offer a prerequisite checklist.
+//
+// The hypervisor library check reports "not applicable" here for the same reason: upstream's
+// Windows shim would load krun.dll, but Boks has no Windows backend to load it for, so a
+// verdict on the file would be noise on top of the failure above.
 func extraChecks() []Check { return nil }
-
-// hypervisorLibraryNames is krun.dll, and used to be nothing at all.
-//
-// Returning nil made the shared check print "hypervisor library  skip  not applicable on this
-// platform" — which was defensible while the VMM question was open, and is not now. The shim
-// that runs on Windows is upstream nerdbox's, and on Windows it loads its VMM from a single
-// filename: `krun.dll` (internal/vm/libkrun/instance.go). "Not applicable" was reported on a
-// Windows 11 machine on 2026-08-13 with a krun.dll sitting in the directory being searched.
-func hypervisorLibraryNames() []string { return []string{"krun.dll"} }
-
-// hypervisorLibrarySearchPaths is the shim's own scan, not a Windows-flavoured guess at one.
-//
-// There is no /usr/lib equivalent to enumerate here and no loader configuration to fall back
-// on: the shim builds a path out of PATH and LIBKRUN_PATH and hands the result to
-// syscall.LoadLibrary, so those two variables are the whole search. nerdboxSearchPaths is
-// that list, shared with the guest-image check because the shim resolves both the same way.
-func hypervisorLibrarySearchPaths() []string { return nerdboxSearchPaths() }
-
-// hypervisorLibraryHint says what a miss means here, which is more than it means on Unix: the
-// shim never consults the loader's search path on Windows, so a krun.dll this check cannot
-// find is one the shim cannot find either — subject to containerd's PATH not being ours.
-//
-// Where to get one takes care to state, because the true answer changed recently and is
-// easy to overclaim in either direction. packaging/libkrun-windows/ now carries a patch
-// series that builds a real krun.dll: CI links it on a windows-latest runner with virtio-net,
-// and all nineteen symbols nerdbox resolves at load are exported. But no VM has ever booted
-// on Windows, and a boot attempt on real hardware got as far as kernel loading and stopped
-// there. So the remedy says a DLL can be built and declines to say it will start a sandbox.
-// Anything exporting libkrun's C ABI under this name loads.
-func hypervisorLibraryHint() string {
-	return "Searched PATH and LIBKRUN_PATH, which is the shim's whole search on Windows:\n" +
-		"it loads the resolved path directly and never consults the loader's search path.\n" +
-		"Note that containerd's PATH is the daemon's, not your shell's.\n" +
-		"There is no krun.dll to install from upstream libkrun: its Windows port is targeted\n" +
-		"at libkrun 2.0. This repository builds one — apply packaging/libkrun-windows/patches/\n" +
-		"to the pinned revision in that directory and build with --features blk,net.\n" +
-		"Having one is not enough to start a sandbox: no VM has ever booted on Windows, and\n" +
-		"the furthest a real attempt reached was loading the guest kernel. See the platform\n" +
-		"check."
-}

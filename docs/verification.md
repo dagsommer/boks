@@ -514,8 +514,9 @@ On a host with hardware virtualisation (bare metal Linux with KVM, or Apple sili
    set-up macOS host is `ok`, `runtime entitlement` included.
 
    Two other checks can warn without the host being wrong, and both name their reason:
-   `hypervisor library`, when libkrun is installed somewhere other than the two prefixes
-   Boks looks in (it does not parse the dynamic loader's configuration), and
+   `hypervisor library`, when libkrun is not where the shim's own search would find it —
+   which `doctor` reproduces, but against *this* process's `PATH` and `LIBKRUN_PATH` rather
+   than containerd's, so it cannot prove the shim will come up empty — and
    `runtime entitlement`, when `codesign` cannot be run at all. On Linux, `virtualization`
    is a real probe of `/dev/kvm` and is `ok` or `fail`, never `warn`.
 
