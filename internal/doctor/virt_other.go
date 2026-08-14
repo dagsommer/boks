@@ -22,9 +22,7 @@ func virtualizationCheck() Check {
 	}
 }
 
-func extraChecks() []Check                   { return nil }
-func hypervisorLibraryNames() []string       { return nil }
-func hypervisorLibrarySearchPaths() []string { return nil }
+func extraChecks() []Check { return nil }
 
 // unsupportedRemedy is for platforms with no VM backend at all.
 //

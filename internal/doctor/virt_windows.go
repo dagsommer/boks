@@ -51,10 +51,8 @@ func virtualizationCheck() Check {
 
 // extraChecks adds no Windows-only requirements, deliberately — see the comment above on why
 // this does not offer a prerequisite checklist.
+//
+// The hypervisor library check reports "not applicable" here for the same reason: upstream's
+// Windows shim would load krun.dll, but Boks has no Windows backend to load it for, so a
+// verdict on the file would be noise on top of the failure above.
 func extraChecks() []Check { return nil }
-
-// hypervisorLibraryNames is empty because a Windows port would not link libkrun at all; the
-// VMM question is open. The shared check reports "not applicable" rather than a false miss.
-func hypervisorLibraryNames() []string { return nil }
-
-func hypervisorLibrarySearchPaths() []string { return nil }
