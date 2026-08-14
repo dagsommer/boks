@@ -783,9 +783,29 @@ A real correction factor needs an in-guest measurement.
 reaches the console, in either round. It is not a late-attach problem: the pipe client was
 connected a full second before the first byte arrived. `hvc_console_print` buffers 16
 characters at a time — the first chunk is exactly 16 bytes in both runs — and the
-`CON_PRINTBUFFER` replay at `hvc0` registration is discarded before the virtio-console tx
-queue is live. There is no 8250 in libkrun's legacy device set, so there is no `earlycon`
-to recover them. Early boot is unobservable through this path by construction.
+`CON_PRINTBUFFER` replay at `hvc0` registration is truncated to that chunk. There is no
+8250 in libkrun's legacy device set, so there is no `earlycon` to recover them. Early boot
+is unobservable through this path by construction.
+
+That paragraph was inference when written. It was confirmed directly on 2026-08-14 with
+device-level tracing under a real containerd: the first Tx descriptor is 16 bytes, 43 ms
+after `Starting port io for port 0`, and 282 descriptors carrying 10,628 bytes produced the
+same 54 kmsg lines the host saw — so bytes written match bytes delivered and there is no
+host-side pipe fault. The loss happens inside the guest, before virtio is involved at all,
+which rules out the console device and the pipe as causes rather than merely leaving them
+unaccused.
+
+**A calibration baseline for the console, from a known-good run.** On a working console the
+device trace shows, exactly once each and in this order: `console: activate event`,
+`Device is ready: initialization ok`, `Port ready 0`, `Starting port io for port 0`. The
+whole control handshake completes in 14 ms. `Starting port io for port 0` is the decisive
+line — for port 0 it follows only from the guest's `init_port_console()`, so its presence
+means `hvc_alloc` ran for our port. A future run missing any of the four has a real device
+fault; a run with all four and no output does not, and the fault is elsewhere.
+
+Enabling that trace costs no code change: nerdbox calls `krun_init_log` with `options = 0`,
+so `RUST_LOG` in the shim's environment overrides its hardcoded level. Confirmed to
+propagate containerd → shim → libkrun on a real host.
 
 ### The nerdbox shim starts on Windows, 2026-08-14
 

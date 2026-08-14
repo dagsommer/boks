@@ -1,6 +1,6 @@
-From 843fc9c4172919fefdd06f1240a73650781153c0 Mon Sep 17 00:00:00 2001
+From e1783cb225cdec6afe01b1c37df2d098718a273d Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
-Date: Fri, 14 Aug 2026 08:03:08 +0200
+Date: Fri, 14 Aug 2026 10:42:45 +0200
 Subject: [PATCH] ctr: let --platform choose the spec's platform on Windows
 
 `ctr run --runtime io.containerd.nerdbox.v1 --snapshotter erofs <linux image>`
@@ -50,12 +50,263 @@ implies linux/amd64 and still clears the rootfs path -- that is an LCOW
 property, not a Linux one, so it stays keyed to the snapshotter -- and every
 other invocation still gets the Windows spec plus the two Windows-only spec
 options, which are also still applied when --platform names a Windows platform.
----
- cmd/ctr/commands/run/run_windows.go | 62 +++++++++++++++++++++++++----
- 1 file changed, 54 insertions(+), 8 deletions(-)
 
+## Choosing the platform is not enough: the `windows` section has to go too
+
+Measured on Windows 11, 2026-08-14. With the above, containerd started the
+shim, booted the microVM, and the guest mounted the container's rootfs -- and
+then crun refused the spec:
+
+    load `config.json`: Required field 'layerFolders' not present
+
+A Linux spec generated on a Windows host carries a `windows` section.
+generateDefaultSpecWithPlatform (pkg/oci/spec.go:97-100) ends its non-Windows
+branch with
+
+    if err == nil && runtime.GOOS == "windows" {
+        // To run LCOW we have a Linux and Windows section. Add an empty one now.
+        s.Windows = &specs.Windows{}
+    }
+
+which is unconditional in the host's OS and blind to the guest's runtime.
+`omitempty` does not drop it: specs.Spec.Windows is a *pointer*, and a non-nil
+pointer to a zero struct is not empty to encoding/json. specs.Windows.LayerFolders
+carries no omitempty of its own, so what is marshalled -- and what nerdbox
+forwards into the guest verbatim -- is `"windows":{"layerFolders":null}`. crun
+parses that with libocispec, whose generated parser checks a schema's required
+fields whenever the object holding them is present, and runtime-spec's
+schema/config-windows.json makes layerFolders required. The section is optional;
+its contents are not. So the "empty and harmless" object is fatal.
+
+It is removed rather than filled in: a Linux guest has no layer folders, and a
+value invented to satisfy a parser is a lie the guest then has to ignore.
+
+Only for a non-Windows platform with a snapshotter that is not windows-lcow --
+the case this patch created and nothing else can reach. LCOW keeps its section,
+because the runhcs shim is what fills LayerFolders in.
+
+The option is applied **last**, and that is load-bearing. containerd's own
+image-config options read `s.Windows != nil` as "this is LCOW, the guest
+resolves users and groups for itself": oci.WithAdditionalGIDs returns early
+(spec_opts.go:873-876) and oci.WithUser uses Process.User.Username as a holding
+spot (spec_opts.go:624-627). Both alternatives mount the image's snapshot on the
+host, and mount_windows.go rejects any mount whose type is not "windows-layer".
+Removing the section before oci.WithImageConfig has run would trade
+`Required field 'layerFolders' not present` for `invalid windows mount type: erofs`
+one step earlier.
+
+The flags that write into the Windows section and nowhere else -- --cni,
+--isolated, --cpu-count, --cpu-shares, --cpu-max, --device -- would be discarded
+along with it, so they are now refused rather than ignored on a non-Windows
+spec. --memory-limit is not among them: oci.WithMemoryLimit writes both sections
+when both exist, and the Linux one survives.
+
+withoutWindowsSection lives in guestspec.go, with no build constraint, purely so
+that it can be tested somewhere other than Windows. guestspec_test.go builds the
+spec a Windows host would have produced by hand -- the condition is the host's
+own OS, which no test can choose -- and asserts both halves: that it marshals as
+the text crun rejected, and that the option removes it and disturbs nothing else.
+---
+ cmd/ctr/commands/run/guestspec.go      |  72 +++++++++++++++++
+ cmd/ctr/commands/run/guestspec_test.go | 107 +++++++++++++++++++++++++
+ cmd/ctr/commands/run/run_windows.go    |  91 +++++++++++++++++++--
+ 3 files changed, 262 insertions(+), 8 deletions(-)
+ create mode 100644 cmd/ctr/commands/run/guestspec.go
+ create mode 100644 cmd/ctr/commands/run/guestspec_test.go
+
+diff --git a/cmd/ctr/commands/run/guestspec.go b/cmd/ctr/commands/run/guestspec.go
+new file mode 100644
+index 0000000..37cb4fc
+--- /dev/null
++++ b/cmd/ctr/commands/run/guestspec.go
+@@ -0,0 +1,72 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package run
++
++import (
++	"context"
++
++	"github.com/containerd/containerd/v2/core/containers"
++	"github.com/containerd/containerd/v2/pkg/oci"
++	specs "github.com/opencontainers/runtime-spec/specs-go"
++)
++
++// withoutWindowsSection removes the spec's `windows` section.
++//
++// It exists for one caller, run_windows.go, and lives in a file with no build constraint
++// only so that it can be tested on a host that is not Windows -- everything it repairs is
++// produced by a Windows host and consumed by a Linux guest, and neither is the machine the
++// tests run on.
++//
++// The section it removes is added by oci.WithDefaultSpecForPlatform: generateDefaultSpecWithPlatform
++// (pkg/oci/spec.go) ends its non-Windows branch with
++//
++//	if err == nil && runtime.GOOS == "windows" {
++//		// To run LCOW we have a Linux and Windows section. Add an empty one now.
++//		s.Windows = &specs.Windows{}
++//	}
++//
++// so *every* Linux spec generated on a Windows host carries one, whatever runtime is going
++// to consume it. `omitempty` does not drop it: specs.Spec.Windows is a pointer, and a
++// non-nil pointer to a zero struct is not empty as far as encoding/json is concerned. What
++// gets marshalled is `"windows":{"layerFolders":null}`, because specs.Windows.LayerFolders
++// carries no omitempty of its own.
++//
++// For LCOW that is correct -- the runhcs shim fills LayerFolders in with the container's
++// layer paths. For any other guest runtime it is fatal. crun parses config.json with
++// libocispec, whose generated parser checks a schema's required fields whenever the object
++// holding them is present, and runtime-spec's schema/config-windows.json makes layerFolders
++// required. So a Linux container created through a Windows host dies at
++//
++//	load `config.json`: Required field 'layerFolders' not present
++//
++// having already booted the guest. The section is removed rather than filled in because a
++// Linux guest has no layer folders; a value invented to satisfy a parser would be a lie the
++// guest then has to ignore.
++//
++// APPLY IT LAST. containerd's own image-config options read `s.Windows != nil` as "this is
++// LCOW, the guest resolves users and groups for itself": oci.WithAdditionalGIDs returns
++// early, and oci.WithUser records the image's user string in Process.User.Username instead
++// of looking it up. Both alternatives mount the image's snapshot on the host, which a
++// Windows host cannot do to a Linux filesystem -- mount_windows.go rejects any mount whose
++// type is not "windows-layer". Removing the section before oci.WithImageConfig has run
++// therefore trades this failure for `invalid windows mount type: erofs`, one step earlier.
++func withoutWindowsSection() oci.SpecOpts {
++	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
++		s.Windows = nil
++		return nil
++	}
++}
+diff --git a/cmd/ctr/commands/run/guestspec_test.go b/cmd/ctr/commands/run/guestspec_test.go
+new file mode 100644
+index 0000000..a358a2c
+--- /dev/null
++++ b/cmd/ctr/commands/run/guestspec_test.go
+@@ -0,0 +1,107 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package run
++
++import (
++	"context"
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/containerd/containerd/v2/core/containers"
++	"github.com/opencontainers/runtime-spec/specs-go"
++)
++
++// linuxSpecFromAWindowsHost is what oci.WithDefaultSpecForPlatform("linux/amd64") produces
++// when runtime.GOOS == "windows": the Linux spec, plus the empty Windows section
++// generateDefaultSpecWithPlatform adds for LCOW. It is built by hand because the condition
++// is the *host's* OS, which no test can choose.
++func linuxSpecFromAWindowsHost() *specs.Spec {
++	return &specs.Spec{
++		Version: specs.Version,
++		Root:    &specs.Root{Path: "rootfs"},
++		Process: &specs.Process{Cwd: "/", Args: []string{"/bin/true"}},
++		Linux:   &specs.Linux{CgroupsPath: "/default/ctr"},
++		Windows: &specs.Windows{},
++	}
++}
++
++// TestAnEmptyWindowsSectionMarshalsAsTheFieldCrunRejects is the reason this option exists,
++// and the reason `omitempty` is not the fix. specs.Spec.Windows is tagged
++// `json:"windows,omitempty"`, but omitempty on a pointer means *nil*, and the section added
++// for LCOW is a non-nil pointer to a zero struct. LayerFolders has no omitempty at all, so
++// what reaches the guest is the exact text crun refused on 2026-08-14.
++func TestAnEmptyWindowsSectionMarshalsAsTheFieldCrunRejects(t *testing.T) {
++	b, err := json.Marshal(linuxSpecFromAWindowsHost())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(b), `"windows":{"layerFolders":null}`) {
++		t.Fatalf("expected the marshalled spec to carry `\"windows\":{\"layerFolders\":null}`, "+
++			"which is what libocispec rejects with `Required field 'layerFolders' not present`; got %s", b)
++	}
++}
++
++func TestWithoutWindowsSectionRemovesIt(t *testing.T) {
++	s := linuxSpecFromAWindowsHost()
++	if err := withoutWindowsSection()(context.Background(), nil, &containers.Container{}, s); err != nil {
++		t.Fatal(err)
++	}
++	if s.Windows != nil {
++		t.Fatalf("the windows section survived: %+v", s.Windows)
++	}
++
++	b, err := json.Marshal(s)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(string(b), `"windows"`) {
++		t.Fatalf("the marshalled spec still names a windows section: %s", b)
++	}
++
++	// Everything else has to survive: this option's whole job is one field.
++	if s.Linux == nil || s.Linux.CgroupsPath != "/default/ctr" {
++		t.Errorf("the linux section was disturbed: %+v", s.Linux)
++	}
++	if s.Root == nil || s.Root.Path != "rootfs" {
++		t.Errorf("the root section was disturbed: %+v", s.Root)
++	}
++	if s.Process == nil || s.Process.Cwd != "/" {
++		t.Errorf("the process section was disturbed: %+v", s.Process)
++	}
++}
++
++// A spec that never had the section is left exactly as it was -- which is every spec built
++// on a Linux or macOS host, so this is the assertion that the option changes nothing there.
++func TestWithoutWindowsSectionIsANoOpWhenThereIsNoSection(t *testing.T) {
++	s := linuxSpecFromAWindowsHost()
++	s.Windows = nil
++	before, err := json.Marshal(s)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := withoutWindowsSection()(context.Background(), nil, &containers.Container{}, s); err != nil {
++		t.Fatal(err)
++	}
++	after, err := json.Marshal(s)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(before) != string(after) {
++		t.Fatalf("the spec changed:\n before %s\n after  %s", before, after)
++	}
++}
 diff --git a/cmd/ctr/commands/run/run_windows.go b/cmd/ctr/commands/run/run_windows.go
-index 26620b4..4a8b6bc 100644
+index 26620b4..4d46261 100644
 --- a/cmd/ctr/commands/run/run_windows.go
 +++ b/cmd/ctr/commands/run/run_windows.go
 @@ -19,6 +19,7 @@ package run
@@ -74,7 +325,7 @@ index 26620b4..4a8b6bc 100644
  	specs "github.com/opencontainers/runtime-spec/specs-go"
  	"github.com/urfave/cli/v2"
  )
-@@ -68,14 +70,44 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
+@@ -68,14 +70,67 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
  
  		id = cliContext.Args().Get(1)
  		snapshotter := cliContext.String("snapshotter")
@@ -98,6 +349,12 @@ index 26620b4..4a8b6bc 100644
 +			specPlatform = "linux/amd64"
 +		}
 +		var imgPlatform platforms.MatchComparer
++		// Whether the empty `windows` section that oci.WithDefaultSpecForPlatform adds to
++		// every non-Windows spec built on a Windows host has to come back out again. See
++		// withoutWindowsSection: it is there for LCOW, whose runtime fills it in, and it is
++		// fatal to a guest runtime that hands the spec to crun. Decided here, applied at
++		// the very end of this block, because the options in between read it.
++		var dropWindowsSection bool
 +		if specPlatform == "" {
  			opts = append(opts, oci.WithDefaultSpec())
  			opts = append(opts, oci.WithWindowNetworksAllowUnqualifiedDNSQuery())
@@ -120,11 +377,28 @@ index 26620b4..4a8b6bc 100644
 +			} else if snapshotter == "windows-lcow" {
 +				// LCOW's guest brings its own rootfs; the spec must not name one.
 +				opts = append(opts, oci.WithRootFSPath(""))
++			} else {
++				// A non-Windows spec for something that is not LCOW: the only
++				// case where the LCOW section is neither wanted nor tolerated.
++				dropWindowsSection = true
++			}
++		}
++		// Several flags below write into the Windows section and nowhere else, so
++		// dropping that section would discard them without a word. Refuse them
++		// instead: none of them means anything to a non-Windows guest, and a flag
++		// that is accepted and ignored is worse than one that is refused. Only
++		// reachable via an explicit --platform, which nothing could have passed
++		// before, so no existing invocation starts failing.
++		if dropWindowsSection {
++			for _, flag := range []string{"cni", "isolated", "cpu-count", "cpu-shares", "cpu-max", "device"} {
++				if cliContext.IsSet(flag) {
++					return nil, fmt.Errorf("--%s configures a Windows container and has no meaning in a %s spec", flag, specPlatform)
++				}
 +			}
  		}
  		if ef := cliContext.String("env-file"); ef != "" {
  			opts = append(opts, oci.WithEnvFile(ef))
-@@ -83,9 +115,23 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
+@@ -83,9 +138,23 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
  		opts = append(opts, oci.WithEnv(cliContext.StringSlice("env")))
  		opts = append(opts, withMounts(cliContext))
  
@@ -151,3 +425,19 @@ index 26620b4..4a8b6bc 100644
  		}
  		unpacked, err := image.IsUnpacked(ctx, snapshotter)
  		if err != nil {
+@@ -166,6 +235,12 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
+ 			}
+ 			opts = append(opts, oci.WithWindowsDevice(idType, devID))
+ 		}
++
++		// Last, after every option above has had its look at the spec. See
++		// withoutWindowsSection for why it is removed and why the order is not free.
++		if dropWindowsSection {
++			opts = append(opts, withoutWindowsSection())
++		}
+ 	}
+ 
+ 	if cliContext.Bool("cni") {
+-- 
+2.53.0
+
