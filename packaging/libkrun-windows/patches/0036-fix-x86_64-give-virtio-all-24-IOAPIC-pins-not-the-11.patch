@@ -1,7 +1,7 @@
 From 9a5efc1dedc4ec41933c039bed7f9fa27e0f7db0 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Fri, 14 Aug 2026 16:41:06 +0200
-Subject: [PATCH 36/36] fix(x86_64): give virtio all 24 IOAPIC pins, not the 11
+Subject: [PATCH 36/37] fix(x86_64): give virtio all 24 IOAPIC pins, not the 11
  legacy ISA ones
 
 Boks' own `shell` image cannot boot on Windows: the erofs snapshotter gives
@@ -249,6 +249,3 @@ index 113db46..bc462e6 100644
  
  const IO_REG_SEL: u64 = 0x00;
  const IO_WIN: u64 = 0x10;
--- 
-2.53.0
-

@@ -1,0 +1,572 @@
+From ca893fb88d1a064393b83ff7a8c8b3fb2f7b8088 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 17:19:15 +0200
+Subject: [PATCH 37/37] cmos: publish the host's wall clock, instead of zeroes
+
+The first container Boks ran end to end on Windows 11 reported
+
+    uptime  139.62 1110.64
+    date -u Tue Nov 30 00:02:19 UTC 1999   (host: 2026-08-14T14:58:07Z)
+
+and every HTTPS request out of that guest failed with "curl (60) SSL
+certificate problem: certificate is not yet valid". Nothing that fetches
+a dependency, clones over HTTPS or calls an API can work in a guest whose
+clock says 1999.
+
+1999-11-30 is not a plausible clock reading. It is not the epoch, not the
+1980 a dead CMOS battery gives you, and 139.62 s of uptime says the guest
+had been running for over two minutes when it printed 00:02:19 -- so the
+value it started from was 1999-11-30T00:00:00Z exactly, or 943_920_000.
+That constant is reachable in one way. Linux reads this device in
+mach_get_cmos_time() (arch/x86/kernel/rtc.c), which with CONFIG_ACPI off
+-- so with no FADT century register to consult -- finishes:
+
+    year += CMOS_YEARS_OFFS;               /* 2000 */
+    now->tv_sec = mktime64(year, mon, day, hour, min, sec);
+
+An all-zero register file is year 0, month 0, day 0, and mktime64() does
+not validate: month 0 rolls back to December and day 0 to the day before
+the 1st, so mktime64(2000, 0, 0, 0, 0, 0) == 943_920_000. The guest had
+not read a clock that was wrong. It had read a device that has never had
+a clock in it at all -- Cmos::new() zeroed 128 bytes, wrote the two
+memory-size fields, and left every time register at zero forever.
+
+Nothing about that is Windows-specific, and it is worth being explicit
+that the device has been broken on every platform since it was added. It
+was invisible because until the WHP backend existed no guest ever read
+these registers:
+
+  * Linux/KVM. The guest kernel is CONFIG_KVM_GUEST=y and
+    CONFIG_PARAVIRT_CLOCK=y. kvmclock_init() runs from setup_arch(),
+    before timekeeping_init(), and points x86_platform.get_wallclock at
+    kvm_get_wallclock(), which reads the host's wall clock from the
+    kvmclock MSR page. mach_get_cmos_time() is never called.
+  * macOS/HVF. aarch64 only, where the RTC is the PL031 in
+    legacy::rtc_pl031, which has always seeded itself from
+    ClockType::Real, and the aarch64 guest config has CONFIG_RTC_CLASS=y,
+    CONFIG_RTC_HCTOSYS=y and CONFIG_RTC_DRV_PL031=y to consume it.
+  * Windows/WHP. No KVM CPUID signature, therefore no kvmclock; no PIT,
+    HPET or PM timer either. CMOS is the only wall clock the partition
+    has.
+
+So publish the host's wall clock: seconds through years plus the century
+register at 0x32, in the BCD, 24-hour encoding status register B declares,
+with UIP in status register A held clear (mach_get_cmos_time() spins on it
+with no timeout) and VRT in status register D set. The date arithmetic is
+Howard Hinnant's civil_from_days, and the tests decode it back through a
+verbatim transcription of the kernel's own mktime64() -- checking the
+device against its actual consumer rather than against a restatement of
+the encoder, which is what a bug whose fingerprint is a date arithmetic
+edge case deserves.
+
+One read burst gets one instant. The guest reads seven registers on the
+strength of "UIP is clear, so the time will not change for 244 us", and
+each of those reads is a port-I/O VM exit handled in user mode under WHP;
+computing the time per register would let a burst straddle a second
+boundary and put the guest up to 59 s ahead, or -- if the tick crossed
+midnight on 31 December -- in the wrong year, which is the whole problem
+again. The latch ages out after 100 ms, far longer than any read burst
+and far shorter than the one-second resolution the registers can express,
+so the device stays a clock rather than becoming a snapshot.
+
+Two things this deliberately does not do.
+
+It does not accept writes to the data port; they stay ignored, as before.
+A guest-settable RTC means modelling an offset from host time, and no
+guest that boots here asks for one: the x86_64 config has
+"# CONFIG_RTC_CLASS is not set", so there is no rtc-cmos driver to write
+back through, and aarch64 talks to the PL031 instead.
+
+It does not keep the guest in sync afterwards, and cannot. The value is
+recomputed on every read, so a guest that reads repeatedly does track the
+host -- but that same missing CONFIG_RTC_CLASS means this guest reads the
+persistent clock exactly once, in timekeeping_init(), and thereafter
+free-runs on the TSC with no /dev/rtc, no hwclock and no NTP client in the
+rootfs to correct it. Boot-time accuracy is what certificate validity
+needs and what a two-second container gets; long-lived guests will drift
+with the TSC, and a host suspend/resume will not be caught. Closing that
+gap needs a paravirtual clock or a time-sync channel, which is a much
+larger change than this one and belongs with the guest image that would
+have to consume it.
+
+Setting the clock here rather than in the init is also what makes it right
+at the moment userspace starts: timekeeping_init() is inside
+start_kernel(), long before PID 1. An init calling clock_settime() would
+be correcting a value the kernel had already sampled wrong, and would
+leave everything stamped before it ran -- including anything the kernel
+itself wrote -- in 1999.
+
+UNVERIFIED: no Windows host was available, so no guest has read these
+registers. What is tested, on the host, is that the register file decodes
+back to the host's own clock through the kernel's arithmetic, for every
+date from 2000 to 2100 and for the live clock through the BusDevice
+interface the vCPU's port-I/O exit calls.
+---
+ src/devices/src/legacy/x86_64/cmos.rs | 420 +++++++++++++++++++++++++-
+ 1 file changed, 418 insertions(+), 2 deletions(-)
+
+diff --git a/src/devices/src/legacy/x86_64/cmos.rs b/src/devices/src/legacy/x86_64/cmos.rs
+index 52223c9..cf88ed8 100644
+--- a/src/devices/src/legacy/x86_64/cmos.rs
++++ b/src/devices/src/legacy/x86_64/cmos.rs
+@@ -1,18 +1,197 @@
+ // Copyright 2025 Red Hat, Inc.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++//! MC146818-compatible CMOS RAM and real-time clock.
++//!
++//! The CMOS RAM half carries the memory-size bytes a legacy BIOS would have
++//! left for the guest. The RTC half publishes the host's wall clock, which is
++//! the only channel through which an x86 guest running under a hypervisor
++//! without a paravirtual clock can learn what year it is.
++//!
++//! # Why the RTC half exists
++//!
++//! Every time register used to read back as zero, because the register file was
++//! a zeroed array that nothing ever wrote a time into. Linux consumes it in
++//! `mach_get_cmos_time()` (arch/x86/kernel/rtc.c), which — with `CONFIG_ACPI`
++//! off, so no FADT century register — ends in
++//!
++//! ```text
++//! year += CMOS_YEARS_OFFS;               /* 2000 */
++//! now->tv_sec = mktime64(year, mon, day, hour, min, sec);
++//! ```
++//!
++//! so an all-zero register file becomes `mktime64(2000, 0, 0, 0, 0, 0)`. Month
++//! 0 and day 0 are a month and a day *before* the base of `mktime64`'s
++//! calendar, and it computes them without complaint: 943_920_000, which is
++//! 1999-11-30T00:00:00Z. That constant is the signature of this bug — a guest
++//! reporting a date near 1999-11-30 has not read a clock that is merely wrong,
++//! it has read no clock at all.
++//!
++//! The consequence is not cosmetic. Every X.509 certificate presented to that
++//! guest has a `notBefore` in this century, so every TLS handshake fails with
++//! "certificate is not yet valid", and nothing can fetch a dependency, clone
++//! over HTTPS, or call an API.
++//!
++//! # Why nobody hit it before
++//!
++//! Nothing about the defect is Windows-specific — it is simply that until the
++//! WHP backend existed, no guest ever read these registers:
++//!
++//! * **Linux/KVM.** The guest kernel is built `CONFIG_KVM_GUEST=y` and
++//!   `CONFIG_PARAVIRT_CLOCK=y`, and `kvmclock_init()` runs from `setup_arch()`,
++//!   before `timekeeping_init()`. It replaces `x86_platform.get_wallclock` with
++//!   `kvm_get_wallclock()`, which reads the host's wall clock out of the
++//!   kvmclock MSR page. `mach_get_cmos_time()` is never called.
++//! * **macOS/HVF.** aarch64 only, where the RTC is the PL031 in
++//!   `legacy::rtc_pl031`, which has always seeded itself from
++//!   `ClockType::Real`. The aarch64 guest config has `CONFIG_RTC_CLASS=y` and
++//!   `CONFIG_RTC_DRV_PL031=y` to consume it.
++//! * **Windows/WHP.** No KVM CPUID signature, therefore no kvmclock, and the
++//!   x86_64 guest config has `# CONFIG_RTC_CLASS is not set` — there is no
++//!   `/dev/rtc`, no `rtc-cmos` driver and no `hwclock` for userspace to fall
++//!   back on. `read_persistent_clock64()` -> `mach_get_cmos_time()` at
++//!   `timekeeping_init()` is the one and only wall-clock read the guest will
++//!   ever perform, and it lands here.
++//!
++//! That last point also fixes *when* the clock has to be right: at
++//! `timekeeping_init()`, which is inside `start_kernel()` and therefore long
++//! before PID 1, let alone before a container's entrypoint. Handing the time
++//! over here is what makes it correct for a container that lives two seconds.
++//! It is equally what makes this the only place it can be handed over: an init
++//! that called `clock_settime()` would be correcting a clock the kernel had
++//! already sampled wrong, and would still leave every timestamp taken before it
++//! ran in 1999.
++
+ use std::cmp::min;
++use std::time::{Duration, Instant};
+ 
+ use crate::bus::BusDevice;
++use utils::time::{ClockType, NANOS_PER_SECOND, get_time};
+ 
+ const INDEX_MASK: u8 = 0x7f;
+ const INDEX_OFFSET: u64 = 0x0;
+ const DATA_OFFSET: u64 = 0x1;
+ const DATA_LEN: usize = 128;
+ 
++// The MC146818 time-of-day and status registers. Everything outside this set is
++// plain CMOS RAM, and is served out of `data`.
++const REG_SECONDS: u8 = 0x00;
++const REG_MINUTES: u8 = 0x02;
++const REG_HOURS: u8 = 0x04;
++const REG_WEEKDAY: u8 = 0x06;
++const REG_DAY_OF_MONTH: u8 = 0x07;
++const REG_MONTH: u8 = 0x08;
++const REG_YEAR: u8 = 0x09;
++const REG_STATUS_A: u8 = 0x0a;
++const REG_STATUS_B: u8 = 0x0b;
++const REG_STATUS_C: u8 = 0x0c;
++const REG_STATUS_D: u8 = 0x0d;
++/// The century register. Its address is not architectural — it is whatever the
++/// ACPI FADT names — but 0x32 is what every PC has used and what firmware
++/// reports, so a guest that looks for one looks here.
++const REG_CENTURY: u8 = 0x32;
++
++/// Status register A. Bit 7 (UIP, update-in-progress) is clear and stays clear;
++/// the divider and rate-select bits are the power-on defaults of a running
++/// oscillator. Reporting UIP set spuriously would be worse than useless:
++/// `mach_get_cmos_time()` spins on it with no timeout, so a stuck bit hangs the
++/// boot CPU.
++const STATUS_A: u8 = 0x26;
++/// Status register B. Bit 1 (24/12) set means 24-hour hours; bit 2 (DM) clear
++/// means the time registers are BCD, which is what a PC-compatible guest
++/// assumes and what `RTC_ALWAYS_BCD` hard-codes on x86. No interrupt-enable bit
++/// is set, because this device has no interrupt line to raise them on.
++const STATUS_B: u8 = 0x02;
++/// Status register C, the interrupt-flag register. Always zero: no periodic,
++/// alarm or update-ended interrupt is ever generated.
++const STATUS_C: u8 = 0x00;
++/// Status register D. Bit 7 (VRT, valid RAM and time) set is a battery-backed
++/// RTC saying its contents are trustworthy. The old zeroed register file
++/// reported the opposite — dead battery — while still handing out a date, which
++/// is precisely the combination a guest is entitled to disbelieve.
++const STATUS_D: u8 = 0x80;
++
++/// How long a latched calendar keeps being served before the host clock is
++/// sampled again. See [`Cmos::calendar`].
++const LATCH_WINDOW: Duration = Duration::from_millis(100);
++
++/// A broken-down UTC calendar, in binary. Converted to BCD only on the way out.
++///
++/// UTC, not local time, because that is the interpretation the guest applies:
++/// `read_persistent_clock64()` feeds `mach_get_cmos_time()`'s result straight
++/// into the timekeeper as seconds since the epoch, with no timezone step. A
++/// microVM has no CMOS bit to negotiate that in, so the choice has to be made
++/// here and stated.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct Calendar {
++    second: u8,
++    minute: u8,
++    hour: u8,
++    /// 1 = Sunday, as the MC146818 numbers it.
++    weekday: u8,
++    day: u8,
++    month: u8,
++    /// Year within the century, 0..=99.
++    year: u8,
++    /// Century, e.g. 20 for 2026.
++    century: u8,
++}
++
++/// Splits seconds since the Unix epoch into a UTC calendar.
++///
++/// The date half is Howard Hinnant's `civil_from_days`, which shifts the era to
++/// start on 1 March so that the leap day falls at the end of a 400-year cycle
++/// and needs no special case. It is exact for every date this device can
++/// express, which is what matters here: the fingerprint of the bug being fixed
++/// is a date arithmetic edge case, and replacing it with a second one would be
++/// a poor trade.
++fn calendar_from_unix(secs: u64) -> Calendar {
++    let days = (secs / 86_400) as i64;
++    let secs_of_day = secs % 86_400;
++
++    // 719_468 is the number of days from 0000-03-01 to 1970-01-01, so `z` is
++    // days since the start of the era containing the epoch.
++    let z = days + 719_468;
++    let era = z.div_euclid(146_097);
++    let day_of_era = z.rem_euclid(146_097); // [0, 146_096]
++    let year_of_era =
++        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
++    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
++    let month_prime = (5 * day_of_year + 2) / 153; // [0, 11], March = 0
++    let day = day_of_year - (153 * month_prime + 2) / 5 + 1; // [1, 31]
++    let month = if month_prime < 10 {
++        month_prime + 3
++    } else {
++        month_prime - 9
++    };
++    // The era starts in March, so January and February belong to the next year.
++    let year = year_of_era + era * 400 + i64::from(month <= 2);
++
++    Calendar {
++        second: (secs_of_day % 60) as u8,
++        minute: (secs_of_day / 60 % 60) as u8,
++        hour: (secs_of_day / 3_600) as u8,
++        // 1970-01-01 was a Thursday, and the register numbers Sunday as 1,
++        // which puts Thursday at 5.
++        weekday: ((days + 4).rem_euclid(7) + 1) as u8,
++        day: day as u8,
++        month: month as u8,
++        year: (year % 100) as u8,
++        century: (year / 100) as u8,
++    }
++}
++
++/// Encodes a value in the range 0..=99 as packed BCD, the format status
++/// register B advertises.
++fn bin_to_bcd(val: u8) -> u8 {
++    ((val / 10) << 4) | (val % 10)
++}
++
+ pub struct Cmos {
+     index: u8,
+     data: [u8; DATA_LEN],
++    /// The calendar currently being published, and the instant it was sampled.
++    latch: Option<(Instant, Calendar)>,
+ }
+ 
+ impl Cmos {
+@@ -35,7 +214,68 @@ impl Cmos {
+         data[0x5c] = (high_mem >> 8) as u8;
+         data[0x5d] = (high_mem >> 16) as u8;
+ 
+-        Cmos { index: 0, data }
++        Cmos {
++            index: 0,
++            data,
++            latch: None,
++        }
++    }
++
++    /// Returns the calendar to publish, sampling the host clock if the latched
++    /// one has aged out.
++    ///
++    /// The contract a guest relies on is "while UIP is clear, the time
++    /// registers will not change for at least 244 µs" — `mach_get_cmos_time()`
++    /// waits for UIP to clear and then reads seven registers on the strength of
++    /// it. We report UIP permanently clear, so we owe the guest that stability,
++    /// and we cannot honour it by sampling the clock per register: each read is
++    /// a port-I/O VM exit, and under WHP those are handled in user mode, so a
++    /// burst of them can take far longer than the hardware window and straddle
++    /// a second boundary. A guest that read `sec = 59` and then a minute that
++    /// had already ticked would land up to 59 seconds ahead — and if the tick
++    /// crossed midnight on 31 December, in the wrong year, which for
++    /// certificate validity is the whole problem again.
++    ///
++    /// Latching for a window rather than forever keeps the device a clock
++    /// rather than a snapshot: a later reader — a resume path re-reading the
++    /// persistent clock, or a guest polling for the seconds digit to advance —
++    /// still sees the host clock move. 100 ms is far longer than any plausible
++    /// read burst and far shorter than the one-second resolution the registers
++    /// can express, so it is invisible from the guest either way.
++    fn calendar(&mut self) -> Calendar {
++        let now = Instant::now();
++        match self.latch {
++            Some((sampled_at, calendar)) if now.duration_since(sampled_at) < LATCH_WINDOW => {
++                calendar
++            }
++            _ => {
++                let calendar = calendar_from_unix(get_time(ClockType::Real) / NANOS_PER_SECOND);
++                self.latch = Some((now, calendar));
++                calendar
++            }
++        }
++    }
++
++    /// Serves one register, by index.
++    fn read_register(&mut self, index: u8) -> u8 {
++        match index {
++            REG_SECONDS => bin_to_bcd(self.calendar().second),
++            REG_MINUTES => bin_to_bcd(self.calendar().minute),
++            REG_HOURS => bin_to_bcd(self.calendar().hour),
++            REG_WEEKDAY => bin_to_bcd(self.calendar().weekday),
++            REG_DAY_OF_MONTH => bin_to_bcd(self.calendar().day),
++            REG_MONTH => bin_to_bcd(self.calendar().month),
++            REG_YEAR => bin_to_bcd(self.calendar().year),
++            REG_CENTURY => bin_to_bcd(self.calendar().century),
++            REG_STATUS_A => STATUS_A,
++            REG_STATUS_B => STATUS_B,
++            REG_STATUS_C => STATUS_C,
++            REG_STATUS_D => STATUS_D,
++            // Everything else, including the three alarm registers, is CMOS
++            // RAM. The alarm registers read as zero because no alarm can be
++            // set: writes to the data port are not accepted (see `write`).
++            _ => self.data[(index & INDEX_MASK) as usize],
++        }
+     }
+ }
+ 
+@@ -53,7 +293,7 @@ impl BusDevice for Cmos {
+             }
+             DATA_OFFSET => {
+                 debug!("cmos: read data offset from index={:x}", self.index);
+-                self.data[(self.index & INDEX_MASK) as usize]
++                self.read_register(self.index & INDEX_MASK)
+             }
+             _ => {
+                 debug!("cmos: unsupported read offset");
+@@ -73,7 +313,183 @@ impl BusDevice for Cmos {
+                 debug!("cmos: update index");
+                 self.index = data[0] & INDEX_MASK;
+             }
++            // Writes to the data port stay ignored, so the time registers are
++            // read-only and track the host. Accepting them would mean modelling
++            // a guest-set offset from host time, and no guest libkrun boots asks
++            // for one: the x86_64 guest has no `CONFIG_RTC_CLASS`, hence no
++            // driver that could issue a `settimeofday`-to-RTC writeback, and the
++            // aarch64 guest talks to the PL031 instead.
+             _ => debug!("cmos: ignoring unsupported write to CMOS"),
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Reads one register through the bus interface, the way a guest would.
++    fn read_reg(cmos: &mut Cmos, index: u8) -> u8 {
++        cmos.write(0, INDEX_OFFSET, &[index]);
++        let mut out = [0u8];
++        cmos.read(0, DATA_OFFSET, &mut out);
++        out[0]
++    }
++
++    fn bcd_to_bin(val: u8) -> u32 {
++        u32::from((val & 0x0f) + (val >> 4) * 10)
++    }
++
++    /// `mktime64()` from the Linux kernel (kernel/time/time.c), transcribed
++    /// verbatim, including its acceptance of month 0 and day 0. This is the
++    /// consumer of everything this device publishes, so the tests below check
++    /// the register file by running it through the real decoder rather than by
++    /// asserting on the encoding in isolation.
++    fn mktime64(year0: u32, mon0: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
++        let (mut mon, mut year) = (mon0 as i64, year0 as i64);
++        mon -= 2;
++        if mon <= 0 {
++            mon += 12;
++            year -= 1;
++        }
++        ((((year / 4 - year / 100 + year / 400 + 367 * mon / 12 + day as i64) + year * 365
++            - 719_499)
++            * 24
++            + hour as i64)
++            * 60
++            + min as i64)
++            * 60
++            + sec as i64
++    }
++
++    /// The number the defect produced, and the reason this device exists.
++    ///
++    /// A zeroed register file means year 0, month 0, day 0. Linux adds
++    /// `CMOS_YEARS_OFFS` to the year and hands the rest to `mktime64()`
++    /// unvalidated, which walks a month and a day back off the start of 2000
++    /// and lands on 1999-11-30T00:00:00Z. The guest that found this reported
++    /// `Tue Nov 30 00:02:19 UTC 1999` at an uptime of 139.62 s, which is this
++    /// constant plus that uptime, to the second.
++    #[test]
++    fn zeroed_register_file_is_1999_11_30() {
++        assert_eq!(mktime64(2000, 0, 0, 0, 0, 0), 943_920_000);
++    }
++
++    /// Decodes a calendar exactly as `mach_get_cmos_time()` does with
++    /// `CONFIG_ACPI` off: BCD everywhere, no century register, year + 2000.
++    fn decode_as_guest(c: Calendar) -> i64 {
++        mktime64(
++            bcd_to_bin(bin_to_bcd(c.year)) + 2000,
++            bcd_to_bin(bin_to_bcd(c.month)),
++            bcd_to_bin(bin_to_bcd(c.day)),
++            bcd_to_bin(bin_to_bcd(c.hour)),
++            bcd_to_bin(bin_to_bcd(c.minute)),
++            bcd_to_bin(bin_to_bcd(c.second)),
++        )
++    }
++
++    /// Every date this century, encoded and then decoded by the guest's own
++    /// arithmetic, has to come back unchanged. The stride of 999_983 s is prime
++    /// and coprime with the day, so the walk lands on every phase of the day,
++    /// week, month and leap cycle, including 2024-02-29 and every month length.
++    ///
++    /// The range stops at 2100 because `CMOS_YEARS_OFFS` does: a kernel built
++    /// without `CONFIG_ACPI` has no century register to read, so two BCD digits
++    /// plus a hard-coded 2000 is all it can express. `known_dates` checks that
++    /// the century register itself keeps counting past that, for a guest that
++    /// does read one.
++    #[test]
++    fn round_trips_through_the_guest_decoder() {
++        let mut secs = 946_684_800u64; // 2000-01-01T00:00:00Z
++        while secs < 4_102_444_800 {
++            // 2100-01-01T00:00:00Z
++            let calendar = calendar_from_unix(secs);
++            assert_eq!(
++                decode_as_guest(calendar),
++                secs as i64,
++                "round trip failed at unix {secs}"
++            );
++            secs += 999_983;
++        }
++    }
++
++    /// Spot-checks against dates computed independently, including the two the
++    /// investigation turned on.
++    #[test]
++    fn known_dates() {
++        // The host clock at the failing run: 2026-08-14T14:58:07Z, a Friday.
++        let c = calendar_from_unix(1_786_719_487);
++        assert_eq!(
++            (
++                c.century, c.year, c.month, c.day, c.hour, c.minute, c.second
++            ),
++            (20, 26, 8, 14, 14, 58, 7)
++        );
++        assert_eq!(c.weekday, 6); // Sunday = 1, so Friday = 6.
++
++        // The epoch itself: 1970-01-01T00:00:00Z, a Thursday.
++        let c = calendar_from_unix(0);
++        assert_eq!((c.century, c.year, c.month, c.day), (19, 70, 1, 1));
++        assert_eq!(c.weekday, 5);
++
++        // A leap day, and the day after a century that is not a leap year.
++        assert_eq!(
++            (
++                calendar_from_unix(1_709_164_800).month,
++                calendar_from_unix(1_709_164_800).day
++            ),
++            (2, 29)
++        );
++        let c = calendar_from_unix(4_107_542_400);
++        assert_eq!((c.century, c.year, c.month, c.day), (21, 0, 3, 1));
++    }
++
++    /// The registers a guest actually reads must be BCD, must be stable across
++    /// one read burst, and must not be the zeros that started all this.
++    #[test]
++    fn register_file_publishes_a_plausible_present() {
++        let mut cmos = Cmos::new(512 * 1024 * 1024, 0);
++
++        // Status registers: UIP clear (or `mach_get_cmos_time()` spins for
++        // ever), 24-hour BCD, and the valid-time bit set.
++        assert_eq!(read_reg(&mut cmos, REG_STATUS_A) & 0x80, 0);
++        assert_eq!(read_reg(&mut cmos, REG_STATUS_B) & 0x06, 0x02);
++        assert_eq!(read_reg(&mut cmos, REG_STATUS_D) & 0x80, 0x80);
++
++        // The whole burst, in the order `mach_get_cmos_time()` issues it.
++        let sec = bcd_to_bin(read_reg(&mut cmos, REG_SECONDS));
++        let min = bcd_to_bin(read_reg(&mut cmos, REG_MINUTES));
++        let hour = bcd_to_bin(read_reg(&mut cmos, REG_HOURS));
++        let day = bcd_to_bin(read_reg(&mut cmos, REG_DAY_OF_MONTH));
++        let mon = bcd_to_bin(read_reg(&mut cmos, REG_MONTH));
++        let year = bcd_to_bin(read_reg(&mut cmos, REG_YEAR));
++        let century = bcd_to_bin(read_reg(&mut cmos, REG_CENTURY));
++
++        assert!(sec < 60 && min < 60 && hour < 24);
++        assert!((1..=31).contains(&day) && (1..=12).contains(&mon));
++        assert_eq!(century, 20);
++
++        // What the guest computes must be within a minute of what the host
++        // clock says, and — the point of the exercise — nowhere near 1999.
++        let guest = mktime64(year + 2000, mon, day, hour, min, sec);
++        let host = (get_time(ClockType::Real) / NANOS_PER_SECOND) as i64;
++        assert!(
++            (guest - host).abs() < 60,
++            "guest would compute {guest}, host says {host}"
++        );
++        assert!(guest > 1_700_000_000, "guest would compute {guest}");
++    }
++
++    /// The memory-size bytes a BIOS-less guest may still look for are unchanged
++    /// by the RTC work, and the RAM area is untouched by it.
++    #[test]
++    fn memory_size_registers_survive() {
++        let mut cmos = Cmos::new(512 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
++        let ext = u32::from(read_reg(&mut cmos, 0x34)) | u32::from(read_reg(&mut cmos, 0x35)) << 8;
++        assert_eq!(ext, (512 - 16) * 1024 * 1024 / (64 * 1024));
++        let high = u32::from(read_reg(&mut cmos, 0x5b))
++            | u32::from(read_reg(&mut cmos, 0x5c)) << 8
++            | u32::from(read_reg(&mut cmos, 0x5d)) << 16;
++        assert_eq!(u64::from(high), 4 * 1024 * 1024 * 1024 / (64 * 1024));
++    }
++}

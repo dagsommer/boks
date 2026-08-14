@@ -1,7 +1,7 @@
 From f55235f2d71953ec56be3e7e5053eb20c8b22025 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 22:11:51 +0200
-Subject: [PATCH 31/36] windows: take CPUID exits, and make leaf 0x15 reachable
+Subject: [PATCH 31/37] windows: take CPUID exits, and make leaf 0x15 reachable
  on any host
 
 ---
@@ -359,6 +359,3 @@ index cd5e6a6..12fb5d9 100644
          unsafe {
              // Leaf 0 returns the maximum supported standard leaf in EAX.
              // leaves 0x15 and 0x16 may not be supported (like in non-Intel hardware (like AMD)
--- 
-2.53.0
-
