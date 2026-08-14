@@ -23,11 +23,15 @@ import (
 func acquire(path string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, err
+		// Not a held lock: the file could not be opened at all. Saying so here is
+		// what keeps the caller from reporting it as a running supervisor.
+		return nil, fmt.Errorf("opening the supervisor lock %s: %w", path, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("the lock %s is held: %w", path, err)
+		// Only this branch means somebody else is holding it, and only this branch
+		// may claim so.
+		return nil, fmt.Errorf("%w: %s (%v)", errLockHeld, path, err)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
