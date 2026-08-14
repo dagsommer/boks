@@ -2,9 +2,11 @@ package enforce
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,11 +207,117 @@ func TestLockIsExclusive(t *testing.T) {
 	if !locked(path) {
 		t.Error("a held lock was reported as free")
 	}
-	if _, err := acquire(path); err == nil {
+	second, err := acquire(path)
+	if err == nil {
+		second()
 		t.Error("the lock was acquired twice")
+	} else if !errors.Is(err, errLockHeld) {
+		t.Errorf("a held lock did not report itself as held: %v", err)
 	}
 	release()
 	if locked(path) {
 		t.Error("a released lock was reported as held")
+	}
+}
+
+// A supervisor that cannot start is not a supervisor that is already running.
+//
+// `boks net serve` answered every failure to take the lock with "already has a network
+// supervisor", so the first Windows run reported a fresh sandbox — whose directory held
+// nothing but an empty log — as one that already had a supervisor, with the true cause
+// ("sandbox networking is not available on Windows") wrapped inside as a detail. Anyone
+// reading that log top to bottom went looking for a stale process that had never existed.
+func TestServeBlamesAnExistingSupervisorOnlyWhenThereIsOne(t *testing.T) {
+	const sandbox = "shell-boks"
+
+	t.Run("a lock somebody else holds", func(t *testing.T) {
+		stateDir := t.TempDir()
+		dir := dirFor(stateDir, sandbox)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		release, err := acquire(filepath.Join(dir, lockFile))
+		if err != nil {
+			// A platform with no supervisor lock cannot have a held one either; the
+			// case below is the one that matters there.
+			t.Skipf("no supervisor lock on this platform: %v", err)
+		}
+		defer release()
+
+		err = Serve(context.Background(), Spec{Sandbox: sandbox, StateDir: stateDir}, io.Discard, nil)
+		if err == nil {
+			t.Fatal("Serve started a second supervisor for a sandbox that already had one")
+		}
+		if !strings.Contains(err.Error(), "already has a network supervisor") {
+			t.Errorf("a held lock was not reported as a running supervisor: %v", err)
+		}
+	})
+
+	t.Run("a lock that cannot be taken for any other reason", func(t *testing.T) {
+		stateDir := t.TempDir()
+		dir := dirFor(stateDir, sandbox)
+		// A directory where the lock file belongs: acquire fails and nothing holds
+		// anything. On Windows acquire refuses before it gets this far, which is the
+		// case this test was written for; both must be reported as themselves.
+		if err := os.MkdirAll(filepath.Join(dir, lockFile), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		err := Serve(context.Background(), Spec{Sandbox: sandbox, StateDir: stateDir}, io.Discard, nil)
+		if err == nil {
+			t.Fatal("Serve reported success without taking the lock")
+		}
+		if strings.Contains(err.Error(), "already has a network supervisor") {
+			t.Errorf("a supervisor that never existed was blamed for the failure: %v", err)
+		}
+		if errors.Is(err, errLockHeld) {
+			t.Errorf("a lock nobody holds was reported as held: %v", err)
+		}
+		if !strings.Contains(err.Error(), sandbox) {
+			t.Errorf("the error does not say which sandbox it is about: %v", err)
+		}
+	})
+}
+
+// What a caller is told when a supervisor goes without reporting ready. The reason is in its
+// log; "it exited before it was ready" describes a crash, and is the wrong thing to say
+// about a process that declined to start on purpose.
+func TestSupervisorFailureReadsTheReasonFromTheLog(t *testing.T) {
+	tests := []struct {
+		name string
+		log  string
+		want string
+	}{
+		{
+			name: "the error the supervisor exited with",
+			log: "network: opening the link\n" +
+				"boks: boks net serve: sandbox \"shell-boks\": sandbox networking is not\n" +
+				"available on Windows (see docs/windows.md)\n",
+			want: "boks net serve: sandbox \"shell-boks\": sandbox networking is not\n" +
+				"available on Windows (see docs/windows.md)",
+		},
+		{
+			name: "a log with no error of ours in it",
+			log:  "panic: something else entirely\n",
+			want: "panic: something else entirely",
+		},
+		{name: "an empty log", log: "", want: ""},
+		{name: "whitespace only", log: "\n\n", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), logFile)
+			if err := os.WriteFile(path, []byte(tt.log), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got := supervisorFailure(path); got != tt.want {
+				t.Errorf("supervisorFailure() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	if got := supervisorFailure(filepath.Join(t.TempDir(), "absent.log")); got != "" {
+		t.Errorf("supervisorFailure() on a missing log = %q, want empty", got)
 	}
 }
