@@ -1,7 +1,7 @@
 From c29bab61e667a070d3516325197fb5f7f9320d93 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 18:37:33 +0200
-Subject: [PATCH 29/35] windows: give WHP the 16-byte alignment its structs
+Subject: [PATCH 29/36] windows: give WHP the 16-byte alignment its structs
  require
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

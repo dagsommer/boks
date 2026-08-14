@@ -1,7 +1,7 @@
 From 176b73cab9abf1de5221a772f7e271e0b16b1bc7 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:35:53 +0200
-Subject: [PATCH 25/35] net: bound the declared frame length before slicing to
+Subject: [PATCH 25/36] net: bound the declared frame length before slicing to
  it
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
