@@ -236,12 +236,19 @@ func hypervisorLibraryCheck() Check {
 }
 
 func hypervisorLibraryResult(goos, goarch string, getenv func(string) string, fsys libraryFS) Result {
-	if goos != "linux" && goos != "darwin" {
-		// Windows and everything else: the platform check already says why Boks does
-		// not start a sandbox there, and a libkrun verdict on top of it would be noise
-		// about a library no Boks code path opens on this platform. krun.dll does
-		// exist, and this project builds one that boots a guest — but only containerd's
-		// shim loads it, and Boks never gets that far on Windows. See virt_windows.go.
+	switch goos {
+	case "linux", "darwin":
+	case "windows":
+		// Windows used to be skipped here, on the grounds that the platform check
+		// already said sandboxes could not start there and a verdict about a file
+		// nothing would load was noise. Both halves of that stopped being true: a
+		// container has run in a microVM on Windows through containerd, the shim and
+		// krun.dll (docs/verification.md), and `boks run` now attempts a sandbox there
+		// rather than refusing. So "is krun.dll where the shim will look for it" is a
+		// live question with a real answer, and it is the first thing to check when
+		// nothing connects to a sandbox's link socket.
+	default:
+		// plan9 and friends: no backend, nothing to look for.
 		return Result{Status: StatusSkip, Detail: "not applicable on this platform"}
 	}
 
@@ -260,8 +267,14 @@ func hypervisorLibraryResult(goos, goarch string, getenv func(string) string, fs
 		"It opens the full path it built itself, so ld.so.conf and the SONAME do\n" +
 		"not enter into it.\n"
 	defaultDirs := "/usr/local/lib, /usr/local/lib64, /usr/lib and /lib"
-	if goos == "darwin" {
+	switch goos {
+	case "darwin":
 		defaultDirs = "/usr/local/lib, /usr/local/lib64, /usr/lib, /lib and /opt/homebrew/lib"
+	case "windows":
+		// The shim's fallback list is explicitly Unix-only (nerdbox NewInstance takes
+		// the defaults branch when the host is not Windows), so PATH and LIBKRUN_PATH
+		// are the whole of the search here.
+		defaultDirs = "nowhere: the shim has no default directories on Windows"
 	}
 	searchText := fmt.Sprintf(howItSearches, strings.Join(names, ", "), defaultDirs)
 	envCaveat := "Both variables are read from containerd's environment, since containerd spawns\n" +
@@ -298,12 +311,20 @@ func hypervisorLibraryResult(goos, goarch string, getenv func(string) string, fs
 		}
 	}
 
+	install := "Install libkrun (>= 1.18) into one of those directories.\n"
+	if goos == "windows" {
+		// There is no libkrun to install on Windows: the DLL is built from this
+		// project's own patch series, and where it has to be is decided by the PATH
+		// containerd runs with rather than by a system directory.
+		install = "Build krun.dll from packaging/libkrun-windows (with `--features blk,net`,\n" +
+			"or the sandbox's network device will not exist) and put it on the PATH that\n" +
+			"containerd itself runs with, or name its directory in LIBKRUN_PATH.\n"
+	}
 	return Result{
 		Status: StatusWarn,
 		Detail: canonicalLibraryName(goos) + " not found where the shim looks",
-		Remedy: fmt.Sprintf("Could not find libkrun anywhere the VM runtime looks.\n%s"+
-			"Install libkrun (>= 1.18) into one of those directories.\n%s",
-			searchText, envCaveat),
+		Remedy: fmt.Sprintf("Could not find libkrun anywhere the VM runtime looks.\n%s%s%s",
+			searchText, install, envCaveat),
 	}
 }
 

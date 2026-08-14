@@ -259,6 +259,18 @@ func stopContainer(ctx context.Context, container client.Container) error {
 // and the cost of missing an event is a stack that lingers for one interval, while the cost
 // of a dropped stream is a stack that lingers forever.
 func WaitUntilStopped(ctx context.Context, address, name string, appear, interval time.Duration) error {
+	return WatchTask(ctx, address, name, appear, interval, nil)
+}
+
+// WatchTask is WaitUntilStopped with a signal for the moment the task is first seen running.
+//
+// The signal costs this loop nothing — it already distinguishes "not yet" from "it ran" — and
+// it is the only cheap answer to a question the supervisor cannot otherwise ask: *by when
+// should the VM have connected to the link socket?* Measuring that from the moment the socket
+// was bound would be measuring an image pull, because the network is started before the
+// container is created. started is called at most once, and a nil callback is the ordinary
+// case.
+func WatchTask(ctx context.Context, address, name string, appear, interval time.Duration, started func()) error {
 	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
 	c, err := connect(ctx, address)
 	if err != nil {
@@ -279,6 +291,9 @@ func WaitUntilStopped(ctx context.Context, address, name string, appear, interva
 		}
 		switch {
 		case running:
+			if !seen && started != nil {
+				started()
+			}
 			seen = true
 		case seen:
 			return nil // it ran, and now it does not
