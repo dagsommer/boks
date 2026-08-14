@@ -45,6 +45,24 @@ version = 3
 # If you change these paths, change them in new-containerd-root.ps1's arguments too:
 #
 #     .\new-containerd-root.ps1 -Root D:\cd\root -State D:\cd\state
+#
+# ########################################################################################
+#
+# IF YOU RUN THIS DAEMON ELEVATED, CHANGE THESE PATHS AND DO NOT RUN
+# new-containerd-root.ps1.
+#
+# You have to run elevated (or turn on Developer Mode machine-wide) to create a TASK at
+# all — containerd's NewBundle symlinks unconditionally and unprivileged Windows will not.
+# Unpacking an image, which is what this config was written for, does not need it.
+#
+# But an elevated daemon must create its own root. MkdirAllWithACL applies its protected
+# DACL only to components it creates and returns early on ones that already exist, so a
+# root pre-created by an ordinary user keeps that user's permissions — and the elevated
+# daemon then fills it with the content store, the snapshotters and the bolt database, all
+# writable by an unprivileged account that can put a binary into a layer a later container
+# runs. Point an elevated daemon at a fresh root and let it create it.
+#
+# See README.md, "Elevation, Developer Mode, and the choice you actually have".
 # ---------------------------------------------------------------------------------------
 root = 'C:\cdtest\root'
 state = 'C:\cdtest\state'

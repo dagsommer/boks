@@ -3,11 +3,16 @@
 The procedure for the first `ctr run` on Windows: containerd, the nerdbox shim, `krun.dll`, a
 Linux guest kernel and an EROFS rootfs, composed into one container.
 
-> **Nothing in this document has been executed.** No machine on this project has Windows. Every
-> step below was derived by reading source — containerd v2.3.3, nerdbox v0.2.3 (`cd2c23f`), and
-> the Boks patch series in `packaging/` — and every expectation is labelled **source** (traced to
-> a specific file and line), **inference** (reasoned from one), or **unknown**. Where an earlier
-> step *was* measured on the Windows 11 test machine, it says so and gives the date.
+> **Steps 0–3 have been executed on Windows 11. Steps 4–7 have not.** This document was written
+> entirely by reading source — containerd v2.3.3, nerdbox v0.2.3 (`cd2c23f`), and the Boks patch
+> series in `packaging/` — and every expectation is labelled **source** (traced to a specific
+> file and line), **inference** (reasoned from one), or **unknown**. Where a step *was* measured
+> on the Windows 11 test machine, it says so and gives the date.
+>
+> The first run through it found two things reading had missed, and both are now folded in: a
+> silent-corruption trap in containerd's `mkfs` handling (`patches/0005`, and the note in step 5)
+> and the fact that **creating a task needs elevation or Developer Mode** ("Before step 0"). The
+> version of this document that said to run all of it unelevated was wrong.
 
 The command this is all for:
 
@@ -32,6 +37,8 @@ nobody else's — so the procedure splits it in two.
 | containerd unpacks a Linux image with the EROFS snapshotter | **measured**, 2026-08-14 |
 | containerd creates a usable `--root` unelevated | **fixed by a documented prerequisite** — see `packaging/containerd-windows/README.md` |
 | `ctr run` can produce a Linux OCI spec on Windows | **patched**, never run — `patches/0004` |
+| a failed `mkfs.ext4` cannot be mistaken for a formatted image | **patched** — `patches/0005`. Before it, the file a failed format left behind was accepted by the next attempt and the guest would have been handed 64 MiB of zeroes as ext4 |
+| creating a task bundle at all | **blocked without elevation or Developer Mode.** `NewBundle` symlinks unconditionally; measured 2026-08-14. See "Before step 0" below |
 | any of the above composed into one container | **never attempted.** This document. |
 
 Each stage works alone. Nothing has ever been run in sequence.
@@ -148,8 +155,58 @@ container.
 
 ## 3. The procedure
 
-Every step says what success looks like and what the likeliest failure means. Run all of it
-**unelevated**, as one user, from one console.
+Every step says what success looks like and what the likeliest failure means. Run all of it as
+one user, from one console.
+
+### Before step 0: this needs elevation, or Developer Mode
+
+**This document used to say "run all of it unelevated". That was wrong, and the first
+end-to-end run on hardware is what found out.**
+
+Steps 0–3 are fine unelevated — they were measured that way on 2026-08-14, and they create no
+task. **Steps 4, 6 and 7 create a task, and unprivileged Windows cannot.**
+`core/runtime/v2/bundle.go:103` does, in `NewBundle`, for every task bundle:
+
+```go
+if err := os.Symlink(work, filepath.Join(b.Path, "work")); err != nil {
+```
+
+Creating a symlink needs `SeCreateSymbolicLinkPrivilege`. Go already passes
+`SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` (`os/file_windows.go:371`), which Windows
+honours **only under Developer Mode**. Measured on the test machine:
+`New-Item -ItemType SymbolicLink` → *"Administrator privilege required"*; `mklink /J` succeeds.
+
+**The junction trick used for the root-ACL blocker does not apply here.** That one works
+because `MkdirAllWithACL` accepts a directory that already exists. Here the link must land
+inside `b.Path`, and `b.Path` is created by containerd itself with `os.Mkdir(b.Path, 0700)`
+(`bundle.go:74`) whose error is returned unconditionally — so `b.Path` must *not* pre-exist,
+and there is no moment at which a junction could be placed inside it.
+
+So, three options, and their costs:
+
+| | What it costs |
+| --- | --- |
+| **Run `containerd.exe` elevated** | the daemon, every shim and every VM run with an administrator's token. **Its `--root` must then be created by the elevated daemon itself** — see below |
+| **Turn on Developer Mode** | machine-wide. It grants unprivileged symlink creation to **every process run by every user on that machine**, not to containerd and not to you, and switches on other developer features besides |
+| **Neither** | steps 0–3 work; steps 4 onwards do not. This is a real option, and it is what the containerd bundle's own test procedure assumes |
+
+**On a corporate-managed machine, Developer Mode may not be your call.** It is commonly
+disabled by policy (`AllowDevelopmentWithoutDevLicense`) and the toggle may be greyed out or
+revert. Nothing here can tell you it is fine to enable, because that depends on a policy this
+document cannot see. Ask first.
+
+**If you run elevated, do not reuse the `--root` from step 0.** `MkdirAllWithACL` applies its
+protected DACL only to components it creates and returns early on ones that exist, so a root
+pre-created by an ordinary user keeps that user's permissions — and an elevated daemon then
+fills it with the content store, the snapshotters and the bolt database, all writable by an
+unprivileged account. That account can put a binary into a layer a later container runs. Give
+the elevated daemon a fresh root of its own and let it create it; `new-containerd-root.ps1` is
+for the unelevated case only. Full reasoning in `packaging/containerd-windows/README.md`,
+"Elevation, Developer Mode, and the choice you actually have".
+
+*That elevation makes the symlink succeed is inferred from Windows' default privilege
+assignment plus the unelevated failure measured above; nobody has watched containerd create a
+task bundle elevated.*
 
 ### Step 0 — create containerd's root and state
 
@@ -179,11 +236,19 @@ $env:Path = "C:\boks-test;$env:Path"
 $env:CONTAINERD_ADDRESS = '\\.\pipe\boks-containerd'
 ```
 
-**Success:** the plugin graph initialises. `ctr.exe plugins ls` shows at most the two known
-unrelated failures (`io.containerd.internal.v1.opt` wanting `C:\ProgramData\containerd\root`,
-`cri` wanting `C:\Program Files\containerd`), neither of which cascades.
+**Success:** the plugin graph initialises. Unelevated, `ctr.exe plugins ls` shows at most two
+failures — `io.containerd.internal.v1.opt` wanting `C:\ProgramData\containerd\root` and `cri`
+wanting `C:\Program Files\containerd` — neither of which cascades. **Elevated, both disappear.**
 
-**Failure:** more than two failures means step 0 did not take, or `config.toml` was not passed.
+This document previously called those two "known unrelated failures". They are not unrelated:
+they are the same root cause as step 0's, arriving at two more plugins. Both paths are under
+`%ProgramData%` and `C:\Program Files`, which an ordinary user cannot create; with an
+administrator's token they can be, and are. Measured, 2026-08-14. It changes no advice — they
+still cascade into nothing either way — but "unrelated" was simply wrong, and it was the kind
+of wrong that stops you looking.
+
+**Failure:** more than two unelevated (or any at all elevated) means step 0 did not take, or
+`config.toml` was not passed.
 
 **A console, not a service** — twice over: you need the live plugin log, and you need the shim to
 inherit *this* console's `PATH`.
@@ -304,19 +369,23 @@ is no `mkfs.ext4` on Windows in any packaged form. nerdbox's README tells macOS 
 `brew install e2fsprogs` for exactly this reason, and adds that Homebrew does not put it on
 `PATH` (nerdbox `README.md:114-140`).
 
-The escape is in the same file: **formatting is skipped entirely when the file already exists.**
+The escape is in the same file: **formatting is skipped when the image is already formatted.**
+So a correct image put there in advance is accepted. `rwlayer-64m.img` in the bundle is exactly
+that: 64 MiB, `mkfs.ext4 -q`, made on the Linux CI runner where that binary exists.
 
-```go
-// core/mount/manager/mkfs.go:94-96
-if _, err := r.Stat(subpath); err == nil {
-    // Check magic number
-} else if os.IsNotExist(err) {
-    ... format it ...
-```
-
-No magic-number check, no size check — the comment is a TODO. So a correct image put there in
-advance is accepted. `rwlayer-64m.img` in the bundle is exactly that: 64 MiB, `mkfs.ext4 -q`,
-made on the Linux CI runner where that binary exists.
+> **This used to say "skipped when the file already exists", and it meant it.** Upstream
+> containerd decided by `Stat` alone, with a `// Check magic number` comment where the check
+> belonged. Since the format path creates and truncates the file *before* running mkfs, the
+> failure in step 4 left behind 67,108,864 bytes of zeroes that the next attempt accepted on
+> sight — and the tester avoided mounting them only by overwriting that file before retrying.
+> Measured on the machine: `ext4 magic @1080 : 0x0000`.
+>
+> `patches/0005` fixes it: the magic is read (`53 ef` at offset 1080 for ext4), a file that
+> fails the check is refused and left alone, and a file this code created and failed to format
+> is removed. **Two consequences for the procedure below.** The copy in step 5 now *creates*
+> `rwlayer.img` rather than overwriting one — step 4 no longer leaves anything there. And if
+> you copy the wrong file, or a truncated one, step 6 now says so instead of booting a guest
+> onto a filesystem that does not exist.
 
 `writablePath(id)` is `<erofs root>\snapshots\<id>\rwlayer.img` (`erofs.go:206-208`). **Step 4's
 error message names the exact path** — take it from there rather than guessing:
@@ -513,20 +582,28 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
 
 ## 6. Failure modes, most likely first
 
-1. **`mkfs.ext4` not found** — certain on any single-command `ctr run`, which is why step 4 is
+1. **`NewBundle` cannot create its symlink** — certain from step 4 onwards on an unelevated
+   machine without Developer Mode, and it lands before the shim is ever launched. Measured,
+   2026-08-14. *Fix: elevate, or Developer Mode, or stop after step 3. See "Before step 0".*
+2. **`mkfs.ext4` not found** — certain on any single-command `ctr run`, which is why step 4 is
    written as a deliberate failure. `failed format "…rwlayer.img": mkfs.ext4 failed: …
    executable file not found`. Deterministic from source; there is no branch that avoids it.
-   *Fix: step 5.*
-2. **A guest artifact or `krun.dll` not on containerd's `PATH`.** Likely on a first run, and the
+   With `patches/0005` the half-made image is removed as part of that failure, so step 5
+   creates the file rather than overwriting one. *Fix: step 5.*
+3. **`…rwlayer.img` exists but carries no ext4 superblock** — new with `patches/0005`. It means
+   step 5's copy did not land, landed truncated, or landed on the wrong path. Before that patch
+   this was not an error at all; it was a guest booting onto zeroes. *Fix: recopy, and check
+   the size is exactly 67,108,864 bytes.*
+4. **A guest artifact or `krun.dll` not on containerd's `PATH`.** Likely on a first run, and the
    likeliest specific cause is starting containerd before editing `PATH`, or as a service, since
    the shim inherits the daemon's environment and not your shell's. The three error strings in
    §1 name the file. *Fix: restart containerd from a console whose `PATH` is right.*
-3. **A Windows OCI spec.** Certain without `patches/0004` or without `--platform linux/amd64`.
+5. **A Windows OCI spec.** Certain without `patches/0004` or without `--platform linux/amd64`.
    Surfaces late and confusingly, as a crun error about a missing `linux` block, because nothing
    between `ctr` and crun inspects the spec's platform. *Fix: step 4's check.*
-4. **containerd locked out of its own root.** Certain on a clean machine without step 0.
+6. **containerd locked out of its own root.** Certain on a clean machine without step 0.
    Measured. Reported as a content-store `mkdir` denial with 43 plugin failures.
-5. **The five shim stubs that have never executed.** PR #13948 implements `newServer`,
+7. **The five shim stubs that have never executed.** PR #13948 implements `newServer`,
    `serveListener`, `reap`, `openLog` and `subreaper` for Windows; `setupSignals` is the only one
    that has ever run, and only because it is the first. A real containerd driving a real ttrpc
    TaskService over `serveListener`'s pipe is new ground, and #13948 is unmerged upstream and has
@@ -534,31 +611,31 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
    `packaging/nerdbox-windows/README.md` lists four specific things in it that look wrong.
    Symptom shape: the shim starting and then failing to serve, or a 10 s hang followed by
    `waitForShimPipe` giving up.
-6. **The vsock link between Go's AF_UNIX and libkrun's Winsock backend.** Never exercised in
+8. **The vsock link between Go's AF_UNIX and libkrun's Winsock backend.** Never exercised in
    either direction. Both ends are ours, both are new, and they must meet on a relative path with
    backslashes (`vm\run_vminitd.sock`). Symptom: `VM did not connect within 30s`, with the guest
    either never having dialled or having dialled somewhere else. The libkrun side is
    `packaging/libkrun-windows/patches/0017`, whose own message says "Not executed."
-7. **The VM failing to boot under the shim although it boots under a bare probe.** The shim's VM
+9. **The VM failing to boot under the shim although it boots under a bare probe.** The shim's VM
    has strictly more in it: two or more virtio-blk disks, two vsock ports, a console pipe, and a
    guest kernel cmdline the probe did not use. nerdbox's own `integration/test.ps1` records that
    **Windows allows only one VM partition per process with the current libkrun build**, which
    also means a shim that leaks a partition poisons every later container in that shim.
-8. **`vminitd` exiting.** The panic seen before was caused by a probe with no vsock; this path
+10. **`vminitd` exiting.** The panic seen before was caused by a probe with no vsock; this path
    configures both ports, so it should survive (**inference**). Everything after the dial-back —
    the tmpfs overlays over `/etc`, `/run`, `/tmp` on a read-only erofs root, mounting the
    container layers, invoking crun — has never run on a Windows-hosted VM. Watch the console pipe.
-9. **crun rejecting the spec.** Two candidates, both from containerd's spec generation rather
+11. **crun rejecting the spec.** Two candidates, both from containerd's spec generation rather
    than from nerdbox: the empty `"windows": {}` object that nerdbox forwards verbatim, and any
    Windows-shaped field that survives. **Unknown** — crun is not in either tree.
-10. **The overlay mount inside the guest.** Requires `{{ mount 0 }}` templates in `upperdir=` and
+12. **The overlay mount inside the guest.** Requires `{{ mount 0 }}` templates in `upperdir=` and
     `workdir=`, which block mode supplies. If `default_size = 0` is ever set in `config.toml`,
     this becomes `cannot use virtiofs for upper dir in overlay: not implemented` with **no
     fallback on Windows**. Do not set it.
-11. **Stdio.** Step 7's territory: vsock 1026, the stream-ID handshake, `-t` and the console. Also
+13. **Stdio.** Step 7's territory: vsock 1026, the stream-ID handshake, `-t` and the console. Also
     where `openLog`'s silently-discarding writer would cost you the early shim log lines, though
     nerdbox sets `NoSetupLogger` so it is not on the current path.
-12. **Teardown.** `service_windows.go:195` does `os.RemoveAll("rootfs")` and
+14. **Teardown.** `service_windows.go:195` does `os.RemoveAll("rootfs")` and
     `manager_windows.go` carries a `removeRootfs` for the bind-filter unmount problem. A failed
     teardown leaves a bundle and a snapshot behind and makes the *next* run confusing rather than
     the current one.
@@ -576,7 +653,14 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
   blob will.
 - **The writable-layer workaround is a workaround.** Shipping a pre-formatted image because
   `mkfs.ext4` does not exist on Windows is not a fix; the fix is either a Windows `mkfs.ext4` or
-  a snapshotter that does not need one. Neither exists today, and the mount manager's
-  skip-if-exists is a TODO comment away from growing a magic-number check that would defeat it.
+  a snapshotter that does not need one. Neither exists today. An earlier version of this
+  document worried that the mount manager's skip-if-exists was "a TODO comment away from
+  growing a magic-number check that would defeat it". The check has now been written — by us,
+  as `patches/0005` — and it does **not** defeat this: a genuinely formatted image passes it,
+  which is what `rwlayer-64m.img` is. What the check ends is the *other* reading of
+  skip-if-exists, where a file that merely existed was good enough.
+- **Whether elevation is acceptable is not this document's call.** Steps 4 onwards need an
+  elevated daemon or a machine-wide Developer Mode, and both are decisions with costs outside
+  this procedure. Nothing here has been run elevated end to end either.
 - **The `-info` / `plugins ls` weak-signal warning still applies.** A shim that reports its
   runtime id is a shim that parsed its flags.
