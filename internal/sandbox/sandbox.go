@@ -23,7 +23,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -342,23 +341,34 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 		return nil, fmt.Errorf("looking up image %s: %w", cfg.Image, err)
 	}
 
-	image, err = c.Pull(ctx, cfg.Image,
-		client.WithPullUnpack,
-		client.WithPullSnapshotter(cfg.Snapshotter),
-	)
+	image, err = c.Pull(ctx, cfg.Image, pullOptions(cfg)...)
 	if err != nil {
 		return nil, fmt.Errorf("pulling image %s: %w", cfg.Image, err)
 	}
 	return image, nil
 }
 
-// guestPlatform is the platform the OCI spec describes.
+// pullOptions are the options every Boks image pull is made with.
 //
-// The guest is always Linux, even when the host is not: the spec describes the microVM's
-// contents, not the machine running Boks. Without this, spec generation on macOS produces a
-// Darwin spec with no Linux section, and the image config cannot be applied at all.
-func guestPlatform() string {
-	return "linux/" + runtime.GOARCH
+// The platform is the guest's and is stated here rather than left to containerd's default.
+// containerd resolves an unqualified pull against platforms.Default(), which is the *host's*
+// platform: linux/<arch> on Linux and darwin/<arch> ahead of linux/<arch> on macOS — both of
+// which happen to find the Linux manifest — but windows/<arch> on Windows, which finds
+// nothing. A Windows user would be told that an image every other tool can pull has no
+// manifest for their platform, which is true and useless: the platform that matters is the
+// one inside the VM.
+//
+// runtimecfg.Connect sets the same platform as the client's default, which is what the paths
+// with no per-call option — GetImage, and so IsUnpacked and Unpack above — use. Saying it
+// again here is not redundancy for its own sake: this is the call a reader asking "which
+// platform does Boks pull?" will look at, and it keeps a client built some other way from
+// quietly pulling the host's.
+func pullOptions(cfg Config) []client.RemoteOpt {
+	return []client.RemoteOpt{
+		client.WithPullUnpack,
+		client.WithPullSnapshotter(cfg.Snapshotter),
+		client.WithPlatform(runtimecfg.GuestPlatform()),
+	}
 }
 
 // create pulls the image if needed and registers the container with containerd.
@@ -387,8 +397,11 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	specOpts := []oci.SpecOpts{
 		// Must come first: it resets the spec to the platform default, discarding
 		// anything applied before it.
-		oci.WithDefaultSpecForPlatform(guestPlatform()),
-		oci.WithImageConfig(image),
+		oci.WithDefaultSpecForPlatform(runtimecfg.GuestPlatform()),
+		// Immediately after, because the default it repairs is written by the line
+		// above and by nothing else.
+		withPOSIXCgroupsPath(),
+		imageConfigOpt(image),
 		oci.WithAnnotations(resourceAnnotations(cfg)),
 	}
 	if len(processArgs) > 0 {
