@@ -572,11 +572,17 @@ One networking-adjacent thing runs unconditionally: `addResolvConf` reads the **
 read fails, and the code falls through to the guest's own `/etc/resolv.conf`. Not fatal
 (**source**).
 
-**Boks' own refusal does not apply here.** `internal/network/vmm_windows.go` still declines to
-start sandbox networking on Windows, and it should — that refusal rests on "no frame has ever
-crossed that device", which is still true. But this test goes through `ctr` and the shim, not
-through Boks, so nothing in that file is consulted. A container that runs here with no NIC
-neither lifts that refusal nor contradicts it.
+**Boks' own network path does not apply here.** This test goes through `ctr` and the shim with
+no NIC at all, so none of `internal/network` is involved and a container that runs here says
+nothing either way about the link.
+
+`internal/network/vmm_windows.go` used to refuse outright on Windows; it no longer does, and
+the reason it stopped is worth keeping straight. The refusal rested on "no frame has ever
+crossed that device", which is *still true* — what changed is that a refusal is a bad way to
+hold that position, since it guarantees the fact stays unknown. `boks run` now binds the socket
+and attempts the sandbox, and if nothing connects to the link socket within 30 s of the task
+starting, the supervisor exits with an error naming what did not happen. Attempting it is not
+evidence that it works, and this document's checks are still the ones that have been run.
 
 ## 5. Runtime options and annotations
 

@@ -344,17 +344,46 @@ func TestHypervisorLibraryAlwaysExplainsItself(t *testing.T) {
 	}
 }
 
-// Windows gets no verdict on libkrun. krun.dll exists — this project builds one, and on
-// 2026-08-14 it booted a guest under containerd's shim — but Boks itself never loads it there,
-// because the platform check fails first. A second line about a file this process would not
-// open is noise.
-func TestHypervisorLibraryIsSkippedWhereBoksLoadsNoLibrary(t *testing.T) {
-	for _, goos := range []string{"windows", "plan9"} {
-		res := hypervisorLibraryResult(goos, "amd64",
-			envOf(map[string][]string{"PATH": {"/usr/bin"}}), fakeFS("/usr/lib/libkrun.so"))
-		if res.Status != StatusSkip {
-			t.Errorf("goos %q: Status = %v, want skip", goos, res.Status)
+// A platform with no backend at all gets no verdict on libkrun: a line about a file nothing
+// would load is noise on top of the platform check.
+func TestHypervisorLibraryIsSkippedWhereBoksHasNoBackend(t *testing.T) {
+	res := hypervisorLibraryResult("plan9", "amd64",
+		envOf(map[string][]string{"PATH": {"/usr/bin"}}), fakeFS("/usr/lib/libkrun.so"))
+	if res.Status != StatusSkip {
+		t.Errorf("Status = %v, want skip", res.Status)
+	}
+}
+
+// Windows is no longer skipped, and that is a consequence of `boks run` being allowed to
+// attempt a sandbox there: "is krun.dll on the PATH containerd runs with" became the first
+// thing to check when nothing connects to a sandbox's link socket, so doctor has to answer it.
+//
+// Two things are pinned because they are what makes the answer usable there: the file the shim
+// actually stats is krun.dll, and the remedy does not send a Windows user looking in /usr/lib —
+// the shim has no default directories on that platform, so PATH and LIBKRUN_PATH are the whole
+// of the search.
+func TestHypervisorLibraryAnswersForWindows(t *testing.T) {
+	// Host-style paths, as every other case here uses: the search splits PATH and joins
+	// directories with the *running* platform's separator, because that is what the shim
+	// does too. Only the file names and the default directories are decided by goos.
+	found := hypervisorLibraryResult("windows", "amd64",
+		envOf(map[string][]string{"PATH": {"/krun"}}), fakeFS("/krun/krun.dll"))
+	if found.Status != StatusOK {
+		t.Errorf("krun.dll on PATH: Status = %v, want ok (%s)", found.Status, found.Detail)
+	}
+
+	missing := hypervisorLibraryResult("windows", "amd64",
+		envOf(map[string][]string{"PATH": {"/bin"}}), fakeFS("/bin/kernel32.dll"))
+	if missing.Status == StatusOK || missing.Status == StatusSkip {
+		t.Fatalf("krun.dll absent: Status = %v, want a warning", missing.Status)
+	}
+	for _, want := range []string{"krun.dll", "no default directories on Windows", "--features blk,net"} {
+		if !strings.Contains(missing.Remedy, want) {
+			t.Errorf("the Windows remedy does not mention %q:\n%s", want, missing.Remedy)
 		}
+	}
+	if strings.Contains(missing.Remedy, "/usr/lib") {
+		t.Errorf("the Windows remedy points at Unix directories the shim never stats:\n%s", missing.Remedy)
 	}
 }
 
