@@ -1,0 +1,1078 @@
+From 42f07841eb083f8ae40427b301f1ed66ee02028f Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 08:28:07 +0200
+Subject: [PATCH 33/34] windows: start application processors from the VMM, not
+ from a guest halt loop
+
+This backend claimed that "WHP starts every virtual processor runnable, so the
+wait has to be expressed as code", parked every AP at a `cli; hlt; jmp`
+trampoline at guest physical 0x1000, and left it at that. Nothing then ever
+started an AP. The claim was never verified -- the commit that introduced the
+trampoline says the bug it fixed was one that "would have shown up the moment a
+Windows guest was given more than one vCPU", i.e. it was reasoned about, not
+observed -- and the mechanism it describes cannot work in any case: `cli; hlt`
+masks exactly the interrupts that were supposed to wake it, so the only thing
+that could ever restart such an AP is an INIT/SIPI applied by the hypervisor.
+
+superradcompany/libkrun (Apache-2.0) asserts the opposite, that "WHP's
+in-hypervisor local APIC emulation does not start APs itself". Neither
+statement is the whole truth. `WHV_EXTENDED_VM_EXITS.X64ApicInitSipiExitTrap`
+(bit 6, per the Windows SDK's WinHvPlatformDefs.h) makes it a choice:
+
+  * leave it clear and WHP applies INIT and SIPI itself -- crosvm's
+    WhpxSplitIrqChip, QEMU's kernel-irqchip=on path and Microsoft's own openvmm
+    all run in-hypervisor LAPIC emulation with the bit clear, contain no
+    INIT/SIPI logic at all, and support SMP;
+  * set it and the guest's ICR write comes out as an
+    X64ApicInitSipiTrap exit on the writing vCPU, and starting the target
+    becomes the VMM's job.
+
+The bit is now set whenever the partition has more than one processor, and
+`ApStartupRouter` does the job: it decodes the trapped ICR (INIT and startup
+delivery modes; self, all-including-self and all-excluding-self shorthands;
+physical destination resolved through each processor's actual
+`WHvX64RegisterApicId` rather than an assumed identity map), holds each AP's
+thread outside `WHvRunVirtualProcessor` until its startup IPI arrives, and then
+has that AP's own thread apply the vector.
+
+Taking the trap is what makes this correct without having to settle the one
+question the evidence disagrees on. crosvm and QEMU both write a boot state
+into every vCPU and run them all immediately, which only works if WHP holds APs
+in wait-for-SIPI; openvmm's OpenHCL backend, against the same hypervisor
+through a different interface, states the reverse outright and sets the flag
+itself. Because an AP's thread never enters the guest before its SIPI, and
+because `apply_sipi_startup_state` clears `WHvRegisterInternalActivityState`
+(bit 0, `StartupSuspend`) unconditionally, the result is the same either way.
+
+Three properties of the trap are inferred rather than documented, no project
+having been found that enables the bit: that the exit lands on the sending
+vCPU, that `ApicIcr` carries the two xAPIC ICR halves combined, and that the
+instruction has already retired so RIP must not be advanced. The first two fail
+visibly and harmlessly -- parked APs and a verbatim warn of the undecodable ICR
+-- and the third is bounded by a consecutive-trap counter that fails the vCPU
+with a named error instead of letting the sender spin forever.
+
+INIT is handled rather than dropped, which is what lets a guest offline a CPU
+and bring it back: an INIT to a running AP re-parks it and cancels its run, and
+its thread returns to waiting. The level-triggered INIT de-assert is ignored
+explicitly -- Linux sends it with destination 0 and no shorthand, so taken at
+face value it reads as "reset the boot processor, mid-boot".
+
+The trampoline stays. It is no longer how an AP waits, but it is still the
+state an AP holds while parked, and the difference between four bytes that halt
+and zeroed memory that triple-faults is worth keeping for a state whose
+reachability is precisely what is not established. It also makes "this AP never
+got its SIPI" (rip=0x1001) legible next to "this AP started and crashed".
+
+A host whose WHP does not offer the trap now fails partition setup with a named
+error for vcpus > 1 instead of booting a guest whose APs can never start.
+
+Adapted in part from superradcompany/libkrun (Apache-2.0), whose WHP backend
+implements the same trap-based design.
+
+x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu,
+-p libkrun --features blk,net: 0 errors each. `cargo fmt --all --check` clean.
+NOT RUN AGAINST A GUEST: there is no Windows host, no WHP and no VM in this
+environment, and no part of this has executed.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/arch/src/x86_64/windows/regs.rs |  90 ++++-
+ src/vmm/src/windows/vstate.rs       | 537 ++++++++++++++++++++++++++--
+ src/whp/src/lib.rs                  | 128 ++++++-
+ 3 files changed, 712 insertions(+), 43 deletions(-)
+
+diff --git a/src/arch/src/x86_64/windows/regs.rs b/src/arch/src/x86_64/windows/regs.rs
+index 98af78a..1847bf5 100644
+--- a/src/arch/src/x86_64/windows/regs.rs
++++ b/src/arch/src/x86_64/windows/regs.rs
+@@ -32,6 +32,11 @@ pub fn setup_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
+         ])
+         .map_err(Error::SetWhpRegisters)
+     } else {
++        // The AP's state before its startup IPI. It is not expected to be
++        // executed — the vCPU thread is held outside the guest until the SIPI
++        // arrives, and [`apply_sipi_startup_state`] then overwrites CS and RIP
++        // with the vector the guest asked for. See [`setup_ap_trampoline`] for
++        // why it is nevertheless pointed somewhere inert.
+         let rip = if cfg!(feature = "tee") {
+             RESET_VECTOR_SEV_AP
+         } else {
+@@ -111,7 +116,7 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
+     .map_err(Error::SetWhpRegisters)
+ }
+ 
+-/// The idle loop APs execute until the BSP starts them.
++/// The idle loop an AP would execute if it ever ran before its startup IPI.
+ ///
+ /// ```text
+ ///   0x1000:  fa        cli
+@@ -131,20 +136,87 @@ const AP_TRAMPOLINE_CODE: [u8; 4] = [0xfa, 0xf4, 0xeb, 0xfc];
+ 
+ /// Writes the AP idle trampoline into guest memory.
+ ///
+-/// [`setup_regs`] parks every non-boot vCPU at [`AP_TRAMPOLINE_START`], so
+-/// something has to put instructions there. Without this the APs would execute
+-/// whatever happens to be at guest physical 0x1000 — zeroed memory, i.e. a run
+-/// of `add [bx+si], al` — and wander off into a triple fault.
++/// **This is no longer the mechanism by which an AP waits for the BSP.** That
++/// is `vmm::windows::vstate::ApStartupRouter`, which holds the AP's *thread*
++/// outside `WHvRunVirtualProcessor` until the guest's startup IPI arrives, so
++/// in the intended flow nothing at [`AP_TRAMPOLINE_START`] is ever fetched:
++/// the first instruction an AP executes is at `vector << 12`, in the guest
++/// kernel's own trampoline, after [`apply_sipi_startup_state`] has pointed it
++/// there.
+ ///
+-/// The KVM path needs no counterpart: `KVM_ARM_VCPU_POWER_OFF` has no x86
+-/// equivalent, but KVM starts x86 APs in the INIT-received (wait-for-SIPI)
+-/// state, so they never execute anything until the BSP starts them. WHP starts
+-/// every virtual processor runnable, so the wait has to be expressed as code.
++/// It is kept for two reasons that outlive the mechanism it used to be:
++///
++/// * **It is the state the AP holds while parked, and that state should be
++///   inert.** Whether WHP creates virtual processors past index 0 in the
++///   wait-for-SIPI state is undocumented, and the evidence is contradictory —
++///   see the module notes in `vmm::windows::vstate`. If some path ever does
++///   enter the guest on an AP before its SIPI, the difference between these
++///   four bytes and what is otherwise at guest physical 0x1000 is the
++///   difference between a halt and executing zeroed memory (a run of
++///   `add [bx+si], al`) into a triple fault.
++/// * **It makes "the AP never got its SIPI" legible.** An AP found at
++///   `rip=0x1001` has been let into the guest and is waiting; an AP found at
++///   `rip=0` in real mode has been started and has crashed. Without the
++///   trampoline both look alike.
++///
++/// The KVM path needs no counterpart: KVM starts x86 APs in the INIT-received
++/// (wait-for-SIPI) state, so they never execute anything until the BSP starts
++/// them, and `KVM_ARM_VCPU_POWER_OFF` has no x86 equivalent to write.
+ pub fn setup_ap_trampoline(mem: &GuestMemoryMmap) -> Result<()> {
+     mem.write_slice(&AP_TRAMPOLINE_CODE, GuestAddress(AP_TRAMPOLINE_START))
+         .map_err(|_| Error::WriteApTrampoline)
+ }
+ 
++/// Puts a parked AP into the state a startup IPI leaves a processor in, and
++/// releases it to run.
++///
++/// The architectural effect of a SIPI carrying vector `V` is that the target
++/// begins executing in real mode at `CS = V << 8`, `CS.base = V << 12`,
++/// `IP = 0`, with everything else still holding the reset state it had while
++/// waiting. That is exactly what is written here, which is why
++/// [`setup_regs`] and [`setup_sregs`] must leave an AP's control registers at
++/// their power-on values: CR0.PE clear, no paging, no long mode. Handing the
++/// guest's 16-bit trampoline a vCPU that this backend had already switched into
++/// long mode would fault on its first instruction.
++///
++/// `WHvRegisterInternalActivityState` is cleared in the same call. Its bit 0 is
++/// `StartupSuspend`, the hypervisor's own wait-for-SIPI flag; a virtual
++/// processor holding it does not fetch instructions no matter what its
++/// registers say. Whether WHP sets it on a freshly created AP is undocumented,
++/// so the clear is unconditional: writing zero to a register that is already
++/// zero costs nothing, and skipping it on a processor that *is* suspended would
++/// hang the guest with no symptom beyond an AP that never appears.
++///
++/// Writing the register is the synchronous way to do this. The asynchronous
++/// alternative — asking WHP to deliver a SIPI with `WHvRequestInterrupt` —
++/// races the guest's own INIT-SIPI-SIPI sequence, a race Microsoft's own
++/// openvmm documents and avoids the same way.
++pub fn apply_sipi_startup_state(vcpu: &whp::WhpVcpu, vector: u8) -> Result<()> {
++    let mut cs = AlignedRegisterValue::zeroed();
++    // SAFETY: `AlignedRegisterValue` wraps `WHV_REGISTER_VALUE`; writing the
++    // `Segment` member is how a segment register is composed for WHP.
++    let seg = unsafe { &mut cs.Segment };
++    seg.Base = u64::from(vector) << 12;
++    seg.Limit = 0xffff;
++    seg.Selector = u16::from(vector) << 8;
++    // Present, S=1, type 0xb (code, execute/read, accessed); L and D/B clear,
++    // i.e. a 16-bit code segment. Same packing as `setup_sregs` uses.
++    seg.Anonymous.Anonymous._bitfield = 0x9b;
++
++    vcpu.set_registers([
++        (WHvX64RegisterCs, cs),
++        (WHvX64RegisterRip, AlignedRegisterValue::from_reg64(0)),
++        // Bit 1 reads as one; every other flag is clear at reset, IF included,
++        // so the AP starts with interrupts masked as the architecture requires.
++        (WHvX64RegisterRflags, AlignedRegisterValue::from_reg64(0x2)),
++        (
++            WHvRegisterInternalActivityState,
++            AlignedRegisterValue::from_reg64(0),
++        ),
++    ])
++    .map_err(Error::SetWhpRegisters)
++}
++
+ /// Reset CS.base to 0 for an AP vCPU so that RIP addresses land in low
+ /// memory rather than at the default reset CS.base of 0xFFFF_0000.
+ /// All other segment registers and control registers stay at their
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+index 2f4eb10..2b67d40 100644
+--- a/src/vmm/src/windows/vstate.rs
++++ b/src/vmm/src/windows/vstate.rs
+@@ -42,15 +42,23 @@
+ //!   interrupts only. Injecting a `#GP` (which is what KVM does for an
+ //!   unhandled MSR by default) would need `WHvX64RegisterPendingEvent`; see
+ //!   [`Vcpu::handle_msr_access`] for the policy that is implemented instead.
++//! * **An AP bring-up the hypervisor performs for you.** KVM starts x86
++//!   application processors in the INIT-received (wait-for-SIPI) state and
++//!   applies the guest's INIT/SIPI itself. WHP will do the same — but only for
++//!   as long as the partition leaves `X64ApicInitSipiExitTrap` clear. This
++//!   backend sets it whenever there is more than one processor and starts the
++//!   APs itself; see [`ApStartupRouter`] for which parts of that are documented
++//!   and which are inferred.
+ //! * **Pause / resume.** Not implemented. Unlike HVF there is no vtimer offset
+ //!   to advance, but the guest TSC would still jump by the pause duration, and
+ //!   nothing in the Windows path requests a pause today. `WhpVm::cancel_vcpu`
+ //!   is the primitive a future implementation would build on.
+ 
++use std::cell::Cell;
+ use std::fmt::{Display, Formatter};
+ use std::io;
+ use std::result;
+-use std::sync::Arc;
++use std::sync::{Arc, Condvar, Mutex};
+ use std::thread;
+ use std::time::Duration;
+ 
+@@ -95,6 +103,8 @@ pub enum Error {
+     VcpuSpawn(io::Error),
+     /// The emulator could not emulate the intercepted instruction.
+     VcpuEmulation(whp::Error),
++    /// The same INIT/SIPI trap kept firing at the same address.
++    VcpuInitSipiTrapLoop { rip: u64, count: u32 },
+     /// An exit we have no handling for.
+     VcpuUnhandledWhpExit(u32),
+     /// Cannot access a vCPU register.
+@@ -128,6 +138,14 @@ impl Display for Error {
+             VcpuRun(e) => write!(f, "Cannot run the VCPUs: {e}"),
+             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
+             VcpuEmulation(e) => write!(f, "Cannot emulate the intercepted instruction: {e}"),
++            VcpuInitSipiTrapLoop { rip, count } => write!(
++                f,
++                "The INIT/SIPI trap fired {count} times in a row at rip=0x{rip:x}. The guest is \
++                 almost certainly re-executing the same write to the local APIC's ICR, which \
++                 means WHP does not retire the instruction before raising \
++                 WHvRunVpExitReasonX64ApicInitSipiTrap and this backend would have to advance RIP \
++                 itself"
++            ),
+             VcpuUnhandledWhpExit(reason) => {
+                 write!(f, "Unexpected WHvRunVirtualProcessor exit reason: {reason}")
+             }
+@@ -139,10 +157,340 @@ impl Display for Error {
+ 
+ pub type Result<T> = result::Result<T, Error>;
+ 
++/// Where an application processor is in its bring-up.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum ApParkState {
++    /// Held outside the guest: its thread has not called
++    /// `WHvRunVirtualProcessor` and will not until a startup IPI arrives.
++    Parked,
++    /// A startup IPI arrived carrying this vector. The AP's own thread applies
++    /// it — nobody writes another processor's registers — and then runs.
++    SipiPending(u8),
++    /// Executing guest code.
++    Running,
++}
++
++struct ApStartupState {
++    /// Indexed by processor index; `slots[0]` is the BSP and is always
++    /// [`ApParkState::Running`].
++    slots: Vec<ApParkState>,
++    /// The xAPIC ID WHP gave each processor, indexed by processor index. The
++    /// guest addresses IPIs by APIC ID, so this is the map that turns a trapped
++    /// ICR's destination field back into an index.
++    apic_ids: Vec<u32>,
++    /// Set when any vCPU stops, so that APs the guest never started do not
++    /// leave their threads blocked forever.
++    shutdown: bool,
++}
++
++/// Starts application processors on the guest's behalf.
++///
++/// # Which side starts APs under WHP
++///
++/// Neither the claim this backend used to carry ("WHP starts every virtual
++/// processor runnable, so the wait has to be expressed as code") nor its
++/// opposite ("WHP's local APIC emulation does not start APs itself") is the
++/// whole truth, and Microsoft documents neither. What the headers and the
++/// existing consumers between them establish is that **it is a choice the VMM
++/// makes**, by way of one capability bit:
++///
++/// * With `WHV_EXTENDED_VM_EXITS.X64ApicInitSipiExitTrap` clear, WHP's
++///   in-hypervisor local APIC applies INIT and SIPI itself. crosvm's
++///   `WhpxSplitIrqChip`, QEMU's `kernel-irqchip=on` path and Microsoft's own
++///   openvmm all run xAPIC/x2APIC emulation with that bit clear, contain no
++///   INIT/SIPI logic whatsoever, and support SMP guests. crosvm goes further
++///   and writes down that "Whpx handles VCPU blocking".
++/// * With the bit set — which is what `WhpVm::configure_partition` asks for
++///   whenever the partition has more than one processor — the guest's ICR write
++///   comes out as a `WHvRunVpExitReasonX64ApicInitSipiTrap` exit on the writing
++///   vCPU instead, and starting the target becomes the VMM's job. That is what
++///   this type does.
++///
++/// # Why take the trap at all, if WHP would do it
++///
++/// Because the one thing that is *not* settled is the state a freshly created
++/// virtual processor is in. crosvm and QEMU both write a boot state into every
++/// vCPU and then call `WHvRunVirtualProcessor` on all of them at once, which
++/// only works if WHP holds APs in wait-for-SIPI; but openvmm's OpenHCL backend,
++/// against the same hypervisor through a different interface, states the
++/// reverse outright — "The hypervisor initializes startup suspend to false.
++/// Application processors must instead come up in the wait-for-SIPI state" —
++/// and sets the flag itself.
++///
++/// Taking the trap makes that question moot rather than answering it. An AP's
++/// thread never enters the guest before its startup IPI, so it does not matter
++/// whether WHP would have let it; and
++/// `arch::x86_64::regs::apply_sipi_startup_state` clears `StartupSuspend`
++/// unconditionally, so it does not matter whether WHP had set it. The design is
++/// correct under both readings, which is the property worth having for code
++/// that cannot be tested here.
++///
++/// # What is inferred rather than documented
++///
++/// Three properties of the trap itself have no documentation and no other
++/// consumer to copy from — no project found enables this bit:
++///
++/// * that the exit is raised on the *sending* vCPU (the context carries only
++///   the ICR value, and `WHvRunVirtualProcessor` returns per-processor, so
++///   there is nowhere else it could sensibly go);
++/// * that `ApicIcr` is the two 32-bit xAPIC ICR halves combined, destination in
++///   bits 56..63, as `WHvRunVpExitReasonX64ApicSmiTrap` presents the same
++///   field;
++/// * that the instruction has already retired, as the "Trap" in the name
++///   implies, so RIP must not be advanced.
++///
++/// The first two fail visibly and harmlessly: a trap that never arrives leaves
++/// the APs parked and the guest reporting them as unresponsive, and an ICR that
++/// decodes to nothing recognised is logged verbatim at warn level. The third
++/// would wedge the *sending* vCPU in a loop, so [`Vcpu::run_emulation`] counts
++/// consecutive traps at one address and fails the vCPU with
++/// [`Error::VcpuInitSipiTrapLoop`] rather than hanging.
++pub struct ApStartupRouter {
++    state: Mutex<ApStartupState>,
++    /// Signals a parked AP that its slot changed, or that the VM is going away.
++    wakeup: Condvar,
++}
++
++impl ApStartupRouter {
++    /// ICR bits 8..10, delivery mode: INIT.
++    const DELIVERY_MODE_INIT: u64 = 0b101;
++    /// ICR bits 8..10, delivery mode: startup (SIPI).
++    const DELIVERY_MODE_STARTUP: u64 = 0b110;
++    /// ICR bit 11: destination mode is logical rather than physical.
++    const DEST_MODE_LOGICAL: u64 = 1 << 11;
++    /// ICR bit 14: level. Clear on the level-triggered INIT de-assert.
++    const LEVEL_ASSERT: u64 = 1 << 14;
++    /// ICR bits 18..19, destination shorthand.
++    const SHORTHAND_NONE: u64 = 0b00;
++    const SHORTHAND_SELF: u64 = 0b01;
++    const SHORTHAND_ALL_INCLUDING_SELF: u64 = 0b10;
++    const SHORTHAND_ALL_EXCLUDING_SELF: u64 = 0b11;
++    /// Physical destination 0xff is the broadcast APIC ID.
++    const DEST_BROADCAST: u32 = 0xff;
++
++    fn new(vcpu_count: u8) -> Self {
++        let slots = (0..vcpu_count)
++            .map(|id| {
++                // The BSP is started by this backend, at the kernel entry
++                // point; only the APs wait for the guest.
++                if id == 0 {
++                    ApParkState::Running
++                } else {
++                    ApParkState::Parked
++                }
++            })
++            .collect();
++
++        Self {
++            state: Mutex::new(ApStartupState {
++                slots,
++                // Overwritten per processor by `set_apic_id`. The identity map
++                // is the fallback for a path that never creates vCPUs through
++                // `Vcpu::new_x86_64`, and is what WHP is expected to assign
++                // anyway.
++                apic_ids: (0..u32::from(vcpu_count)).collect(),
++                shutdown: false,
++            }),
++            wakeup: Condvar::new(),
++        }
++    }
++
++    fn vcpu_count(&self) -> u8 {
++        self.state.lock().unwrap().slots.len() as u8
++    }
++
++    /// Records the xAPIC ID WHP assigned to a processor.
++    fn set_apic_id(&self, index: u8, apic_id: u32) {
++        let mut state = self.state.lock().unwrap();
++        if let Some(slot) = state.apic_ids.get_mut(index as usize) {
++            *slot = apic_id;
++        }
++    }
++
++    /// Whether a processor is in the guest as far as the router is concerned.
++    /// A vCPU that finds itself no longer running has been re-parked by an INIT
++    /// and must leave the guest.
++    fn is_running(&self, index: u8) -> bool {
++        let state = self.state.lock().unwrap();
++        state.slots.get(index as usize) == Some(&ApParkState::Running)
++    }
++
++    /// Wakes every parked AP so its thread can exit.
++    fn shutdown(&self) {
++        self.state.lock().unwrap().shutdown = true;
++        self.wakeup.notify_all();
++    }
++
++    /// Blocks an AP's thread until the guest sends it a startup IPI, and
++    /// returns the vector it carried. `None` means the VM is going away.
++    fn wait_for_sipi(&self, index: u8) -> Option<u8> {
++        let mut state = self.state.lock().unwrap();
++        loop {
++            if state.shutdown {
++                return None;
++            }
++            // Latching Running here, rather than after the registers are
++            // written, is deliberate: the second SIPI of the guest's
++            // INIT-SIPI-SIPI is meant to be swallowed by an AP that the first
++            // one already started, and this is what makes it a no-op.
++            if let ApParkState::SipiPending(vector) = state.slots[index as usize] {
++                state.slots[index as usize] = ApParkState::Running;
++                debug!("vCPU {index} unparked by a startup IPI, vector 0x{vector:x}");
++                return Some(vector);
++            }
++            state = self.wakeup.wait(state).unwrap();
++        }
++    }
++
++    /// Applies a trapped write to the local APIC's interrupt command register.
++    ///
++    /// `vm` is needed to break a target that is *already* in the guest out of
++    /// `WHvRunVirtualProcessor`, which is how an INIT reaches a processor the
++    /// guest is taking back — an offlined CPU being brought online again, or a
++    /// kexec. Without it such a target would keep running until its next exit.
++    fn deliver_icr(&self, sender: u8, icr: u64, vm: &WhpVm) {
++        let delivery_mode = (icr >> 8) & 0x7;
++        let vector = (icr & 0xff) as u8;
++
++        match delivery_mode {
++            Self::DELIVERY_MODE_INIT => {
++                // The level-triggered de-assert that follows every INIT assert
++                // carries destination 0 and no shorthand. Taken at face value
++                // it reads as "INIT the processor with APIC ID 0" — the BSP,
++                // mid-boot. Bit 14 is what tells the two apart, and this is the
++                // single most damaging thing to get wrong here.
++                if icr & Self::LEVEL_ASSERT == 0 {
++                    trace!("vCPU {sender}: INIT de-assert (icr=0x{icr:x}); ignored");
++                    return;
++                }
++            }
++            Self::DELIVERY_MODE_STARTUP => {}
++            _ => {
++                // NMI, SMI and fixed IPIs are delivered by WHP's own local APIC
++                // emulation and should never reach this trap.
++                warn!("vCPU {sender}: unexpected trapped IPI ignored (icr=0x{icr:x})");
++                return;
++            }
++        }
++
++        let Some(targets) = self.resolve_targets(sender, icr) else {
++            return;
++        };
++
++        let mut state = self.state.lock().unwrap();
++        for target in targets {
++            if target == sender {
++                // Reachable through the self and all-including-self shorthands.
++                // A processor cannot put itself into wait-for-SIPI here: it is
++                // the one holding this exit.
++                trace!("vCPU {sender}: INIT/SIPI addressed to itself ignored");
++                continue;
++            }
++            if target == 0 {
++                // Resetting the boot processor would mean re-running the whole
++                // boot-state setup, which this backend has no path for. Nothing
++                // in a Linux SMP bring-up does it.
++                warn!("vCPU {sender}: INIT/SIPI to the boot processor ignored (icr=0x{icr:x})");
++                continue;
++            }
++            let slot = &mut state.slots[target as usize];
++
++            if delivery_mode == Self::DELIVERY_MODE_INIT {
++                if *slot == ApParkState::Running {
++                    // Put it back in wait-for-SIPI and get it out of the guest
++                    // so its own thread notices. It re-checks its slot on every
++                    // trip round the run loop, so the cancel is a latency
++                    // optimisation rather than the mechanism.
++                    debug!("vCPU {sender}: INIT re-parks vCPU {target}");
++                    *slot = ApParkState::Parked;
++                    vm.cancel_vcpu(u32::from(target));
++                }
++                // An AP that is already parked holds the reset state an INIT
++                // would put it in, so there is nothing to do.
++                continue;
++            }
++
++            match *slot {
++                ApParkState::Running => {
++                    // Architecturally a SIPI is only accepted in the
++                    // wait-for-SIPI state. Dropping it is what makes the guest's
++                    // second SIPI harmless.
++                    trace!("vCPU {sender}: startup IPI to running vCPU {target} ignored");
++                }
++                _ => {
++                    debug!("vCPU {sender}: startup IPI vector 0x{vector:x} -> vCPU {target}");
++                    *slot = ApParkState::SipiPending(vector);
++                }
++            }
++        }
++        drop(state);
++        self.wakeup.notify_all();
++    }
++
++    /// Turns an ICR's shorthand and destination fields into processor indices.
++    /// `None` means the addressing mode is one this backend cannot resolve, in
++    /// which case the IPI has already been logged and must be dropped.
++    fn resolve_targets(&self, sender: u8, icr: u64) -> Option<Vec<u8>> {
++        let state = self.state.lock().unwrap();
++        let count = state.slots.len() as u8;
++
++        match (icr >> 18) & 0x3 {
++            Self::SHORTHAND_SELF => Some(vec![sender]),
++            Self::SHORTHAND_ALL_INCLUDING_SELF => Some((0..count).collect()),
++            Self::SHORTHAND_ALL_EXCLUDING_SELF => {
++                Some((0..count).filter(|&t| t != sender).collect())
++            }
++            Self::SHORTHAND_NONE => {
++                if icr & Self::DEST_MODE_LOGICAL != 0 {
++                    // Resolving a logical destination needs each processor's
++                    // LDR and DFR, which live inside WHP's local APIC and are
++                    // only reachable through
++                    // `WHvGetVirtualProcessorInterruptControllerState` — not
++                    // bound here. Linux addresses INIT and SIPI physically
++                    // (`wakeup_secondary_cpu_via_init` passes a physical APIC
++                    // ID), so this should not be reachable; if it ever is, the
++                    // AP simply fails to start rather than the wrong one being
++                    // reset.
++                    warn!(
++                        "vCPU {sender}: logically addressed INIT/SIPI is not supported, ignored \
++                         (icr=0x{icr:x})"
++                    );
++                    return None;
++                }
++
++                // Destination field: ICR bits 56..63, i.e. bits 24..31 of the
++                // high half of the xAPIC's two 32-bit ICR registers.
++                let dest = ((icr >> 56) & 0xff) as u32;
++                if dest == Self::DEST_BROADCAST {
++                    // Physical broadcast nominally includes the sender; it is
++                    // dropped here for the same reason the self shorthand is.
++                    return Some((0..count).filter(|&t| t != sender).collect());
++                }
++                match state.apic_ids.iter().position(|&id| id == dest) {
++                    Some(index) => Some(vec![index as u8]),
++                    None => {
++                        warn!(
++                            "vCPU {sender}: INIT/SIPI to unknown APIC ID 0x{dest:x} ignored \
++                             (icr=0x{icr:x})"
++                        );
++                        None
++                    }
++                }
++            }
++            _ => unreachable!("two bits have four values, all matched above"),
++        }
++    }
++}
++
+ /// A wrapper around creating and using a WHP partition.
+ pub struct Vm {
+     whp_vm: Arc<WhpVm>,
+ 
++    // Shared with every vCPU: the BSP writes into it from its INIT/SIPI trap
++    // handler and the APs block on it. Built here because `Vm::new` is the only
++    // place that knows the processor count before the vCPUs exist.
++    ap_startup: Arc<ApStartupRouter>,
++
+     // Keeping the guest memory alive here is load-bearing, not bookkeeping.
+     // `WHvMapGpaRange` records raw host pointers into these mappings, and the
+     // partition keeps dereferencing them for as long as it exists. `Vmm` stores
+@@ -165,10 +513,15 @@ impl Vm {
+         // WHvCreatePartition when the feature is simply not enabled.
+         whp::check_hypervisor().map_err(Error::HypervisorUnavailable)?;
+ 
++        // Refuses `vcpu_count > 1` on a host whose WHP cannot trap INIT/SIPI,
++        // because the APs of such a guest could never be started. The error
++        // surfaces from here rather than from `krun_set_vm_config`, which has no
++        // partition to ask and would have to guess.
+         let whp_vm = WhpVm::new(u32::from(vcpu_count)).map_err(Error::VmSetup)?;
+ 
+         Ok(Vm {
+             whp_vm: Arc::new(whp_vm),
++            ap_startup: Arc::new(ApStartupRouter::new(vcpu_count)),
+             guest_memory: None,
+         })
+     }
+@@ -179,6 +532,11 @@ impl Vm {
+         &self.whp_vm
+     }
+ 
++    /// The shared AP bring-up state; see [`ApStartupRouter`].
++    pub fn ap_startup(&self) -> &Arc<ApStartupRouter> {
++        &self.ap_startup
++    }
++
+     /// Maps every guest memory region into the partition's physical address
+     /// space.
+     pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
+@@ -338,6 +696,16 @@ pub struct Vcpu {
+ 
+     exit_evt: EventFd,
+ 
++    // Shared bring-up state: this vCPU parks in it when it is an AP, and writes
++    // into it when it is the one whose INIT/SIPI was trapped.
++    ap_startup: Arc<ApStartupRouter>,
++
++    // Consecutive INIT/SIPI traps at one address, and that address. Guards
++    // against the one failure mode of the trap that would hang rather than
++    // degrade; see [`ApStartupRouter`].
++    init_sipi_trap_rip: Cell<u64>,
++    init_sipi_trap_repeats: Cell<u32>,
++
+     // The receiving end of the responses channel which will be given to the handler.
+     response_receiver: Option<Receiver<VcpuResponse>>,
+     // The transmitting end of the responses channel owned by the vcpu side.
+@@ -374,6 +742,13 @@ impl Vcpu {
+             WhpVcpu::new(vm.whp_vm().clone(), u32::from(id)).map_err(Error::VcpuCreate)?;
+         let (response_sender, response_receiver) = unbounded();
+ 
++        // Record what WHP called this processor while we still have it in hand.
++        // The guest addresses INIT and SIPI by APIC ID, and the router has to
++        // map that back to an index; assuming the two are equal would be a
++        // silent way to start the wrong processor.
++        let ap_startup = vm.ap_startup().clone();
++        ap_startup.set_apic_id(id, whp_vcpu.apic_id().map_err(Error::VcpuRegisterAccess)?);
++
+         Ok(Vcpu {
+             id,
+             whp_vcpu: Some(whp_vcpu),
+@@ -381,6 +756,9 @@ impl Vcpu {
+             io_bus,
+             guest_memory,
+             exit_evt,
++            ap_startup,
++            init_sipi_trap_rip: Cell::new(0),
++            init_sipi_trap_repeats: Cell::new(0),
+             response_receiver: Some(response_receiver),
+             response_sender,
+         })
+@@ -426,13 +804,28 @@ impl Vcpu {
+             .expect("vCPU was already moved to its thread");
+ 
+         if kernel_boot {
+-            // Must precede `setup_regs`, which parks every AP at
+-            // `AP_TRAMPOLINE_START`. WHP, unlike KVM, starts every virtual
+-            // processor runnable rather than in the wait-for-SIPI state, so the
+-            // "wait for the BSP" has to exist as instructions in guest memory.
++            // Must precede `setup_regs`, which points every AP at
++            // `AP_TRAMPOLINE_START`. That is no longer how an AP waits — see
++            // `ApStartupRouter` — but it is still the state it holds while
++            // parked, and `setup_ap_trampoline` documents why that state is
++            // worth making inert rather than leaving as zeroed memory.
+             if self.id != 0 {
+                 arch::x86_64::regs::setup_ap_trampoline(guest_mem)
+                     .map_err(Error::REGSConfiguration)?;
++
++                // The one observation that would settle whether WHP creates APs
++                // in the wait-for-SIPI state, recorded on the way past. Bit 0 is
++                // `StartupSuspend`. Nothing branches on it: the AP is parked and
++                // the flag cleared either way, so this exists purely so the
++                // first multi-vCPU boot answers the question in its own log.
++                match whp_vcpu.internal_activity_state() {
++                    Ok(state) => debug!(
++                        "vCPU {} initial InternalActivityState=0x{state:x} (StartupSuspend={})",
++                        self.id,
++                        state & 1
++                    ),
++                    Err(e) => debug!("vCPU {} InternalActivityState unreadable: {e}", self.id),
++                }
+             }
+ 
+             arch::x86_64::msr::setup_msrs(whp_vcpu).map_err(Error::MSRSConfiguration)?;
+@@ -494,6 +887,12 @@ impl Vcpu {
+     ) -> Result<VcpuEmulation> {
+         let exit = whp_vcpu.run().map_err(Error::VcpuRun)?;
+ 
++        // The trap-loop counter only means anything for traps that follow one
++        // another with nothing in between, so any other exit clears it.
++        if !matches!(exit, VcpuExitReason::ApicInitSipi { .. }) {
++            self.init_sipi_trap_repeats.set(0);
++        }
++
+         match exit {
+             // The guest touched an I/O port or an unmapped physical address.
+             // Both are handed to the instruction emulator, which decodes the
+@@ -531,13 +930,14 @@ impl Vcpu {
+                 // Deliberately *not* a shutdown, unlike the KVM backend's
+                 // `KVM_EXIT_HLT` arm. That arm is safe on KVM only because an
+                 // in-kernel LAPIC means HLT never reaches userspace at all;
+-                // here HLT is routine. In particular every AP spends the whole
+-                // pre-SMP-boot window in the `cli; hlt; jmp` trampoline that
+-                // `arch::x86_64::regs::setup_ap_trampoline` writes, so reading
+-                // a halt -- even one with interrupts masked -- as "the guest is
+-                // finished" would tear the VM down the moment a second vCPU
+-                // started. Shutdown arrives through the i8042 reset port and
+-                // `exit_evt`, or as an unrecoverable exception below.
++                // here HLT is routine. An AP no longer waits in a `cli; hlt`
++                // trampoline -- it waits outside the guest, in
++                // [`ApStartupRouter`] -- but a guest that offlines a CPU parks
++                // it in `play_dead`, which is the same `cli; hlt` loop, so
++                // reading a halt (even one with interrupts masked) as "the
++                // guest is finished" would still tear the VM down. Shutdown
++                // arrives through the i8042 reset port and `exit_evt`, or as an
++                // unrecoverable exception below.
+                 trace!(
+                     "vCPU {} halted at rip=0x{:x} (rflags=0x{:x})",
+                     self.id,
+@@ -572,6 +972,10 @@ impl Vcpu {
+                 Ok(VcpuEmulation::Handled)
+             }
+             VcpuExitReason::MsrAccess => self.handle_msr_access(whp_vcpu),
++            VcpuExitReason::ApicInitSipi { icr } => {
++                self.handle_init_sipi_trap(whp_vcpu, icr)?;
++                Ok(VcpuEmulation::Handled)
++            }
+             VcpuExitReason::InterruptWindow => {
+                 // We asked to be told when the guest could next take an
+                 // interrupt. We do not queue interrupts ourselves — the IOAPIC
+@@ -652,6 +1056,46 @@ impl Vcpu {
+         thread::sleep(HALT_POLL_INTERVAL);
+     }
+ 
++    /// Services a trapped write to the local APIC's interrupt command register.
++    ///
++    /// RIP is deliberately *not* advanced. `WHvRunVpExitReasonX64ApicInitSipiTrap`
++    /// is named a trap rather than a fault, which in this API's vocabulary
++    /// (alongside `X64ApicSmiTrap` and `X64ApicWriteTrap`) means the write has
++    /// already been performed and the VMM is being told about it after the fact.
++    /// That is an inference — Microsoft documents the struct and nothing else —
++    /// so the cost of it being wrong is bounded here rather than left to hang:
++    /// a guest re-executing the same ICR write forever would take this exit
++    /// forever, at one unchanging address.
++    ///
++    /// The bound has to clear the whole of a Linux bring-up. `do_boot_cpu`
++    /// sends INIT, INIT de-assert and two SIPIs per AP, all from the same
++    /// instruction, with only TSC delay loops in between — so no other exit
++    /// separates them — and may retry the sequence. Sixteen writes per
++    /// processor plus a fixed allowance covers that with room to spare while
++    /// still terminating in well under a second.
++    fn handle_init_sipi_trap(&self, whp_vcpu: &WhpVcpu, icr: u64) -> Result<()> {
++        let rip = whp_vcpu.exit_rip();
++        let repeats = if rip == self.init_sipi_trap_rip.get() {
++            self.init_sipi_trap_repeats.get() + 1
++        } else {
++            self.init_sipi_trap_rip.set(rip);
++            1
++        };
++        self.init_sipi_trap_repeats.set(repeats);
++
++        let limit = 64 + 16 * u32::from(self.ap_startup.vcpu_count());
++        if repeats > limit {
++            return Err(Error::VcpuInitSipiTrapLoop {
++                rip,
++                count: repeats,
++            });
++        }
++
++        trace!("vCPU {} INIT/SIPI trap, icr=0x{icr:x}", self.id);
++        self.ap_startup.deliver_icr(self.id, icr, whp_vcpu.vm());
++        Ok(())
++    }
++
+     /// Services an MSR the partition did not handle.
+     ///
+     /// `WhpVm::configure_partition` sets `X64MsrExitBitmap` bit 0
+@@ -715,28 +1159,67 @@ impl Vcpu {
+             return;
+         }
+ 
+-        loop {
+-            match self.run_emulation(&mut whp_vcpu, &emulator) {
+-                // Emulation ran successfully, continue.
+-                Ok(VcpuEmulation::Handled) => (),
+-                // The guest is idle; park before re-entering.
+-                Ok(VcpuEmulation::Halted) => self.wait_for_interrupt(),
+-                // The guest was rebooted or halted for good.
+-                Ok(VcpuEmulation::Stopped) => {
+-                    self.exit(FC_EXIT_CODE_OK);
+-                    break;
+-                }
+-                // Emulation errors lead to vCPU exit.
+-                Err(e) => {
+-                    error!("vCPU {} exiting: {e}", self.id);
++        // Outer loop: one pass per time this processor is started by the guest.
++        // A BSP makes exactly one pass; an AP makes one per INIT/SIPI, which is
++        // what lets a guest offline a CPU and bring it back.
++        'started: loop {
++            // An AP does not enter the guest at all until the guest asks for
++            // it. This is the wait that used to be a `cli; hlt` loop in guest
++            // memory: holding the thread here is what makes the design correct
++            // whether or not WHP would have held the processor itself.
++            if self.id != 0 {
++                let Some(vector) = self.ap_startup.wait_for_sipi(self.id) else {
++                    // The VM is going away and this AP was never started.
++                    return;
++                };
++
++                if let Err(e) = arch::x86_64::regs::apply_sipi_startup_state(&whp_vcpu, vector) {
++                    error!("vCPU {} could not apply its startup IPI: {e:?}", self.id);
+                     self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+-                    break;
++                    return;
++                }
++                info!(
++                    "vCPU {} started at 0x{:x} by a startup IPI",
++                    self.id,
++                    u64::from(vector) << 12
++                );
++            }
++
++            loop {
++                // An INIT from the guest takes this processor back. The cancel
++                // that accompanies it only breaks the current
++                // `WHvRunVirtualProcessor`; noticing is this side's job.
++                if self.id != 0 && !self.ap_startup.is_running(self.id) {
++                    debug!("vCPU {} re-parked by INIT", self.id);
++                    continue 'started;
++                }
++
++                match self.run_emulation(&mut whp_vcpu, &emulator) {
++                    // Emulation ran successfully, continue.
++                    Ok(VcpuEmulation::Handled) => (),
++                    // The guest is idle; park before re-entering.
++                    Ok(VcpuEmulation::Halted) => self.wait_for_interrupt(),
++                    // The guest was rebooted or halted for good.
++                    Ok(VcpuEmulation::Stopped) => {
++                        self.exit(FC_EXIT_CODE_OK);
++                        return;
++                    }
++                    // Emulation errors lead to vCPU exit.
++                    Err(e) => {
++                        error!("vCPU {} exiting: {e}", self.id);
++                        self.exit(FC_EXIT_CODE_GENERIC_ERROR);
++                        return;
++                    }
+                 }
+             }
+         }
+     }
+ 
+     fn exit(&mut self, exit_code: u8) {
++        // Release any AP the guest never started, so its thread does not
++        // outlive the VM blocked on a startup IPI that will never come.
++        self.ap_startup.shutdown();
++
+         self.response_sender
+             .send(VcpuResponse::Exited(exit_code))
+             .expect("failed to send Exited status");
+diff --git a/src/whp/src/lib.rs b/src/whp/src/lib.rs
+index 12fb5d9..907bfbf 100644
+--- a/src/whp/src/lib.rs
++++ b/src/whp/src/lib.rs
+@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Hypervisor::{
+     WHV_PARTITION_PROPERTY_CODE, WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME,
+     WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT,
+     WHV_TRANSLATE_GVA_RESULT_CODE, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT,
+-    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
++    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor, WHvCapabilityCodeExtendedVmExits,
+     WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeInterruptClockFrequency,
+     WHvCapabilityCodeProcessorClockFrequency, WHvCapabilityCodeProcessorFeaturesBanks,
+     WHvCreatePartition, WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
+@@ -31,13 +31,14 @@ use windows_sys::Win32::System::Hypervisor::{
+     WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+     WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
+     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+-    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRequestInterrupt, WHvRunVirtualProcessor,
+-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
+-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
+-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
++    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRegisterInternalActivityState,
++    WHvRequestInterrupt, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
++    WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
++    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
++    WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
+     WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
+     WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
+-    WHvSetupPartition, WHvTranslateGva, WHvX64LocalApicEmulationModeXApic,
++    WHvSetupPartition, WHvTranslateGva, WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId,
+     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
+     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+ };
+@@ -56,6 +57,7 @@ const DEFAULT_LAPIC_FREQUENCY_HZ: u64 = 100_000_000;
+ pub enum Error {
+     CheckCapability(i32),
+     HypervisorNotPresent,
++    ApicInitSipiTrapUnsupported,
+     CreatePartition(i32),
+     SetPartitionProperty(i32),
+     SetupPartition(i32),
+@@ -82,6 +84,12 @@ impl Display for Error {
+         match self {
+             CheckCapability(hr) => write!(f, "WHvGetCapability failed: HRESULT 0x{hr:08x}"),
+             HypervisorNotPresent => write!(f, "WHP hypervisor is not present on this system"),
++            ApicInitSipiTrapUnsupported => write!(
++                f,
++                "this host's Windows Hypervisor Platform cannot trap INIT/SIPI \
++                 (WHV_EXTENDED_VM_EXITS.X64ApicInitSipiExitTrap is not offered), so application \
++                 processors cannot be started; use a single vCPU"
++            ),
+             CreatePartition(hr) => write!(f, "WHvCreatePartition failed: HRESULT 0x{hr:08x}"),
+             SetPartitionProperty(hr) => {
+                 write!(f, "WHvSetPartitionProperty failed: HRESULT 0x{hr:08x}")
+@@ -173,6 +181,44 @@ pub fn check_hypervisor() -> Result<(), Error> {
+     Ok(())
+ }
+ 
++/// `WHV_EXTENDED_VM_EXITS` bit 0 — `X64CpuidExit`.
++const EXTENDED_VM_EXIT_X64_CPUID: u64 = 1 << 0;
++/// `WHV_EXTENDED_VM_EXITS` bit 1 — `X64MsrExit`.
++const EXTENDED_VM_EXIT_X64_MSR: u64 = 1 << 1;
++/// `WHV_EXTENDED_VM_EXITS` bit 6 — `X64ApicInitSipiExitTrap`.
++///
++/// The bit position is read off the Windows SDK's `WinHvPlatformDefs.h`, whose
++/// `WHV_EXTENDED_VM_EXITS` bitfield runs `X64CpuidExit`, `X64MsrExit`,
++/// `ExceptionExit`, `X64RdtscExit`, `X64ApicSmiExitTrap`, `HypercallExit`,
++/// `X64ApicInitSipiExitTrap`. `windows-sys` models the union as an opaque
++/// `u64`, so the name never reaches Rust and the offset has to be spelled out.
++const EXTENDED_VM_EXIT_X64_APIC_INIT_SIPI_TRAP: u64 = 1 << 6;
++
++/// The `WHV_EXTENDED_VM_EXITS` bits this host is willing to offer.
++///
++/// A partition may only ask for exits the platform reports here; requesting an
++/// unsupported one fails `WHvSetPartitionProperty` wholesale, which would take
++/// the CPUID and MSR exits down with it.
++fn extended_vm_exits_supported() -> Result<u64, Error> {
++    let mut capability = MaybeUninit::<WHV_CAPABILITY>::uninit();
++    let mut written_size: u32 = 0;
++
++    unsafe {
++        let hr = WHvGetCapability(
++            WHvCapabilityCodeExtendedVmExits,
++            capability.as_mut_ptr().cast(),
++            mem::size_of::<WHV_CAPABILITY>() as u32,
++            &mut written_size,
++        );
++
++        if hr != S_OK {
++            return Err(Error::CheckCapability(hr));
++        }
++
++        Ok(capability.assume_init().ExtendedVmExits.AsUINT64)
++    }
++}
++
+ fn get_processor_features_banks() -> Result<WHV_PROCESSOR_FEATURES_BANKS, Error> {
+     let mut capability = MaybeUninit::<WHV_CAPABILITY>::uninit();
+     let mut written_size: u32 = 0;
+@@ -327,8 +373,40 @@ impl WhpVm {
+         // CPUID exits are not a blanket trap: they fire only for the leaves
+         // named in `CpuidExitList` below. See that list for why the leaves it
+         // holds cannot be served from `CpuidResultList` instead.
++        //
++        // These two are requested unconditionally, exactly as they were before
++        // the INIT/SIPI trap existed. They could be masked against
++        // `extended_vm_exits_supported()` for symmetry, but a capability query
++        // that came back unexpectedly narrow would then silently drop the CPUID
++        // exits — and with them the synthetic leaf 0x15 the guest's whole notion
++        // of time hangs off. A partition that cannot have them should fail
++        // loudly at `WHvSetPartitionProperty` instead.
++        let mut extended_vm_exits = EXTENDED_VM_EXIT_X64_CPUID | EXTENDED_VM_EXIT_X64_MSR;
++
++        // Application processors are started by the VMM, not by WHP: see
++        // `ApStartupRouter` in `vmm::windows::vstate` for the whole mechanism
++        // and for the evidence behind it. All this bit does is redirect the
++        // guest's INIT/SIPI writes to the local APIC's ICR into
++        // `WHvRunVpExitReasonX64ApicInitSipiTrap` exits on the writing vCPU,
++        // which is the only way the VMM can observe them.
++        //
++        // Asked for only when there is more than one processor. A uniprocessor
++        // guest never writes an INIT or a startup IPI, so the bit would change
++        // nothing for it — and leaving the single-vCPU partition configured
++        // byte for byte as it was keeps the one configuration that has actually
++        // booted out of the blast radius of this change.
++        if vcpu_count > 1 {
++            if extended_vm_exits_supported()? & EXTENDED_VM_EXIT_X64_APIC_INIT_SIPI_TRAP == 0 {
++                // Refuse rather than boot a guest whose APs can never start.
++                // Without the trap the INIT/SIPI would be consumed inside WHP's
++                // local APIC emulation and the VMM would never learn of it.
++                return Err(Error::ApicInitSipiTrapUnsupported);
++            }
++            extended_vm_exits |= EXTENDED_VM_EXIT_X64_APIC_INIT_SIPI_TRAP;
++        }
++
+         Self::set_property(handle, WHvPartitionPropertyCodeExtendedVmExits, |p| {
+-            p.ExtendedVmExits.AsUINT64 = 0b11; // bit 0 = X64CpuidExit, bit 1 = X64MsrExit
++            p.ExtendedVmExits.AsUINT64 = extended_vm_exits;
+         })?;
+ 
+         // The leaves the VMM rewrites on each exit, in `normalize_cpuid`.
+@@ -1089,6 +1167,13 @@ pub enum VcpuExitReason {
+     Canceled,
+     CpuidAccess,
+     MsrAccess,
++    /// The guest wrote an INIT or startup IPI to its local APIC's interrupt
++    /// command register. Raised on the *writing* vCPU, carrying the 64-bit ICR
++    /// value it wrote, only while the partition asked for
++    /// `X64ApicInitSipiExitTrap`.
++    ApicInitSipi {
++        icr: u64,
++    },
+     InterruptWindow,
+     UnrecoverableException,
+     InvalidVpRegisterValue,
+@@ -1401,6 +1486,30 @@ impl WhpVcpu {
+         self.index
+     }
+ 
++    /// The xAPIC ID WHP gave this virtual processor.
++    ///
++    /// Read rather than assumed to equal [`WhpVcpu::index`]: the guest addresses
++    /// an INIT/SIPI at an APIC ID, and the VMM has to map that back to a
++    /// processor index. WHP is not documented to make the two equal, and nothing
++    /// in this backend rewrites the topology CPUID leaves that would let us
++    /// impose it.
++    pub fn apic_id(&self) -> Result<u32, Error> {
++        let [id] = self.get_registers64([WHvX64RegisterApicId])?;
++        Ok(id as u32)
++    }
++
++    /// Reads `WHvRegisterInternalActivityState`, whose bit 0 is `StartupSuspend`
++    /// — the wait-for-SIPI state — bit 1 `HaltSuspend` and bit 2 `IdleSuspend`.
++    ///
++    /// Only used for diagnostics: which of these WHP sets on a freshly created
++    /// virtual processor is undocumented, and knowing it is what would tell us
++    /// whether the AP park in `vmm::windows::vstate` is load-bearing or merely
++    /// belt and braces. Logging it costs one register read per AP at boot.
++    pub fn internal_activity_state(&self) -> Result<u64, Error> {
++        let [state] = self.get_registers64([WHvRegisterInternalActivityState])?;
++        Ok(state)
++    }
++
+     /// Clear the deliverability-notification request so WHP stops exiting
+     /// on every STI instruction. Called after an InterruptWindow exit.
+     /// https://github.com/google/crosvm/blob/main/hypervisor/src/whpx/whpx_sys/WinHvPlatformDefs.h#L773
+@@ -1425,6 +1534,11 @@ impl WhpVcpu {
+             WHvRunVpExitReasonCanceled => VcpuExitReason::Canceled,
+             WHvRunVpExitReasonX64Cpuid => VcpuExitReason::CpuidAccess,
+             WHvRunVpExitReasonX64MsrAccess => VcpuExitReason::MsrAccess,
++            WHvRunVpExitReasonX64ApicInitSipiTrap => VcpuExitReason::ApicInitSipi {
++                // SAFETY: the exit reason selects this union member;
++                // `WHV_X64_APIC_INIT_SIPI_CONTEXT` is a single `UINT64`.
++                icr: unsafe { ctx.Anonymous.ApicInitSipi.ApicIcr },
++            },
+             WHvRunVpExitReasonX64InterruptWindow => VcpuExitReason::InterruptWindow,
+             WHvRunVpExitReasonUnrecoverableException => VcpuExitReason::UnrecoverableException,
+             WHvRunVpExitReasonInvalidVpRegisterValue => VcpuExitReason::InvalidVpRegisterValue,
+-- 
+2.53.0
+

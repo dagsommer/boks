@@ -1,7 +1,7 @@
 From 154bc9681f44fe428d1714aaf3f7708fe9891a23 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:28:21 +0200
-Subject: [PATCH 08/32] windows: write the AP idle trampoline, and stop reading
+Subject: [PATCH 08/34] windows: write the AP idle trampoline, and stop reading
  HLT as shutdown
 
 Two bugs that would have shown up the moment a Windows guest was given more
