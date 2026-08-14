@@ -1088,6 +1088,59 @@ the case where that reading is wrong — makes the shim log *which* of its two w
 `output drain` or `stdin drain`, so one line of the next run settles it. Until that run, the
 30 s is measured and the cause is inferred.
 
+### Boks runs a container on Windows, on its own stack, with policy enforced, 2026-08-14
+
+`boks run --net nat shell <workspace> -- uname -a`, on real Windows 11 hardware, exit 0 in
+12.2 s:
+
+```
+Linux (none) 6.12.44 #1 SMP Thu Aug 13 14:58:57 UTC 2026 x86_64 GNU/Linux
+```
+
+That is Boks itself — not `ctr` — running a container inside a microVM on Windows. The
+guest enumerated `virtio0`…`virtio14`, fifteen devices against the nineteen-line budget,
+and **said nothing at all about interrupts**: no `IRQ`, no `MP-BIOS`, no "not connected".
+The IOAPIC pin fix is confirmed by silence, which is the strongest form of that result.
+
+**The guest attached to Boks' own link socket** —
+
+```
+network: the guest attached to the link socket …\boks\net\shell-boks\net.sock
+```
+
+— the first Ethernet frame path contact on Windows, ending a claim this document carried
+for a week.
+
+**And the policy engine judged real traffic.** Not an attach; decisions:
+
+```
+Allowed: shell-boks network github.com:443    allowed by rule "github.com:443"
+         shell-boks network 140.82.121.3:443  no deny rule matched the resolved address
+Blocked: shell-boks network example.com:443   forward-bypass
+         denied by default (policy "standard" allows only listed destinations)
+```
+
+Three `policy-log.jsonl` entries with `stage:connect` and `stage:dial`. The allowed
+destination completed a TCP connection to a resolved GitHub address; the denied one was
+refused at CONNECT.
+
+**A new defect, found in the same run: the guest's wall clock is 1999.**
+
+```
+uptime  139.62 1110.64
+date -u Tue Nov 30 00:02:19 UTC 1999      (host: 2026-08-14T14:58:07Z)
+```
+
+The monotonic clock was fixed on 2026-08-13 by publishing a real CPUID crystal; the
+**RTC** is a separate thing and is still unset. The consequence is not cosmetic: the
+allowed request above failed with `curl (60) SSL certificate problem: certificate is not
+yet valid`. **Every TLS handshake in a Windows guest fails this way**, so the policy
+result above is stronger than it looks — the denial was enforced, and the allowance was
+carried far enough to fail on the guest's own date rather than on policy.
+
+Scope: `--net nat`, one sandbox, one machine. `boks rm` could not run because containerd
+was already down, so teardown is unverified in this run.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
