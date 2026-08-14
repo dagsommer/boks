@@ -20,12 +20,15 @@
 # to the pinned release, that the erofs plugin packages still cross-compile for Windows and are
 # genuinely linked into the binary, that the diff-service default order in the built PE really
 # names erofs first (read out of .data, because `strings` cannot tell that from three unrelated
-# words), that mkfs.erofs.exe carries no hardcoded "/tmp", and that the go-erofs recipe still
-# produces a PE32+ binary whose help text advertises tar mode. It also parses
-# new-containerd-root.ps1 — the bundled script that must be run before containerd, because
-# an unelevated containerd creates its own --root with a DACL that excludes the user.
+# words), that the mount manager's superblock probe table in the built PE really says ext4's
+# magic is 53 ef at offset 1080 (read out of .data for the same reason — a two-byte magic and a
+# small integer occur by coincidence all over a 37 MB binary), that mkfs.erofs.exe carries no
+# hardcoded "/tmp", and that the go-erofs recipe still produces a PE32+ binary whose help text
+# advertises tar mode. It also parses new-containerd-root.ps1 — the bundled script that must be
+# run before containerd, because an unelevated containerd creates its own --root with a DACL
+# that excludes the user.
 #
-# It runs exactly one thing: the Go tests for the diff service and the transfer plugin, on
+# It runs the Go tests for the diff service, the transfer plugin and the mount manager, on
 # Linux, because that code is platform-neutral. Everything else is inspection.
 #
 # It proves NOTHING about whether the Windows binaries run. No Windows binary is executed here —
@@ -398,21 +401,41 @@ jobs:
               "_out/$arch/containerd.exe" erofs windows windows-lcow
           done
 
-      # The only claim in this whole workflow that is checked by running something rather
-      # than by looking at bytes. Dropping a skipped differ from the order is what keeps a
-      # host with no mkfs.erofs.exe from losing its diff service — and with it bolt, and
-      # every service that depends on bolt — now that erofs is a default order entry.
-      - name: Run the diff-service and transfer plugin tests
+      # Patch 0005 turns "the image file exists" into "the image file has this filesystem's
+      # superblock magic". The table it reads that from is static data, so it can be read
+      # back out of the PE the same way the diff order is — and unlike the diff order, the
+      # values are a two-byte magic and a small integer, which `strings` could not
+      # distinguish from noise even in principle. An unpatched build of the same tree has no
+      # such table and fails this check.
+      - name: Assert the mkfs transformer carries the superblock probe table
         working-directory: containerd
         run: |
           set -euo pipefail
-          go test ./plugins/services/diff/... ./plugins/transfer/... -count=1
+          for arch in amd64 arm64; do
+            python3 ../boks/packaging/containerd-windows/assert-mkfs-magic.py \
+              "_out/$arch/containerd.exe" \
+              ext2:1080:53ef ext3:1080:53ef ext4:1080:53ef xfs:0:58465342
+          done
+
+      # The only claims in this whole workflow that are checked by running something rather
+      # than by looking at bytes. Dropping a skipped differ from the order is what keeps a
+      # host with no mkfs.erofs.exe from losing its diff service — and with it bolt, and
+      # every service that depends on bolt — now that erofs is a default order entry. The
+      # mount-manager tests are where patch 0005 is actually exercised: the probe table
+      # asserted above only says what the binary believes, and one of these tests formats an
+      # image with the real mkfs.ext4 and feeds it back in, so the constants are checked
+      # against what the formatter writes rather than against themselves.
+      - name: Run the diff-service, transfer plugin and mount-manager tests
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          go test ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/manager/... -count=1
           # The Windows-only assertions cannot run here, but they can at least be
           # type-checked, so a rename in the patched code fails in CI and not on a desktop.
           # cmd/ctr is in the list for patch 0004, whose whole diff is in a _windows.go
           # file: `go build ./cmd/ctr` for Linux does not compile a line of it.
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet \
-            ./plugins/services/diff/... ./plugins/transfer/... ./cmd/ctr/...
+            ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/... ./cmd/ctr/...
 
       # Two import lines cannot plausibly break Linux, which is exactly why it costs nothing
       # to assert instead of assume.
@@ -521,8 +544,12 @@ jobs:
       # Windows in any packaged form. nerdbox's own README tells macOS users to brew
       # install e2fsprogs for exactly this.
       #
-      # core/mount/manager/mkfs.go:94 skips formatting entirely when the target file
-      # already exists, so a correct image dropped in beforehand is all that is needed.
+      # core/mount/manager/mkfs.go skips formatting when the target file already carries the
+      # filesystem's superblock magic, so a correct image dropped in beforehand is all that
+      # is needed. Before patch 0005 it skipped formatting whenever the file merely existed,
+      # which is why the ext4 magic is asserted here and not just the byte count: this image
+      # is the one file in the bundle that has to be genuinely formatted, and a truncate
+      # without a mkfs would have been accepted by the old code and by nothing else.
       # 64 MiB of mostly zeros; the artifact zip takes it to well under 100 KB.
       - name: Format the writable-layer image Windows cannot make for itself
         run: |
@@ -535,7 +562,12 @@ jobs:
             || { echo "not an ext4 image" >&2; file staging/rwlayer-64m.img >&2; exit 1; }
           [ "$(wc -c <staging/rwlayer-64m.img)" -eq 67108864 ] \
             || { echo "image is not exactly 64 MiB, which is the size the snapshotter asks for" >&2; exit 1; }
-          echo "  rwlayer-64m.img: $(file -b staging/rwlayer-64m.img)"
+          # The exact bytes patch 0005 makes containerd look for: EXT2_SUPER_MAGIC, a __le16
+          # at offset 0x38 of a superblock that starts 1024 bytes in, so 1080 absolute.
+          magic="$(dd if=staging/rwlayer-64m.img bs=1 skip=1080 count=2 status=none | od -An -tx1 | tr -d ' \n')"
+          [ "$magic" = "53ef" ] \
+            || { echo "no ext4 superblock magic at offset 1080 — containerd will refuse this image" >&2; exit 1; }
+          echo "  rwlayer-64m.img: $(file -b staging/rwlayer-64m.img), magic 53 ef at 1080"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -561,6 +593,15 @@ jobs:
             echo "starting containerd. \`mkfs.erofs.exe\` must be resolvable when containerd"
             echo "initialises, or the erofs differ returns \`ErrSkipPlugin\` and vanishes with no"
             echo "error that mentions it."
+            echo
+            echo "**These steps run unelevated. Creating a *task* does not.** containerd's"
+            echo "\`NewBundle\` symlinks unconditionally (\`core/runtime/v2/bundle.go:103\`) and"
+            echo "unprivileged Windows will not create a symlink without Developer Mode, so"
+            echo "\`ctr run\` needs an elevated daemon or a machine-wide Developer Mode. Nothing"
+            echo "below reaches that — it unpacks an image and stops. If you do run elevated,"
+            echo "give the daemon a **fresh \`--root\` it creates itself**: an elevated daemon"
+            echo "pointed at a root an unprivileged user made hands that user its content"
+            echo "store. See \`README.md\` in the artifact."
             echo
             echo "**Run unelevated, pass \`--config\`, and create \`root\`/\`state\` first.** The"
             echo "defaults fail three ways over: a normal user cannot create"
