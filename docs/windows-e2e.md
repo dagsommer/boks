@@ -664,3 +664,34 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
   this procedure. Nothing here has been run elevated end to end either.
 - **The `-info` / `plugins ls` weak-signal warning still applies.** A shim that reports its
   runtime id is a shim that parsed its flags.
+
+## Debugging a silent guest
+
+If the guest boots and says nothing, the console is the first suspect and the wrong one to
+guess at. Two things settle it without touching code.
+
+**Turn up libkrun's own console tracing.** nerdbox calls `krun_init_log` with `options = 0`,
+which builds the logger with `from_env` — so `RUST_LOG` in the *shim's* environment overrides
+the hardcoded `warn`:
+
+```
+RUST_LOG=warn,krun_devices::virtio::console=trace
+```
+
+| What appears | What it means |
+| --- | --- |
+| no `console: activate event` | the guest never set DRIVER_OK — it is not reaching virtio probe at all, so this is not a console problem |
+| activate, but no `Device is ready` | the control-queue or IRQ handshake is broken |
+| `Device is ready`, `Port ready 0`, `Starting port io for port 0`, but no `Tx` | **the console is fine.** `Starting port io` follows the guest's `PORT_OPEN(1)`, which for port 0 is sent only by `init_port_console()` — so `hvc_alloc()` ran for our port. printk is going elsewhere, or the kernel is genuinely silent |
+| `Tx … bytes` but nothing on the pipe | a host-side pipe fault; an error-level line names it, visible even at `warn` |
+
+**Do not add `earlycon=uart8250,io,0x3f8`.** It is the obvious next step and it will cost you
+the round. `PortIODeviceManager::register_devices` maps `0x3f8` only when a serial console was
+configured, and nerdbox configures none, so COM1 is unmapped. A read miss leaves the buffer
+zeroed, so LSR reads `0x00`, and `serial_putc`'s `for(;;) { if (uart_lsr_tx_empty(status))
+break; }` never terminates — the guest hangs on the first early-console character, before
+anything you were trying to see. `earlycon=uart8250,io,0x2f8` will not hang, because those
+ports get a sink, but it discards everything: liveness only. Real pre-virtio output needs
+`krun_add_serial_console_default` called first, which is the one window `hvc0` can never
+cover.
+
