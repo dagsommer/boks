@@ -1,7 +1,7 @@
 From 4bec79c47d1342db6a5aece5b08270cea5d6f3ff Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:11:42 +0200
-Subject: [PATCH 16/36] vsock: separate TSI from the guest-IPC half of the
+Subject: [PATCH 16/37] vsock: separate TSI from the guest-IPC half of the
  device
 
 virtio-vsock in this tree carries two unrelated things. TSI hijacks the guest's
@@ -611,6 +611,3 @@ index 254f4b9..a20c25e 100644
      fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
      fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
      fn push_op_request(&self) {}
--- 
-2.53.0
-

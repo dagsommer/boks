@@ -1132,11 +1132,38 @@ date -u Tue Nov 30 00:02:19 UTC 1999      (host: 2026-08-14T14:58:07Z)
 ```
 
 The monotonic clock was fixed on 2026-08-13 by publishing a real CPUID crystal; the
-**RTC** is a separate thing and is still unset. The consequence is not cosmetic: the
+**RTC** is a separate thing and was unset in this run. The consequence is not cosmetic: the
 allowed request above failed with `curl (60) SSL certificate problem: certificate is not
 yet valid`. **Every TLS handshake in a Windows guest fails this way**, so the policy
 result above is stronger than it looks — the denial was enforced, and the allowance was
 carried far enough to fail on the guest's own date rather than on policy.
+
+**Diagnosed and fixed in the libkrun series on 2026-08-14; not yet re-measured on
+hardware.** 1999-11-30T00:00:00Z is 943,920,000, which is `mktime64(2000, 0, 0, 0, 0, 0)`
+— exactly what `mach_get_cmos_time()` (arch/x86/kernel/rtc.c) computes from an all-zero
+CMOS register file, since it adds `CMOS_YEARS_OFFS` to a year of 0 and passes month 0 and
+day 0 through unvalidated. 00:02:19 is that constant plus the 139.62 s of uptime, to the
+second. The guest read its clock correctly; libkrun's CMOS device had never had a clock in
+it — `Cmos::new()` zeroed 128 bytes, filled in the two memory-size fields, and left every
+time register at zero.
+
+The device was therefore wrong on every host, not only Windows, and it stayed invisible
+because no guest read it. Linux/KVM guests are built `CONFIG_KVM_GUEST=y`, so
+`kvm_get_wallclock()` takes over `x86_platform.get_wallclock` before `timekeeping_init()`
+and the wall clock comes from the kvmclock MSR page; macOS/aarch64 guests read the PL031,
+which has always been seeded from the host clock. Under WHP there is no kvmclock, and no
+PIT, HPET or PM timer either, so CMOS is the only wall clock the partition has. Patch 37
+of the Windows series publishes the host's clock there in BCD. Because the x86_64 guest
+image is built `# CONFIG_RTC_CLASS is not set`, the guest reads that clock exactly once,
+in `timekeeping_init()` — inside `start_kernel()`, so a container that lives two seconds
+still gets a valid date — and thereafter free-runs on the TSC. Nothing re-syncs it: there
+is no `/dev/rtc`, no `hwclock` and no NTP client in the guest rootfs, and a host
+suspend/resume will not be caught.
+
+Unverified: no Windows host was available to boot it. What was tested, on the host, is
+that the register file decodes back to the host's own clock through a verbatim
+transcription of the kernel's `mktime64()`, for every date from 2000 to 2100 and for the
+live clock through the same `BusDevice` entry point the vCPU's port-I/O exit calls.
 
 Scope: `--net nat`, one sandbox, one machine. `boks rm` could not run because containerd
 was already down, so teardown is unverified in this run.
