@@ -1,0 +1,422 @@
+From 092b9eb210a5cfc133f4c2021aa2ce9247e90987 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 13:56:38 +0200
+Subject: [PATCH] fix(shim): end the Windows stdin copy no client will ever
+ close
+
+Every container with attached stdio takes a further 30.0 s to be deleted after
+its process has already exited. Measured on Windows 11, 2026-08-14, on the run
+that first carried a container end to end (`ctr tasks start`, real stdio):
+
+  12:47:08.080  reaped child process
+  12:47:38.089  level=ERROR msg="failed to shutdown io after delete"
+                error="io shutdown: context deadline exceeded"
+
+30.009 s, with the container's output already on the console. Nothing is being
+waited for that arrives.
+
+This is not the create-failure stall fixed in the previous patch. That one was
+a process that never started, whose streams the guest never attached to
+anything; the fix was to stop granting those teardowns the full drain budget.
+Here the process ran, exited, and drained: `Delete` legitimately keeps the full
+budget, and it is a different call site (`service.go`'s `Delete`, not
+`Create`'s error paths).
+
+What does not end is the *stdin* half. forwardIO's shutdown waits for two
+things (`internal/shim/task/io.go`): `ioDone`, the output copies draining, and
+`stdinDone`, the stdin copy reaching EOF and delivering its in-band
+`CloseWrite`. `ioDone` is fine -- the guest closes stdout/stderr when the
+process exits, which is exactly what the create-failure case could not do, and
+the host `Wait` handler had already blocked on it and returned. `stdinDone` is
+not: on Windows the stdin copy is `io.CopyBuffer` reading a named-pipe
+connection, and a named pipe ends only when a peer disconnects.
+
+Neither peer does.
+
+  - The shim's `stdinEOF` (called by `CloseIO`, and by teardown as a safety
+    net) only closes a `closeRequested` channel. That channel is examined
+    *between* copies and while re-dialing after a detach -- never while a read
+    is in flight, which is where the goroutine actually is.
+
+  - containerd's own client-side stdio never disconnects either. In
+    `pkg/cio/io_windows.go`, `copyIO` accepts the stdin connection inside a
+    goroutine and appends only the *listener* to the cio's closers, so
+    `cio.Close()` closes the listener and leaves the connection open; the
+    Windows cio sets no `cancel` func at all, so `cio.Cancel()` -- which
+    `task.Delete` calls before issuing the RPC -- does nothing. The connection
+    stays open, held by a goroutine blocked copying an `os.Stdin` that a
+    console never EOFs.
+
+The Unix build does not have this bug, and the asymmetry is the whole
+explanation: there `cio`'s `cancel` closes the client's own O_WRONLY FIFO
+handle, and the shim drops its matching reference in `stdinEOF`, so the FIFO
+reaches a real EOF and the copy returns. On Windows there is no second
+reference to drop and no client close to wait for. The wait can only expire.
+
+So `stdinEOF` now disconnects the client, by closing the connection the copy is
+reading (`stdinClient` in `io_copystreams_windows.go`). Deliberately the cause
+and not the symptom: shortening the ceiling would still leave a stream that
+never closes, and would still truncate the ceiling for the output drain, which
+is a wait worth its full budget.
+
+Closing it cannot truncate stdin. The copy reads in a tight loop, so it is
+blocked in a read only when the pipe's buffer is empty -- every byte written
+before EOF was requested has already been relayed to the guest. A byte racing
+the close would be one written after `CloseIO`, which the client has by then
+promised not to send. The in-band `CloseWrite` that follows is unchanged and
+still ordered after every relayed byte.
+
+Detach and re-attach are unchanged, which is the property most at risk here: a
+client disconnecting *without* `CloseIO` is still a detach, still delivers no
+EOF, and the goroutine still waits indefinitely for a new client on the same
+pipe path. Only an explicit `stdinEOF` closes anything. The one new interaction
+is the race where a redial completes just as `stdinEOF` cancels it: the fresh
+connection is closed rather than read, since reading it would block on exactly
+the connection nobody will ever end.
+
+Plain-file stdin is left alone. A file reaches EOF by itself, and closing one
+mid-copy could truncate a redirect still being read.
+
+Alongside, `io.go` now says *which* of the two waits expired. They share one
+deadline, so `context deadline exceeded` alone does not distinguish "the guest
+never closed the output streams" from "the stdin copy never ended" -- the two
+have nothing in common but the timeout, and telling them apart from a log line
+is otherwise a VM run away. The next such stall reports `io shutdown: output
+drain: ...` or `io shutdown: stdin drain: ...`. If this fix is right, the line
+does not appear at all; if the analysis above is wrong about which half stalls,
+the next run says so in one word.
+
+`TestCopyStreamsStdinEOFWithClientAttached` covers it with no VM: a client that
+writes and then holds its connection open forever, as containerd's does, and a
+`stdinDone` that must close anyway. It fails before this change and runs in the
+existing windows-latest unit-test job.
+
+Not executed. The stall was measured on hardware; the mechanism is read from
+the two sources above and the fix is compiled for windows/amd64, windows/arm64,
+linux/amd64 and linux/arm64. No VM has been booted with it, and the new test
+has not been run on Windows -- this machine cannot run Windows binaries.
+---
+ internal/shim/task/io.go                      | 47 +++++----
+ internal/shim/task/io_copystreams_windows.go  | 98 ++++++++++++++++++-
+ .../shim/task/io_copystreams_windows_test.go  | 80 +++++++++++++++
+ 3 files changed, 206 insertions(+), 19 deletions(-)
+
+diff --git a/internal/shim/task/io.go b/internal/shim/task/io.go
+index 1034bec..a0f7d3d 100644
+--- a/internal/shim/task/io.go
++++ b/internal/shim/task/io.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"crypto/rand"
+ 	"encoding/base64"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net"
+@@ -111,14 +112,19 @@ func (s *service) forwardIO(ctx context.Context, ss streamCreator, idPrefix stri
+ 		return stdio.Stdio{}, nil, nil, nil, err
+ 	}
+ 	return pio, func(ctx context.Context) error {
+-		// Release our stdin FIFO write reference (if any) unconditionally,
+-		// as a safety net for callers that tear down the process without
+-		// ever issuing CloseIO (e.g. Kill+Delete). This is idempotent: it
+-		// is a no-op if CloseIO already released it. Dropping the
+-		// reference here only allows the host-side stdin copy to reach a
+-		// real EOF once the external client has also closed its own
+-		// write end; it does not force-close anything the client still
+-		// holds open.
++		// Signal stdin EOF (if any) unconditionally, as a safety net for
++		// callers that tear down the process without ever issuing CloseIO
++		// (e.g. Kill+Delete). This is idempotent: it is a no-op if CloseIO
++		// already did it.
++		//
++		// What that costs the client differs by platform, because what a
++		// client holds open differs. On Unix it drops the host's own
++		// O_WRONLY reference on the stdin FIFO, which lets the copy reach a
++		// real EOF once the external client has closed its own write end
++		// too, and force-closes nothing. On Windows there is no second
++		// reference to drop -- a named pipe ends only when a peer
++		// disconnects -- so it disconnects the client, ending a read that
++		// would otherwise never return. See io_copystreams_windows.go.
+ 		if stdinEOF != nil {
+ 			if err := stdinEOF(); err != nil {
+ 				log.G(ctx).WithError(err).Warn("error releasing stdin during io shutdown")
+@@ -136,25 +142,30 @@ func (s *service) forwardIO(ctx context.Context, ss streamCreator, idPrefix stri
+ 			ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+ 			defer cancel()
+ 		}
+-		var err error
++		// Name which of the two waits expired. They share one deadline, so a
++		// bare context.DeadlineExceeded from here says only "something did not
++		// drain in 30 s" -- and the two have entirely different causes: ioDone
++		// is the guest failing to close the output streams, stdinDone is the
++		// host-side stdin copy failing to end. Distinguishing them from a log
++		// line costs nothing and is otherwise a VM run away.
++		var errs []error
+ 		select {
+ 		case <-ioDone:
+ 		case <-ctx.Done():
+-			err = ctx.Err()
++			errs = append(errs, fmt.Errorf("output drain: %w", ctx.Err()))
+ 		}
+ 		// Wait for the stdin copy goroutine to finish draining and send
+ 		// its in-band CloseWrite before we close the underlying stream
+-		// connection out from under it. Bounded by the same deadline as
+-		// ioDone above; if the external client never closes its own FIFO
+-		// write end, this times out and we force-close everything below,
+-		// same as the ioDone safety net.
++		// connection out from under it. The stdinEOF above is what ends
++		// that copy, so this should be a short wait; it is bounded by the
++		// same deadline as ioDone for the cases it cannot end -- a copy
++		// blocked writing to a guest that has stopped reading without
++		// closing -- where the force-close below is the only way out.
+ 		if stdinDone != nil {
+ 			select {
+ 			case <-stdinDone:
+ 			case <-ctx.Done():
+-				if err == nil {
+-					err = ctx.Err()
+-				}
++				errs = append(errs, fmt.Errorf("stdin drain: %w", ctx.Err()))
+ 			}
+ 		}
+ 		for i, c := range streams {
+@@ -162,7 +173,7 @@ func (s *service) forwardIO(ctx context.Context, ss streamCreator, idPrefix stri
+ 				c.Close()
+ 			}
+ 		}
+-		return err
++		return errors.Join(errs...)
+ 	}, ioDone, stdinEOF, nil
+ }
+ 
+diff --git a/internal/shim/task/io_copystreams_windows.go b/internal/shim/task/io_copystreams_windows.go
+index 09642b6..fedb2fa 100644
+--- a/internal/shim/task/io_copystreams_windows.go
++++ b/internal/shim/task/io_copystreams_windows.go
+@@ -65,6 +65,77 @@ func (w *writeErrRecorder) Write(p []byte) (int, error) {
+ 	return n, err
+ }
+ 
++// stdinClient tracks the client-side stdin connection the copy goroutine is
++// currently reading from, so that stdinEOF can end a read that is already in
++// flight.
++//
++// Nothing else can end it. Unlike a POSIX FIFO -- where the host holds its own
++// O_WRONLY reference and dropping it lets the FIFO reach EOF -- a named pipe
++// connection ends only when the peer disconnects, and containerd's client-side
++// stdio never disconnects this one: pkg/cio/io_windows.go's copyIO leaves the
++// accepted connection out of the cio's closers (only the *listener* is closed by
++// Close) and its cio has no cancel func at all, so the connection stays open,
++// held by a goroutine blocked copying an os.Stdin that a console never EOFs.
++// The Unix build's cio does close its stdin FIFO handle in cancel, which is why
++// this only bites on Windows.
++//
++// Closing the connection cannot truncate stdin. The copy goroutine reads in a
++// tight loop, so it is blocked in a read only when the pipe's buffer is empty:
++// every byte the client wrote before it declared stdin finished has already been
++// relayed to the guest. A byte racing the close would be one written after
++// CloseIO, which the client has by then promised not to send.
++type stdinClient struct {
++	mu sync.Mutex
++	// conn is the connection currently being read, nil between a client
++	// disconnecting and the next one attaching.
++	conn io.Closer
++	// eof records that stdinEOF has been called, so a connection attached
++	// after it is closed rather than read.
++	eof bool
++	// closed records that requestEOF actually closed a connection, which is
++	// what distinguishes "the read ended because we ended it" from a real
++	// error worth logging.
++	closed bool
++}
++
++// requestEOF records that no further stdin will be relayed and ends any read in
++// flight by closing the connection under it. Idempotent: go-winio's Close is,
++// and the flags only ever move one way.
++func (c *stdinClient) requestEOF() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.eof = true
++	if c.conn != nil {
++		c.conn.Close()
++		c.conn = nil
++		c.closed = true
++	}
++}
++
++// attach makes conn the connection to read next, reporting false -- and closing
++// conn -- if stdinEOF has already fired. Without that check a redial that
++// completed just as stdinEOF cancelled it would hand the loop a fresh connection
++// to block on forever, which is the stall this type exists to end.
++func (c *stdinClient) attach(conn io.Closer) bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.eof {
++		conn.Close()
++		c.closed = true
++		return false
++	}
++	c.conn = conn
++	return true
++}
++
++// endedByEOF reports whether requestEOF closed a connection, i.e. whether the
++// copy error the caller is holding is one we caused.
++func (c *stdinClient) endedByEOF() bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.closed
++}
++
+ // copyStreams returns a stdinEOF function and a stdinDone channel for the
+ // stdin pipe (both nil when stdin is empty).
+ //
+@@ -88,6 +159,14 @@ func (w *writeErrRecorder) Write(p []byte) (int, error) {
+ // disconnect (or the current one, if it already happened) deliver EOF to
+ // the guest via CloseWrite.
+ //
++// stdinEOF also disconnects the client itself, by closing the connection
++// the copy is reading (stdinClient). That is not an optimisation: on this
++// platform it is the only thing that can end the read at all, because
++// containerd's client never closes its end of the stdin pipe. Without it a
++// container with attached stdio takes the full ioShutdown ceiling -- 30 s,
++// measured on Windows 11, 2026-08-14 -- to be deleted after its process has
++// already been reaped and its output already relayed.
++//
+ // Reconnecting is only correct when the copy ended because the client
+ // went away. If it ended because writing to the guest-facing stream
+ // failed, the loop stops instead -- see writeErrRecorder.
+@@ -213,8 +292,18 @@ func copyStreams(ctx context.Context, streams [3]io.ReadWriteCloser, stdin, stdo
+ 		// the guest instead of waiting for a new client to reconnect.
+ 		closeRequested := make(chan struct{})
+ 		var closeOnce sync.Once
++		// client holds the connection the copy goroutine is reading, so
++		// stdinEOF can end a read that is already in flight. Only named
++		// pipes are tracked: a plain file always reaches EOF on its own,
++		// and closing one mid-copy could truncate a stdin redirect that is
++		// still being read.
++		client := &stdinClient{}
++		if namedPipe {
++			client.attach(f)
++		}
+ 		stdinEOF = func() error {
+ 			closeOnce.Do(func() { close(closeRequested) })
++			client.requestEOF()
+ 			return nil
+ 		}
+ 
+@@ -234,7 +323,7 @@ func copyStreams(ctx context.Context, streams [3]io.ReadWriteCloser, stdin, stdo
+ 				// what unblocks this read, so every byte buffered before
+ 				// EOF is forwarded before we either reconnect or deliver
+ 				// the in-band CloseWrite below.
+-				if _, err := io.CopyBuffer(w, f, *p); err != nil {
++				if _, err := io.CopyBuffer(w, f, *p); err != nil && !client.endedByEOF() {
+ 					log.G(ctx).WithError(err).Warn("error copying stdin")
+ 				}
+ 				f.Close()
+@@ -284,6 +373,13 @@ func copyStreams(ctx context.Context, streams [3]io.ReadWriteCloser, stdin, stdo
+ 					}
+ 					break readLoop
+ 				}
++				// The dial and stdinEOF can complete in either order.
++				// If stdinEOF won, the new client is closed rather than
++				// read: reading it would block on a connection nothing
++				// will ever end.
++				if !client.attach(conn) {
++					break readLoop
++				}
+ 				f = conn
+ 			}
+ 
+diff --git a/internal/shim/task/io_copystreams_windows_test.go b/internal/shim/task/io_copystreams_windows_test.go
+index b957f0b..90ffb7a 100644
+--- a/internal/shim/task/io_copystreams_windows_test.go
++++ b/internal/shim/task/io_copystreams_windows_test.go
+@@ -180,6 +180,86 @@ func TestCopyStreamsStdinDetachReattach(t *testing.T) {
+ 	require.Equal(t, "firstsecond", data, "expected data from both the pre-detach and post-reattach writers")
+ }
+ 
++// TestCopyStreamsStdinEOFWithClientAttached is the regression test for the
++// 30 s teardown stall measured on Windows 11 on 2026-08-14: every container
++// with attached stdio took the full ioShutdown ceiling to be deleted, long
++// after its process had been reaped and its output relayed.
++//
++// The client here behaves exactly as containerd's own client-side stdio does
++// (pkg/cio/io_windows.go): it accepts the stdin connection, writes, and then
++// keeps the connection open forever, because its copy goroutine is blocked on
++// an os.Stdin that a console never EOFs and nothing in cio's Close or Cancel
++// touches the accepted connection. Nothing but stdinEOF can end the shim's
++// read of that connection, so if stdinEOF does not close it, stdinDone never
++// closes and forwardIO's shutdown waits its whole budget.
++//
++// It also pins the ordering that makes closing safe: bytes written before
++// stdinEOF must already have been relayed to the guest.
++func TestCopyStreamsStdinEOFWithClientAttached(t *testing.T) {
++	pipePath := testPipeName(t)
++	l, err := winio.ListenPipe(pipePath, &winio.PipeConfig{
++		InputBufferSize:  4096,
++		OutputBufferSize: 4096,
++	})
++	require.NoError(t, err, "ListenPipe")
++	defer l.Close()
++
++	accepted := make(chan error, 1)
++	// hold keeps the client's end of the pipe open until the test is over,
++	// the way containerd's cio holds its own for the life of the process.
++	hold := make(chan struct{})
++	t.Cleanup(func() { close(hold) })
++	go func() {
++		conn, err := l.Accept()
++		if err != nil {
++			accepted <- fmt.Errorf("accept: %w", err)
++			return
++		}
++		// Deliberately never closed: this is the client that hangs on to
++		// its end of the pipe for the life of the process.
++		defer conn.Close()
++		if _, err := conn.Write([]byte("hello")); err != nil {
++			accepted <- fmt.Errorf("write: %w", err)
++			return
++		}
++		accepted <- nil
++		<-hold
++	}()
++
++	sc := newFakeStdinStream()
++	streams := [3]io.ReadWriteCloser{sc, nil, nil}
++	ioDone := make(chan struct{})
++
++	stdinEOF, stdinDone, err := copyStreams(context.Background(), streams, pipePath, "", "", ioDone)
++	require.NoError(t, err, "copyStreams")
++	require.NoError(t, <-accepted, "writer")
++
++	// Wait for the write to be relayed, so the copy goroutine is parked in
++	// a read on a connection that will never end by itself -- the exact
++	// state the stall was measured in.
++	require.Eventually(t, func() bool {
++		data, _ := sc.snapshot()
++		return data == "hello"
++	}, 5*time.Second, 10*time.Millisecond, "expected the client's write to be relayed to the guest")
++
++	if _, eof := sc.snapshot(); eof {
++		t.Fatal("stdin EOF (CloseWrite) delivered before stdinEOF was called")
++	}
++
++	require.NoError(t, stdinEOF())
++
++	select {
++	case <-stdinDone:
++	case <-time.After(5 * time.Second):
++		t.Fatal("stdinDone did not close after stdinEOF while a client was still attached; " +
++			"the shim is waiting for a disconnect that will never come")
++	}
++
++	data, eof := sc.snapshot()
++	require.True(t, eof, "expected CloseWrite to have been called after stdinEOF")
++	require.Equal(t, "hello", data, "bytes written before stdinEOF must be relayed, not truncated by the close")
++}
++
+ // TestCopyStreamsStdinCloseWithoutDetach verifies the simple case (no
+ // detach involved): a single client writes and disconnects, then stdinEOF
+ // is called; the guest-facing stream must have received the data and EOF.
