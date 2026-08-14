@@ -75,14 +75,37 @@ the tool is absent, so the failure only appears when an image is unpacked.
 apt install erofs-utils      # or: brew install erofs-utils
 ```
 
-Version matters and `doctor` does not check it: containerd's EROFS snapshotter needs **1.8 or
-later**, and Ubuntu 24.04 LTS ships 1.7.1.
+### `snapshotter tools` fails with `mkfs.erofs 1.7.1 is older than 1.8`
 
-### `hypervisor library` warns but everything works
+containerd's EROFS snapshotter needs **1.8 or later**, and Ubuntu 24.04 LTS ships 1.7.1.
+The tool being present is not enough: an older one runs, and the pull still breaks while
+the layer is unpacked. `doctor` reads `mkfs.erofs -V` and fails on a version below the
+minimum; a version it cannot parse is a warning, not a verdict.
 
-`doctor` stats the usual locations for `libkrun` and does not parse the dynamic loader's
-configuration. If libkrun is installed somewhere else on the loader's search path, the
-warning is harmless. The check never fails for this reason.
+Install a newer `erofs-utils` from backports, from a later release, or from
+[source](https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git).
+
+### `hypervisor library` warns
+
+`doctor` searches for libkrun exactly the way the nerdbox shim does, because that is the
+only search that decides whether a VM boots: the shim stats `libkrun-<arch>.so` then
+`libkrun.so` (on macOS the `.dylib` and `-efi` spellings) in each `PATH` entry, then in
+`LIBKRUN_PATH` — or, when that is unset, in `/usr/local/lib`, `/usr/local/lib64`,
+`/usr/lib` and `/lib`, plus `/opt/homebrew/lib` on macOS. It then `dlopen`s that exact
+path, so the loader's configuration and the library's SONAME never enter into it.
+
+Two consequences are worth knowing:
+
+- **`libkrun.so.1` alone is not enough.** A soname-versioned file is never stat-ed by the
+  shim. `doctor` reports it as a near miss with the symlink that fixes it, rather than as
+  `ok` — which is what it used to say, on hosts that then failed at VM boot.
+- **A multiarch directory is not searched.** `libkrun.so` in `/usr/lib/x86_64-linux-gnu` is
+  invisible to the shim. Symlink it into `/usr/lib`, or set `LIBKRUN_PATH`.
+
+The check warns rather than fails, and always will: `PATH` and `LIBKRUN_PATH` are read from
+**containerd's** environment, which `doctor` cannot see. If libkrun is somewhere the daemon's
+environment covers, the warning is harmless. Note that setting `LIBKRUN_PATH` *replaces* the
+default directories rather than adding to them.
 
 ---
 

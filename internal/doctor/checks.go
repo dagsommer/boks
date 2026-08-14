@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -45,9 +46,10 @@ func containerdFailure(address string, err error) Result {
 	res := Result{Status: StatusFail, Detail: "unreachable at " + address}
 
 	if _, statErr := os.Stat(address); errors.Is(statErr, fs.ErrNotExist) {
-		res.Remedy = fmt.Sprintf("No containerd socket at %s.\n"+
+		res.Remedy = fmt.Sprintf("No containerd %s at %s.\n"+
 			"Install and start containerd, or point Boks elsewhere with\n"+
-			"--containerd-address / BOKS_CONTAINERD_ADDRESS.", address)
+			"--containerd-address / BOKS_CONTAINERD_ADDRESS.",
+			containerdEndpointNoun(address), address)
 		return res
 	}
 	if errors.Is(err, fs.ErrPermission) || strings.Contains(err.Error(), "permission denied") {
@@ -58,6 +60,19 @@ func containerdFailure(address string, err error) Result {
 	}
 	res.Remedy = fmt.Sprintf("Could not talk to containerd at %s: %v", address, err)
 	return res
+}
+
+// containerdEndpointNoun names what the address is, so that the message does not call a
+// Windows named pipe a socket. containerd's default address there is
+// \\.\pipe\containerd-containerd; on Linux and macOS it is a Unix socket path.
+func containerdEndpointNoun(address string) string {
+	normalised := strings.ToLower(address)
+	normalised = strings.TrimPrefix(normalised, "npipe://")
+	normalised = strings.ReplaceAll(normalised, "/", `\`)
+	if strings.HasPrefix(normalised, `\\.\pipe\`) {
+		return "named pipe"
+	}
+	return "socket"
 }
 
 // snapshotterCheck confirms the snapshotter the VM runtime needs is present and usable.
@@ -101,12 +116,21 @@ func snapshotterCheck() Check {
 	}
 }
 
-// snapshotterToolsCheck looks for the host binaries a snapshotter shells out to.
+// snapshotterToolsCheck looks for the host binaries a snapshotter shells out to, and checks
+// that they are new enough.
 //
 // containerd reports the erofs snapshotter as initialised even when mkfs.erofs is absent;
 // the failure only appears when an image is unpacked, as an opaque exec error deep in a
-// pull. Checking up front turns that into an actionable message.
+// pull. Checking up front turns that into an actionable message. A too-old mkfs.erofs fails
+// the same way and just as late, so presence alone is not enough to report "ok".
 func snapshotterToolsCheck() Check {
+	return snapshotterToolsCheckWith(runVersionProbe)
+}
+
+// snapshotterToolsCheckWith takes the version probe as a parameter so the version rules can
+// be tested against constructed output rather than against whatever erofs-utils the machine
+// running the tests happens to have.
+func snapshotterToolsCheckWith(probe versionProbe) Check {
 	return Check{
 		Name: "snapshotter tools",
 		Run: func(ctx context.Context, env Env) Result {
@@ -115,14 +139,16 @@ func snapshotterToolsCheck() Check {
 				return Result{Status: StatusSkip, Detail: "no host tools needed for " + env.Snapshotter}
 			}
 			var missing []string
-			var found []string
+			found := map[string]string{}
+			var paths []string
 			for _, binary := range required {
 				path, err := exec.LookPath(binary)
 				if err != nil {
 					missing = append(missing, binary)
 					continue
 				}
-				found = append(found, path)
+				found[binary] = path
+				paths = append(paths, path)
 			}
 			if len(missing) > 0 {
 				return Result{
@@ -134,7 +160,18 @@ func snapshotterToolsCheck() Check {
 						env.Snapshotter, strings.Join(missing, " and ")),
 				}
 			}
-			return Result{Status: StatusOK, Detail: strings.Join(found, ", ")}
+
+			if path, ok := found["mkfs.erofs"]; ok {
+				res := erofsVersionResult(ctx, path, probe)
+				if res.Status != StatusOK {
+					return res
+				}
+				return Result{
+					Status: StatusOK,
+					Detail: fmt.Sprintf("%s (erofs-utils %s)", strings.Join(paths, ", "), res.Detail),
+				}
+			}
+			return Result{Status: StatusOK, Detail: strings.Join(paths, ", ")}
 		},
 	}
 }
@@ -183,42 +220,87 @@ func runtimeShimCheck() Check {
 // hypervisorLibraryCheck looks for libkrun, the VMM the shim links against. The shim can be
 // installed without it, and the resulting failure at VM boot is opaque, so it is worth
 // reporting separately.
+//
+// It searches exactly the way the shim does — see libkrun.go — because anything else answers
+// a different question. This check used to stat a list of prefixes of its own invention, and
+// was wrong in both directions: it accepted libkrun.so.1, a name the shim never stats, and so
+// gave a clean bill of health to a host that would fail at VM boot; and it never looked at
+// PATH or LIBKRUN_PATH, so a libkrun the shim *would* load was reported missing.
 func hypervisorLibraryCheck() Check {
 	return Check{
 		Name: "hypervisor library",
 		Run: func(ctx context.Context, env Env) Result {
-			names := hypervisorLibraryNames()
-			if len(names) == 0 {
-				return Result{Status: StatusSkip, Detail: "not applicable on this platform"}
-			}
-			for _, dir := range hypervisorLibrarySearchPaths() {
-				for _, name := range names {
-					candidate := filepath.Join(dir, name)
-					if _, err := os.Stat(candidate); err == nil {
-						return Result{Status: StatusOK, Detail: candidate}
-					}
-				}
-			}
-			return Result{
-				Status: StatusWarn,
-				Detail: names[0] + " not found",
-				Remedy: fmt.Sprintf("Could not find %s in the usual locations.\n"+
-					"The VM runtime links against libkrun (>= 1.18) to boot microVMs.\n"+
-					"If it is installed elsewhere on the loader's search path this warning\n"+
-					"is harmless; Boks does not parse the dynamic loader configuration.",
-					strings.Join(names, " or ")),
-			}
+			return hypervisorLibraryResult(runtime.GOOS, runtime.GOARCH, os.Getenv, hostLibraryFS())
 		},
 	}
 }
 
-// splitList splits a PATH-style list, dropping empty entries.
-func splitList(value string) []string {
-	var out []string
-	for _, part := range filepath.SplitList(value) {
-		if part != "" {
-			out = append(out, part)
+func hypervisorLibraryResult(goos, goarch string, getenv func(string) string, fsys libraryFS) Result {
+	if goos != "linux" && goos != "darwin" {
+		// Windows and everything else: the platform check already says why sandboxes
+		// cannot start there, and a libkrun verdict on top of it would be noise about a
+		// backend that does not exist yet. See virt_windows.go.
+		return Result{Status: StatusSkip, Detail: "not applicable on this platform"}
+	}
+
+	names := nerdboxLibraryNames(goos, goarch)
+	scan := scanForHypervisorLibrary(goos, goarch, getenv, fsys)
+	if scan.Loadable != "" {
+		return Result{Status: StatusOK, Detail: scan.Loadable}
+	}
+
+	// A miss is a warning rather than a failure for one reason: the search depends on
+	// PATH and LIBKRUN_PATH, and the values that decide the outcome are containerd's, not
+	// this shell's. doctor cannot read the daemon's environment, so it cannot prove the
+	// shim will come up empty.
+	const howItSearches = "The shim looks for\n  %s\n" +
+		"in each PATH entry, then in LIBKRUN_PATH — or, when that is unset, in\n%s.\n" +
+		"It opens the full path it built itself, so ld.so.conf and the SONAME do\n" +
+		"not enter into it.\n"
+	defaultDirs := "/usr/local/lib, /usr/local/lib64, /usr/lib and /lib"
+	if goos == "darwin" {
+		defaultDirs = "/usr/local/lib, /usr/local/lib64, /usr/lib, /lib and /opt/homebrew/lib"
+	}
+	searchText := fmt.Sprintf(howItSearches, strings.Join(names, ", "), defaultDirs)
+	envCaveat := "Both variables are read from containerd's environment, since containerd spawns\n" +
+		"the shim, and setting LIBKRUN_PATH replaces the defaults above rather than adding\n" +
+		"to them. If libkrun is already somewhere the daemon's PATH or LIBKRUN_PATH covers,\n" +
+		"this warning is harmless."
+
+	if len(scan.NearMisses) > 0 {
+		// A host can have a whole shelf of these; list enough to recognise the shape of
+		// the problem and say how many were left out rather than filling the screen.
+		const listed = 4
+		var lines []string
+		for i, miss := range scan.NearMisses {
+			if i == listed {
+				lines = append(lines, fmt.Sprintf("  … and %d more",
+					len(scan.NearMisses)-listed))
+				break
+			}
+			lines = append(lines, fmt.Sprintf("  %s\n    %s", miss.Path, miss.Reason))
+		}
+		fix := fmt.Sprintf("Point LIBKRUN_PATH at %s.\n",
+			filepath.Dir(scan.NearMisses[0].Path))
+		if target := scan.NearMisses[0].SymlinkTarget; target != "" {
+			fix = fmt.Sprintf("Give it a name and a directory the shim uses — a symlink is enough:\n"+
+				"  sudo ln -s %s %s\n"+
+				"or point LIBKRUN_PATH at %s.\n",
+				scan.NearMisses[0].Path, target, filepath.Dir(scan.NearMisses[0].Path))
+		}
+		return Result{
+			Status: StatusWarn,
+			Detail: "found " + scan.NearMisses[0].Path + ", which the shim will not load",
+			Remedy: fmt.Sprintf("libkrun is on this host, where the VM runtime will not load it from:\n%s\n%s\n%s%s",
+				strings.Join(lines, "\n"), searchText, fix, envCaveat),
 		}
 	}
-	return out
+
+	return Result{
+		Status: StatusWarn,
+		Detail: canonicalLibraryName(goos) + " not found where the shim looks",
+		Remedy: fmt.Sprintf("Could not find libkrun anywhere the VM runtime looks.\n%s"+
+			"Install libkrun (>= 1.18) into one of those directories.\n%s",
+			searchText, envCaveat),
+	}
 }
