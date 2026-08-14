@@ -254,6 +254,128 @@ entirely possible to have the snapshotter present and the differ missing, which 
 confusing half-state the test commands below are designed to detect.
 
 
+## Elevation, Developer Mode, and the choice you actually have
+
+**This page used to tell you to run everything unelevated, full stop. That was wrong for
+anything that creates a task**, and the first end-to-end run on Windows 11 found out where.
+
+The line is not between "containerd" and "Boks". It is between **unpacking an image** and
+**running a container**:
+
+| What you are doing | Unelevated, no Developer Mode |
+| --- | --- |
+| everything in "Testing it on Windows" below — `plugins ls`, `images pull`, checking EROFS blobs | **works.** Measured, 2026-08-14. No task bundle is created, so nothing below is reached |
+| `ctr run`, `ctr tasks start`, or anything Boks does with a sandbox | **fails**, in containerd, before the shim is launched |
+
+### Why
+
+`core/runtime/v2/bundle.go:103`, in `NewBundle`, for **every task bundle**, unconditionally:
+
+```go
+// symlink workdir
+if err := os.Symlink(work, filepath.Join(b.Path, "work")); err != nil {
+    return nil, err
+}
+```
+
+Creating a symlink on Windows requires `SeCreateSymbolicLinkPrivilege`, which an ordinary user
+does not hold. Go already does the one thing that can help — `os/file_windows.go:371` passes
+`SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, and retries without it if that fails — but
+**Windows honours that flag only when Developer Mode is on.** Measured on the test machine:
+
+```
+New-Item -ItemType SymbolicLink   ->  "Administrator privilege required"
+mklink /J  (a junction)           ->  succeeds
+```
+
+### The junction workaround does not transfer, and it is worth saying why
+
+The root-ACL problem below is fixed by *pre-creating* a directory, because
+`MkdirAllWithACL` returns early on a path that already exists. Nothing equivalent is available
+here. The link has to appear at `b.Path\work`, and `b.Path` is created by containerd itself two
+dozen lines earlier:
+
+```go
+// bundle.go:74
+if err := os.Mkdir(b.Path, 0700); err != nil {
+    return nil, err
+}
+```
+
+`os.Mkdir`, not `MkdirAll`, and the error is returned with no `IsExist` tolerance — so `b.Path`
+**must not exist** when `NewBundle` runs. There is no moment at which you could put a junction
+inside it. That the target is a directory, and so junction-shaped, does not matter; there is
+nowhere to stand.
+
+### The three options, and what each costs
+
+**1. Run `containerd.exe` elevated.** Administrators hold `SeCreateSymbolicLinkPrivilege` by
+default, so `NewBundle` succeeds. Cost: the daemon, every shim it spawns and every VM those
+shims start run with an administrator's token. For a machine you are testing on, that is a
+defensible trade; for anything else, weigh it. **Read the security note below before doing
+this** — it changes how `--root` must be created, and getting that wrong is an escalation.
+*(That elevation makes the symlink succeed is inferred from Windows' default privilege
+assignment plus the failure measured unelevated; nobody has watched containerd create a task
+bundle elevated.)*
+
+**2. Turn on Developer Mode** (Settings → System → For developers). Cost, stated plainly
+because it is easy to wave through: Developer Mode is **machine-wide and grants unprivileged
+symlink creation to every process run by every user on that machine**, not to containerd and
+not to you. It is not scoped to an application, a directory or a session. It also switches on
+other developer features you did not ask for.
+
+On a **corporate-managed machine this may not be your decision at all.** It is commonly
+disabled by policy (`AllowDevelopmentWithoutDevLicense`), and the toggle may be greyed out or
+silently revert. If your machine is managed, ask before flipping it rather than after — and
+note that this document is in no position to tell you it is fine, because whether it is
+depends on a policy we cannot see.
+
+**3. Neither.** Perfectly reasonable, and it is what the test procedure below assumes. You get
+the whole unpack path — which is the part of this bundle that has actually been proven to work
+on Windows — and you do not get a running container.
+
+There is no fourth option that Boks can supply. A patch making the symlink optional would be a
+change to containerd's bundle layout, affecting `work` resolution on every platform, and it is
+not obviously right: the symlink exists so that a bundle under `--state` can find its working
+directory under `--root`. If containerd upstream wants a Windows answer, a junction created
+with `CreateDirectory` + a reparse point, or simply recording the path in a file, would both
+work — but that is upstream's design call, not something to fork here.
+
+### If you do run elevated: `--root` must be created by the elevated daemon
+
+**Do not point an elevated containerd at a `--root` that an unprivileged user created.** This
+is the one thing in this section that is a security boundary rather than a convenience.
+
+`MkdirAllWithACL` applies its protected DACL only to path components **it** creates, and
+returns early on anything that already exists (see the next section for the exact mechanism).
+So a root pre-created by an ordinary user keeps that user's inherited permissions, and the
+elevated daemon then fills it with the content store, the snapshotters' root filesystems and
+the bolt metadata database — all writable by that unprivileged user. They can put a binary into
+a layer a later container executes, or repoint an image's metadata at content they control,
+against a daemon running as an administrator. That is precisely the escalation the `P`
+(PROTECTED) in containerd's SDDL exists to prevent, reached by a different route.
+
+Elevated, you do not need to pre-create anything: `MkdirAllWithACL` succeeds and the ACL it
+writes names `Administrators` and `SYSTEM`, which is what the daemon is. Just start it.
+
+**`new-containerd-root.ps1` is for the unelevated case only.** Its whole job is to hand you a
+root you can write to without the ACL, and that is exactly the wrong shape for a privileged
+daemon. If you switch to running elevated, use a *different* root directory that the elevated
+daemon creates for itself — not the one the script made, which an unprivileged account still
+owns.
+
+### The `opt` and `cri` plugin failures were not unrelated
+
+Unelevated, `ctr plugins ls` shows two failures — `io.containerd.internal.v1.opt` and `cri` —
+and this project described them as known and unrelated. **Elevated, both disappear.** They were
+artefacts of running unelevated, not independent problems.
+
+That is consistent with what they want: `opt` and `cri` default to paths under
+`%ProgramData%\containerd` and `C:\Program Files\containerd`, neither of which an ordinary user
+can create — the same root cause as the `--root` problem below, arriving at two more plugins.
+Neither cascades either way, so it changes no advice; it changes what "two known unrelated
+failures" means, which was simply not true.
+
 ## The root directory must exist first
 
 **Create `root` and `state` before starting `containerd.exe`.** This is a hard prerequisite,
@@ -417,7 +539,7 @@ write there. The difference is **who decides, and how long the decision lasts.**
    permissions land on one test root on one desktop, put there deliberately. A patched binary
    applies the same relaxation on every host it is ever run on, including hosts where the root
    is later reused by a service.
-4. **We would have to carry it, and argue for it.** The other three patches in `patches/` are
+4. **We would have to carry it, and argue for it.** The other four patches in `patches/` are
    things we want upstream and expect containerd to take. "Relax a deliberate security control
    so our test setup needs one command fewer" is not that, and Boks — whose entire premise is
    isolation — is a bad place for it to originate.
@@ -439,7 +561,12 @@ ext4 image that only matters when you go on to *run* a container, and
 [`docs/windows-e2e.md`](../../docs/windows-e2e.md) explains why it has to be made on Linux.
 
 **Run all of this unelevated, pass the config, and create the directories first.** All three
-matter, and each one costs you a run if you skip it:
+matter, and each one costs you a run if you skip it.
+
+Unelevated is correct **for this test**, and only because none of it creates a task: the
+symlink in `NewBundle` that unprivileged Windows refuses is never reached. If you go on to
+`ctr run`, read "Elevation, Developer Mode, and the choice you actually have" above first — and
+if you decide to run elevated, do **not** reuse the `--root` that step 0 creates here.
 
 - **Create `root` and `state` before starting containerd** — `.\new-containerd-root.ps1`. See
   "The root directory must exist first" above for the failure this avoids and why the fix is

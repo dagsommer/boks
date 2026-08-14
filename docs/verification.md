@@ -882,12 +882,11 @@ A diagnostic improved on the way. A missing `mkfs.erofs.exe` used to surface as
 was confirmed accidentally when the tester restarted the daemon without the bundle on
 `PATH`.
 
-### What has to happen next, and two obstacles found by reading
+### What has to happen next: two obstacles found by reading, and two by running
 
 Unpacking an image is not running one. The procedure for the first `ctr run` on Windows is
 [windows-e2e.md](windows-e2e.md); it was written from the sources of containerd v2.3.3 and
-nerdbox `cd2c23f`, **none of it has been executed**, and it found two more containerd-side
-obstacles before anyone tried:
+nerdbox `cd2c23f`, and it found two containerd-side obstacles before anyone tried:
 
 - **`ctr run` on Windows cannot produce a Linux OCI spec.** It chooses the spec's platform
   from the snapshotter name alone, and only `windows-lcow` means Linux; the `--platform`
@@ -900,8 +899,54 @@ obstacles before anyone tried:
   `mkfs/ext4`; that type is not in nerdbox's `runtime-allow-mounts`, so containerd's own
   mount manager handles it by exec'ing `mkfs.ext4`. nerdbox tells macOS users to
   `brew install e2fsprogs` for exactly this. containerd skips formatting when the target
-  file already exists, so the bundle now ships a pre-formatted `rwlayer-64m.img`. That is a
-  workaround, and it is labelled as one.
+  image is already formatted, so the bundle ships a pre-formatted `rwlayer-64m.img`. That is
+  a workaround, and it is labelled as one.
+
+**Running it found two more, 2026-08-14.** Neither was visible by reading, and one of them
+would have corrupted silently.
+
+**containerd left a half-made image behind and then trusted it.** `core/mount/manager/mkfs.go`
+decided an image was formatted by calling `Stat` on it, with `// Check magic number` where the
+check belonged. The format path creates and truncates the file *before* running mkfs, so the
+guaranteed `mkfs.ext4` failure above left 67,108,864 bytes of zeroes that the next attempt
+accepted on sight:
+
+```
+snapshots\3\rwlayer.img   exists: True   size: 67,108,864
+ext4 magic @1080 : 0x0000        (a real ext4 superblock is 0xEF53)
+```
+
+Nothing was actually mounted, and only because the next thing the tester did was overwrite that
+file with the pre-formatted one. The other order hands the guest a filesystem that is not there.
+`packaging/containerd-windows/patches/0005` reads the magic before believing a file, refuses one
+that fails the check without touching it, and deletes one it created and could not format. The
+pre-formatted-image workflow is unaffected: `rwlayer-64m.img` carries a real superblock.
+
+**Windows genuinely requires elevation or Developer Mode, and this repository said otherwise.**
+`core/runtime/v2/bundle.go:103` does `os.Symlink` unconditionally in `NewBundle`, for every task
+bundle. Unprivileged Windows will not create a symlink without `SeCreateSymbolicLinkPrivilege`;
+Go already passes `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, which Windows honours only
+under Developer Mode. Measured: `New-Item -ItemType SymbolicLink` → *"Administrator privilege
+required"*, while `mklink /J` succeeds. The junction workaround used for the root-ACL blocker
+does not transfer — the link must land inside `b.Path`, and `b.Path` must not pre-exist
+(`os.Mkdir` at `bundle.go:74`, error returned unconditionally), so there is no moment to place
+one.
+
+So the honest position: **unpacking an image works as an ordinary user; creating a task does
+not.** The options are an elevated daemon, machine-wide Developer Mode, or neither — with the
+costs of each, including that Developer Mode grants unprivileged symlink creation to every
+process on the machine and may not be the user's decision on a managed one, set out in
+`packaging/containerd-windows/README.md`. If containerd is run elevated, its `--root` must be
+created by the elevated daemon itself: pointing it at a root an unprivileged user pre-created
+hands that user full control over a privileged daemon's content store, which is the escalation
+the protected DACL above exists to prevent, reached from the other side.
+`new-containerd-root.ps1` is therefore for the unelevated case only.
+
+**And the two "known unrelated" plugin failures were neither.** `io.containerd.internal.v1.opt`
+and `cri` failed unelevated and **disappear elevated** — they wanted directories under
+`%ProgramData%` and `C:\Program Files`, the same root cause as the `--root` problem above.
+Neither cascades, so no advice changes; what changes is that "unrelated" was wrong, and it is
+the kind of wrong that stops you looking.
 
 ### What was proven on the machine with no hypervisor
 

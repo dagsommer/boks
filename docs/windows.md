@@ -63,6 +63,17 @@ That is Boks' architecture, on Windows, in a shipping product. So the question "
 userspace process terminate and judge a guest's every packet on Windows" is answered *yes*, by
 demonstration.
 
+> **"No administrator rights" is true of `sbx`, and is not yet true of the Boks stack.** That
+> bullet is about the reference product's installer and its enforcement design, both verified
+> from its shipped binaries, and neither is contradicted by anything below. But do not read it
+> as a claim about what Boks needs today. On the first end-to-end run on Windows 11,
+> **containerd could not create a task bundle unelevated**: `core/runtime/v2/bundle.go:103`
+> symlinks unconditionally in `NewBundle`, and unprivileged Windows will not create a symlink
+> without Developer Mode. Unpacking an image works fine as an ordinary user; running a
+> container needs an elevated daemon or a machine-wide Developer Mode. That is a real parity
+> gap against `sbx`, it is containerd's rather than Boks', and it is documented with its costs
+> in `packaging/containerd-windows/README.md` and `docs/windows-e2e.md`.
+
 | Half | Status |
 |---|---|
 | A Linux microVM per sandbox on Windows, driven through containerd | **Already upstream.** `containerd/nerdbox` builds its shim for `windows/amd64` and `windows/arm64` and loads a VMM DLL named `krun.dll`. |
