@@ -17,7 +17,7 @@ written in.
 | **Guide** | [get-started.md](get-started.md), [install.md](install.md), [walkthrough.md](walkthrough.md), [usage.md](usage.md), [agents.md](agents.md) |
 | **Reference** | [architecture.md](architecture.md), [security-model.md](security-model.md), [cli.md](cli.md), [troubleshooting.md](troubleshooting.md), [faq.md](faq.md) |
 | **Project** | [roadmap.md](roadmap.md), [release-notes.md](release-notes.md) |
-| **Engineering record** (repo only) | [verification.md](verification.md), [docker-sandbox-parity.md](docker-sandbox-parity.md), [windows.md](windows.md), [upstream-libkrun-virtio-net.md](upstream-libkrun-virtio-net.md) |
+| **Engineering record** (repo only) | [verification.md](verification.md), [docker-sandbox-parity.md](docker-sandbox-parity.md), [windows.md](windows.md), [windows-e2e.md](windows-e2e.md), [upstream-libkrun-virtio-net.md](upstream-libkrun-virtio-net.md) |
 
 The first three groups are the site: the pages a *user* of Boks needs. The engineering
 record stays in the repository for contributors and is deliberately not published — the

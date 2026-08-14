@@ -162,7 +162,10 @@ container's upper directory back into an EROFS blob will fail on Windows. Pullin
 does not go through it.
 
 **Unknown — running a container.** Actually mounting the result is nerdbox's and the guest's
-problem, not containerd's, and none of it has been tried.
+problem, not containerd's, and none of it has been tried. `docs/windows-e2e.md` is the procedure
+for trying it, and it turned up two more containerd-side obstacles by reading: the OCI spec's
+platform (patch `0004` above) and the writable layer, which the erofs snapshotter asks containerd
+to format with `mkfs.ext4` — a binary that does not exist on Windows.
 
 ### The differ is invisible without `mkfs.erofs.exe`
 
@@ -358,7 +361,10 @@ Nothing here needs the nerdbox shim, a guest kernel, or a working microVM. This 
 question — *can containerd on Windows unpack a Linux image with EROFS?* — and nothing else.
 
 Download the `containerd-windows-amd64-bundle` artifact from the workflow run. It contains
-`containerd.exe`, `ctr.exe`, `mkfs.erofs.exe` and `config.toml`.
+`containerd.exe`, `ctr.exe`, `mkfs.erofs.exe`, `config.toml`, `new-containerd-root.ps1` and
+`rwlayer-64m.img`. The last of those is not needed for this test — it is a pre-formatted 64 MiB
+ext4 image that only matters when you go on to *run* a container, and
+[`docs/windows-e2e.md`](../../docs/windows-e2e.md) explains why it has to be made on Linux.
 
 **Run all of this unelevated, pass the config, and create the directories first.** All three
 matter, and each one costs you a run if you skip it:
