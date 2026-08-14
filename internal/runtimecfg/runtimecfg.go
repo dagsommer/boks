@@ -16,6 +16,8 @@ import (
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/platforms"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 const (
@@ -48,6 +50,44 @@ func DefaultAddress() string {
 	return defaults.DefaultAddress
 }
 
+// guestOS is the operating system inside every Boks sandbox.
+//
+// It is a constant rather than the host's because a microVM booting a Linux kernel can
+// execute Linux binaries and nothing else. The host decides the *architecture* — an amd64
+// machine cannot run an arm64 guest at any useful speed, and an arm64 one cannot run amd64
+// at all — but it does not get a say in the operating system.
+const guestOS = "linux"
+
+// GuestPlatform is the OCI platform of everything that runs inside a sandbox: the image
+// Boks pulls, the rootfs it unpacks, and the spec it generates.
+//
+// It exists because containerd's own answer is the *host's* platform, and on Windows that
+// answer is wrong in a way that fails late and reads like a missing image. platforms.Default()
+// returns linux/<arch> on Linux and — because a Mac can run Linux binaries under a VM —
+// darwin/<arch> ahead of linux/<arch> on macOS, so both hosts happen to resolve a Linux
+// manifest. On Windows it returns windows/<arch> with an OSVersion attached, which matches no
+// Linux manifest at all: `boks run` would report that an image every other tool can pull does
+// not exist for this platform.
+//
+// The same value is what the OCI spec is generated for, and that half has already been paid
+// for once: generating the spec for the host's platform on macOS produced a Darwin spec with
+// no Linux section, and the image config could not be applied to it at all.
+//
+// Everything that talks to containerd therefore asks for this instead of the host's default —
+// see Connect, which sets it on the client so that GetImage, Unpack and image config
+// resolution all agree with the pull.
+func GuestPlatform() string { return guestOS + "/" + runtime.GOARCH }
+
+// guestPlatformMatcher is GuestPlatform as containerd's manifest matcher.
+//
+// platforms.Only, not OnlyStrict: Only is what platforms.Default() uses on Unix, and it is
+// what makes an arm64 host accept the arm64/v8 spelling and an amd64 host accept a 386 image.
+// Matching the strictness of the thing being replaced is the point — this is a change of
+// *which* platform is asked for, not of how tolerantly it is matched.
+func guestPlatformMatcher() platforms.MatchComparer {
+	return platforms.Only(ocispec.Platform{OS: guestOS, Architecture: runtime.GOARCH})
+}
+
 // connectTimeout bounds how long a containerd dial may take. Diagnostics should be fast:
 // waiting out a full gRPC backoff to learn the daemon is absent is not useful.
 const connectTimeout = 3 * time.Second
@@ -55,14 +95,25 @@ const connectTimeout = 3 * time.Second
 // Connect opens a containerd client against address.
 //
 // A missing UNIX socket is reported immediately rather than after a dial timeout, since
-// "containerd is not running" is the most common case and the slowest to discover.
+// "containerd is not running" is the most common case and the slowest to discover. The stat
+// is skipped on Windows, where the address is the named pipe \\.\pipe\containerd-containerd
+// rather than a path on disk.
+//
+// The client's default platform is the guest's, not the host's. That default is what
+// GetImage, and therefore IsUnpacked, Unpack and the image config the OCI spec is built from,
+// resolve manifests with — and unlike the pull there is no per-call option to override it. A
+// client left on platforms.Default() would, on a Windows host, hold an image object that
+// cannot find its own Linux manifest.
 func Connect(ctx context.Context, address string) (*client.Client, error) {
 	if runtime.GOOS != "windows" && !strings.Contains(address, "://") {
 		if _, err := os.Stat(address); err != nil {
 			return nil, fmt.Errorf("containerd socket %s: %w", address, err)
 		}
 	}
-	return client.New(address, client.WithTimeout(connectTimeout))
+	return client.New(address,
+		client.WithTimeout(connectTimeout),
+		client.WithDefaultPlatform(guestPlatformMatcher()),
+	)
 }
 
 // Snapshotters lists the snapshotters containerd has successfully initialised. Plugins that
