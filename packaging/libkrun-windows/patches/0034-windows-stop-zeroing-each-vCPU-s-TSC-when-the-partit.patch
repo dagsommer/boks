@@ -1,0 +1,186 @@
+From a187e12a395566fd60c7a8b6b28124d60e11b43e Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 08:28:38 +0200
+Subject: [PATCH 34/34] windows: stop zeroing each vCPU's TSC when the
+ partition has several
+
+`setup_msrs` wrote `WHvX64RegisterTsc = 0` on every vCPU, which is exact parity
+with the KVM path's `create_boot_msr_entries`. On KVM that is safe for any
+processor count, because `kvm_synchronize_tsc()` sees that the writes carry the
+same value within a short window, declares them matched, and gives every vCPU
+one shared TSC offset. WHP documents no such heuristic and there is no reason
+to assume one.
+
+Without it the writes are exactly what they look like: N commands to set N
+clocks to zero, issued one after another from a single thread while the rest of
+the boot state is being built. Each processor starts counting from zero at a
+different instant, so vCPU 0 -- written first -- runs permanently ahead of every
+vCPU written after it.
+
+Linux measures precisely that quantity. `check_tsc_sync_source()` runs as each
+AP comes up: the two processors read the TSC alternately under a shared lock and
+any value the AP reads that is lower than one the BSP already read counts as
+warp. An AP whose TSC was zeroed later reads lower every time, so the check
+cannot pass -- it is not a risk but a certainty. The kernel then prints
+"Measured N cycles TSC warp between CPUs, turning off TSC clock" and calls
+`mark_tsc_unstable()`, re-engaging the `sched_clock_local()` clamp that froze
+every printk timestamp until CPUID leaf 0x15 started carrying a real crystal
+frequency.
+
+So the write is dropped where it does harm. Nothing needs it: guests read TSC
+differences, and a time base that starts at some large value is what real
+hardware looks like, its TSC counting since power-on. Leaving the register
+alone also preserves whatever cross-vCPU coherency WHP set up when it created
+the partition, which is the only coherency on offer -- Hyper-V virtualizes the
+TSC with one scale and offset per partition, which is what makes a single
+reference-TSC page valid on every processor in it. That last point is TLFS
+behaviour, not a documented WHP guarantee, and is marked as an inference in the
+code.
+
+The uniprocessor case still writes it. Not because the write is right there,
+but because removing it would change the one configuration that has actually
+booted at the same moment this backend first attempts a different one, and the
+next multi-vCPU boot needs to be attributable. The comment says to delete the
+branch once a multiprocessor guest is known to come up.
+
+UNVERIFIED: nothing here has run. If the reasoning about WHP's per-partition
+TSC is wrong and each virtual processor is instead rebased at creation time,
+this changes nothing and the warp remains -- which the guest would report in
+those same words.
+
+x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu,
+-p libkrun --features blk,net: 0 errors each. `cargo fmt --all --check` clean.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/arch/src/x86_64/windows/msr.rs | 75 ++++++++++++++++++++++++++++--
+ src/vmm/src/windows/vstate.rs      |  3 +-
+ 2 files changed, 72 insertions(+), 6 deletions(-)
+
+diff --git a/src/arch/src/x86_64/windows/msr.rs b/src/arch/src/x86_64/windows/msr.rs
+index 63f59dc..459efa0 100644
+--- a/src/arch/src/x86_64/windows/msr.rs
++++ b/src/arch/src/x86_64/windows/msr.rs
+@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Hypervisor::{
+ 
+ type Result<T> = std::result::Result<T, Error>;
+ 
+-const REGISTERS: [(WHV_REGISTER_NAME, u64); 9] = [
++const REGISTERS: [(WHV_REGISTER_NAME, u64); 8] = [
+     (WHvX64RegisterSysenterCs, 0x0),
+     (WHvX64RegisterSysenterEsp, 0x0),
+     (WHvX64RegisterSysenterEip, 0x0),
+@@ -21,13 +21,69 @@ const REGISTERS: [(WHV_REGISTER_NAME, u64); 9] = [
+     (WHvX64RegisterCstar, 0x0),
+     (WHvX64RegisterSfmask, 0x0),
+     (WHvX64RegisterLstar, 0x0),
+-    (WHvX64RegisterTsc, 0x0),
+     (WHvX64RegisterMsrMtrrDefType, MTRR_ENABLE | MTRR_MEM_TYPE_WB),
+ ];
+ 
++/// `IA32_TSC`, zeroed so the guest's time base starts near zero.
++///
++/// Split out of [`REGISTERS`] because it is the one entry that stops being safe
++/// when the partition has more than one processor. See [`setup_msrs`].
++const TSC_REGISTER: (WHV_REGISTER_NAME, u64) = (WHvX64RegisterTsc, 0x0);
++
+ /// Configure MSRs via the WHP API.
+-pub fn setup_msrs(vcpu: &whp::WhpVcpu) -> Result<()> {
+-    vcpu.set_registers64(REGISTERS).map_err(Error::SetMsrsWhp)
++///
++/// # Why `IA32_TSC` is skipped on a multiprocessor partition
++///
++/// The KVM path writes `MSR_IA32_TSC = 0` on every vCPU
++/// (`create_boot_msr_entries`), and this function used to copy it exactly. On
++/// KVM that is safe for any processor count because `kvm_synchronize_tsc()`
++/// notices that the writes carry the same value within a short window, declares
++/// them matched, and gives every vCPU one shared TSC offset. WHP documents no
++/// such heuristic, and there is no reason to assume one.
++///
++/// Without it the writes are just what they look like: N independent commands
++/// to set N clocks to zero, issued sequentially from one thread. Each processor
++/// therefore starts counting from zero at a different instant, and vCPU 0 —
++/// written first — runs permanently ahead of every vCPU written after it, by
++/// the wall-clock cost of the boot setup in between.
++///
++/// Linux measures exactly that. `check_tsc_sync_source()` runs as each AP comes
++/// up: the two processors read the TSC alternately under a shared lock, and any
++/// value the AP reads that is *lower* than one the BSP has already read counts
++/// as warp. An AP whose TSC was zeroed later reads lower every single time, so
++/// the check does not merely risk failing, it cannot pass. The kernel then
++/// prints "Measured N cycles TSC warp between CPUs, turning off TSC clock" and
++/// calls `mark_tsc_unstable()` — which re-engages the `sched_clock_local()`
++/// clamp that froze every printk timestamp before CPUID leaf 0x15 started
++/// carrying a real crystal frequency.
++///
++/// So the write is dropped when it would be harmful. Nothing needs it: the
++/// guest reads only TSC *differences*, and a processor whose time base starts
++/// at some large value is what real hardware looks like, the TSC there counting
++/// since power-on. Leaving the register alone also keeps whatever cross-vCPU
++/// coherency WHP established when it created the partition, which is the only
++/// coherency available — Hyper-V virtualizes the TSC with one scale and offset
++/// for a whole partition, which is what makes its single reference-TSC page
++/// valid on every processor in it. (INFERENCE: that is TLFS behaviour, not a
++/// documented WHP guarantee.)
++///
++/// # Why the uniprocessor case still writes it
++///
++/// It is not that the write is right there — it is that dropping it would
++/// change the one configuration that has actually booted, at the same time as
++/// this backend first tries to boot a different one. Bundling the two would
++/// make the result of the next multi-vCPU boot impossible to attribute. Once a
++/// multiprocessor guest is known to come up, this branch should go and
++/// `TSC_REGISTER` should be deleted outright.
++pub fn setup_msrs(vcpu: &whp::WhpVcpu, vcpu_count: u8) -> Result<()> {
++    vcpu.set_registers64(REGISTERS).map_err(Error::SetMsrsWhp)?;
++
++    if vcpu_count == 1 {
++        vcpu.set_registers64([TSC_REGISTER])
++            .map_err(Error::SetMsrsWhp)?;
++    }
++
++    Ok(())
+ }
+ 
+ #[cfg(test)]
+@@ -42,7 +98,7 @@ mod tests {
+         }
+         let vm = std::sync::Arc::new(whp::WhpVm::new(1).expect("failed to create WHP partition"));
+         let vcpu = whp::WhpVcpu::new(vm, 0).expect("failed to create vCPU");
+-        setup_msrs(&vcpu).expect("setup_msrs failed");
++        setup_msrs(&vcpu, 1).expect("setup_msrs failed");
+         let actual = vcpu
+             .get_registers64(REGISTERS.map(|(name, _)| name))
+             .expect("failed to read register back");
+@@ -52,5 +108,14 @@ mod tests {
+             REGISTERS.map(|(_, value)| value),
+             "mismatch for msrs values"
+         );
++
++        // The TSC is only written for a uniprocessor partition, and it is the
++        // one register here that keeps moving after it is set, so it is checked
++        // as a bound rather than for equality: it must have been rebased near
++        // zero rather than left at the host's count.
++        let [tsc] = vcpu
++            .get_registers64([TSC_REGISTER.0])
++            .expect("failed to read the TSC back");
++        assert!(tsc < 1 << 32, "TSC was not rebased: {tsc:#x}");
+     }
+ }
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+index 2b67d40..5581774 100644
+--- a/src/vmm/src/windows/vstate.rs
++++ b/src/vmm/src/windows/vstate.rs
+@@ -828,7 +828,8 @@ impl Vcpu {
+                 }
+             }
+ 
+-            arch::x86_64::msr::setup_msrs(whp_vcpu).map_err(Error::MSRSConfiguration)?;
++            arch::x86_64::msr::setup_msrs(whp_vcpu, vcpu_config.vcpu_count)
++                .map_err(Error::MSRSConfiguration)?;
+             arch::x86_64::regs::setup_regs(whp_vcpu, kernel_start_addr.raw_value())
+                 .map_err(Error::REGSConfiguration)?;
+             arch::x86_64::regs::setup_sregs(guest_mem, whp_vcpu)
+-- 
+2.53.0
+
