@@ -36,12 +36,16 @@ would sell.
 
 - **Linux is untested in practice.** The boundary was verified on macOS on Apple silicon; the
   Linux/KVM path is designed for but has not been exercised end to end.
-- **Native Windows support is in progress, and no sandbox has ever booted on Windows.** The
-  obstacle is narrow: a Windows Hypervisor Platform backend for libkrun is being built in
-  this repository's [patch series](../packaging/libkrun-windows/) — every libkrun crate now
-  compiles for Windows, and `krun.dll` links on a real Windows runner in CI — and nerdbox already builds a Windows shim for it. What
-  remains is the `krun.dll` C API layer and **`virtio-net`, the single device not yet
-  ported**, which is exactly the one Boks' enforcement depends on. In the meantime Boks
+- **Native Windows support is in progress: the stack underneath Boks runs a container there,
+  `boks run` does not.** A Windows Hypervisor Platform backend for libkrun is being built in
+  this repository's [patch series](../packaging/libkrun-windows/), and on 2026-08-14
+  `ctr tasks start` carried a Linux container end to end on real Windows 11 hardware —
+  containerd, the [nerdbox shim](../packaging/nerdbox-windows/), `krun.dll`, WHP — booting in
+  1.9 s and printing the guest kernel's own `uname`. What remains for Boks is **`virtio-net`**,
+  which is exactly the device its enforcement depends on: no Ethernet frame has crossed one on
+  Windows, so `boks run` declines to start sandbox networking there rather than pretend
+  otherwise, and `boks doctor` fails its platform check. Elevation (or Developer Mode) is also
+  still needed, for a symlink containerd makes in the task bundle. In the meantime Boks
   should run **inside WSL2** with nested virtualisation: unchanged, with workspace paths
   preserved exactly. Untested, but every ingredient is there — see [Windows](windows.md).
 
