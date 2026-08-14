@@ -1,0 +1,357 @@
+From 3ce2d615541860a5916ef90b24388d64a57aecff Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 09:07:48 +0200
+Subject: [PATCH 35/35] libkrun: restore krun_set_exec() for non-nitro builds
+
+Driving a real containerd through the nerdbox shim on Windows 11 gets as far as
+CreateTask with the right erofs/ext4/overlay mounts and then dies 48 ms into VM
+setup:
+
+    ctr: failed to create shim task: failed to set exec:
+         krun_set_exec failed: -129
+
+-129 is -ENOTSUP; the MSVC CRT numbers ENOTSUP 129 where glibc numbers it 95.
+Nothing about that is a Windows fault. It is a version-pin mismatch, and it
+fails identically on Linux and macOS.
+
+Upstream 4d2201e ("libkrun: remove exec/env/workdir/rlimits support from
+non-nitro builds", 2026-06-30) moved exec_path/args/env/workdir/rlimits out of
+ContextConfig into a NitroConfig gated on cfg(feature = "aws-nitro"), left
+-ENOTSUP stubs behind so libkrun.so.2 keeps exporting the symbols, and dropped
+the corresponding injection from krun_start_enter(): the kernel command line
+then carried only DEFAULT_KERNEL_CMDLINE, the block root, and whatever
+krun_append_kernel_cmdline() had added. The replacement is Config::apply()
+reading /.krun_config.json out of the guest rootfs. 4d2201e is an ancestor of
+our pin 07fd40d (it is its parent), so we inherit the stubs.
+
+nerdbox v0.2.3 builds libkrun v1.19.0 (Dockerfile, ARG LIBKRUN_VERSION=v1.19.0,
+tagged 2026-06-09), three weeks before that commit, and its host code is written
+to that API. internal/vm/libkrun/instance.go calls SetExec("/sbin/vminitd",
+InitArgs, env) once, immediately after SetKernel and before console setup, vsock
+configuration and krun_start_enter, and treats any non-zero return as fatal.
+The gate carries no target_os condition, so every platform hits it.
+
+Pinning libkrun back to v1.19.0 is not available to us: the WHP backend this
+whole port stands on postdates that tag. Adopting the replacement would mean
+teaching nerdbox to write /.krun_config.json into its guest image and dropping
+the SetExec call -- a change to both the host code and the image build of a
+second component we already carry patches for, to arrive at the same behaviour.
+So the smaller divergence is here: restore what v1.19.0 did, in the one place
+that has a caller.
+
+Restoring the symbol alone would have been worse than the stub. A krun_set_exec
+that stores a workload nobody reads returns zero, nerdbox proceeds through
+console setup and vsock configuration into krun_start_enter, and the guest boots
+with vminitd as PID 1 holding no argv and no environ -- no -vsock-rpc-port, no
+-vsock-stream-port, no -vsock-cid -- so it never dials back and the failure
+surfaces much later as a timeout with nothing pointing at its cause. The
+plumbing therefore had to be checked before the setter was worth restoring, and
+it survives:
+
+  - KernelCmdlineConfig still has krun_env and epilog, and vmm's builder still
+    splices both into the guest cmdline (src/vmm/src/builder.rs). krun_env goes
+    in unconditionally, including when the caller supplied its own cmdline
+    through krun_set_kernel() -- which is nerdbox's path, since it boots an
+    external kernel with "root=/dev/vda rootfstype=erofs ro init=/sbin/vminitd".
+    epilog is appended last, after the TSI and DHCP tokens, so the "--" stays at
+    the end where the kernel expects it.
+  - The guest side is untouched by 4d2201e. The kernel hands init every
+    unrecognised KEY=value token as an environment variable and everything after
+    "--" as init's argv[1..], which is all nerdbox's vminitd needs. libkrun's own
+    init still reads KRUN_INIT and execs it, and still honours KRUN_WORKDIR and
+    KRUN_RLIMITS (init/init-binary/src/main.rs, src/env.rs), so the restored
+    tokens land where they always did.
+
+Only krun_set_exec is restored. nerdbox binds nineteen symbols and calls
+krun_set_env, krun_set_workdir and krun_set_rlimits from none of them -- the
+env it cares about is the third argument to SetExec -- so those three stay
+-ENOTSUP stubs rather than becoming API we diverge on and never exercise.
+
+The injection is emitted only when krun_set_exec() was actually called. A caller
+on upstream's .krun_config.json path leaves exec_path as None and gets the
+byte-identical cmdline it got before this patch, rather than a stray trailing
+"--" that v1.19.0 always appended. aws-nitro keeps its own NitroConfig, its
+vsock delivery and its early return into krun_start_enter_nitro(), untouched.
+
+Verified: cargo check -p libkrun --features blk,net is clean on
+x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu;
+krun.dll links via winbuild.sh and still exports all nineteen symbols nerdbox
+resolves; cargo fmt --all --check passes. On an aarch64 Linux host, against the
+built libkrun.so, krun_set_exec now returns 0 where it returned -95, an unknown
+context still returns -ENOENT, and krun_set_env/workdir/rlimits still return
+-95. Instrumenting the assembly showed krun_env=" KRUN_INIT=/sbin/vminitd
+\"TERM=xterm\" ..." and epilog=" -- \"-vsock-rpc-port=1025\" ..." with the call,
+and the unchanged krun_env=" " with epilog=None without it. --features aws-nitro
+still fails to build exactly as it did before this patch, on three pre-existing
+errors that have nothing to do with exec (an unresolved aws_nitro::enclave
+import from a feature that is not forwarded to the dependency, plus two net
+gating errors).
+
+Not verified: no Windows host, no WHP, and no guest were available here, so
+nothing downstream of the host-side cmdline assembly has been run. That the
+guest actually boots and vminitd actually connects back remains untested.
+---
+ include/libkrun.h      |   9 ++-
+ src/libkrun/src/lib.rs | 177 ++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 173 insertions(+), 13 deletions(-)
+
+diff --git a/include/libkrun.h b/include/libkrun.h
+index 6a84689..97af327 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -803,8 +803,12 @@ int32_t krun_set_workdir(uint32_t ctx_id,
+  * to be passed to the executable, and the environment variables to be
+  * configured in the context of the executable.
+  *
+- * Only available in aws-nitro builds. Non-nitro builds return -ENOTSUP;
+- * use libkrun_init's Config::apply() with .krun_config.json instead.
++ * Available in every build. Upstream restricted this to aws-nitro builds in
++ * favour of libkrun_init's Config::apply() with .krun_config.json; this tree
++ * keeps the non-nitro implementation, which passes the workload to the guest
++ * on the kernel command line, because our consumers still drive libkrun
++ * through this call. Note that krun_set_env(), krun_set_workdir() and
++ * krun_set_rlimits() were *not* restored and still return -ENOTSUP.
+  *
+  * Arguments:
+  *  "ctx_id"    - the configuration context ID.
+@@ -816,7 +820,6 @@ int32_t krun_set_workdir(uint32_t ctx_id,
+  *
+  * Returns:
+  *  Zero on success or a negative error number on failure.
+- *  -ENOTSUP - not available in this build (non-nitro)
+  */
+ int32_t krun_set_exec(uint32_t ctx_id,
+                       const char *exec_path,
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 4a77bf5..c162222 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -186,12 +186,44 @@ struct NitroConfig {
+     console_output: Option<PathBuf>,
+ }
+ 
++/// Workload description supplied through `krun_set_exec()`.
++///
++/// Upstream commit 4d2201e ("libkrun: remove exec/env/workdir/rlimits support
++/// from non-nitro builds") moved these fields into `NitroConfig` and turned the
++/// non-nitro setters into `-ENOTSUP` stubs, on the grounds that callers should
++/// describe the workload with `Config::apply()` reading `/.krun_config.json`
++/// from the guest rootfs instead.
++///
++/// We restore the non-nitro path because nerdbox — the consumer this Windows
++/// port exists for — is pinned to libkrun v1.19.0's API: it calls
++/// `krun_set_exec()` exactly once, treats a non-zero return as fatal, and knows
++/// nothing about `.krun_config.json`. Adopting the replacement would mean
++/// patching nerdbox's guest image build as well as its host code, i.e. a larger
++/// divergence in a second component, to reach the same place. Re-pinning libkrun
++/// back to v1.19.0 is not an option either: the WHP backend postdates it.
++///
++/// Only `krun_set_exec()` is restored. `krun_set_env()`, `krun_set_workdir()`
++/// and `krun_set_rlimits()` stay `-ENOTSUP` stubs because nothing we build
++/// against calls them; restoring an API nobody exercises would be untested
++/// divergence for its own sake.
++#[cfg(not(feature = "aws-nitro"))]
++#[derive(Default)]
++struct ExecConfig {
++    exec_path: Option<String>,
++    /// Already collapsed into a kernel command-line fragment by
++    /// `collapse_str_array()`, i.e. each element individually double-quoted.
++    args: Option<String>,
++    env: Option<String>,
++}
++
+ #[derive(Default)]
+ struct ContextConfig {
+     krunfw: KrunfwBindingsResult,
+     vmr: VmResources,
+     #[cfg(feature = "aws-nitro")]
+     nitro: NitroConfig,
++    #[cfg(not(feature = "aws-nitro"))]
++    exec: ExecConfig,
+     // Read when refusing a TSI port map after a NIC has been added, and when naming interfaces.
+     #[cfg(any(unix, feature = "net"))]
+     net_index: u8,
+@@ -241,7 +273,43 @@ impl NitroConfig {
+     }
+ }
+ 
++#[cfg(not(feature = "aws-nitro"))]
++impl ExecConfig {
++    fn set_exec_path(&mut self, exec_path: String) {
++        self.exec_path = Some(exec_path);
++    }
++
++    fn set_env(&mut self, env: String) {
++        self.env = Some(env);
++    }
++
++    fn set_args(&mut self, args: String) {
++        self.args = Some(args);
++    }
++}
++
+ impl ContextConfig {
++    /// The `KRUN_INIT=` cmdline token naming the guest workload, or `None` when
++    /// the caller never called `krun_set_exec()`. `None` is what keeps this
++    /// restoration invisible to callers on the `.krun_config.json` path.
++    #[cfg(not(feature = "aws-nitro"))]
++    fn get_exec_path(&self) -> Option<String> {
++        self.exec
++            .exec_path
++            .as_ref()
++            .map(|exec_path| format!("KRUN_INIT={exec_path}"))
++    }
++
++    #[cfg(not(feature = "aws-nitro"))]
++    fn get_env(&self) -> String {
++        self.exec.env.clone().unwrap_or_default()
++    }
++
++    #[cfg(not(feature = "aws-nitro"))]
++    fn get_args(&self) -> String {
++        self.exec.args.clone().unwrap_or_default()
++    }
++
+     #[cfg(all(feature = "blk", not(feature = "tee")))]
+     fn set_block_root(&mut self, device: String, fstype: Option<String>, options: Option<String>) {
+         self.block_root = Some(BlockRootConfig {
+@@ -1326,7 +1394,8 @@ pub unsafe extern "C" fn krun_set_workdir(ctx_id: u32, c_workdir_path: *const c_
+     }
+ }
+ 
+-#[cfg(feature = "aws-nitro")]
++// Used by the aws-nitro setters and by the restored non-nitro krun_set_exec(),
++// so it is no longer gated on the feature.
+ unsafe fn collapse_str_array(array: &[*const c_char]) -> Result<String, std::str::Utf8Error> {
+     unsafe {
+         let mut strvec = Vec::new();
+@@ -1347,18 +1416,74 @@ unsafe fn collapse_str_array(array: &[*const c_char]) -> Result<String, std::str
+ /// Set the executable to be run inside the VM, together with its arguments
+ /// and environment variables.
+ ///
+-/// Only available in aws-nitro builds. Non-nitro builds return `-ENOTSUP`;
+-/// use Config::apply() with .krun_config.json instead.
++/// Restored from libkrun v1.19.0. Upstream 4d2201e reduced this to an
++/// `-ENOTSUP` stub for non-nitro builds; see `ExecConfig` for why we diverge.
++/// The stored values are turned into kernel command-line tokens by
++/// `krun_start_enter()` — restoring this setter without that consumer would
++/// return success and then boot a guest with no workload configured, which is
++/// strictly worse than the stub's honest `-ENOTSUP`.
++#[allow(clippy::format_collect)]
+ #[allow(clippy::missing_safety_doc)]
+ #[unsafe(no_mangle)]
+ #[cfg(not(feature = "aws-nitro"))]
+ pub unsafe extern "C" fn krun_set_exec(
+-    _ctx_id: u32,
+-    _c_exec_path: *const c_char,
+-    _c_argv: *const *const c_char,
+-    _c_envp: *const *const c_char,
++    ctx_id: u32,
++    c_exec_path: *const c_char,
++    c_argv: *const *const c_char,
++    c_envp: *const *const c_char,
+ ) -> i32 {
+-    -libc::ENOTSUP
++    unsafe {
++        let exec_path = match CStr::from_ptr(c_exec_path).to_str() {
++            Ok(path) => path,
++            Err(e) => {
++                debug!("Error parsing exec_path: {e:?}");
++                return -libc::EINVAL;
++            }
++        };
++
++        let args = if !c_argv.is_null() {
++            let argv_array: &[*const c_char] = slice::from_raw_parts(c_argv, MAX_ARGS);
++            match collapse_str_array(argv_array) {
++                Ok(s) => s,
++                Err(e) => {
++                    debug!("Error parsing args: {e:?}");
++                    return -libc::EINVAL;
++                }
++            }
++        } else {
++            "".to_string()
++        };
++
++        let env = if !c_envp.is_null() {
++            let envp_array: &[*const c_char] = slice::from_raw_parts(c_envp, MAX_ARGS);
++            match collapse_str_array(envp_array) {
++                Ok(s) => s,
++                Err(e) => {
++                    debug!("Error parsing args: {e:?}");
++                    return -libc::EINVAL;
++                }
++            }
++        } else {
++            // NULL envp means "inherit the VMM's environment", as in v1.19.0.
++            // Spelled out here instead of via the `std::env` import, which is
++            // gated to Linux at the top of this file.
++            std::env::vars()
++                .map(|(key, value)| format!(" {key}=\"{value}\""))
++                .collect()
++        };
++
++        match CTX_MAP.lock().unwrap().entry(ctx_id) {
++            Entry::Occupied(mut ctx_cfg) => {
++                let cfg = ctx_cfg.get_mut();
++                cfg.exec.set_exec_path(exec_path.to_string());
++                cfg.exec.set_env(env);
++                cfg.exec.set_args(args);
++            }
++            Entry::Vacant(_) => return -libc::ENOENT,
++        }
++
++        KRUN_SUCCESS
++    }
+ }
+ 
+ /// Set the executable to be run inside the VM, together with its arguments
+@@ -3395,10 +3520,42 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+         prolog.push(' ');
+         prolog.push_str(arg);
+     }
++    // Consumer for the workload restored in `krun_set_exec()`. The guest picks
++    // it up entirely through the kernel command line: the kernel hands init
++    // every unrecognised `KEY=value` token as an environment variable, and
++    // everything after `--` as init's argv[1..]. That reaches both kinds of
++    // guest init we care about — libkrun's own init, which reads `KRUN_INIT`
++    // and execs it (init/init-binary/src/main.rs), and a caller-supplied
++    // `init=` binary such as nerdbox's vminitd, which just wants its argv and
++    // environ. `krun_env` and `epilog` are still spliced into the cmdline by
++    // vmm's builder even when the caller supplied its own cmdline via
++    // `krun_set_kernel()`, which is the path nerdbox takes.
++    //
++    // Emitted only when `krun_set_exec()` was actually called, so callers using
++    // upstream's `.krun_config.json` mechanism get byte-identical cmdlines to
++    // before this patch.
++    #[cfg(not(feature = "aws-nitro"))]
++    let (krun_env, epilog) = match ctx_cfg.get_exec_path() {
++        Some(exec_path) => (
++            format!(
++                " {} {} {}",
++                exec_path,
++                ctx_cfg.get_block_root(),
++                ctx_cfg.get_env()
++            ),
++            Some(format!(" -- {}", ctx_cfg.get_args())),
++        ),
++        None => (format!(" {}", ctx_cfg.get_block_root()), None),
++    };
++    // aws-nitro returned into krun_start_enter_nitro() above; this is dead code
++    // there, and its workload is delivered over vsock rather than the cmdline.
++    #[cfg(feature = "aws-nitro")]
++    let (krun_env, epilog) = (format!(" {}", ctx_cfg.get_block_root()), None);
++
+     let kernel_cmdline = KernelCmdlineConfig {
+         prolog: Some(prolog),
+-        krun_env: Some(format!(" {}", ctx_cfg.get_block_root())),
+-        epilog: None,
++        krun_env: Some(krun_env),
++        epilog,
+     };
+ 
+     if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
+-- 
+2.53.0
+
