@@ -948,6 +948,47 @@ and `cri` failed unelevated and **disappear elevated** — they wanted directori
 Neither cascades, so no advice changes; what changes is that "unrelated" was wrong, and it is
 the kind of wrong that stops you looking.
 
+### A microVM boots under containerd on Windows, 2026-08-14
+
+The full stack ran on real Windows 11 hardware: containerd started the nerdbox shim over
+ttrpc, the shim loaded `krun.dll`, configured the VM and booted it, and the guest reached
+userspace and mounted the container's own root filesystem.
+
+```
+kmsg "erofs: (device vda): mounted with root inode @ nid 36."
+kmsg "Run /sbin/vminitd as init process"
+msg="VM started" t_boot=1.7006629s
+component=vminitd "initialized vminitd"
+kmsg "EXT4-fs (vdb): mounted filesystem ... r/w with ordered data mode."
+kmsg "overlayfs: \"xino\" feature enabled using 2 upper inode bits."
+```
+
+**`vminitd` survived**, which was the open question. Earlier bare-probe boots ended in
+`Attempted to kill init!` because the probe configured no vsock and init had nothing to
+dial back to; through the shim both ports exist and it came up, registered its plugins and
+served them. 54 kmsg lines with 54 distinct timestamps, so the clock runs under the shim
+too, not only under the probe.
+
+**The predicted failure did not happen.** A console audit had warned the guest might boot
+silently if the console device did not enumerate as `hvc0`. It does. `hvcN` numbering comes
+from `hvc_alloc` taking the first free `vtermnos` slot rather than from MMIO order, nothing
+else constructs a virtio-console on the Windows path, and the `console=hvc0` binding
+survives its initial setup failure because `try_enable_preferred_console` sets the index
+before setup and does not reset it on failure.
+
+**Where it stopped:** `crun` refused the spec with `Required field 'layerFolders' not
+present`. The spec carried `"windows":{"layerFolders":null}` — a Linux spec with a Windows
+section, because spec generation adds one on a Windows *host* regardless of the target
+platform, and libocispec makes `layerFolders` required whenever `windows` is present. So an
+"empty and harmless" object is fatal. `docs/windows-e2e.md` had flagged this exact hazard
+as unverified; it is now verified.
+
+Also observed: after the create failure the run stalled a fixed 30.0 s at 0-3% CPU before
+reporting `io shutdown: context deadline exceeded` — a separate defect on the error path.
+
+Every failure mode ranked ahead of this one is now cleared on that machine. Elevation is
+still required, for the task-bundle symlink.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
