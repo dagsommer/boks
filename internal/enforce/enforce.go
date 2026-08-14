@@ -413,6 +413,11 @@ const noProxy = "localhost,127.0.0.1,::1"
 // file there would break every destination Boks does not intercept — which is nearly all of
 // them. Those three are set only when a public root store was found to bundle the Boks CA
 // with, and are left alone otherwise.
+//
+// Where those roots come from differs by platform and is the subject of roots.go: a PEM file
+// on Unix, the certificate store read through CryptoAPI on Windows. That file also explains
+// why Windows treats "no roots" as an error that stops the sandbox, while Unix treats it as a
+// reason to leave the three replacing variables unset.
 func (s Spec) writeGuestCA(authority *ca.Authority) ([]string, workspace.Workspace, error) {
 	dir := s.certDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -431,7 +436,15 @@ func (s Spec) writeGuestCA(authority *ca.Authority) ([]string, workspace.Workspa
 		"NODE_EXTRA_CA_CERTS=" + path.Join(GuestCADir, certFile),
 	}
 
-	if roots, ok := hostRoots(); ok {
+	// hostRoots reads the host's public root store; see roots.go for how, per platform, and
+	// for why the Windows implementation refuses rather than returning nothing. An error
+	// here aborts Prepare, so nothing is created — a sandbox that could not be given a
+	// working trust bundle must not start with a half-working one.
+	roots, err := hostRoots()
+	if err != nil {
+		return nil, workspace.Workspace{}, err
+	}
+	if len(roots) > 0 {
 		bundle := append(append([]byte{}, roots...), authority.CertPEM()...)
 		if err := os.WriteFile(filepath.Join(dir, bundleFile), bundle, 0o644); err != nil {
 			return nil, workspace.Workspace{}, fmt.Errorf("enforce: writing the guest CA bundle: %w", err)
@@ -453,25 +466,6 @@ func (s Spec) writeGuestCA(authority *ca.Authority) ([]string, workspace.Workspa
 		GuestPath: GuestCADir,
 		Mode:      workspace.ModeReadOnly,
 	}, nil
-}
-
-// hostRootBundles are the usual locations of a PEM root store. The list is the same one
-// Go's own x509 package walks, which is why it covers the distributions it does.
-var hostRootBundles = []string{
-	"/etc/ssl/certs/ca-certificates.crt", // Debian, Ubuntu, Alpine
-	"/etc/pki/tls/certs/ca-bundle.crt",   // Fedora, RHEL
-	"/etc/ssl/ca-bundle.pem",             // openSUSE
-	"/etc/ssl/cert.pem",                  // macOS, Alpine
-}
-
-func hostRoots() ([]byte, bool) {
-	for _, path := range hostRootBundles {
-		data, err := os.ReadFile(path)
-		if err == nil && len(data) > 0 {
-			return data, true
-		}
-	}
-	return nil, false
 }
 
 // Session is a running network for one sandbox: the host-side stack, and the filtering
