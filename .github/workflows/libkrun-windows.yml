@@ -148,7 +148,7 @@ jobs:
       # The export assertions matter for a reason particular to how this DLL is consumed:
       # containerd's nerdbox shim reflects over its whole binding table and resolves every
       # symbol EAGERLY at load. One missing export does not fail late at the call site — it
-      # fails the load, on every platform. These four are the ones a boot depends on.
+      # fails the load, on every platform.
       #
       # krun-cpuid is deliberately absent from this workflow entirely. It is built against
       # `kvm_bindings`, and KVM is Linux-only, so the series gates it out of the Windows
@@ -169,24 +169,50 @@ jobs:
           dll=target/x86_64-pc-windows-msvc/release/krun.dll
           test -f "$dll" || { echo "no krun.dll was produced" >&2; exit 1; }
           echo "krun.dll: $(wc -c <"$dll") bytes"
-          # ALL NINETEEN symbols nerdbox binds, not a sample. Its loader reflects over the
+          # ALL TWENTY symbols nerdbox binds, not a sample. Its loader reflects over the
           # whole binding table and resolves every one eagerly, so the DLL either satisfies
           # all of them or fails to load — there is no partial success to sample for. This
           # list is every `C:"krun_..."` tag on the libkrun struct in nerdbox's
-          # internal/vm/libkrun/krun.go; regenerate it from that file if nerdbox changes.
+          # internal/vm/libkrun/krun.go, AS PATCHED by packaging/nerdbox-windows/patches/.
+          # Regenerate it, rather than editing by hand, with:
+          #
+          #   grep -oE 'C:"krun_[a-z0-9_]+"' internal/vm/libkrun/krun.go \
+          #     | sed 's/C:"//;s/"//' | sort | tr '\n' ' '
+          #
+          # It was nineteen until nerdbox patch 0003 added krun_add_vsock. That patch exists
+          # because libkrun de84d01 removed the implicit vsock device, so the ports nerdbox
+          # maps now answer -ENODEV unless krun_add_vsock() was called first — which means a
+          # binding, which means one more export this DLL has to carry.
           #
           # Measured on a real Windows 11 machine on 2026-08-13: 18 of 19 resolved, and the
           # missing one — krun_set_console_output, gated behind an unrelated `aws-nitro`
           # feature — was enough on its own to stop nerdbox loading the DLL. A four-symbol
           # sample had reported everything fine.
-          for sym in krun_add_disk krun_add_disk2 krun_add_net_unixgram krun_add_net_unixstream krun_add_virtiofs3 krun_add_vsock_port2 krun_create_ctx krun_free_ctx krun_get_shutdown_eventfd krun_init_log krun_set_console_output krun_set_exec krun_set_gpu_options krun_set_gvproxy_path krun_set_kernel krun_set_log_level krun_set_net_mac krun_set_vm_config krun_start_enter; do
-            if grep -qa "$sym" "$dll"; then
+          #
+          # Match WHOLE names, not substrings. A bare `grep -qa krun_add_vsock` is satisfied by
+          # the bytes of `krun_add_vsock_port2`, and `krun_add_disk` by `krun_add_disk2`, so a
+          # substring test would report those two present no matter what the DLL exports.
+          # Export names sit in the name table as NUL-terminated ASCII, so replacing every
+          # non-printable byte with a newline puts each name alone on a line and `grep -qx`
+          # can then be exact. `tr` rather than `strings` — coreutils is there on the runner,
+          # binutils is not guaranteed to be.
+          tr -c '[:print:]' '\n' <"$dll" | sort -u >/tmp/krun-dll-strings.txt
+          missing=0
+          for sym in krun_add_disk krun_add_disk2 krun_add_net_unixgram krun_add_net_unixstream krun_add_virtiofs3 krun_add_vsock krun_add_vsock_port2 krun_create_ctx krun_free_ctx krun_get_shutdown_eventfd krun_init_log krun_set_console_output krun_set_exec krun_set_gpu_options krun_set_gvproxy_path krun_set_kernel krun_set_log_level krun_set_net_mac krun_set_vm_config krun_start_enter; do
+            if grep -qxF "$sym" /tmp/krun-dll-strings.txt; then
               echo "  export present: $sym"
             else
               echo "  EXPORT MISSING: $sym — nerdbox resolves eagerly, so this fails the load" >&2
-              exit 1
+              missing=$((missing + 1))
             fi
           done
+          # Report every missing export, not just the first: nerdbox names only the one symbol
+          # its loader tripped over, so a one-at-a-time CI is a one-boot-at-a-time diagnosis.
+          if [ "$missing" -ne 0 ]; then
+            echo "$missing of 20 bound symbols are not exported" >&2
+            exit 1
+          fi
+          echo "all 20 symbols nerdbox binds are exported"
 
       - name: Record how far the port got
         if: always()
