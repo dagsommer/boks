@@ -16,7 +16,7 @@ written in.
 | **Guide** | [get-started.md](get-started.md), [usage.md](usage.md), [agents.md](agents.md) |
 | **Reference** | [architecture.md](architecture.md), [security-model.md](security-model.md), [cli.md](cli.md), [troubleshooting.md](troubleshooting.md), [faq.md](faq.md) |
 | **Project** | [roadmap.md](roadmap.md), [release-notes.md](release-notes.md) |
-| **Evidence** | [verification.md](verification.md), [docker-sandbox-parity.md](docker-sandbox-parity.md), [windows.md](windows.md), [upstream-libkrun-virtio-net.md](upstream-libkrun-virtio-net.md) |
+| **Evidence** | [verification.md](verification.md), [verify-linux-prompt.md](verify-linux-prompt.md), [docker-sandbox-parity.md](docker-sandbox-parity.md), [windows.md](windows.md), [upstream-libkrun-virtio-net.md](upstream-libkrun-virtio-net.md) |
 
 The Evidence group is last and is not diminished by that. It is what every claim in the
 other three is answerable to, and the guide pages link into it wherever a reader could
