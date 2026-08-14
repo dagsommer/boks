@@ -824,18 +824,55 @@ containerd entirely with a 3 KB tar and a single-variable change: creating `C:\t
 it succeed. Now uses `GetTempPathW`, self-deletes via `FILE_FLAG_DELETE_ON_CLOSE`, and
 reports the true error.
 
-**Still open: containerd locks itself out of its own root.** Unelevated, on first run, it
-creates `--root` with an ACL granting only `SYSTEM` and `Administrators` — not the
-unelevated user who owns it — then fails to create anything inside, taking 43 plugins
-down. Pre-creating the directories avoids it entirely, because `MkdirAllWithACL` is a
-no-op on existing ones. The first successful run only worked by luck: the directories
-happened to exist already.
+**containerd locked itself out of its own root — now a documented prerequisite, not a
+patch.** Unelevated, on first run, it creates `--root` with an ACL granting only `SYSTEM`
+and `Administrators` — not the unelevated user who owns it — then fails to create
+anything inside, taking 43 plugins down. The first successful run only worked by luck:
+the directories happened to exist already.
+
+The ACL is `D:P(A;OICI;GA;;;BA)(A;OICI;GA;;;SY)`, applied by `sys.MkdirAllWithACL` to
+every component it creates. The `P` is a protected DACL — it blocks inheritance from the
+parent — and the whole thing is correct for the deployment containerd on Windows is built
+for: a service running as LocalSystem, whose content store, snapshots and bolt database
+an unprivileged user must not be able to edit. It is simply not conditioned on the
+identity containerd runs under.
+
+Pre-creating the directories avoids it exactly rather than luckily: `mkdirall` returns
+early for a directory that already exists, applying no ACL at all. We chose that over
+patching containerd to add an ACE for its own token user, and not because pre-creating is
+more secure — both end with a directory the user can write to, unavoidably. The
+difference is durability: `MkdirAllWithACL` being a no-op on existing directories means an
+ACE written once is permanent, so a root created by an unelevated daemon and later reused
+by a service-mode one would hand an unprivileged user inheritable full control over a
+LocalSystem daemon's state. Full reasoning, and `new-containerd-root.ps1`, in
+`packaging/containerd-windows/README.md`, "The root directory must exist first".
 
 A diagnostic improved on the way. A missing `mkfs.erofs.exe` used to surface as
 `no unpack platforms defined`, naming nothing useful. It now logs
 `differ "erofs" is registered but unavailable, dropping it from the diff order`, which
 was confirmed accidentally when the tester restarted the daemon without the bundle on
 `PATH`.
+
+### What has to happen next, and two obstacles found by reading
+
+Unpacking an image is not running one. The procedure for the first `ctr run` on Windows is
+[windows-e2e.md](windows-e2e.md); it was written from the sources of containerd v2.3.3 and
+nerdbox `cd2c23f`, **none of it has been executed**, and it found two more containerd-side
+obstacles before anyone tried:
+
+- **`ctr run` on Windows cannot produce a Linux OCI spec.** It chooses the spec's platform
+  from the snapshotter name alone, and only `windows-lcow` means Linux; the `--platform`
+  flag it advertises is read only by `run_unix.go`. `--snapshotter erofs` therefore gets a
+  Windows spec for a Linux image, and nothing between `ctr` and crun inspects it, so the
+  error would surface inside the guest. `packaging/containerd-windows/patches/0004` makes
+  `--platform` select it, as it already does on Unix.
+- **The writable layer needs `mkfs.ext4`, which Windows does not have.** On non-Linux the
+  erofs snapshotter defaults to block mode (64 MiB), so an active snapshot's first mount is
+  `mkfs/ext4`; that type is not in nerdbox's `runtime-allow-mounts`, so containerd's own
+  mount manager handles it by exec'ing `mkfs.ext4`. nerdbox tells macOS users to
+  `brew install e2fsprogs` for exactly this. containerd skips formatting when the target
+  file already exists, so the bundle now ships a pre-formatted `rwlayer-64m.img`. That is a
+  workaround, and it is labelled as one.
 
 ### What was proven on the machine with no hypervisor
 

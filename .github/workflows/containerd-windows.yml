@@ -510,6 +510,33 @@ jobs:
           cp boks/packaging/containerd-windows/new-containerd-root.ps1 staging/
           ls -l staging/
 
+      # The writable layer, formatted here because Windows cannot format it.
+      #
+      # On non-Linux the erofs snapshotter defaults to block mode
+      # (plugins/snapshots/erofs/erofs_other.go: defaultWritableSize = 64 MiB, and
+      # erofs.go:187 sets blockMode = defaultSize > 0), so an active snapshot's first
+      # mount is `mkfs/ext4` with `X-containerd.mkfs.size=67108864`. containerd's mount
+      # manager handles that type itself -- nerdbox's runtime-allow-mounts covers only
+      # `mkdir/*,format/*,erofs` -- by exec'ing `mkfs.ext4`, which does not exist on
+      # Windows in any packaged form. nerdbox's own README tells macOS users to brew
+      # install e2fsprogs for exactly this.
+      #
+      # core/mount/manager/mkfs.go:94 skips formatting entirely when the target file
+      # already exists, so a correct image dropped in beforehand is all that is needed.
+      # 64 MiB of mostly zeros; the artifact zip takes it to well under 100 KB.
+      - name: Format the writable-layer image Windows cannot make for itself
+        run: |
+          set -euo pipefail
+          command -v mkfs.ext4 >/dev/null \
+            || { echo "mkfs.ext4 is missing on this runner" >&2; exit 1; }
+          truncate -s 64M staging/rwlayer-64m.img
+          mkfs.ext4 -q staging/rwlayer-64m.img
+          file staging/rwlayer-64m.img | grep -q 'ext4 filesystem' \
+            || { echo "not an ext4 image" >&2; file staging/rwlayer-64m.img >&2; exit 1; }
+          [ "$(wc -c <staging/rwlayer-64m.img)" -eq 67108864 ] \
+            || { echo "image is not exactly 64 MiB, which is the size the snapshotter asks for" >&2; exit 1; }
+          echo "  rwlayer-64m.img: $(file -b staging/rwlayer-64m.img)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: containerd-windows-amd64-bundle
@@ -524,7 +551,7 @@ jobs:
             echo "## Windows test bundle (amd64)"
             echo
             echo "Artifact \`containerd-windows-amd64-bundle\` — three binaries, a \`config.toml\`,"
-            echo "\`new-containerd-root.ps1\` and the README."
+            echo "\`new-containerd-root.ps1\`, a pre-formatted \`rwlayer-64m.img\` and the README."
             echo
             echo '```'
             (cd staging && sha256sum ./*.exe | sed 's|\./||')

@@ -219,6 +219,13 @@ io.containerd.nerdbox.v1 ...`; the shim log is a named pipe at
 `\\.\pipe\containerd-shim-<namespace>-<id>-log`, and per the caveat above it drops everything
 written before a reader attaches.
 
+**That run has its own document.** It needs `krun.dll`, `nerdbox-kernel-x86_64` and
+`nerdbox-rootfs.erofs` on *containerd's* `PATH` — not your shell's, since the shim inherits the
+daemon's environment — an EROFS snapshotter, a Linux OCI spec that `ctr` on Windows will not
+generate unaided, and a writable layer Windows cannot format. See
+[`docs/windows-e2e.md`](../../docs/windows-e2e.md) for the full procedure, what each step proves,
+and the ranked list of ways it is expected to fail.
+
 ## Upstreaming
 
 - Patch 0001: nothing to do but wait for
