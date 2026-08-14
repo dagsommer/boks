@@ -1,0 +1,254 @@
+From 9a5efc1dedc4ec41933c039bed7f9fa27e0f7db0 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 16:41:06 +0200
+Subject: [PATCH 36/36] fix(x86_64): give virtio all 24 IOAPIC pins, not the 11
+ legacy ISA ones
+
+Boks' own `shell` image cannot boot on Windows: the erofs snapshotter gives
+each of the image's 7 layers its own virtio-blk device, and with the ext4
+writable layer, virtiofs, console, vsock and the NIC that is 12 MMIO devices
+against 11 usable interrupt lines. The build fails with
+
+    RegisterBlockDevice(IrqsExhausted)
+
+surfacing through the C API as -22. IRQ_BASE=5/IRQ_MAX=15 is the legacy ISA
+range, but an IOAPIC has 24 inputs and this VMM has no other claimant for the
+top 8: there is no PCI bus for pins 16-23 to collide with (on real hardware
+they carry PIRQ A-H) and no ACPI at all, so no SCI either. Below 5 the pins
+are genuinely taken -- PIT, i8042, 8259 cascade and the four 16550s -- which
+is why IRQ_BASE does not move.
+
+Raising IRQ_MAX alone would not have worked, and that is the substance of
+this change. The guest learns its virtio interrupts from
+`virtio_mmio.device=<size>@<addr>:<irq>`, but it only has an irq_desc to hang
+them on if the interrupt controller told it the pin exists. We ship no ACPI,
+so the MP table is the only description the guest gets, and it declared
+mp_INT sources for pins 0-15 only. Linux walks every pin the version register
+advertises (`io_apic_get_redir_entries()` -> `nr_registers` ->
+`for_each_ioapic_pin`) and in `setup_IO_APIC_irqs()` allocates an IRQ only
+for a pin `find_irq_entry()` finds an entry for; the rest are logged "not
+connected" and left unmapped. Pins 16-23 were therefore visible but dead, and
+a device placed there would have failed at request_irq() with a far more
+confusing symptom than IrqsExhausted. So emit one source entry per pin.
+
+Declaring 16-23 as ISA sources is safe on x86_64: `pin_2_irq()` ignores
+srcbusirq entirely there (the PIRQ override that reads it is CONFIG_X86_32),
+and `alloc_irq_from_domain()` returns irq == gsi == pin for gsi >=
+nr_legacy_irqs(), so pin 16 is IRQ 16 to the guest -- exactly what the
+command line says. The table grows by 8 entries (64 bytes) inside a region
+already reserved as E820_RESERVED from 0x9fc00 to 0xe0000.
+
+The pin count now has one definition, in arch, which both the MP table and
+the IOAPIC emulation read, because the two disagreeing is precisely the bug
+this fixes. All three backends stay correct: the WHP and KVM split-irqchip
+userspace IOAPIC already implemented 24 pins and bounds-check against the
+same constant; KVM's in-kernel IOAPIC has KVM_IOAPIC_NUM_PINS == 24 and
+default routing for GSI 0-23; hvf and the aarch64/riscv64 layouts are
+untouched, each carrying its own IRQ_BASE/IRQ_MAX.
+
+This raises the budget from 11 devices to 19. It does not make the per-layer
+device count scale -- a 20-layer image would still exhaust 19 lines -- but
+that is a design question for the snapshotter, not the interrupt map.
+
+Verified by cross-compilation and cross-execution on an aarch64 Linux host:
+`cargo check` is clean for x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+and x86_64-pc-windows-msvc with --features blk,net; krun.dll links and still
+exports all 20 symbols nerdbox binds; the new mptable test runs under
+qemu-x86_64 and asserts every pin 0-23 has exactly one mp_INT entry. Not
+verified: no VM was booted. The claim that the guest now accepts IRQ 16-23
+rests on the Linux sources cited above, not on execution.
+---
+ src/arch/src/x86_64/layout.rs    | 32 +++++++++++-
+ src/arch/src/x86_64/mptable.rs   | 89 ++++++++++++++++++++++++++++++--
+ src/devices/src/legacy/ioapic.rs |  8 ++-
+ 3 files changed, 123 insertions(+), 6 deletions(-)
+
+diff --git a/src/arch/src/x86_64/layout.rs b/src/arch/src/x86_64/layout.rs
+index a52285d..0336602 100644
+--- a/src/arch/src/x86_64/layout.rs
++++ b/src/arch/src/x86_64/layout.rs
+@@ -22,11 +22,39 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
+ /// Start of the high memory.
+ pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
+ 
+-// Typically, on x86 systems 16 IRQs are used (0-15).
++/// Number of redirection entries (pins) on the single emulated IOAPIC.
++///
++/// 24 is the count every IOAPIC since the 82093AA has had, and the one the
++/// emulation in `devices::legacy::ioapic` implements: it sizes `ioredtbl` to
++/// this and reports `IOAPIC_NUM_PINS - 1` in the max-redirection-entry field
++/// of the version register, which is what the guest reads back. KVM's
++/// in-kernel IOAPIC agrees (`KVM_IOAPIC_NUM_PINS == 24`).
++///
++/// Linux drives its pin loop straight off that version register
++/// (`io_apic_get_redir_entries()` -> `ioapics[].nr_registers` ->
++/// `for_each_ioapic_pin`), so all 24 pins are walked at boot regardless of
++/// what we do here. Whether a pin is *usable* is decided by the MP table:
++/// `setup_IO_APIC_irqs()` calls `find_irq_entry()` per pin and only allocates
++/// an IRQ for pins that have an `mp_INT` source entry. See `mptable.rs`,
++/// which emits one entry per pin for exactly this reason.
++pub const IOAPIC_NUM_PINS: u32 = 24;
++
++// Pins 0-4 are spoken for by the legacy ISA devices this VMM still builds:
++// 0 is the PIT, 1 the i8042 keyboard, 2 the 8259 cascade, and 3/4 the four
++// 16550 serial ports (COM2/COM4 on 3, COM1/COM3 on 4) -- see the
++// `register_irqfd_evt!` calls in `vmm::builder`. Nothing claims a pin above
++// 4: there is no PCI bus in this VMM (so the PIRQ lines 16-23 have no other
++// user) and no ACPI at all (so there is no SCI to reserve either).
+ /// First usable IRQ ID for virtio device interrupts on x86_64.
+ pub const IRQ_BASE: u32 = 5;
+ /// Last usable IRQ ID for virtio device interrupts on x86_64.
+-pub const IRQ_MAX: u32 = 15;
++///
++/// One virtio-mmio device is given one IOAPIC pin, and the guest is told which
++/// one through `virtio_mmio.device=<size>@<addr>:<irq>` on the kernel command
++/// line. On x86_64 Linux maps that number 1:1 onto the GSI, and with a single
++/// IOAPIC at GSI base 0 the GSI is the pin, so the last usable pin is the last
++/// usable IRQ.
++pub const IRQ_MAX: u32 = IOAPIC_NUM_PINS - 1;
+ 
+ /// Address for the TSS setup.
+ pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
+diff --git a/src/arch/src/x86_64/mptable.rs b/src/arch/src/x86_64/mptable.rs
+index dcc2273..bee31e8 100644
+--- a/src/arch/src/x86_64/mptable.rs
++++ b/src/arch/src/x86_64/mptable.rs
+@@ -14,6 +14,8 @@ use libc::c_char;
+ use arch_gen::x86::mpspec;
+ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+ 
++use super::layout::IOAPIC_NUM_PINS;
++
+ // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
+ // trait (in this case `ByteValued`) where:
+ // *    the type that is implementing the trait is foreign or
+@@ -119,7 +121,7 @@ fn compute_mp_size(num_cpus: u8) -> usize {
+         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
+         + mem::size_of::<MpcIoapicWrapper>()
+         + mem::size_of::<MpcBusWrapper>()
+-        + mem::size_of::<MpcIntsrcWrapper>() * 16
++        + mem::size_of::<MpcIntsrcWrapper>() * IOAPIC_NUM_PINS as usize
+         + mem::size_of::<MpcLintsrcWrapper>() * 2
+ }
+ 
+@@ -214,8 +216,24 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
+         base_mp = base_mp.unchecked_add(size);
+         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
+     }
+-    // Per kvm_setup_default_irq_routing() in kernel
+-    for i in 0..16 {
++    // One mp_INT source entry per IOAPIC pin, not just per legacy ISA IRQ.
++    //
++    // This is what actually decides how many IRQs a guest can use. Linux walks
++    // every pin the version register advertises, but in `setup_IO_APIC_irqs()`
++    // it only allocates an IRQ for a pin that `find_irq_entry(.., mp_INT)`
++    // finds an entry for; a pin without one is logged "not connected" and left
++    // with no irq_desc, so a `virtio_mmio.device=...:<pin>` naming it would
++    // fail at request_irq() even though the pin exists in the IOAPIC. Stopping
++    // at 16 therefore capped virtio at IRQ 15 no matter what IRQ_MAX said.
++    //
++    // Declaring 16-23 here is safe because we own the whole interrupt map:
++    // there is no PCI bus for these pins to collide with (on real hardware
++    // they are PIRQ A-H) and no ACPI to describe them differently. On x86_64
++    // `pin_2_irq()` ignores srcbusirq entirely -- the PIRQ override path that
++    // reads it is CONFIG_X86_32-only -- and `alloc_irq_from_domain()` hands
++    // back irq == gsi == pin for gsi >= nr_legacy_irqs(), so pin 16 really is
++    // IRQ 16 to the guest.
++    for i in 0..IOAPIC_NUM_PINS as u8 {
+         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
+         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
+         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
+@@ -301,6 +319,71 @@ mod tests {
+         }
+     }
+ 
++    /// Every IOAPIC pin must have an `mp_INT` source entry, because that is
++    /// what decides whether the guest can use it.
++    ///
++    /// Linux walks pins 0..`nr_registers` (24, read back from our version
++    /// register) and, per pin, looks for an entry with `dstirq == pin`; a pin
++    /// without one is logged "not connected" and never gets an irq_desc, so a
++    /// `virtio_mmio.device=...:<pin>` naming it cannot be requested. Declaring
++    /// only 0..16 was therefore the real ceiling on device count -- IRQ_MAX
++    /// could say 23 and the guest would still refuse pins 16-23.
++    ///
++    /// This asserts the full range is covered exactly once, so that IRQ_BASE
++    /// ..=IRQ_MAX is backed end to end.
++    #[test]
++    fn intsrc_entry_per_ioapic_pin() {
++        let num_cpus = 4;
++        let mem = GuestMemoryMmap::from_ranges(&[(
++            GuestAddress(MPTABLE_START),
++            compute_mp_size(num_cpus),
++        )])
++        .unwrap();
++        setup_mptable(&mem, num_cpus).unwrap();
++
++        let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
++        let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
++        let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
++        let mpc_end = mpc_offset
++            .checked_add(u64::from(mpc_table.0.length))
++            .unwrap();
++
++        let mut entry_offset = mpc_offset
++            .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
++            .unwrap();
++        let mut seen = vec![0u32; IOAPIC_NUM_PINS as usize];
++        while entry_offset < mpc_end {
++            let entry_type: u8 = mem.read_obj(entry_offset).unwrap();
++            if u32::from(entry_type) == mpspec::MP_INTSRC {
++                let intsrc: MpcIntsrcWrapper = mem.read_obj(entry_offset).unwrap();
++                assert_eq!(
++                    u32::from(intsrc.0.irqtype),
++                    mpspec::mp_irq_source_types_mp_INT,
++                    "interrupt source entries must be mp_INT for find_irq_entry() to match"
++                );
++                let pin = intsrc.0.dstirq;
++                assert!(
++                    (pin as u32) < IOAPIC_NUM_PINS,
++                    "entry targets pin {pin}, which the IOAPIC does not have"
++                );
++                seen[pin as usize] += 1;
++            }
++            entry_offset = entry_offset
++                .checked_add(table_entry_size(entry_type) as u64)
++                .unwrap();
++            assert!(entry_offset <= mpc_end);
++        }
++
++        for (pin, count) in seen.iter().enumerate() {
++            assert_eq!(*count, 1, "IOAPIC pin {pin} has {count} mp_INT entries");
++        }
++
++        // The interrupts the MMIO device manager will hand out must all be
++        // inside the range just proven to be declared.
++        assert!(super::super::layout::IRQ_BASE < super::super::layout::IRQ_MAX);
++        assert_eq!(super::super::layout::IRQ_MAX, IOAPIC_NUM_PINS - 1);
++    }
++
+     #[test]
+     fn bounds_check() {
+         let num_cpus = 4;
+diff --git a/src/devices/src/legacy/ioapic.rs b/src/devices/src/legacy/ioapic.rs
+index 113db46..bc462e6 100644
+--- a/src/devices/src/legacy/ioapic.rs
++++ b/src/devices/src/legacy/ioapic.rs
+@@ -13,7 +13,13 @@ use crate::bus::BusDevice;
+ use crate::legacy::irqchip::IrqChipT;
+ 
+ const IOAPIC_BASE: u32 = 0xfec0_0000;
+-pub(super) const IOAPIC_NUM_PINS: usize = 24;
++
++/// Taken from `arch` rather than restated, because the MP table has to declare
++/// an `mp_INT` source entry for every pin the version register advertises here
++/// -- a pin the guest sees but finds no entry for is dead weight, and a pin the
++/// MP table declares but this emulation does not have would be worse. Keeping
++/// one definition makes the two impossible to disagree.
++pub(super) const IOAPIC_NUM_PINS: usize = arch::x86_64::layout::IOAPIC_NUM_PINS as usize;
+ 
+ const IO_REG_SEL: u64 = 0x00;
+ const IO_WIN: u64 = 0x10;
+-- 
+2.53.0
+

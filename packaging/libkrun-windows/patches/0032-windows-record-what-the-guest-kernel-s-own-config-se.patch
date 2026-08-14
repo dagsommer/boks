@@ -1,7 +1,7 @@
 From 199295225778c4ca743d1dcf11ff32a76c8dd37a Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 22:15:26 +0200
-Subject: [PATCH 32/35] windows: record what the guest kernel's own config
+Subject: [PATCH 32/36] windows: record what the guest kernel's own config
  settles about the clock
 
 ---

@@ -1,7 +1,7 @@
 From 123dcee3150ef841bddf594c37993c98d4ff3606 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 13:46:08 +0200
-Subject: [PATCH 05/35] windows: keep krun-vmm's dependency graph buildable on
+Subject: [PATCH 05/36] windows: keep krun-vmm's dependency graph buildable on
  Windows
 
 Two dependency-level blockers stopped krun-vmm from even reaching its own

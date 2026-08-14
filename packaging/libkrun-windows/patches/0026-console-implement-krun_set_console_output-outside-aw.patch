@@ -1,7 +1,7 @@
 From ce3e58abf1985334111b8e57fc34b82dcdd351d7 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 16:25:44 +0200
-Subject: [PATCH 26/35] console: implement krun_set_console_output outside
+Subject: [PATCH 26/36] console: implement krun_set_console_output outside
  aws-nitro
 
 The symbol was gated on `aws-nitro`, an unrelated backend, with a FIXME

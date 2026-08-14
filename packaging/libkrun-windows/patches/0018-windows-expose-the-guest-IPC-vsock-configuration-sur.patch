@@ -1,7 +1,7 @@
 From e5770a95443558d0e6f91093c46915d10cc1be81 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:12:18 +0200
-Subject: [PATCH 18/35] windows: expose the guest-IPC vsock configuration
+Subject: [PATCH 18/36] windows: expose the guest-IPC vsock configuration
  surface
 
 With the device built on Windows, the configuration path that reaches it can
