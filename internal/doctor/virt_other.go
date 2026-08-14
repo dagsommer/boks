@@ -22,9 +22,7 @@ func virtualizationCheck() Check {
 	}
 }
 
-func extraChecks() []Check                   { return nil }
-func hypervisorLibraryNames() []string       { return nil }
-func hypervisorLibrarySearchPaths() []string { return nil }
+func extraChecks() []Check { return nil }
 
 // hypervisorLibraryHint is never shown here: with no library names, the check skips before it
 // can miss. It exists because the shared check requires every platform to provide one.
