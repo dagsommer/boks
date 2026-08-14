@@ -1,7 +1,7 @@
 From 53ea1e8d499659a734b65a95b8262ee492f8b3ff Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:29:53 +0200
-Subject: [PATCH 21/34] windows: add a Winsock AF_UNIX backend for the
+Subject: [PATCH 21/35] windows: add a Winsock AF_UNIX backend for the
  virtio-net unixstream link
 
 This is the last device between libkrun and a VM that boots on Windows with a
