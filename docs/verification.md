@@ -789,6 +789,54 @@ Sandboxes installed, and carries an unrelated `containerd-shim-nerdbox-v1.exe` f
 weeks earlier with 4,497 s of CPU time, plus pipes from that install. Enumerating the pipe
 namespace finds those too; match the exact name from `boot.bin` rather than pattern-matching.
 
+### containerd unpacks a Linux image with EROFS on Windows, 2026-08-14
+
+The question this settles is whether containerd on Windows — which normally manages
+*Windows* containers through HCS — can unpack a **Linux** image with the **EROFS**
+snapshotter, which is the only snapshotter nerdbox's non-Linux mount path accepts.
+
+It can. `ctr images pull --platform linux/amd64 --snapshotter erofs` succeeds, without
+`--local`, and the daemon log shows the work being done rather than merely reported:
+
+```
+running mkfs.erofs.exe [mkfs.erofs --tar=f --aufs --quiet ... layer.erofs]
+image unpacked  chainID="sha256:34884abbe..."  duration=537.8359ms
+```
+
+`layer.erofs`, 8,736,768 bytes, magic `E0F5E1E2` at offset 1024.
+
+Getting there took five blockers, four now fixed and one open. Two are worth recording
+for what they say about how a check can lie:
+
+**`plugins ls` said `ok` while the differ was never consulted.** containerd's Windows
+diff-service default order is `['windows', 'windows-lcow']`; the erofs differ loaded
+fine and was simply never asked, and the walk ended at the Windows differ rejecting its
+mounts. `ok` means *initialised*, never *reachable*. The fix puts `erofs` first — first,
+because `MountsToLayer` returns `ErrNotImplemented` for foreign mounts and the walk
+continues, while the Windows differs fail hard and end it. Proven to be compiled into the
+binary, not supplied by config, by deleting the config block, wiping the root so nothing
+could be cached, and re-pulling successfully.
+
+**`mkfs.erofs.exe` reported `No space left on device` with 61 GB free.** `erofs_tmpfile`
+read only `TMPDIR` and fell back to a hardcoded `/tmp`, which mingw resolves to `C:\tmp`;
+`erofs_diskbuf_init` then discarded the real errno and returned `-ENOSPC`. Isolated from
+containerd entirely with a 3 KB tar and a single-variable change: creating `C:\tmp` made
+it succeed. Now uses `GetTempPathW`, self-deletes via `FILE_FLAG_DELETE_ON_CLOSE`, and
+reports the true error.
+
+**Still open: containerd locks itself out of its own root.** Unelevated, on first run, it
+creates `--root` with an ACL granting only `SYSTEM` and `Administrators` — not the
+unelevated user who owns it — then fails to create anything inside, taking 43 plugins
+down. Pre-creating the directories avoids it entirely, because `MkdirAllWithACL` is a
+no-op on existing ones. The first successful run only worked by luck: the directories
+happened to exist already.
+
+A diagnostic improved on the way. A missing `mkfs.erofs.exe` used to surface as
+`no unpack platforms defined`, naming nothing useful. It now logs
+`differ "erofs" is registered but unavailable, dropping it from the diff order`, which
+was confirmed accidentally when the tester restarted the daemon without the bundle on
+`PATH`.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
