@@ -21,10 +21,14 @@
 # pinned revision and still compiles into a PE executable for both Windows architectures. That
 # is enough to stop a merge that breaks the series or drifts the pin.
 #
-# It proves NOTHING about whether the shim runs. Nobody has started this shim on Windows. The
-# bug this whole directory exists to fix was invisible to a compiler — the unpatched shim built
-# perfectly and died at runtime in 118 ms — so a green run here is precisely the kind of
-# evidence that already failed to catch the problem once. Compiling a shim is not starting one.
+# It proves NOTHING about whether the shim runs. The patched shim HAS been started on Windows —
+# on 2026-08-14 it served ttrpc under a real containerd and ran a container in a microVM (see
+# docs/verification.md) — but not by this job, which has no Windows runner and no hypervisor.
+# The bug this whole directory exists to fix was invisible to a compiler, the unpatched shim
+# built perfectly and died at runtime in 118 ms, and the 30-second teardown stall that patch
+# 0005 fixes was found by running rather than by building. A green run here is precisely the
+# kind of evidence that has now failed to catch the problem twice. Compiling a shim is not
+# starting one.
 #
 # Triggers: only a change to the patches, the pin, or this file. Plus workflow_dispatch, for
 # when you want to know whether the series still applies to a nerdbox that has moved.
@@ -159,6 +163,23 @@ jobs:
             echo "  $f: PE, $(wc -c <"$f") bytes"
           done
 
+      # `go build` never compiles a _test.go file, and patch 0005 adds one that only exists on
+      # Windows (io_copystreams_windows_test.go). Without this step a broken Windows-only test
+      # would go green here and fail for the first time on someone's Windows machine, which is
+      # the audience least able to debug it. `go vet` type-checks test files, so it catches
+      # that without needing a Windows runner. It cannot run them — that still needs Windows.
+      - name: Vet the patched packages for Windows, including their tests
+        working-directory: nerdbox
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            echo "::group::GOOS=windows GOARCH=$arch go vet ./internal/..."
+            GOOS=windows GOARCH="$arch" go vet ./internal/...
+            echo "::endgroup::"
+          done
+
       # The patched shim must not fix Windows by breaking Linux. Patch 0002 changes a
       # `//go:build windows` file, so this should be free — which is exactly why it is cheap
       # to assert rather than assume.
@@ -188,11 +209,13 @@ jobs:
             echo
             echo "nerdbox \`${{ steps.pin.outputs.rev }}\` + \`packaging/nerdbox-windows/patches/\`."
             echo
-            echo "The series applies and builds a PE executable for windows/amd64 and windows/arm64."
+            echo "The series applies and builds a PE executable for windows/amd64 and windows/arm64,"
+            echo "and its Windows-only test files type-check."
             echo
-            echo "**This is compile-time evidence only.** The shim has never been started on"
-            echo "Windows. The unpatched shim compiled cleanly too and died at runtime in 118 ms;"
-            echo "a green run here would not have caught that. Download the artifact and run the"
-            echo "commands in \`packaging/nerdbox-windows/README.md\` to learn anything about"
-            echo "whether it works."
+            echo "**This is compile-time evidence only, and a green run here means very little.**"
+            echo "The unpatched shim compiled cleanly too and died at runtime in 118 ms. A patched"
+            echo "one has since run a container on Windows 11 (2026-08-14, docs/verification.md),"
+            echo "and the run found a 30-second teardown stall that every build before it had"
+            echo "passed. Download the artifact and run the commands in"
+            echo "\`packaging/nerdbox-windows/README.md\` to learn anything about whether it works."
           } >>"$GITHUB_STEP_SUMMARY"
