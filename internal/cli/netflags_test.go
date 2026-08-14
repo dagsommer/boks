@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -147,6 +148,34 @@ func TestOrphanedStackWarningStatesTheMeasuredOutcome(t *testing.T) {
 	}
 	if strings.Contains(got, "unverified") {
 		t.Errorf("the warning still calls a measured outcome unverified:\n%s", got)
+	}
+}
+
+// TestUnexercisedNetworkWarningClaimsNothing covers the note printed before a sandbox is
+// created on a platform where no frame has ever crossed the link — today, Windows.
+//
+// The condition is constructed rather than depended on: the warning takes the reason as an
+// argument for exactly this, so the Windows text can be rendered on a machine that is not
+// Windows. What it must do is refuse to promise anything, and name the failure that looks like
+// success — a guest left on the runtime's own transport, where its 127.0.0.1 is the host's.
+func TestUnexercisedNetworkWarningClaimsNothing(t *testing.T) {
+	got := unexercisedNetworkWarning(errors.New("no frame has ever crossed this device on Windows"))
+	for _, want := range []string{
+		"WARNING",
+		"attempt, not a claim",
+		"no frame has ever crossed this device on Windows",
+		"stack.log",
+		"not contained",
+		"boks policy log",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the warning does not say %q:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"is supported", "works on Windows"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("the warning claims %q, which nothing has shown:\n%s", unwanted, got)
+		}
 	}
 }
 

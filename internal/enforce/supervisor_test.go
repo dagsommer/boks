@@ -35,7 +35,11 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		os.Exit(2)
 	}
-	err = Serve(context.Background(), spec, os.Stdout, func(ctx context.Context) error {
+	err = Serve(context.Background(), spec, os.Stdout, func(ctx context.Context, started func()) error {
+		// The fake sandbox's task is "running" for as long as the sentinel is
+		// absent, so the supervisor is told it started immediately — the same
+		// signal the real watch gives when containerd first reports the task.
+		started()
 		sentinel := filepath.Join(spec.StateDir, stopSentinel)
 		for {
 			if _, err := os.Stat(sentinel); err == nil {

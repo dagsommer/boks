@@ -47,8 +47,30 @@ type provider interface {
 	listen(addr string) (net.Listener, error)
 	// dial opens a connection into the virtual network from the host side.
 	dial(ctx context.Context, addr string) (net.Conn, error)
+	// connected returns a channel closed the first time a peer attaches to the link
+	// socket. See (*Network).Connected.
+	connected() <-chan struct{}
 	stop() error
 }
+
+// peerSignal records the first time anything connects to the link socket.
+//
+// It is one bit, latched, and never unlatched: what a caller wants to know is whether a VM
+// ever arrived, not whether one is attached right now. A VMM that restarts disconnects and
+// reconnects (see gateway.serve), and a signal that flapped with it would turn every restart
+// into an alarm.
+type peerSignal struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func newPeerSignal() *peerSignal { return &peerSignal{ch: make(chan struct{})} }
+
+// attached latches the signal. It is called from the accept loop, so it must be safe to call
+// on every connection and cheap after the first.
+func (p *peerSignal) attached() { p.once.Do(func() { close(p.ch) }) }
+
+func (p *peerSignal) waiter() <-chan struct{} { return p.ch }
 
 // ErrNoNetwork is returned by Listen and Dial when the sandbox has no virtual network to
 // listen in — ModeNone, or a stack that was never started.
@@ -74,9 +96,9 @@ func NewFromPlan(plan Plan) (*Network, error) {
 	var p provider
 	switch plan.Mode {
 	case ModeNone:
-		p = &blackhole{}
+		p = &blackhole{peers: newPeerSignal()}
 	case ModeNAT:
-		p = &gateway{}
+		p = &gateway{peers: newPeerSignal()}
 	default:
 		return nil, fmt.Errorf("network: unsupported mode %q", plan.Mode)
 	}
@@ -139,6 +161,20 @@ func (n *Network) DialGuest(ctx context.Context, port int) (net.Conn, error) {
 	return n.provider.dial(ctx, net.JoinHostPort(n.plan.GuestAddr.Addr().String(), strconv.Itoa(port)))
 }
 
+// Connected returns a channel that is closed the first time something attaches to the link
+// socket — that is, the first time anything claims to be this sandbox's VM.
+//
+// It answers one question, and it is a question only because of Windows: *did a VMM ever turn
+// up*. On a platform where a guest has been watched across this link, waiting on it is
+// pointless, because the alternative to the VM connecting is the VM failing to boot, which
+// containerd reports by itself. Where nothing has ever put a frame on this device
+// (Unexercised), the silent outcome is the likely one — a shim that does not carry the
+// external network provider leaves the guest on libkrun's TSI and says nothing — and this is
+// the only evidence Boks has that it happened.
+//
+// It is deliberately not "is a VM attached now": see peerSignal.
+func (n *Network) Connected() <-chan struct{} { return n.provider.connected() }
+
 func (n *Network) running() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -184,14 +220,14 @@ func (n *Network) Start(ctx context.Context) error {
 	if n.stopped {
 		return errors.New("network: already stopped")
 	}
-	// Refuse early on a platform where nothing can attach a VM to this link, rather than
-	// binding a socket and waiting for a peer that cannot exist. This is the only place
-	// the platform is asked about: the link is a stream now, so the socket, the framing
-	// and the stack are the same code everywhere.
-	if err := vmmSupported(); err != nil {
-		return err
-	}
-
+	// No platform gate. There used to be one here — Windows was refused before anything
+	// was bound — and removing it is the point of this function's current shape: the
+	// socket, the framing, the switch, the stack and the policy forwarder are the same
+	// code on every platform since the link became a stream, so there is nothing left for
+	// a gate to protect against except the possibility of disappointment. What is *not*
+	// the same everywhere is whether a VMM has ever been seen on the other end; that is
+	// Unexercised, it is a warning rather than a refusal, and the callers who can act on
+	// it do (internal/cli, and the supervisor's bounded wait for a peer).
 	dir := filepath.Dir(n.plan.Socket)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("network: creating %s: %w", dir, err)
@@ -255,6 +291,10 @@ type blackhole struct {
 	conns    map[net.Conn]struct{}
 	stopped  bool
 	done     chan struct{}
+	// peers latches when something first connects. -net none has no stack, but it still
+	// has a link socket the VM's NIC writes to, so "did a VM ever attach" is exactly as
+	// answerable — and exactly as worth answering — here as it is with a stack behind it.
+	peers *peerSignal
 }
 
 func (b *blackhole) start(ctx context.Context, plan Plan, _ *policy.Engine, _ io.Writer) error {
@@ -301,8 +341,11 @@ func (b *blackhole) track(conn net.Conn) bool {
 		return false
 	}
 	b.conns[conn] = struct{}{}
+	b.peers.attached()
 	return true
 }
+
+func (b *blackhole) connected() <-chan struct{} { return b.peers.waiter() }
 
 func (b *blackhole) untrack(conn net.Conn) {
 	b.mu.Lock()
