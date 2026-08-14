@@ -594,6 +594,15 @@ jobs:
             echo "initialises, or the erofs differ returns \`ErrSkipPlugin\` and vanishes with no"
             echo "error that mentions it."
             echo
+            echo "**These steps run unelevated. Creating a *task* does not.** containerd's"
+            echo "\`NewBundle\` symlinks unconditionally (\`core/runtime/v2/bundle.go:103\`) and"
+            echo "unprivileged Windows will not create a symlink without Developer Mode, so"
+            echo "\`ctr run\` needs an elevated daemon or a machine-wide Developer Mode. Nothing"
+            echo "below reaches that — it unpacks an image and stops. If you do run elevated,"
+            echo "give the daemon a **fresh \`--root\` it creates itself**: an elevated daemon"
+            echo "pointed at a root an unprivileged user made hands that user its content"
+            echo "store. See \`README.md\` in the artifact."
+            echo
             echo "**Run unelevated, pass \`--config\`, and create \`root\`/\`state\` first.** The"
             echo "defaults fail three ways over: a normal user cannot create"
             echo "\`C:\\ProgramData\\containerd\`; the cimfs snapshotter cannot initialise without"
