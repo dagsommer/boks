@@ -1,18 +1,35 @@
 # Boks on Windows
 
-Status: **feasibility spike.** One decision from it has since been implemented — the workspace
-path mapping in section 4, which is pure path arithmetic and needs no Windows to be correct —
-and nothing else. No machine on this project has Windows or a hypervisor for it, nothing here
-has been executed on Windows, and none of the findings below were obtained by running anything
-there. They are read from the source of
+Status: **a feasibility spike, and its central question has since been answered by running
+things.** The spike below was written without a Windows machine, from the source of
 `microsoft/hcsshim`, `containerd` and `gvisor-tap-vsock`, from Microsoft's documentation, from
 the CI configuration those projects ship, and — for the section that matters most — from the
 shipped Windows binaries of the reference product. Every claim is labelled **verified** (traced
 to a primary source), **inferred** (reasoned from one), or **unknown**.
 
-The only things that *were* demonstrated are that `GOOS=windows GOARCH=amd64 go build ./...`
-succeeds, and that the netstack compiles for Windows once its build tag is removed. Neither
-demonstrates anything about whether a sandbox would run, and neither is offered as if it did.
+> **What has happened since, and what it invalidates.** This project now has a Windows 11 test
+> machine and four patch series in [`packaging/`](../packaging/): a Windows Hypervisor Platform
+> backend for libkrun, a nerdbox shim that starts on Windows, a containerd with the EROFS
+> snapshotter, and an `mkfs.erofs`. On **2026-08-14** they ran a Linux container end to end —
+> `ctr tasks start`, output returned, guest kernel 6.12.44, boot in 1.9 s. See
+> [verification.md](verification.md) and [windows-e2e.md](windows-e2e.md).
+>
+> So **every sentence below that says there is no VMM for Windows, or that nothing here has been
+> run, is out of date** — the spike's own conclusion (section 8: "wait for libkrun 2.0") was
+> overtaken by building it. Those sentences are corrected where they are load-bearing and left
+> where they are historical reasoning, because this document's value is the reasoning and not
+> its status line.
+>
+> **What is still true is the part that matters to Boks**: `virtio-net`. Boks enforces network
+> policy at that device, no Ethernet frame has crossed one on Windows, and
+> `internal/network/vmm_windows.go` still refuses to start sandbox networking there. `boks run`
+> does not work on Windows. The WSL2 route below remains the only way to use Boks on a Windows
+> machine, and nobody on this project has run that either.
+
+Of the decisions this spike produced, one has been implemented — the workspace path mapping in
+section 4, which is pure path arithmetic and needs no Windows to be correct — and it has still
+never been exercised on Windows, because the request that would exercise it comes from
+`boks run`.
 
 **This document changed its mind once, and the reversal is left visible on purpose.** Sections
 1–6 conclude that Windows structurally cannot support Boks' network enforcement; section 7
@@ -41,6 +58,13 @@ therefore worth refuting explicitly rather than deleting.
 **Windows can host exactly the sandbox Boks builds, including the network enforcement. Boks
 cannot build one there because it has no VMM that speaks the platform's hypervisor API — and
 that is the whole gap.**
+
+*That was the verdict, and the gap it names is closed: this project built the VMM. `krun.dll`
+speaks WHP and, on 2026-08-14, booted a Linux guest under containerd and the nerdbox shim that
+ran a container. What is left of the gap is the one device inside that VMM which carries
+packets — `virtio-net` — and until a frame crosses it, Boks still cannot build a sandbox on
+Windows. The verdict below is preserved because its reasoning is what led to building the
+thing.*
 
 This reverses the conclusion this document reached on its first pass, which was that Windows
 structurally could not support host-terminated guest networking. That conclusion was drawn
@@ -78,20 +102,21 @@ demonstration.
 |---|---|
 | A Linux microVM per sandbox on Windows, driven through containerd | **Already upstream.** `containerd/nerdbox` builds its shim for `windows/amd64` and `windows/arm64` and loads a VMM DLL named `krun.dll`. |
 | Terminating the guest's network in a host userspace process | **Architecturally available.** WHP has no networking API at all: every device, the NIC included, is emulated in the VMM's own process. Networking is entirely the VMM's business. |
-| **A VMM Boks can use to do it** | **Being built, upstream, now.** libkrun has an in-tree WHP backend targeting libkrun 2.0 at the end of 2026 — with virtio-fs, -blk, -console, -balloon and -rng ported and **virtio-net the single exception.** |
+| **A VMM Boks can use to do it** | **Built here, and run.** Upstream libkrun's in-tree WHP backend targets libkrun 2.0 at the end of 2026, with virtio-net the single device not ported. Rather than wait, this project carries its own series ([`packaging/libkrun-windows`](../packaging/libkrun-windows/)); on 2026-08-14 the resulting `krun.dll` booted a Linux guest under containerd and the nerdbox shim and ran a container in it. |
 
-That last row is the whole answer, and it is much narrower than "Boks needs a VMM". Every device
-libkrun needs on Windows has been ported except the one that carries packets — which is exactly
-and only the one Boks depends on.
+That last row was the whole answer, and it was much narrower than "Boks needs a VMM". It is
+narrower still now: every device libkrun needs on Windows has been ported, including — in this
+repository's series — the one that carries packets, and **that one has never carried a packet**.
 
-The recommendation therefore changes shape twice over. It is **not** "do not build a Windows
-backend because policy could not be enforced" — that was wrong. Nor is it "find or write a VMM".
-It is:
+The recommendation therefore changed shape twice over, and then a third time. It is **not** "do
+not build a Windows backend because policy could not be enforced" — that was wrong. Nor is it
+"find or write a VMM"; that VMM now exists and works. What is left is:
 
-**Wait for libkrun 2.0, and if Windows is wanted sooner, contribute the one missing piece:
-port libkrun's `virtio-net` backend from `nix`/`RawFd` to WinSock.** Boks changes nothing
-architectural. Section 8 has the evidence, the second-choice option (OpenVMM), and one cheap
-experiment that could produce a working path today.
+**Get one Ethernet frame across `virtio-net` on Windows.** That is the single measurement
+between the stack that runs today and a Boks sandbox with enforced network policy, and it is
+what `internal/network/vmm_windows.go` refuses on until it happens. Section 8 has the original
+evidence, the second-choice option (OpenVMM) and the reasoning that led to building rather than
+waiting.
 
 ### And there is an answer for Windows users today
 
@@ -111,8 +136,10 @@ This is not a Windows port and must not be described as one, and nobody here has
 is a real answer to "can I use Boks on my Windows machine", it is available now, and it should
 be offered rather than buried.
 
-What has *not* changed is the honesty requirement. None of this has been run. "Docker does it,
-so it is possible" is a strong existence proof and a weak implementation plan.
+What has *not* changed is the honesty requirement. When this was written, none of it had been
+run; since 2026-08-14 the container half has, and the WSL2 route recommended just above still
+has not, by anyone here. "Docker does it, so it is possible" was a strong existence proof and a
+weak implementation plan — the plan only became real when something ran.
 
 ## Why the earlier answers were wrong
 
@@ -275,9 +302,11 @@ Linux path, so exact-path preservation is literally true there too.
 ### What is unverified
 
 **All of it, in combination.** Each ingredient is traced to WSL's source, its issue tracker or
-its kernel config; nobody on this project has run Boks inside WSL2, or run anything on Windows
-at all. The `doctor` logic added for this is tested, but only its logic — the values it reads
-have never been read on a real WSL system.
+its kernel config; **nobody on this project has run Boks inside WSL2.** (Plenty has since been
+run on Windows *natively* — see the banner at the top — but nothing in a WSL distribution, which
+is a different kernel, a different `/dev/kvm` and a different set of failures.) The `doctor`
+logic added for this is tested, but only its logic — the values it reads have never been read on
+a real WSL system.
 
 The specific thing most worth testing first is **`/dev/kvm` on an AMD machine**. Nested
 virtualisation is vendor-agnostic in WSL's source, but the empirical record for AMD bare metal
@@ -693,8 +722,10 @@ Not implemented, deliberately:
 - **A host↔guest inverse for `boks cp`.** `cp` takes the guest path from the user directly
   (`SANDBOX:/abs/path`) and never derives one from a host path, so it has nothing to invert
   today. The mapping is reversible when it does.
-- **Anything that would run.** There is no VMM, so none of this has been executed on Windows
-  and none of it is on a path a user can reach.
+- **Anything that would run.** None of this has been executed on Windows and none of it is on a
+  path a user can reach. That was because there was no VMM; since 2026-08-14 there is one, and
+  the reason is now narrower: `boks run` refuses on Windows before it would ever ask for a path
+  to be mapped.
 
 ### The consequences, stated as costs
 
@@ -931,10 +962,12 @@ supervisor survives Ctrl-C and the closing terminal. The Windows equivalent is
 `SysProcAttr.CreationFlags`, which is a different mechanism with different console-inheritance
 consequences, not a rename.
 
-**This spike does not implement any of it**, because there is no VM under it yet: a correct
-lock with no caller would suggest the supervisor is one file away from working, and it is a
-whole VMM away. `lock_windows.go` records the `LockFileEx` design and the promptness caveat in
-a comment so that whoever does implement it does not rediscover them.
+**This spike does not implement any of it**, because there was no VM under it: a correct lock
+with no caller would suggest the supervisor is one file away from working, and it was a whole
+VMM away. The VMM has since been built; what is still absent is a Boks sandbox on Windows for
+the supervisor to supervise, so the lock still has no caller. `lock_windows.go` records the
+`LockFileEx` design and the promptness caveat in a comment so that whoever does implement it
+does not rediscover them.
 
 ---
 
@@ -1175,7 +1208,10 @@ gvisor-tap-vsock documents QEMU with `-netdev socket,connect=127.0.0.1:1234` aga
 platform. So the fact that Windows' AF_UNIX has no `SOCK_DGRAM` — which looked like a blocker
 in section 6 — stops mattering: a stream protocol over loopback TCP works on Windows today.
 
-That leaves the VMM as the only genuinely missing piece, which is the point of this section.
+That left the VMM as the only genuinely missing piece, which was the point of this section. It
+was then built — [`packaging/libkrun-windows`](../packaging/libkrun-windows/) — and the piece
+now missing is one device inside it, `virtio-net`, which is the device this whole link exists
+to talk to.
 
 **One security consequence to design for, not to discover.** A loopback TCP link is reachable
 by *any* local process, unlike a UNIX socket in a mode-0700 directory. Whoever implements this
@@ -1190,7 +1226,7 @@ Assessed against requirement 2, which is where they are decided.
 
 | Candidate | Windows via WHP | virtio-net backend Boks could own |
 |---|---|---|
-| **libkrun** — what Boks uses today | **In progress, in tree** — see below | **The one device not yet ported.** Everything else was. |
+| **libkrun** — what Boks uses today | **Works, from this project's series**; in progress in tree upstream — see below | **Ported here** (`packaging/libkrun-windows/patches/0021`, a Winsock `AF_UNIX` stream backend) **and never used.** Everything else was ported upstream. |
 | **OpenVMM** (Microsoft, MIT) | **Yes, first-class** — x64 and arm64 | No socket backend, but `net_backend::{Endpoint, Queue}` is a documented pluggable trait with five implementations |
 | **QEMU** + WHPX | Yes, documented and maintained | Exists (`-netdev socket`/`stream` + `virtio-net-pci`) — **but whether it works on a Windows build is unverified** |
 | **crosvm** | Compile-tested upstream, "not tested upstream" at runtime, x86_64 only | **No.** There is no `--net` flag on Windows at all; the datapath is built-in libslirp |
@@ -1292,6 +1328,14 @@ The highest-leverage contribution, if the project wants Windows sooner, is narro
 the single thing standing between the existing work and a Boks sandbox with enforced network
 policy on Windows, and it is squarely in Boks' area of expertise.
 
+*What happened instead: the project did not wait. It carried its own libkrun series, its own
+containerd and shim patches, and on 2026-08-14 ran a container on Windows — all three "already
+being done upstream" pieces built here, months ahead of the release this paragraph recommends
+waiting for. The narrow contribution named above was written too:
+`packaging/libkrun-windows/patches/0021` is that WinSock backend. It has never carried a frame,
+so the last sentence still stands — that port is the single thing between the existing work and
+an enforced sandbox, and writing it was not the same as finishing it.*
+
 Second-best, if libkrun 2.0 slips: **OpenVMM behind a nerdbox `vm-manager.v1` plugin**, writing a
 socket `Endpoint` against its pluggable `net_backend` trait. MIT, boots Linux directly on Windows
 x64 and arm64, the best-maintained WHP code that exists — at the cost of vendoring unpublished
@@ -1327,11 +1371,11 @@ containerd (Windows, named pipe \\.\pipe\containerd-containerd)
 containerd-shim-nerdbox-v1.exe         -- one shim per sandbox
     |
     v
-a VMM on the Windows Hypervisor Platform    <-- THE GAP: Boks has none
+a VMM on the Windows Hypervisor Platform    <-- WAS THE GAP; krun.dll fills it (2026-08-14)
     +-- guest memory mapped into the VMM's own process (WHvMapGpaRange)
     +-- devices emulated in user mode (WHvEmulatorTry{Mmio,Io}Emulation)
     +-- workspace via virtiofs
-    +-- virtio-net, backend owned in user space
+    +-- virtio-net, backend owned in user space   <-- THE GAP NOW: never carried a frame
               |
               v
     Boks' gvisor netstack + policy engine + proxy   (unchanged from Linux/macOS)
@@ -1341,8 +1385,8 @@ Every box except one is either already built or a known port. What changes in Bo
 
 | Package | Change | Size |
 |---|---|---|
-| **the VMM** | **does not exist for Windows** — see section 8 | the entire question |
-| `internal/network` gateway | **done, on the Linux path**: the link is `mode=unixstream` — an AF_UNIX `SOCK_STREAM` socket Boks listens on, `types.QemuProtocol` framing — which Windows AF_UNIX supports. What is left is a VMM to connect to it | none in Boks; all of it in the VMM |
+| **the VMM** | **built since this table was written** — `krun.dll` from [`packaging/libkrun-windows`](../packaging/libkrun-windows/), which ran a container on 2026-08-14. Its `virtio-net` device has a Windows backend that has never carried a frame | was the entire question; now one device |
+| `internal/network` gateway | **done, on the Linux path**: the link is `mode=unixstream` — an AF_UNIX `SOCK_STREAM` socket Boks listens on, `types.QemuProtocol` framing — which Windows AF_UNIX supports. What is left is for a VM to connect to it, which needs `virtio-net` on the other end | none in Boks; all of it in the VMM |
 | `internal/enforce` | `LockFileEx` with a retry, and `CREATE_NEW_PROCESS_GROUP` in place of `setsid` | small (section 6) |
 | `internal/workspace` | Windows host path → `/c/…`; refuse UNC | small — the type already separates `HostPath` from `GuestPath`, so nothing downstream changes |
 | `internal/runtimecfg` | containerd's Windows named-pipe address is already handled; the runtime handler stays `io.containerd.nerdbox.v1` if the shim is the same family | trivial |
@@ -1370,9 +1414,11 @@ Two measurements support that last row, and both were taken during this spike:
 **Built** — message accuracy only, no new capability:
 
 - `internal/doctor/virt_windows.go`: a Windows-specific `virtualization` check whose failure
-  says the platform is not the obstacle and names the missing VMM. It deliberately probes for
-  nothing — offering a prerequisite checklist would imply that completing it leads somewhere,
-  and today there is no Boks Windows backend to enable.
+  says the platform is not the obstacle and names what is. It deliberately probes for nothing —
+  a passing prerequisite checklist in `boks doctor` would imply that completing it produces a
+  Boks sandbox. (Since 2026-08-14 that checklist does produce a running container, and
+  [windows-e2e.md](windows-e2e.md) is it; the check's text now says so, and still fails,
+  because `boks run` refuses at the network.)
 - `internal/doctor/doctor.go`: the platform check's Windows remedy no longer says "blocked on
   runtime support".
 - `internal/network/vmm_windows.go` (then `gateway_windows.go`), `internal/enforce/lock_windows.go`: the errors and
@@ -1401,9 +1447,11 @@ standard exists to prevent.
 
 **Not built, on purpose:**
 
-- **No Windows link transport.** Its shape depends on which VMM, and there is no VMM.
+- **No Windows link transport.** Its shape depended on which VMM, and there was none. The VMM
+  question is settled — `krun.dll`, `mode=unixstream` — and the transport is still unwritten.
 - **No `LockFileEx` supervisor liveness.** A correct primitive with no caller (section 6).
-- **No VMM.** Section 8 is an assessment, not a plan of record.
+- **No VMM.** Section 8 was an assessment, not a plan of record. It has since been overtaken:
+  the WHP backend was built here rather than waited for, and on 2026-08-14 it ran a container.
 - **No new dependencies.** `hcsshim` and `linuxkit/virtsock` remain indirect. Nothing here
   needed to import either; the findings came from reading them.
 
@@ -1503,8 +1551,9 @@ independently, and compares the written guest bundle against that file followed 
 were confirmed to fail against a deliberately mutated Unix path that routed it through the new
 encoder.
 
-**What has not been verified, and cannot be here.** Nothing in `roots_windows.go` has been
-executed. No machine on this project runs Windows, so the store enumeration itself — that
+**What has not been verified.** Nothing in `roots_windows.go` has been executed. There is now a
+Windows 11 machine on this project, so this is a test not yet run rather than one that cannot
+be — the store enumeration itself, that
 `CertOpenSystemStore(0, "ROOT")` returns the collection described above, that the loop
 terminates on `CRYPT_E_NOT_FOUND` rather than hanging or erroring, that `Disallowed` opens on a
 machine where it is empty, that the resulting bundle is one OpenSSL accepts, and that a guest
@@ -1532,7 +1581,9 @@ Ranked by how much it would change the conclusion.
    does not advertise one. **Settle this on real hardware before planning around it.**
 3. **When libkrun 2.0 actually ships, and whether virtio-net is in it.** The maintainer's
    target is "end of the year"; the WHP work is explicitly "not buildable yet". A slip moves
-   Boks' Windows story out by however long.
+   Boks' Windows story out by however long. *No longer gating: this project carries its own
+   backend and does not wait for the release. It gates only how long that series has to be
+   maintained.*
 4. **Whether QEMU's `-netdev socket`/`-netdev stream` works on a Windows host build.** The one
    cheap experiment that could produce a working path today; see section 8.
 5. Whether the VMM would be a separate process or linked in, which decides whether the
@@ -1558,16 +1609,18 @@ and how Docker Sandboxes enforces policy on Windows (section 7).
 ## Verification checklist
 
 For someone with a Windows 11 machine and hardware virtualisation. Written in the spirit of
-[verification.md](verification.md): each step says what would count as evidence, and none of it
-has been run.
+[verification.md](verification.md): each step says what would count as evidence. When it was
+written none of it had been run; parts A and B have since been overtaken by
+[windows-e2e.md](windows-e2e.md), which does more than corroborate section 7 — it runs a
+container. Parts C, D and E are untouched by that.
 
 Five parts, in descending order of value:
 
 - **Part D (steps 15–17) — Boks inside WSL2.** The only steps here that could produce a
   *working* Boks sandbox on a Windows machine, and the cheapest to run. Start here.
 - **Part E (steps 19–21) — the guest trust bundle.** The only Windows-specific Boks code that
-  can be exercised today: it needs a Go toolchain and nothing else, no hypervisor and no
-  sandbox. Cheapest of the lot.
+  can be exercised without a sandbox: it needs a Go toolchain and nothing else, no hypervisor.
+  Cheapest of the lot.
 - **Part A (steps 1–4) — corroborate section 7.** That section reverses this document's
   original verdict on the strength of an import table; an afternoon would make it an
   observation.
@@ -1576,8 +1629,10 @@ Five parts, in descending order of value:
 - **Part C (steps 9–14) — LCOW.** Kept only for anyone who wants to confirm the cul-de-sac
   is one.
 
-Parts A, B and C **will not produce a working Boks sandbox**; Boks has no native Windows
-backend, and none of these steps give it one. They establish whether one is worth building.
+Parts A, B and C **will not produce a working Boks sandbox**, and none of these steps give it
+one — that now waits on `virtio-net` and on lifting the refusal in
+`internal/network/vmm_windows.go`, not on a VMM. They establish whether one is worth building,
+and part B's question has since been answered by building it.
 
 ### Part A — corroborate what the reference product does
 
@@ -1827,8 +1882,10 @@ a working Boks sandbox on a Windows machine.
 
 ### Part E — the guest trust bundle on Windows
 
-The one piece of Windows-specific Boks code that could be exercised today, on a Windows machine
-with no hypervisor and no sandbox at all. It needs only the Go toolchain.
+The one piece of Windows-specific *Boks* code that could be exercised today, on a Windows machine
+with no hypervisor and no sandbox at all. It needs only the Go toolchain. (Everything else that
+now runs on Windows is containerd's, nerdbox's or libkrun's, driven by `ctr` — not Boks' own
+code.)
 
 19. **Confirm the `ROOT` store enumerates.** With a checkout on a Windows host:
 
@@ -1854,8 +1911,9 @@ with no hypervisor and no sandbox at all. It needs only the Go toolchain.
     Evidence: it opens and enumerates, possibly to zero certificates. If it *errors* on a stock
     machine, the fatal treatment is wrong and should become a warning — report it.
 
-21. **Confirm the bundle works inside a guest.** Only possible once there is a Windows backend,
-    or by copying the generated bundle into a Linux container by hand:
+21. **Confirm the bundle works inside a guest.** Now possible on Windows without Boks, by
+    putting the bundle into a container run through [windows-e2e.md](windows-e2e.md) — or, as
+    before, by copying the generated bundle into a Linux container by hand:
 
     ```
     docker run --rm -v "$PWD/bundle.pem:/b.pem" -e SSL_CERT_FILE=/b.pem alpine \

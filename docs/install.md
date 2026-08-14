@@ -86,8 +86,11 @@ CI, and copy the two files over. Nothing about them is specific to your Mac.
 **This one has been run.** On 2026-08-13, on an 18-core aarch64 Linux host, it produced a
 15,835,648-byte `nerdbox-kernel-arm64` carrying the arm64 `ARMd` Image magic and an
 8,343,552-byte `nerdbox-rootfs.erofs` carrying the EROFS superblock magic `0xe0f5e1e2`, in
-about four minutes from a cold cache. What has *not* been shown is either file booting:
-that needs a hypervisor, which the machine that built them does not have.
+about four minutes from a cold cache. **Those two files have still not been booted** — that
+needs a hypervisor, which the machine that built them does not have. Their x86_64 counterparts,
+from the same `buildx bake` recipe run in CI, have: a container ran on them under
+`ctr` on Windows 11 on 2026-08-14 ([Verification](verification.md)). That is evidence about
+the recipe, not about these two files.
 
 `$(brew --prefix)/lib` is already on the shim's own search path on Apple silicon. Any
 directory on containerd's `PATH` or on `LIBKRUN_PATH` works too — the shim scans both.
@@ -156,16 +159,21 @@ this page will carry the `signed-by` setup lines.
 
 ## Windows — in progress
 
-**Native Windows support is being built, and no sandbox has ever booted on Windows.** Both
-halves of that sentence matter. The work is real and visible: a Windows Hypervisor Platform
-backend for libkrun is being developed in this repository's
-[patch series](../packaging/libkrun-windows/), every libkrun crate now compiles for Windows, and `krun.dll` links on a real Windows runner in
-CI, and upstream nerdbox already builds a Windows shim that loads the VMM as `krun.dll`.
-What remains is the `krun.dll` C API layer and `virtio-net` — the one device Boks'
-enforcement depends on — and until a VM boots there, no Windows binary is shipped: a binary
-whose only possible output is a refusal would make the platform look done and move the
-disappointment to a later, more annoying point. [windows.md](windows.md) has the full
-picture.
+**A container runs in a microVM on Windows; `boks run` does not.** Both halves of that
+sentence matter. The stack underneath Boks is there: a Windows Hypervisor Platform backend for
+libkrun is being developed in this repository's [patch series](../packaging/libkrun-windows/),
+a patched nerdbox shim starts and serves ttrpc over a named pipe
+([`packaging/nerdbox-windows`](../packaging/nerdbox-windows/)), and on 2026-08-14
+`ctr tasks start` ran a Linux container end to end on real Windows 11 hardware — output
+returned, guest kernel 6.12.44, boot in 1.9 s ([Verification](verification.md)).
+
+What remains for Boks is `virtio-net`, the one device its enforcement depends on: no Ethernet
+frame has crossed one on Windows, so `boks run` refuses to start sandbox networking there.
+Until that changes no Windows binary is shipped — a binary whose only possible output is a
+refusal would make the platform look done and move the disappointment to a later, more
+annoying point. [windows.md](windows.md) has the full picture, and
+[windows-e2e.md](windows-e2e.md) the procedure that does work today, which is `ctr` rather than
+`boks`.
 
 ### winget — waits on the above
 
@@ -174,9 +182,11 @@ winget install boks   # not published — nothing to install yet
 ```
 
 A winget manifest needs something that works to install. The native binary cannot start a
-sandbox yet, and winget installs packages *on Windows*, not inside a WSL distribution — so
-it cannot deliver the one Windows story Boks has today. The manifest gets written when a
-native sandbox boots.
+sandbox yet — it stops at the network refusal, not at the hypervisor — and winget installs
+packages *on Windows*, not inside a WSL distribution, so it cannot deliver the one Windows
+story Boks has today either. The manifest gets written when `boks run` completes on Windows,
+which is a stricter bar than a microVM booting there, and one the 2026-08-14 run did not
+clear.
 
 ### Meanwhile: run the Linux build inside WSL2
 
@@ -197,13 +207,20 @@ anyone on this project.
 | Piece | Why | macOS/arm64 | Linux | Windows |
 |---|---|---|---|---|
 | `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | in progress — see above |
-| containerd ≥ 2.2 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | **not packaged at a usable version** — Ubuntu 24.04 has 1.7.x | — |
-| `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | **build from source** | — |
-| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker** | **build with Docker** | — |
-| libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | build from source, or a distro that has it | — |
-| `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | — |
+| containerd ≥ 2.2 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | **not packaged at a usable version** — Ubuntu 24.04 has 1.7.x | **patched build from source** |
+| `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | **build from source** | **patched build from source** |
+| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker** | **build with Docker** | **build with Docker**, on a Linux machine or in CI |
+| libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | build from source, or a distro that has it | **`krun.dll`, patched build from source** |
+| `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | **patched build from source** |
 
 The cells in bold are why this page is longer than one install command.
+
+The Windows column changed on 2026-08-14 from "—" to "build it": every one of those pieces has
+now been built for Windows and run together, which is what carried a container through `ctr`.
+None of it is packaged, all four patch series live in [`packaging/`](../packaging/), and
+`mkfs.ext4` — which containerd wants for a container's writable layer — still has no Windows
+build at all, so [windows-e2e.md](windows-e2e.md) supplies that image by hand. `boks` itself
+cannot yet drive any of it.
 
 **nerdbox is packaged nowhere.** Not homebrew-core, not the AUR, not nixpkgs, not Debian,
 and not by Repology in any of the ~400 repositories it tracks. Its own release workflow has
