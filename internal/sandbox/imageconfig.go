@@ -14,10 +14,10 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// The two repairs in this file have one cause between them: containerd generates the OCI
+// The three repairs in this file have one cause between them: containerd generates the OCI
 // spec on the *host*, while the spec describes a Linux guest. Everywhere those two are the
 // same machine — which is Linux, and only Linux — the difference is invisible. On a Windows
-// host it is not, and neither symptom names itself.
+// host it is not, and none of the three symptoms names itself.
 
 // imageConfigOpt applies the guest image's own configuration — environment, argv, working
 // directory and user — to the spec.
@@ -198,6 +198,58 @@ func withPOSIXCgroupsPath() oci.SpecOpts {
 			return nil
 		}
 		s.Linux.CgroupsPath = posixCgroupsPath(s.Linux.CgroupsPath)
+		return nil
+	}
+}
+
+// withoutWindowsSection removes the `windows` section from a Linux spec.
+//
+// containerd puts one there on a Windows host and only on a Windows host. The non-Windows
+// branch of its generateDefaultSpecWithPlatform (pkg/oci/spec.go) ends with
+//
+//	if err == nil && runtime.GOOS == "windows" {
+//		// To run LCOW we have a Linux and Windows section. Add an empty one now.
+//		s.Windows = &specs.Windows{}
+//	}
+//
+// which is a condition on the host's OS and says nothing about the runtime that will read the
+// spec. LCOW wants it — the runhcs shim fills LayerFolders in with the container's layer
+// paths. A microVM guest running crun does not, and cannot survive it.
+//
+// `omitempty` on specs.Spec.Windows does not help: the field is a *pointer*, and to
+// encoding/json a non-nil pointer to a zero struct is not empty. specs.Windows.LayerFolders
+// carries no omitempty of its own, so the section marshals as
+//
+//	"windows":{"layerFolders":null}
+//
+// crun parses config.json with libocispec, whose generated parser checks a schema's required
+// fields whenever the object holding them is present, and runtime-spec's
+// schema/config-windows.json makes layerFolders required. The `windows` object is optional;
+// its contents are not. Measured on Windows 11 on 2026-08-14: the VM booted, the guest
+// mounted the container's rootfs, and crun then refused the spec with
+// `Required field 'layerFolders' not present`.
+//
+// The section is removed rather than filled in. A Linux guest has no layer folders, and a
+// path invented to satisfy a parser would be data the guest has to ignore — worse than the
+// error, because it would not be an error.
+//
+// This runs immediately after the spec is generated, so that from here on the spec is a
+// Linux spec and nothing else, whatever host wrote it. That ordering is not the same as
+// containerd's own ctr, which must remove the section *last*: oci.WithImageConfig reads
+// `s.Windows != nil` as "this is LCOW, the guest resolves users and groups for itself" and
+// takes shortcuts on that basis. Boks never calls oci.WithImageConfig on Windows —
+// imageConfigOpt above substitutes withImageConfigFromMetadata, which reaches no filesystem
+// and consults no platform section — so the shortcut is not one Boks is relying on. Removing
+// the section here makes that comment's claim true unconditionally rather than by accident.
+func withoutWindowsSection() oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Linux == nil {
+			// Not a Linux spec. Boks generates nothing else, but the option runs
+			// unconditionally, and stripping the only platform section from a spec
+			// that is genuinely Windows' would be a worse bug than the one this fixes.
+			return nil
+		}
+		s.Windows = nil
 		return nil
 	}
 }

@@ -398,9 +398,13 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 		// Must come first: it resets the spec to the platform default, discarding
 		// anything applied before it.
 		oci.WithDefaultSpecForPlatform(runtimecfg.GuestPlatform()),
-		// Immediately after, because the default it repairs is written by the line
-		// above and by nothing else.
+		// Immediately after, because what these two repair is written by the line
+		// above and by nothing else. On a Windows host it generates a cgroups path
+		// spelled with backslashes and a `windows` section that the guest's runtime
+		// refuses to load; both are corrected here, so everything below sees a Linux
+		// spec and nothing else.
 		withPOSIXCgroupsPath(),
+		withoutWindowsSection(),
 		imageConfigOpt(image),
 		oci.WithAnnotations(resourceAnnotations(cfg)),
 	}

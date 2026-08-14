@@ -425,14 +425,33 @@ jobs:
       # asserted above only says what the binary believes, and one of these tests formats an
       # image with the real mkfs.ext4 and feeds it back in, so the constants are checked
       # against what the formatter writes rather than against themselves.
-      - name: Run the diff-service, transfer plugin and mount-manager tests
+      #
+      # The cmd/ctr tests are patch 0004's `windows` section. They are runnable here — and
+      # only here — because withoutWindowsSection was deliberately put in a file with no
+      # build constraint: the spec it repairs is written by a Windows host and read by a
+      # Linux guest, so neither end is this runner, and the test builds the Windows host's
+      # spec by hand rather than asking the host it runs on. One of them asserts that the
+      # empty section marshals as `"windows":{"layerFolders":null}` — the exact text crun
+      # refused on real hardware — which is what makes the other one's removal mean
+      # something.
+      - name: Run the diff-service, transfer plugin, mount-manager and ctr spec tests
         working-directory: containerd
         run: |
           set -euo pipefail
           go test ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/manager/... -count=1
+          # Named individually, and their PASS lines checked, because `go test -run` on a
+          # pattern that matches nothing exits 0. A renamed or deleted test would otherwise
+          # turn this assertion off without turning the workflow red.
+          go test ./cmd/ctr/commands/run/... -run WindowsSection -count=1 -v | tee ctr-spec.log
+          for t in TestAnEmptyWindowsSectionMarshalsAsTheFieldCrunRejects \
+                   TestWithoutWindowsSectionRemovesIt \
+                   TestWithoutWindowsSectionIsANoOpWhenThereIsNoSection; do
+            grep -q -- "--- PASS: $t" ctr-spec.log \
+              || { echo "$t did not run — patch 0004's windows-section fix is unasserted" >&2; exit 1; }
+          done
           # The Windows-only assertions cannot run here, but they can at least be
           # type-checked, so a rename in the patched code fails in CI and not on a desktop.
-          # cmd/ctr is in the list for patch 0004, whose whole diff is in a _windows.go
+          # cmd/ctr is in the list for patch 0004, most of whose diff is in a _windows.go
           # file: `go build ./cmd/ctr` for Linux does not compile a line of it.
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet \
             ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/... ./cmd/ctr/...
