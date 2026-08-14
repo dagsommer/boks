@@ -109,23 +109,113 @@ func TestNetworkForHonoursHowTheSandboxWasWired(t *testing.T) {
 		}},
 	}
 	var errOut bytes.Buffer
-	mode, ok := networkFor(wired, network.ModeNone, true, &errOut)
-	if !ok || mode != network.ModeNAT {
-		t.Errorf("networkFor = %v, %v; an existing sandbox keeps the network it was created with", mode, ok)
+
+	// An explicit -net none against a sandbox wired for NAT must stop the run. This used
+	// to print a note and then carry on with NAT, which is the failure the note itself
+	// described: the flag appeared to be obeyed while the container stayed connected.
+	mode, ok, err := networkFor(wired, network.ModeNone, true, &errOut)
+	if err == nil {
+		t.Fatalf("an explicit -net none against a NAT sandbox was accepted (mode=%v, wired=%v); "+
+			"a flag that cannot be applied must not be silently discarded", mode, ok)
 	}
-	if !strings.Contains(errOut.String(), "fixed when a sandbox is created") {
-		t.Errorf("the user was not told their -net flag was ignored:\n%s", errOut.String())
+	for _, want := range []string{"fixed when a sandbox is created", "boks rm shell-proj"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not contain %q:\n%s", want, err)
+		}
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("the refusal was also written to stderr, so it will be reported twice:\n%s", errOut.String())
+	}
+
+	// The refusal is on disagreement, not on the flag being present. Asking for the mode
+	// the sandbox already has is a request that *is* met, so it must not error.
+	errOut.Reset()
+	mode, ok, err = networkFor(wired, network.ModeNAT, true, &errOut)
+	if err != nil || !ok || mode != network.ModeNAT {
+		t.Errorf("networkFor(-net nat on a nat sandbox) = %v, %v, %v; want nat, true, nil", mode, ok, err)
+	}
+
+	// And silence still means "use what the sandbox has", with nothing said.
+	errOut.Reset()
+	mode, ok, err = networkFor(wired, network.ModeNone, false, &errOut)
+	if err != nil || !ok || mode != network.ModeNAT {
+		t.Errorf("networkFor(no -net flag) = %v, %v, %v; want nat, true, nil", mode, ok, err)
 	}
 
 	// A sandbox with no network annotations at all is not "no network": it is on the
 	// runtime's default transport, which reaches host loopback. That has to be said.
 	errOut.Reset()
 	legacy := invocation{name: "old", exists: true, info: sandbox.Info{}}
-	if _, ok := networkFor(legacy, network.ModeNAT, false, &errOut); ok {
-		t.Error("a sandbox with no network annotations was reported as wired")
+	if _, ok, err := networkFor(legacy, network.ModeNAT, false, &errOut); ok || err != nil {
+		t.Errorf("a sandbox with no network annotations: wired=%v err=%v; want false, nil", ok, err)
 	}
 	if !strings.Contains(errOut.String(), "TSI") {
 		t.Errorf("the warning does not name the transport such a sandbox actually uses:\n%s", errOut.String())
+	}
+}
+
+// TestNetworkForHonoursAnExplicitFlagOnANewSandbox: the refusal is about a mode that is
+// already fixed. A sandbox that does not exist yet has nothing to disagree with, so every
+// mode is available and no flag is refused.
+func TestNetworkForHonoursAnExplicitFlagOnANewSandbox(t *testing.T) {
+	fresh := invocation{name: "shell-new", exists: false}
+	for _, mode := range []network.Mode{network.ModeNone, network.ModeNAT} {
+		var errOut bytes.Buffer
+		got, ok, err := networkFor(fresh, mode, true, &errOut)
+		if err != nil || !ok || got != mode {
+			t.Errorf("networkFor(new sandbox, -net %v) = %v, %v, %v; want %v, true, nil",
+				mode, got, ok, err, mode)
+		}
+		if errOut.Len() != 0 {
+			t.Errorf("a new sandbox was warned about its own -net flag:\n%s", errOut.String())
+		}
+	}
+}
+
+// TestUnexercisedWarningIsNotSaidWhenThereIsNoLinkToDial: on Windows, -net none printed
+// "network: none — nothing leaves sandbox X." and then, on the very next line, a WARNING that
+// boks was "attempting a sandbox network". There was no attempt to warn about.
+//
+// The warning's premise is a link the guest could dial that may be enforcing nothing. Under
+// -net none the host end is a blackhole: the NIC exists only to switch the runtime's own
+// transport off, and there is no stack, proxy or policy behind it. Every sentence the warning
+// prints is false there, including the one telling the reader to check `boks policy log`.
+//
+// The platform answer is injected, so the Windows case is constructed on any host.
+func TestUnexercisedWarningIsNotSaidWhenThereIsNoLinkToDial(t *testing.T) {
+	windows := errors.New("this has never been seen carrying a frame on Windows")
+
+	if warnUnexercisedNetwork(windows, network.ModeNone) {
+		t.Error("-net none was warned about a network it does not have")
+	}
+	// The warning must survive for the mode it was written for; gating it on the mode
+	// must not have turned it off everywhere.
+	if !warnUnexercisedNetwork(windows, network.ModeNAT) {
+		t.Error("-net nat on an unexercised platform was not warned about")
+	}
+	// And on a platform where the link has carried frames, neither mode warns.
+	for _, mode := range []network.Mode{network.ModeNone, network.ModeNAT} {
+		if warnUnexercisedNetwork(nil, mode) {
+			t.Errorf("-net %v warned on a platform where the link is exercised", mode)
+		}
+	}
+
+	// The gate reads spec.Plan.Mode, so the predicate being right is only half of it:
+	// the mode has to survive the trip from the flag through planFor into the Plan the
+	// call site actually holds. Walk that chain rather than trusting it.
+	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	for _, mode := range []network.Mode{network.ModeNone, network.ModeNAT} {
+		plan, err := (&policyFlags{}).planFor("shell-proj", mode)
+		if err != nil {
+			t.Fatalf("planFor(%v): %v", mode, err)
+		}
+		if plan.Mode != mode {
+			t.Fatalf("planFor(%v).Mode = %v; the field the warning gates on does not carry the mode",
+				mode, plan.Mode)
+		}
+		if got, want := warnUnexercisedNetwork(windows, plan.Mode), mode != network.ModeNone; got != want {
+			t.Errorf("warnUnexercisedNetwork(windows, planFor(%v).Mode) = %v; want %v", mode, got, want)
+		}
 	}
 }
 
