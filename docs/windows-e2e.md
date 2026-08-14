@@ -323,12 +323,14 @@ That is step 5's problem and is expected here. `--dump-config` runs *before* tas
 ```powershell
 $s = Get-Content -Raw C:\boks-test\spec.json | ConvertFrom-Json
 $null -ne $s.linux          # must be True
+$null -eq $s.windows        # must be True
 $s.process.cwd              # must be /
 $s.process.args             # must be /bin/true
 $s.root.path                # rootfs
 ```
 
-**Success:** a `linux` section exists, `process.cwd` is `/`, `process.args` is `/bin/true`.
+**Success:** a `linux` section exists, there is no `windows` section, `process.cwd` is `/`,
+`process.args` is `/bin/true`.
 
 **Failure:** no `linux` section and `process.cwd` = `C:\`. Then this `ctr.exe` predates `0004`,
 or `--platform linux/amd64` was omitted. On Windows,
@@ -339,10 +341,17 @@ image. Nothing downstream rejects it — nerdbox never reads `spec.Linux`
 `spec.Windows` verbatim into the guest's `config.json` (`bundle/bundle.go:78-88`) — so the error
 surfaces much later, inside crun, as something about a missing `linux` block.
 
-> Expect an empty `"windows": {}` object in the spec even when it is correct.
-> `oci.WithDefaultSpecForPlatform("linux/amd64")` adds one on a Windows host on purpose, for LCOW
-> (`pkg/oci/spec.go:97-100`). nerdbox forwards it to the guest untouched. Whether crun 1.24
-> objects to an empty `windows` object is **unknown** — nothing in either tree answers it.
+> There must be **no** `windows` object in the spec — `$null -eq $s.windows`.
+> `oci.WithDefaultSpecForPlatform("linux/amd64")` adds an empty one on a Windows host on purpose,
+> for LCOW (`pkg/oci/spec.go:97-100`), and nerdbox forwards it to the guest untouched. An earlier
+> version of this document recorded that whether crun objects to it was **unknown**. It objects.
+> Measured 2026-08-14: `load 'config.json': Required field 'layerFolders' not present`, after the
+> VM had booted and mounted the container's rootfs. libocispec checks a schema's required fields
+> whenever the object holding them is present, and runtime-spec's `schema/config-windows.json`
+> makes `layerFolders` required — so the empty object is fatal and `omitempty` never had a chance
+> to drop it, `Windows` being a pointer to a zero struct rather than nil. `patches/0004` now
+> removes the section for a non-Windows spec on a non-LCOW snapshotter. If you still see one,
+> this `ctr.exe` predates that revision of the patch.
 
 > `--platform` exists only on `ctr run`, not on `ctr containers create`
 > (`cmd/ctr/commands/commands.go`, `ContainerFlags`), which is the other reason this step is a
@@ -600,7 +609,10 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
    §1 name the file. *Fix: restart containerd from a console whose `PATH` is right.*
 5. **A Windows OCI spec.** Certain without `patches/0004` or without `--platform linux/amd64`.
    Surfaces late and confusingly, as a crun error about a missing `linux` block, because nothing
-   between `ctr` and crun inspects the spec's platform. *Fix: step 4's check.*
+   between `ctr` and crun inspects the spec's platform. Its sibling — a *correct* Linux spec that
+   still carries the empty `windows` object containerd adds on a Windows host — was measured on
+   2026-08-14 and reads `Required field 'layerFolders' not present`; the same patch removes it.
+   *Fix: step 4's check, which now requires `$null -eq $s.windows` too.*
 6. **containerd locked out of its own root.** Certain on a clean machine without step 0.
    Measured. Reported as a content-store `mkdir` denial with 43 plugin failures.
 7. **The five shim stubs that have never executed.** PR #13948 implements `newServer`,
@@ -626,8 +638,11 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
    the tmpfs overlays over `/etc`, `/run`, `/tmp` on a read-only erofs root, mounting the
    container layers, invoking crun — has never run on a Windows-hosted VM. Watch the console pipe.
 11. **crun rejecting the spec.** Two candidates, both from containerd's spec generation rather
-   than from nerdbox: the empty `"windows": {}` object that nerdbox forwards verbatim, and any
-   Windows-shaped field that survives. **Unknown** — crun is not in either tree.
+   than from nerdbox. The first is no longer a candidate: the empty `"windows": {}` object that
+   nerdbox forwards verbatim **is** rejected — measured 2026-08-14, `Required field 'layerFolders'
+   not present` — and `patches/0004` now removes it. The second, any other Windows-shaped field
+   that survives, remains **unknown**; crun is still not in either tree, and the flags that write
+   into that section are now refused rather than silently dropped.
 12. **The overlay mount inside the guest.** Requires `{{ mount 0 }}` templates in `upperdir=` and
     `workdir=`, which block mode supplies. If `default_size = 0` is ever set in `config.toml`,
     this becomes `cannot use virtiofs for upper dir in overlay: not implemented` with **no
@@ -635,6 +650,12 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
 13. **Stdio.** Step 7's territory: vsock 1026, the stream-ID handshake, `-t` and the console. Also
     where `openLog`'s silently-discarding writer would cost you the early shim log lines, though
     nerdbox sets `NoSetupLogger` so it is not on the current path.
+13a. **A 30-second pause before any create failure is reported.** Measured 2026-08-14. The
+    shim's IO teardown waits for output that a container which never started cannot produce
+    (`internal/shim/task/io.go`), and on a failed create that wait runs to its 30 s ceiling
+    before the real error is printed. `packaging/nerdbox-windows/patches/0004` cuts it to a
+    second. It costs only time, and only on paths that were already failing — but if you are
+    bisecting with an old shim, budget for it.
 14. **Teardown.** `service_windows.go:195` does `os.RemoveAll("rootfs")` and
     `manager_windows.go` carries a `removeRootfs` for the bind-filter unmount problem. A failed
     teardown leaves a bundle and a snapshot behind and makes the *next* run confusing rather than
