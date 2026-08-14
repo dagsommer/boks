@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"syscall"
 	"unsafe"
 )
@@ -110,29 +109,7 @@ func kvmOpenFailure(err error) Result {
 
 // extraChecks adds Linux-only requirements. There are none beyond the shared set: KVM
 // access is covered by virtualizationCheck.
+//
+// Where libkrun is looked for is not a platform decision made here: the shim's own search is
+// transcribed once, for every platform, in libkrun.go.
 func extraChecks() []Check { return nil }
-
-// hypervisorLibrary reports where libkrun is expected on this platform.
-func hypervisorLibraryNames() []string {
-	return []string{"libkrun.so.1", "libkrun.so"}
-}
-
-func hypervisorLibrarySearchPaths() []string {
-	paths := []string{"/usr/lib", "/usr/local/lib", "/usr/lib64"}
-	// Multiarch layouts vary; probe the common ones rather than parsing ld.so config.
-	for _, triple := range []string{"aarch64-linux-gnu", "x86_64-linux-gnu"} {
-		paths = append(paths, "/usr/lib/"+triple)
-	}
-	if extra := os.Getenv("LD_LIBRARY_PATH"); extra != "" {
-		paths = append(paths, splitList(extra)...)
-	}
-	return paths
-}
-
-// hypervisorLibraryHint explains what a miss on Linux does and does not mean. The shim asks
-// dlopen for the library, so the loader's own configuration — ld.so.conf, its cache — can
-// still find one in a directory this check never stats.
-func hypervisorLibraryHint() string {
-	return "If it is installed elsewhere on the loader's search path this warning\n" +
-		"is harmless; Boks does not parse the dynamic loader configuration."
-}

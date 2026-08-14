@@ -5,7 +5,6 @@ package doctor
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -133,26 +132,4 @@ func unsignedBinary(out string) bool {
 	lower := strings.ToLower(out)
 	return strings.Contains(lower, "not signed at all") ||
 		strings.Contains(lower, "code object is not signed")
-}
-
-func hypervisorLibraryNames() []string {
-	return []string{"libkrun.dylib", "libkrun.1.dylib"}
-}
-
-func hypervisorLibrarySearchPaths() []string {
-	paths := []string{
-		"/opt/homebrew/lib", // Apple silicon Homebrew prefix
-		"/usr/local/lib",
-	}
-	if extra := os.Getenv("DYLD_LIBRARY_PATH"); extra != "" {
-		paths = append(paths, splitList(extra)...)
-	}
-	return paths
-}
-
-// hypervisorLibraryHint explains what a miss on macOS does and does not mean: the shim asks
-// dlopen for the library, so a copy elsewhere on the loader's search path still works.
-func hypervisorLibraryHint() string {
-	return "If it is installed elsewhere on the loader's search path this warning\n" +
-		"is harmless; Boks does not parse the dynamic loader configuration."
 }

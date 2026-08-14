@@ -2,8 +2,10 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -103,6 +105,38 @@ func TestContainerdCheckHandlesMissingSocket(t *testing.T) {
 	}
 	if res.Remedy == "" {
 		t.Error("no remedy offered for a missing containerd socket")
+	}
+}
+
+// A Windows named pipe is not a socket, and telling someone their "containerd socket" is
+// missing when the address is \\.\pipe\containerd-containerd names a thing that does not
+// exist on their machine. The address decides the noun, so this is testable anywhere.
+func TestContainerdFailureNamesTheEndpointCorrectly(t *testing.T) {
+	tests := []struct {
+		address string
+		want    string
+	}{
+		{`\\.\pipe\containerd-containerd`, "named pipe"},
+		{`npipe:////./pipe/containerd-containerd`, "named pipe"},
+		{`//./pipe/containerd-containerd`, "named pipe"},
+		{"/run/containerd/containerd.sock", "socket"},
+		{"/var/run/containerd/containerd.sock", "socket"},
+		{"/home/x/pipe/containerd.sock", "socket"},
+	}
+	for _, tt := range tests {
+		if got := containerdEndpointNoun(tt.address); got != tt.want {
+			t.Errorf("containerdEndpointNoun(%q) = %q, want %q", tt.address, got, tt.want)
+		}
+	}
+
+	// The message the user actually reads.
+	res := containerdFailure(`\\.\pipe\containerd-containerd`, errors.New("no such file"))
+	if !strings.Contains(res.Remedy, "No containerd named pipe at") {
+		t.Errorf("remedy calls a named pipe something else:\n%s", res.Remedy)
+	}
+	res = containerdFailure(filepath.Join(t.TempDir(), "containerd.sock"), errors.New("no such file"))
+	if !strings.Contains(res.Remedy, "No containerd socket at") {
+		t.Errorf("remedy does not call a Unix socket a socket:\n%s", res.Remedy)
 	}
 }
 
@@ -219,7 +253,7 @@ func TestNerdboxSearchPathsScansPATHThenLIBKRUNPATH(t *testing.T) {
 	t.Setenv("PATH", onPath)
 	t.Setenv("LIBKRUN_PATH", onLibkrunPath)
 
-	dirs := nerdboxSearchPaths()
+	dirs := nerdboxSearchPaths(runtime.GOOS, os.Getenv)
 	pathIdx, libkrunIdx := indexOfDir(dirs, onPath), indexOfDir(dirs, onLibkrunPath)
 	if pathIdx < 0 {
 		t.Errorf("PATH entry %q missing from the search: %v", onPath, dirs)
@@ -238,42 +272,8 @@ func TestNerdboxSearchPathsMapsEmptyElementToDot(t *testing.T) {
 	t.Setenv("PATH", string(os.PathListSeparator)+t.TempDir())
 	t.Setenv("LIBKRUN_PATH", t.TempDir())
 
-	if indexOfDir(nerdboxSearchPaths(), ".") < 0 {
-		t.Errorf("an empty PATH element was not searched as \".\": %v", nerdboxSearchPaths())
-	}
-}
-
-// hypervisorLibraryResult is exercised with the Windows filename because that is the case
-// that used to report "not applicable". The Windows wiring in virt_windows.go is only
-// compile-checked here (GOOS=windows go vet): this project has no Windows machine.
-func TestHypervisorLibraryResultFindsALibrary(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "krun.dll"))
-
-	res := hypervisorLibraryResult([]string{"krun.dll"}, []string{dir})
-	if res.Status != StatusOK {
-		t.Fatalf("Status = %v (%s), want ok with krun.dll in the searched directory", res.Status, res.Detail)
-	}
-	if want := filepath.Join(dir, "krun.dll"); res.Detail != want {
-		t.Errorf("Detail = %q, want the resolved path %q", res.Detail, want)
-	}
-}
-
-func TestHypervisorLibraryResultWarnsWhenAbsent(t *testing.T) {
-	res := hypervisorLibraryResult([]string{"krun.dll"}, []string{t.TempDir()})
-	if res.Status != StatusWarn {
-		t.Fatalf("Status = %v, want warn: Boks does not know every place a library may live", res.Status)
-	}
-	if !strings.Contains(res.Detail, "krun.dll") || res.Remedy == "" {
-		t.Errorf("a miss must name the library and explain itself: %+v", res)
-	}
-}
-
-// A platform with no library to look for keeps skipping rather than warning about a file it
-// has no name for.
-func TestHypervisorLibraryResultSkipsWithoutNames(t *testing.T) {
-	if res := hypervisorLibraryResult(nil, nil); res.Status != StatusSkip {
-		t.Errorf("Status = %v, want skip when the platform names no library", res.Status)
+	if indexOfDir(nerdboxSearchPaths(runtime.GOOS, os.Getenv), ".") < 0 {
+		t.Errorf("an empty PATH element was not searched as \".\": %v", nerdboxSearchPaths(runtime.GOOS, os.Getenv))
 	}
 }
 
