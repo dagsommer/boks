@@ -56,9 +56,11 @@ a sandbox is reached from anywhere:
 boks run --name shell-boks   # re-attach by name, from any directory
 ```
 
-Some things are fixed when a sandbox is created and are reported rather than obeyed if you
-pass them later: the agent, and `--net`. Both are expressed in annotations the runtime reads
-at boot. Remove the sandbox and run again to change either.
+Some things are fixed when a sandbox is created, because they are expressed in annotations the
+runtime reads at boot: the agent, and `--net`. Passing either with a value the sandbox was not
+created with is refused and nothing runs, rather than being quietly dropped — a `--net none`
+that was ignored would hand you a network while appearing to have been obeyed. Remove the
+sandbox and run again to change either.
 
 ## Workspaces
 
