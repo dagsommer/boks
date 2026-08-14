@@ -1003,8 +1003,28 @@ platform, and libocispec makes `layerFolders` required whenever `windows` is pre
 "empty and harmless" object is fatal. `docs/windows-e2e.md` had flagged this exact hazard
 as unverified; it is now verified.
 
+The section comes from one `if` in containerd's own spec generator
+(`pkg/oci/spec.go`, `generateDefaultSpecWithPlatform`), which adds it to every non-Windows
+spec when `runtime.GOOS == "windows"` — for LCOW, whose runtime fills it in. `omitempty`
+does not drop it because `specs.Spec.Windows` is a *pointer*, and a non-nil pointer to a
+zero struct is not empty to `encoding/json`. Both callers Boks has were affected, because
+both call the same library function: `ctr` (fixed in
+`packaging/containerd-windows/patches/0004`) and Boks itself (fixed in `internal/sandbox`,
+with tests that build the Windows host's spec by hand rather than depending on the host).
+The section is removed rather than filled in — a Linux guest has no layer folders — and it
+must be removed *last* on the `ctr` path, because containerd reads `s.Windows != nil` as
+"this is LCOW" to decide not to mount the image's rootfs on the host.
+
+**Fixed by reading, not by running.** No Windows machine has executed either fix. What is
+established is the mechanism and that the removal behaves on Linux under test; whether the
+container then starts is unknown.
+
 Also observed: after the create failure the run stalled a fixed 30.0 s at 0-3% CPU before
 reporting `io shutdown: context deadline exceeded` — a separate defect on the error path.
+That wait is nerdbox's IO teardown draining streams whose guest end was never attached to
+anything, so it can only ever end at its own ceiling; the five teardowns reachable only by
+a process that never started now get a second instead
+(`packaging/nerdbox-windows/patches/0004`). Also unexecuted.
 
 Every failure mode ranked ahead of this one is now cleared on that machine. Elevation is
 still required, for the task-bundle symlink.

@@ -1,0 +1,160 @@
+From dedcd36ca822bdf50a567ae930118659a884a5b1 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 10:48:19 +0200
+Subject: [PATCH] fix(shim): stop draining IO that a failed create can never
+ produce
+
+A container whose creation fails inside the VM takes a further 30.0 s to say
+so. Measured on Windows 11, 2026-08-14, with a spec crun refused:
+
+  ERRO ... failed to create task
+  ERRO ... failed to shutdown container after create failure:
+           io shutdown: context deadline exceeded
+
+The two lines are 30 seconds apart, at 0-3% CPU. Everything worth reporting
+was known at the first one.
+
+The wait is forwardIO's shutdown (internal/shim/task/io.go). It waits for the
+host-side copy goroutines to drain into the destination FIFO and for stdin to
+reach a real EOF, and when the caller's context carries no deadline it gives
+that wait 30 s:
+
+    if _, ok := ctx.Deadline(); !ok {
+        ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+        ...
+    }
+    select {
+    case <-ioDone:
+    case <-ctx.Done():
+
+For a process that ran, that is the right budget: ioDone is what stands
+between the last byte of output and the Delete that discards it, and 30 s of
+patience is cheap next to a truncated log.
+
+For a process that never started it cannot succeed. ioDone closes only when
+both stdout and stderr copies return (io_copystreams_*.go), and those are
+io.CopyBuffer calls reading a stream whose guest end was never attached to
+anything -- crun rejected config.json, or the options were bad, or the sockets
+could not be bound. Nothing will write to them and nothing will close them
+except the force-close that shutdown performs *after* the wait it is doing.
+The same holds for the stdin side: the client is still holding its write end
+open, so stdinDone will not fire either, and both waits share the one context,
+which is why the stall is exactly the ceiling rather than twice it.
+
+So the ceiling elapses in full, every time, to learn nothing -- and it does it
+between the shim knowing why the container failed and the user being told.
+
+The five sites where IO is torn down for a process that never started now get
+abandonedIOTimeout, a second, instead:
+
+  - bindSockets failed
+  - the task options were rejected
+  - the guest's Create failed          <- the one measured above
+  - socket forwarding failed to start  <- created, never started; crun has not
+                                          exec'd the container process, so
+                                          there is no output either way
+  - Exec found no such container
+
+A second rather than nothing, so a stdin copy caught mid-write has a moment to
+finish. After it, shutdown closes the streams and the goroutines unwind exactly
+as they do today. No path where a process actually ran is touched: Delete,
+Wait and the service's own shutdown callback keep the full budget.
+
+Not executed. The stall was measured; this fix has been compiled for windows
+and linux and reasoned from the code above, and no VM has been booted with it.
+---
+ internal/shim/task/service.go | 43 +++++++++++++++++++++++++++++++----
+ 1 file changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/internal/shim/task/service.go b/internal/shim/task/service.go
+index 522a67d..2c9f9dd 100644
+--- a/internal/shim/task/service.go
++++ b/internal/shim/task/service.go
+@@ -198,6 +198,39 @@ func (c *container) shutdown(ctx context.Context) error {
+ 	return errors.Join(errs...)
+ }
+ 
++// abandonedIOTimeout bounds the teardown of IO belonging to a process that never
++// started.
++//
++// The shutdown forwardIO returns waits for the host-side copy goroutines to drain
++// and for stdin to reach a real EOF, and gives that wait 30 s when the caller's
++// context carries no deadline of its own (io.go). That is the right budget for a
++// process that ran: the bytes it wrote are worth waiting for, and it is the only
++// thing standing between the last byte of output and the Delete that discards it.
++//
++// It buys nothing on a path where the guest never attached anything to the far end
++// of the streams. io.CopyBuffer is then blocked on a connection nobody will ever
++// write to or close, and the only thing that can end it is the force-close shutdown
++// performs *after* the wait. The full budget elapses, every time, to learn nothing.
++//
++// Measured on Windows 11, 2026-08-14: a container whose spec crun refused reported
++//
++//	failed to shutdown container after create failure: io shutdown: context deadline exceeded
++//
++// 30.0 s after the failure, at 0-3% CPU. The error being reported was already known
++// when the wait began.
++//
++// A second is left rather than nothing so a stdin copy caught mid-write has a moment
++// to finish; after it the streams are closed and the goroutines unwind as before.
++const abandonedIOTimeout = time.Second
++
++// shutdownAbandonedIO tears down the IO of a process that never started, under
++// abandonedIOTimeout rather than the drain budget a running process gets.
++func shutdownAbandonedIO(ctx context.Context, shutdown func(context.Context) error) error {
++	ctx, cancel := context.WithTimeout(ctx, abandonedIOTimeout)
++	defer cancel()
++	return shutdown(ctx)
++}
++
+ // service is the shim implementation of a remote shim over GRPC
+ type service struct {
+ 	mu sync.Mutex
+@@ -485,7 +518,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
+ 	// Bind socket forwards on the VM before container creation so
+ 	// that crun can bind-mount the listener sockets into the container.
+ 	if err := bindSockets(ctx, s.sb, sfpr.entries); err != nil {
+-		if err := ioShutdown(ctx); err != nil {
++		if err := shutdownAbandonedIO(ctx, ioShutdown); err != nil {
+ 			log.G(ctx).WithError(err).Error("failed to shutdown io after socket forwarding failure")
+ 		}
+ 		return nil, errgrpc.ToGRPC(err)
+@@ -508,7 +541,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
+ 
+ 	guestOpts, err := guestRuncOptions(ctx, r.Options)
+ 	if err != nil {
+-		if err := ioShutdown(ctx); err != nil {
++		if err := shutdownAbandonedIO(ctx, ioShutdown); err != nil {
+ 			log.G(ctx).WithError(err).Error("failed to shutdown io after options error")
+ 		}
+ 		return nil, errgrpc.ToGRPC(fmt.Errorf("invalid task options: %w", err))
+@@ -527,7 +560,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
+ 	})
+ 	if err != nil {
+ 		log.G(ctx).WithError(err).Error("failed to create task")
+-		if err := c.shutdown(ctx); err != nil {
++		if err := shutdownAbandonedIO(ctx, c.shutdown); err != nil {
+ 			log.G(ctx).WithError(err).Error("failed to shutdown container after create failure")
+ 		}
+ 		return nil, errgrpc.ToGRPC(err)
+@@ -538,7 +571,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
+ 	fwder, err := startSocketForwarding(context.Background(), s.sb, r.ID, sfpr.entries)
+ 	if err != nil {
+ 		log.G(ctx).WithError(err).Error("failed to start socket forwarding")
+-		if err := c.shutdown(ctx); err != nil {
++		if err := shutdownAbandonedIO(ctx, c.shutdown); err != nil {
+ 			log.G(ctx).WithError(err).Error("failed to shutdown container after socket forwarding failure")
+ 		}
+ 		return nil, errgrpc.ToGRPC(err)
+@@ -709,7 +742,7 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
+ 		// The container is gone, so nothing is tracking this exec's IO.
+ 		// Shut it down here before sending back container not found.
+ 		if ioShutdown != nil {
+-			if err := ioShutdown(ctx); err != nil {
++			if err := shutdownAbandonedIO(ctx, ioShutdown); err != nil {
+ 				log.G(ctx).WithError(err).Error("failed to shutdown exec io after container not found")
+ 			}
+ 		}
+-- 
+2.53.0
+
