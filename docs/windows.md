@@ -14,6 +14,20 @@ The only things that *were* demonstrated are that `GOOS=windows GOARCH=amd64 go 
 succeeds, and that the netstack compiles for Windows once its build tag is removed. Neither
 demonstrates anything about whether a sandbox would run, and neither is offered as if it did.
 
+> **Since this spike, on 2026-08-14: `boks run` no longer refuses on Windows.** The gate in
+> `internal/network/vmm_windows.go` that stopped a sandbox before anything was bound has been
+> removed, so the link socket is bound, the netstack is assembled and the sandbox is attempted.
+> That is not a report that it works — **no Ethernet frame has ever crossed libkrun's
+> virtio-net device on Windows**, and nobody has run `boks run` there. The change adds a
+> bounded wait instead: if nothing connects to the link socket within 30 s of the sandbox's
+> task starting, the supervisor exits with an error naming what did not happen and what to
+> check. Two things went with it — `internal/enforce/lock_windows.go` now implements the
+> supervisor's process primitives (`LockFileEx`, `TerminateProcess`, `DETACHED_PROCESS`)
+> instead of refusing, and the supervisor's control socket is deliberately *not* bound on
+> Windows, because neither its 0700 mode nor its peer-credential check can be enforced there
+> (`internal/enforce/control_windows.go`). See docs/verification.md for what has actually been
+> observed on Windows hardware, which is the stack underneath Boks and not Boks.
+
 **This document changed its mind once, and the reversal is left visible on purpose.** Sections
 1–6 conclude that Windows structurally cannot support Boks' network enforcement; section 7
 shows that conclusion was drawn from the wrong API and is wrong. Both are kept, because the
@@ -1356,9 +1370,10 @@ Two measurements support that last row, and both were taken during this spike:
   datagram link that fed it did. That build tag is gone: the file, the gateway and the link
   socket compile for `windows/amd64` — gvisor's netstack, the tap switch, and the DHCP and DNS
   services all build, and `GOOS=windows go build ./...` passes. The enforcement engine is not
-  the obstacle. (It still says nothing about whether a guest could reach it: nothing on
-  Windows emits a frame onto that link, which is why `internal/network/vmm_windows.go`
-  refuses.)
+  the obstacle. (It still says nothing about whether a guest could reach it: nothing has been
+  observed emitting a frame onto that link on Windows. `internal/network/vmm_windows.go` used
+  to refuse on that basis and now warns on it instead — see the note at the top of this
+  document.)
 - **The reference product reaches the same conclusion independently.** Its Windows build links
   the same `gvisor` and `goproxy` versions as its macOS build, and carries all three proxy
   modes. The policy layer is genuinely platform-independent in practice, not just in principle.
@@ -1378,7 +1393,8 @@ Two measurements support that last row, and both were taken during this spike:
 - `internal/network/vmm_windows.go` (then `gateway_windows.go`), `internal/enforce/lock_windows.go`: the errors and
   comments now name WHP and the missing VMM, record the HCS and AF_UNIX findings as *true but
   not load-bearing* so they are not rediscovered as blockers, and carry the `LockFileEx` design
-  for whoever implements it.
+  for whoever implements it. *(Both files have since moved on: the network one warns rather
+  than refuses, and the `LockFileEx` design in the second was implemented from that comment.)*
 
 **Built** — one real capability, on the Linux path, because the WSL2 route is the one users can
 actually take:
@@ -1448,6 +1464,33 @@ the current user, via `golang.org/x/sys/windows`, and a test that asserts the re
 rather than a mode. That is a new dependency edge and code that can only be verified on a
 Windows machine, so it is deliberately not attempted before there is a Windows backend for it to
 protect.
+
+### The two sockets a Windows sandbox would bind, and what protects them
+
+The gap above became sharper on 2026-08-14, when `boks run` was allowed to attempt a sandbox on
+Windows: until then no Boks process bound anything there, so "the modes are not enforced" was
+true and inert. It is not inert now.
+
+**The link socket is bound, and its 0700 directory is decorative on Windows.** The socket
+carrying the guest's Ethernet frames lives in a directory `internal/network` creates with mode
+`0700`, which Windows ignores. What actually keeps another local user out is the ACL inherited
+from `%LocalAppData%\boks` — a real control, on a single-user machine an adequate one, but one
+that belongs to the path rather than to anything Boks asserts, and one that moves the moment
+`BOKS_STATE_DIR` points somewhere shared. A local user who could reach that path could connect
+to the link socket before the VM does and be handed the sandbox's egress, since the first peer
+holds the link. **Do not point `BOKS_STATE_DIR` at a shared location on Windows.**
+
+**The control socket is deliberately not bound there.** `boks ports --publish` on a *running*
+sandbox needs the supervisor's control socket, and that socket's justification (control.go)
+rests on two protections: the 0700 directory, and a peer credential check against the
+supervisor's own uid. Windows has neither — the modes are ignored, and its AF_UNIX carries no
+peer credentials at all, so `peerUID` cannot be implemented for it even in principle
+(`GetNamedPipeClientProcessId` answers that question only for a named pipe). Rather than bind a
+socket that can open a hole into a running VM on the strength of an inherited ACL, the
+supervisor does not bind it: it logs why once, and `boks ports` on a running Windows sandbox
+prints the same reason. Ports given at creation time are unaffected. Closing this properly means
+a named pipe with an explicit security descriptor plus `GetNamedPipeClientProcessId` and
+`OpenProcessToken` on the server side — see `internal/enforce/control_windows.go`.
 
 ### The guest's trust bundle is now built on Windows too
 

@@ -1057,11 +1057,20 @@ reports `windows: ABSENT` — the `layerFolders` fix confirmed from both ends.
 The console baseline held exactly: `activate event`, `Device is ready`, `Port ready 0`,
 `Starting port io for port 0`, once each in order, handshake in 11 ms.
 
-**What this does not mean.** This is `ctr`, not `boks run`. Boks' own path still stops
-earlier, at the network refusal in `internal/network/vmm_windows.go`, and no Ethernet frame
-has yet crossed the virtio-net device on Windows. Elevation is still required, for the
-task-bundle symlink at `bundle.go:103`. So: the stack underneath Boks works on Windows; Boks
-on Windows does not yet.
+**What this does not mean.** This is `ctr`, not `boks run`. No Ethernet frame has crossed the
+virtio-net device on Windows, so nothing here says anything about the network enforcement,
+which is the thing Boks is for. Elevation is still required, for the task-bundle symlink at
+`bundle.go:103`. So: the stack underneath Boks works on Windows; Boks on Windows does not yet.
+
+> **Since this run, `boks run` no longer refuses on Windows.** The gate in
+> `internal/network/vmm_windows.go` that stopped it before anything was bound has been
+> removed, so the socket is bound, the stack is assembled and the sandbox is attempted. That
+> is a change to what is *attempted*, not to what is known: still no frame, still nothing
+> observed on the link, and nobody has run `boks run` on Windows at all. What the change adds
+> is a bounded wait and a legible failure — if nothing connects to the link socket within 30 s
+> of the task starting, the supervisor exits and says what did not happen. Anyone running it
+> should expect that failure and record what happened *before* it, which is the evidence this
+> section is still missing.
 
 **Still open, measured in the same run.** The delete path stalls a fixed 30.009 s —
 `reaped child process` at 12:47:08.080, then `failed to shutdown io after delete: io

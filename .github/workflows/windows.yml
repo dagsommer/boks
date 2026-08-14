@@ -167,17 +167,23 @@ jobs:
       # EXPECTED TO FAIL. Do not delete this step and do not fold it into the one above —
       # either would convert a known gap into a silent one.
       #
-      # These two are the port itself, not test bugs. checkSocketPath in
-      # internal/network/network.go refuses outright on Windows ("the VM runtime does not
-      # support Windows yet"), so every test that builds a Plan fails, and internal/enforce's
-      # shared testSpec helper builds one. That refusal is correct behaviour for today; the
-      # tests are simply ahead of the port.
+      # These two are the port itself, not test bugs. Both refusals that used to fail them
+      # are gone — checkSocketPath stopped refusing on Windows when the link became a stream,
+      # and the vmmSupported() gate in internal/network was removed when `boks run` was
+      # allowed to attempt a sandbox there — so what these tests do on this runner is now
+      # genuinely unknown rather than known-bad. They bind AF_UNIX sockets, spawn a supervisor
+      # process, and exercise file-permission behaviour Windows does not implement; every one
+      # of those has been written to be portable and none has been observed running here.
       #
-      # MOVE THEM UP WHEN: they pass here. The change that does it is the guest link moving
-      # from unixgram to unixstream — see internal/network/gateway_windows.go, which explains
-      # why that is the one change that matters, and docs/windows.md section 8. When they go
-      # green, delete this step and the exclusion in the step above together; do not leave a
-      # tolerated step with nothing left to tolerate.
+      # This step stays tolerated until a run proves otherwise, because the honest state is
+      # "unmeasured", and a required step that has never passed would be a red build with no
+      # information in it.
+      #
+      # MOVE THEM UP WHEN: they pass here. When they go green, delete this step and the
+      # exclusion in the step above together; do not leave a tolerated step with nothing left
+      # to tolerate. Passing here is *not* evidence that a sandbox works on Windows: no
+      # Ethernet frame has ever crossed the virtio-net device there, and none of these tests
+      # involve a VM. See internal/network/vmm_windows.go and docs/verification.md.
       # ---------------------------------------------------------------------------------
       - name: Test the two packages blocked on the port (expected to fail)
         id: blocked
@@ -202,9 +208,9 @@ jobs:
               echo "\`.github/workflows/windows.yml\` and the exclusion in the required step"
               echo "above it, so that \`go test ./...\` is required whole."
             else
-              echo "**\`internal/network\` and \`internal/enforce\` failed, as expected.**"
-              echo "\`checkSocketPath\` refuses on Windows by design; see the comment above"
-              echo "that step for the change that makes them pass."
+              echo "**\`internal/network\` and \`internal/enforce\` failed.** Neither refusal"
+              echo "that used to explain this is still there, so these are now failures to"
+              echo "read rather than a known gap: see the comment above that step."
               echo
               echo '```'
               grep -E '^(FAIL|--- FAIL)' blocked-output.txt || true

@@ -2,38 +2,148 @@ package enforce
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
+	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
-// There is no supervisor on Windows because there is nothing yet for it to supervise.
+// The supervisor's process primitives on Windows.
 //
-// A supervisor exists to hold one sandbox's link socket and run the netstack behind it. On
-// Windows there is no such link, because Boks has no VMM that speaks the Windows Hypervisor
-// Platform and therefore nothing that emits a guest's frames onto a host socket (see
-// internal/network/vmm_windows.go and docs/windows.md). The design is sound there — the
-// reference product runs the same shape on Windows — it simply has no VM under it. These
-// stubs therefore refuse rather than pretending.
+// This file used to refuse — all four functions returned "sandbox networking is not available
+// on Windows" — and the refusal was honest at the time: a supervisor exists to hold one
+// sandbox's link socket and run the netstack behind it, and Windows had no VMM that could put
+// a guest's frames on such a socket. It has one now (see internal/network/vmm_windows.go), so
+// the supervisor has something to supervise, and stub primitives would make `boks run` fail on
+// Windows for a reason that is no longer the real one — the worst kind of error message.
 //
-// This is deliberately *not* an unimplemented file-locking primitive. The Windows equivalent
-// of the flock in lock_unix.go is known and would be `LockFileEx` with
-// `LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`, which is what Go's own toolchain uses
-// in cmd/go/internal/lockedfile — with one semantic difference worth writing down before
-// anybody implements it: Windows releases a byte-range lock when the holder dies, but the
-// documentation states the release is not prompt ("the time it takes for the operating system
-// to unlock these locks depends upon available system resources"). The Unix version relies on
-// release being immediate to answer "is that supervisor gone" with no window. On Windows that
-// answer would need a short retry before it could be trusted.
+// The previous comment also predicted the shape of this file, and it was right about the
+// primitive and about the caveat. Both are recorded again here, because the caveat is the one
+// thing a reader has to know.
 //
-// Writing that primitive now would produce a correct lock with no caller, and would suggest
-// the supervisor is one file away from working. It is not; it is a whole VMM away.
+// **Nothing in this file has ever been executed.** It compiles for windows/amd64 and
+// windows/arm64 and follows the APIs as Microsoft documents them; that is the whole of the
+// claim.
 
-var errUnsupported = errors.New("enforce: sandbox networking is not available on Windows; " +
-	"there is no host-terminated link for a supervisor to own (see docs/windows.md)")
+// acquire takes the supervisor lock for the life of the process, as an exclusive byte-range
+// lock on the lock file.
+//
+// LockFileEx with LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY is the Windows equivalent
+// of the flock in lock_unix.go, and is what Go's own toolchain uses in
+// cmd/go/internal/lockedfile. One byte at offset zero is locked rather than the whole file:
+// the range is a token, nothing reads or writes the file's contents, and a one-byte range
+// cannot be affected by the file's length.
+//
+// The returned function releases the lock explicitly. That is not decoration on this platform:
+// see locked for why the implicit release at process death is the part that cannot be relied
+// on to be prompt.
+func acquire(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	overlapped := new(windows.Overlapped)
+	err = windows.LockFileEx(windows.Handle(f.Fd()),
+		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, overlapped)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("the lock %s is held: %w", path, err)
+	}
+	return func() {
+		_ = windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, overlapped)
+		_ = f.Close()
+	}, nil
+}
 
-func acquire(string) (func(), error) { return nil, errUnsupported }
+// locked reports whether a supervisor is holding the lock.
+//
+// # The one place Windows is not the same as Unix
+//
+// The Unix answer is exact. An flock is released by the kernel the instant the holder dies,
+// so "can I take this lock" answers "is that supervisor gone" with no window at all, and
+// every command that asks — Lookup, List, Ensure — gets a fact.
+//
+// Windows also releases a byte-range lock when the holder dies, but its own documentation
+// declines to say when: "the time it takes for the operating system to unlock these locks
+// depends upon available system resources", with an explicit recommendation to unlock
+// explicitly instead. acquire does unlock explicitly, so a supervisor that exits normally or
+// is terminated through its own teardown leaves nothing behind. What remains is a **crashed**
+// supervisor, whose lock may still look held for some unspecified interval after its process
+// is gone.
+//
+// The consequence is worth stating rather than discovering: during that interval Lookup
+// reports a network that is running when it is not, so `boks run` reuses a dead stack instead
+// of replacing it, and the sandbox has no network with no warning — the very case
+// orphanedStackWarning exists to catch. The next command after the interval sees the truth and
+// recovers. This is not simulated to be better than it is: there is no retry here, because a
+// retry would have to sleep on the common path (a live supervisor, which is exactly what a
+// held lock usually means) to soften a rare one, and `boks net ls` walks every sandbox.
+func locked(path string) bool {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return false // no lock file at all: nothing is running
+	}
+	defer f.Close()
+	overlapped := new(windows.Overlapped)
+	err = windows.LockFileEx(windows.Handle(f.Fd()),
+		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, overlapped)
+	if err != nil {
+		return true // somebody else holds it
+	}
+	_ = windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, overlapped)
+	return false
+}
 
-func locked(string) bool { return false }
+// terminate ends a supervisor.
+//
+// Windows has no SIGTERM to send, and the graceful alternatives do not reach this process:
+// GenerateConsoleCtrlEvent needs a shared console, and detach deliberately gives the
+// supervisor none so that closing the terminal cannot take the sandbox's network with it. So
+// this is TerminateProcess, and the supervisor's own teardown — closing the stack, removing
+// the link socket and the state directory — does not run.
+//
+// Nothing is lost that matters, and it is worth being precise about why rather than assuming
+// it. The host listeners a published port binds are closed by the kernel with the process.
+// The decision log is written a line at a time with no buffering, so no decision is dropped.
+// The link socket and the state directory are removed by Stop, which does it after this
+// returns for exactly this reason.
+//
+// os.FindProcess is deliberately not used: on Windows it opens the process with
+// PROCESS_QUERY_INFORMATION|SYNCHRONIZE and no PROCESS_TERMINATE, so the Kill that follows
+// fails with access denied. The handle is opened here with the right to do the job.
+func terminate(pid int) error {
+	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, uint32(pid))
+	if err != nil {
+		// A pid nothing owns is reported as an invalid parameter rather than as a
+		// missing object. The caller wants "make sure it is gone", so that is not an
+		// error.
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			return nil
+		}
+		return fmt.Errorf("opening the network supervisor process %d: %w", pid, err)
+	}
+	defer windows.CloseHandle(h)
+	if err := windows.TerminateProcess(h, 1); err != nil {
+		return fmt.Errorf("terminating the network supervisor process %d: %w", pid, err)
+	}
+	return nil
+}
 
-func terminate(int) error { return errUnsupported }
-
-func detach(*exec.Cmd) {}
+// detach starts the supervisor without a console and in a process group of its own, so that
+// neither the Ctrl-C for the command that spawned it nor the closing of the terminal it was
+// started from reaches it.
+//
+// DETACHED_PROCESS is what corresponds to setsid here: a process with no console receives no
+// console control event at all, which covers both Ctrl-C and the close of the window.
+// CREATE_NEW_PROCESS_GROUP is kept alongside it because the two answer different halves on
+// Windows and the combination is what every long-lived child in the Go ecosystem uses. Neither
+// affects the handles the supervisor is given — its stdin pipe carries the spec, and its
+// stderr is the sandbox's stack.log — because handle inheritance is independent of the
+// console.
+func detach(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS,
+	}
+}
