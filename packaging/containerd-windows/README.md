@@ -130,6 +130,179 @@ entirely possible to have the snapshotter present and the differ missing, which 
 confusing half-state the test commands below are designed to detect.
 
 
+## The root directory must exist first
+
+**Create `root` and `state` before starting `containerd.exe`.** This is a hard prerequisite,
+not housekeeping, and it is the one thing on this page that will cost you a whole run if you
+skip it:
+
+```powershell
+.\new-containerd-root.ps1        # ships in the bundle; or: mkdir C:\cdtest\root, C:\cdtest\state
+```
+
+### What goes wrong without it
+
+Unelevated, on a machine where those directories do not already exist, containerd creates them
+itself and then cannot write inside them. Measured on Windows 11: **43 plugins failed**, the
+first error being
+
+```
+failed to mkdir "C:\cdtest\root\io.containerd.content.v1.content": Access is denied.
+   id=io.containerd.content.v1.content
+```
+
+and the ACL on the directory containerd had just created being
+
+```
+NT AUTHORITY\SYSTEM         FullControl   Allow
+BUILTIN\Administrators      FullControl   Allow
+Owner: <the unelevated user>
+```
+
+The owner is the user. There is no ACE for the user.
+
+### Why containerd does that
+
+`cmd/containerd/server/server.go` creates both directories through a Windows-specific helper:
+
+```go
+if err := sys.MkdirAllWithACL(config.Root, 0o700); err != nil {   // :70
+if err := sys.MkdirAllWithACL(config.State, 0o711); err != nil {  // :81
+```
+
+`pkg/sys/filesys_windows.go` is a clone of `os.MkdirAll` that additionally applies one SDDL to
+**every path component it creates**:
+
+```go
+// :31
+const SddlAdministratorsLocalSystem = "D:P(A;OICI;GA;;;BA)(A;OICI;GA;;;SY)"
+```
+
+Read that left to right:
+
+| | |
+| --- | --- |
+| `D:` | this is the DACL |
+| `P` | **PROTECTED** — do not inherit any ACE from the parent directory |
+| `(A;OICI;GA;;;BA)` | Allow, Object+Container Inherit, `GENERIC_ALL`, `BUILTIN\Administrators` |
+| `(A;OICI;GA;;;SY)` | Allow, Object+Container Inherit, `GENERIC_ALL`, `NT AUTHORITY\SYSTEM` |
+
+`P` is the load-bearing letter. Without it the directory would inherit whatever the parent
+grants — under `C:\` that includes an inheritable `Modify` for Authenticated Users — and the
+hardening would be undone by wherever the admin happened to point `--root`. The Unix mode
+argument is discarded outright: the signature is `MkdirAllWithACL(path string, _ os.FileMode)`,
+so the `0o700` and `0o711` in `server.go` mean nothing here.
+
+**This ACL is correct for the deployment containerd on Windows is built for.** That deployment
+is a service under the SCM running as LocalSystem. `root` holds the content store (image
+blobs), the snapshotters (container root filesystems) and the bolt metadata database; `state`
+holds shim bootstrap params and pipe addresses. A user who can write there can put a binary
+into a layer that a later container executes, or repoint an image's metadata at content they
+control. That is arbitrary code execution as whatever the daemon runs containers as. The ACL is
+the thing standing in the way, and it is the same SDDL — and the same reasoning — as Moby's
+`system.MkdirAllWithACL` for the Docker data root.
+
+What it is *not* is conditioned on the identity containerd is running under. Unelevated,
+containerd is neither `BA` nor `SY`, so it writes a DACL that excludes itself.
+
+### Why the failure names a plugin instead of a permission
+
+Both `MkdirAllWithACL` calls in `server.go` **succeed**. Creating a directory is a right on the
+*parent*, and the user has that. The denial arrives later, the first time something writes
+*inside* `root`, through a plain `os.MkdirAll` with no ACL involved:
+
+```go
+// plugins/content/local/store.go:94
+if err := os.MkdirAll(root, 0755); err != nil {
+    return nil, fmt.Errorf("failed to mkdir %q: %w", root, err)
+}
+```
+
+`io.containerd.metadata.v1.bolt` requires the content store, and essentially every service
+requires bolt — the same cascade the `disabled_plugins` block in `config.toml` exists to
+prevent for a different cause. Hence 43 failures and an `id=` pointing at the content store.
+
+### Why pre-creating works, exactly
+
+`mkdirall`'s first act is an early return for a directory that is already there:
+
+```go
+// pkg/sys/filesys_windows.go:65
+dir, err := os.Stat(path)
+if err == nil {
+    if dir.IsDir() {
+        return nil
+    }
+    ...
+```
+
+An existing directory is accepted **unchanged** — no SDDL is applied, no ACL is inspected. A
+`root` you created yourself carries ordinary inherited permissions, and everything containerd
+builds underneath it is made with plain `os.MkdirAll`, which inherits from it. That is the
+whole mechanism; it is not a race and not luck.
+
+Two consequences worth stating because both get guessed wrong:
+
+- **Both directories need it, separately.** `MkdirAllWithACL` is called once for `root` and
+  once for `state`, and it recurses — it *does* create missing parents, and it hardens each one
+  it creates. So `C:\cdtest` itself gets the ACL too if containerd is the one to create it.
+- **Relocating `root` does not help.** The early return skips only directories that already
+  exist. Pointing `--root` at `%LOCALAPPDATA%\containerd\root` produces exactly the same
+  lockout, because that leaf does not exist either. Pre-creation is the only fix short of
+  patching containerd.
+
+### If you are already locked out
+
+The user is the **owner**, and a Windows owner is implicitly granted `WRITE_DAC` by the access
+check even when the DACL names nobody. So the directory is recoverable without an
+administrator, unelevated (*inferred from Windows access-check semantics, not from anything we
+have run*):
+
+```powershell
+icacls C:\cdtest\root  /grant "*$([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value):(OI)(CI)F"
+icacls C:\cdtest\state /grant "*$([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value):(OI)(CI)F"
+```
+
+`new-containerd-root.ps1` does this for you: it creates whatever is missing, then proves each
+directory is usable by creating and deleting a probe directory inside it — the same operation
+containerd performs, rather than a second, wrong reimplementation of the Windows access check —
+and repairs the DACL only if that probe fails.
+
+The SID form (`*S-1-5-…`) rather than the account name is deliberate: `icacls` matches account
+and group names literally and they are localised.
+
+### Why Boks does not patch this out
+
+The obvious alternative is a fourth patch: have an unelevated containerd add an ACE for its own
+token user, so that a root it creates is one it can use. It was considered and rejected. The
+honest comparison is not "secure versus insecure" — both routes end with a directory the user
+can write to, which is unavoidable, because containerd running as that user must be able to
+write there. The difference is **who decides, and how long the decision lasts.**
+
+1. **The ACE outlives the run that justified it.** `MkdirAllWithACL` is a no-op on an existing
+   directory, so an ACE written once is permanent. Install containerd as a service afterwards,
+   or point a LocalSystem daemon at the same `--root`, and an unprivileged user now has
+   inheritable (`OICI`) full control over a privileged daemon's content store and metadata
+   database — and over everything that daemon creates inside it from then on. A patch made for
+   the unelevated case would silently degrade the elevated one. That is precisely the
+   escalation the `P` in the SDDL exists to prevent, arrived at by a different route.
+2. **"Which SID" is not a one-line decision.** Elevated administrators have split tokens;
+   service accounts are not LocalSystem; a `runas` shell is a different user from the one who
+   will use the daemon. Every one of those writes a different persistent ACE.
+3. **Pre-creating is chosen locally, by a person, on a directory they own.** The permissive
+   permissions land on one test root on one desktop, put there deliberately. A patched binary
+   applies the same relaxation on every host it is ever run on, including hosts where the root
+   is later reused by a service.
+4. **We would have to carry it, and argue for it.** The other three patches in `patches/` are
+   things we want upstream and expect containerd to take. "Relax a deliberate security control
+   so our test setup needs one command fewer" is not that, and Boks — whose entire premise is
+   isolation — is a bad place for it to originate.
+
+If containerd upstream decides to support a non-service, non-elevated Windows daemon properly,
+the right shape is probably an explicit opt-in (a config key, or a documented `--root` that the
+operator prepares) rather than an implicit ACE. That is upstream's call, and this directory is
+not the place to pre-empt it.
+
 ## Testing it on Windows
 
 Nothing here needs the nerdbox shim, a guest kernel, or a working microVM. This tests one
@@ -138,9 +311,12 @@ question — *can containerd on Windows unpack a Linux image with EROFS?* — an
 Download the `containerd-windows-amd64-bundle` artifact from the workflow run. It contains
 `containerd.exe`, `ctr.exe`, `mkfs.erofs.exe` and `config.toml`.
 
-**Run all of this unelevated, and pass the config.** Both matter, and both cost you a run if you
-skip them:
+**Run all of this unelevated, pass the config, and create the directories first.** All three
+matter, and each one costs you a run if you skip it:
 
+- **Create `root` and `state` before starting containerd** — `.\new-containerd-root.ps1`. See
+  "The root directory must exist first" above for the failure this avoids and why the fix is
+  exact rather than lucky. This is step 0 below and it is not optional.
 - **Do not use the default `--root` / `--state`.** They live under `C:\ProgramData\containerd`,
   which a normal user cannot create — `mkdir C:\ProgramData\containerd\root: Access is denied.`
   Elevating fixes the permission and creates a worse problem: those are the same directories a
@@ -157,20 +333,35 @@ skip them:
 `config.toml` is `packaging/containerd-windows/config.toml` in this repo, and is in the bundle.
 Every line of it is commented with the failure it prevents.
 
-### 0. Put the three binaries in one directory, on PATH
+### 0. Put the binaries in one directory on PATH, and create root and state
 
 ```powershell
 mkdir C:\boks-test
-# copy containerd.exe, ctr.exe, mkfs.erofs.exe, config.toml into it
-mkdir C:\cdtest\root, C:\cdtest\state
+# unzip the bundle into it: containerd.exe, ctr.exe, mkfs.erofs.exe, config.toml,
+# new-containerd-root.ps1
 $env:Path = "C:\boks-test;$env:Path"
+
+C:\boks-test\new-containerd-root.ps1     # unelevated, as the user who will run containerd
 Get-Command mkfs.erofs
 mkfs.erofs -V
 ```
 
-**Proves:** the binary resolves by bare name (containerd calls `exec.Command("mkfs.erofs", ...)`,
-relying on `PATHEXT` to add `.exe`) and it executes at all. `mkfs.erofs.exe` must be on `PATH`
-**before** step 2 starts containerd, or the differ skips itself.
+**Proves:** `root` and `state` exist and this user can write inside them, so containerd will
+accept them rather than replace them with a DACL that excludes you; and that `mkfs.erofs.exe`
+resolves by bare name (containerd calls `exec.Command("mkfs.erofs", ...)`, relying on `PATHEXT`
+to add `.exe`) and executes at all.
+
+Both halves must happen **before** step 3 starts containerd: a late `mkfs.erofs.exe` means the
+differ skips itself, and a missing `root` means containerd hardens it against you.
+
+If the script is blocked by execution policy, either run
+`powershell -ExecutionPolicy Bypass -File C:\boks-test\new-containerd-root.ps1` or just do the
+`mkdir` — the script's extra value is the writability probe and the repair path, not the
+directory creation:
+
+```powershell
+mkdir C:\cdtest\root, C:\cdtest\state
+```
 
 ### 1. Check the daemon runs
 

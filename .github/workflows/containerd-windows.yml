@@ -21,7 +21,9 @@
 # genuinely linked into the binary, that the diff-service default order in the built PE really
 # names erofs first (read out of .data, because `strings` cannot tell that from three unrelated
 # words), that mkfs.erofs.exe carries no hardcoded "/tmp", and that the go-erofs recipe still
-# produces a PE32+ binary whose help text advertises tar mode.
+# produces a PE32+ binary whose help text advertises tar mode. It also parses
+# new-containerd-root.ps1 — the bundled script that must be run before containerd, because
+# an unelevated containerd creates its own --root with a DACL that excludes the user.
 #
 # It runs exactly one thing: the Go tests for the diff service and the transfer plugin, on
 # Linux, because that code is platform-neutral. Everything else is inspection.
@@ -456,6 +458,25 @@ jobs:
         with:
           path: boks
 
+      # The one thing about new-containerd-root.ps1 that can be checked without Windows.
+      # It is shipped to a tester who will run it as the very first command of a session,
+      # and a typo in it would look exactly like the ACL bug it exists to prevent. `pwsh`
+      # is preinstalled on GitHub's ubuntu images; the parser is the same one Windows
+      # PowerShell 7 uses, and it is the only part of the script that is platform-neutral
+      # (WindowsIdentity and icacls.exe are not, so this parses rather than executes).
+      - name: Parse new-containerd-root.ps1
+        shell: pwsh
+        run: |
+          $errs = $null
+          $tokens = $null
+          $script = 'boks/packaging/containerd-windows/new-containerd-root.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errs) | Out-Null
+          if ($errs) {
+            $errs | ForEach-Object { Write-Host "::error file=$script,line=$($_.Extent.StartLineNumber)::$($_.Message)" }
+            exit 1
+          }
+          Write-Host "  $script parses clean ($($tokens.Count) tokens)"
+
       - uses: actions/download-artifact@v4
         with:
           name: mkfs-erofs-windows-amd64
@@ -478,6 +499,12 @@ jobs:
           # at all. Shipping it is the difference between the README's steps working and
           # the tester rediscovering both.
           cp boks/packaging/containerd-windows/config.toml staging/config.toml
+          # Not a convenience either. Without pre-created root/state directories, an
+          # unelevated containerd creates them with a DACL naming only Administrators and
+          # SYSTEM, then cannot write inside its own root — 43 plugins down, behind an
+          # error that names the content store rather than a permission. See the README
+          # section "The root directory must exist first".
+          cp boks/packaging/containerd-windows/new-containerd-root.ps1 staging/
           ls -l staging/
 
       - uses: actions/upload-artifact@v4
@@ -493,8 +520,8 @@ jobs:
           {
             echo "## Windows test bundle (amd64)"
             echo
-            echo "Artifact \`containerd-windows-amd64-bundle\` — three binaries, a \`config.toml\`"
-            echo "and the README."
+            echo "Artifact \`containerd-windows-amd64-bundle\` — three binaries, a \`config.toml\`,"
+            echo "\`new-containerd-root.ps1\` and the README."
             echo
             echo '```'
             (cd staging && sha256sum ./*.exe | sed 's|\./||')
@@ -505,17 +532,21 @@ jobs:
             echo "initialises, or the erofs differ returns \`ErrSkipPlugin\` and vanishes with no"
             echo "error that mentions it."
             echo
-            echo "**Run unelevated, and pass \`--config\`.** The defaults fail twice over: a normal"
-            echo "user cannot create \`C:\\ProgramData\\containerd\`, and the cimfs snapshotter"
-            echo "cannot initialise without privileges — which fails bolt, which fails roughly"
-            echo "forty plugins including the erofs differ. The shipped \`config.toml\` moves the"
-            echo "state to \`C:\\cdtest\`, uses a private pipe, and disables the cimfs plugins."
+            echo "**Run unelevated, pass \`--config\`, and create \`root\`/\`state\` first.** The"
+            echo "defaults fail three ways over: a normal user cannot create"
+            echo "\`C:\\ProgramData\\containerd\`; the cimfs snapshotter cannot initialise without"
+            echo "privileges — which fails bolt, which fails roughly forty plugins including the"
+            echo "erofs differ; and any root directory containerd creates for itself unelevated"
+            echo "gets a protected DACL naming only Administrators and SYSTEM, which locks the"
+            echo "daemon out of its own content store. The shipped \`config.toml\` moves the state"
+            echo "to \`C:\\cdtest\`, uses a private pipe and disables cimfs;"
+            echo "\`new-containerd-root.ps1\` handles the directories."
             echo
             echo "Then, in order — full commands and what each proves are in \`README.md\` in the"
             echo "artifact:"
             echo
             echo '```powershell'
-            echo 'mkdir C:\cdtest\root, C:\cdtest\state'
+            echo '.\new-containerd-root.ps1            # root+state must exist before containerd'
             echo 'mkfs.erofs -V                        # the exe runs at all'
             echo 'containerd.exe --config .\config.toml --log-level debug   # own console'
             echo '$env:CONTAINERD_ADDRESS = ''\\.\pipe\boks-containerd'''
