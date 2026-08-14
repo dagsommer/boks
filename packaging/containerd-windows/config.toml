@@ -12,18 +12,39 @@ version = 3
 # ---------------------------------------------------------------------------------------
 # Where containerd keeps its state.
 #
-# The defaults are under C:\ProgramData\containerd, and creating that as a normal user
-# fails outright:
+# ############ PREREQUISITE — BOTH DIRECTORIES MUST EXIST BEFORE YOU START ###############
+#
+#     .\new-containerd-root.ps1          # or: mkdir C:\cdtest\root, C:\cdtest\state
+#
+# This is not tidying up. If you let containerd create them, it creates them with a
+# PROTECTED DACL granting only BUILTIN\Administrators and NT AUTHORITY\SYSTEM — not the
+# unelevated user who owns them — and then cannot write inside its own root:
+#
+#     failed to mkdir "C:\cdtest\root\io.containerd.content.v1.content": Access is denied.
+#
+# That takes bolt down, and about forty plugins with it, behind an error that names a
+# plugin rather than a permission. Pre-created directories are accepted unchanged,
+# because MkdirAllWithACL returns early for a directory that already exists.
+#
+# Changing `root` below does NOT avoid this — any leaf that does not already exist gets
+# the same ACL, including one inside your own profile. See README.md, "The root
+# directory must exist first".
+#
+# ########################################################################################
+#
+# The defaults are under C:\ProgramData\containerd, which a normal user cannot create at
+# all:
 #
 #     mkdir C:\ProgramData\containerd\root: Access is denied.
 #
 # You can run elevated instead — but then this daemon writes to the same directories a
 # Docker Sandboxes or Docker Desktop containerd installation uses, and you are debugging
 # two daemons. A directory you own, plus a pipe name nothing else answers on, keeps this
-# test entirely to itself. Create the directory first; containerd does not create the
-# parent.
+# test entirely to itself.
 #
-#     mkdir C:\cdtest\root, C:\cdtest\state
+# If you change these paths, change them in new-containerd-root.ps1's arguments too:
+#
+#     .\new-containerd-root.ps1 -Root D:\cd\root -State D:\cd\state
 # ---------------------------------------------------------------------------------------
 root = 'C:\cdtest\root'
 state = 'C:\cdtest\state'
