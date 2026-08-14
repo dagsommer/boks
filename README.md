@@ -357,7 +357,9 @@ not disappear because this invocation typed a different one. A sandbox remembers
 it was created with, so a later `boks start` serves the same containment.
 
 The mode is fixed when a sandbox is created, because it is expressed in annotations the
-runtime reads at boot: `--net` on a sandbox that already exists is reported, not obeyed.
+runtime reads at boot: a `--net` that disagrees with how an existing sandbox was wired is
+refused, and nothing runs. It cannot be applied, and ignoring it would mean `--net none`
+quietly getting a network.
 
 **A sandbox with nothing attached still has its network.** It lives in a `boks net serve`
 process, one per running sandbox, started on demand and never at boot; it exits when the

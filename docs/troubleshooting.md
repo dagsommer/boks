@@ -382,8 +382,10 @@ item on the [roadmap](roadmap.md).
 ### A sandbox ignores `--net none`, or has no policy at all
 
 Network mode is fixed when a sandbox is created, because it is expressed in annotations the
-runtime reads at boot. Passing `--net` to an existing sandbox is reported, not obeyed.
-Remove it and run again.
+runtime reads at boot. Passing a `--net` that disagrees with how the sandbox was wired is
+refused, and nothing runs: the flag cannot be applied, so obeying it is impossible and
+ignoring it would mean `--net none` silently getting you a network. Remove the sandbox and
+run again.
 
 A sandbox created before Boks had network annotations runs on the runtime's default transport
 (libkrun's TSI), where the guest's `127.0.0.1` is the host's and no policy can be applied to
