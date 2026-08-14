@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strings"
 	"text/tabwriter"
 )
@@ -19,8 +20,17 @@ import (
 type Status int
 
 const (
+	// StatusUnknown is the zero value, and means no check reported this: a name in the
+	// display order with nothing recorded against it.
+	//
+	// It is first deliberately. StatusOK used to be the zero value, which made "this
+	// check produced no result" indistinguishable from "this check passed" — a
+	// requirement that was never consulted read as a requirement that was satisfied, in
+	// the one command whose entire job is not to do that. Nothing can now say a host is
+	// ready by omission.
+	StatusUnknown Status = iota
 	// StatusOK means the requirement is satisfied.
-	StatusOK Status = iota
+	StatusOK
 	// StatusWarn means Boks can run but something is degraded or unverified.
 	StatusWarn
 	// StatusFail means sandboxes cannot start until this is fixed.
@@ -78,26 +88,79 @@ type Report struct {
 	Order   []string
 }
 
-// Ready reports whether sandboxes can be expected to start.
-func (r Report) Ready() bool {
-	for _, res := range r.Results {
-		if res.Status == StatusFail {
-			return false
-		}
-	}
-	return true
+// Verdict is the single decision doctor makes about a host: whether sandboxes can start,
+// which checks say they cannot, and the sentence that states it.
+//
+// It exists because that decision used to be made twice — once to choose the summary line
+// and once again to choose the exit code — from two different traversals of the report:
+// Ready() ranged over the results map, Failures() over the display order. Two answers to one
+// question can only ever agree by luck, and the failure mode is the worst one this command
+// has: a summary that says the host is not ready above an exit status that says it is, which
+// is what a script reads. Now Write prints Summary and hands back the same value the caller
+// exits on, so no traversal can disagree with the text the user was shown.
+type Verdict struct {
+	// Ready reports whether sandboxes can be expected to start.
+	Ready bool
+	// Failures names the checks blocking that, in display order.
+	Failures []string
+	// Summary is the closing line of the report, and states exactly the above.
+	Summary string
 }
 
-// Failures returns the names of checks that failed, in display order.
-func (r Report) Failures() []string {
-	var out []string
-	for _, name := range r.Order {
-		if r.Results[name].Status == StatusFail {
-			out = append(out, name)
+// Verdict decides, once, whether this host can start sandboxes.
+//
+// Every name is consulted: those in the display order, and then any result that is not in it
+// at all. A result nobody displays still counts, because the question is whether the host is
+// ready, not whether the table happens to mention why it is not.
+func (r Report) Verdict() Verdict {
+	var failures []string
+	for _, name := range r.names() {
+		// A missing result is a failure and not an omission. Checks are added per
+		// platform and the two collections are built together, so this should be
+		// unreachable — but "should be unreachable" is not a basis for reporting a host
+		// as ready.
+		res, ok := r.Results[name]
+		if !ok || res.Status == StatusFail || res.Status == StatusUnknown {
+			failures = append(failures, name)
 		}
 	}
-	return out
+	if len(failures) == 0 {
+		return Verdict{Ready: true, Summary: "Host looks ready to start sandboxes."}
+	}
+	return Verdict{
+		Failures: failures,
+		Summary: fmt.Sprintf("Not ready: %s must be fixed before sandboxes can start.",
+			strings.Join(failures, ", ")),
+	}
 }
+
+// names is every check the report knows about: the display order first, then anything
+// recorded outside it, sorted so the output does not depend on map iteration order.
+func (r Report) names() []string {
+	names := make([]string, 0, len(r.Order)+len(r.Results))
+	seen := make(map[string]bool, len(r.Order))
+	for _, name := range r.Order {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	var extra []string
+	for name := range r.Results {
+		if !seen[name] {
+			extra = append(extra, name)
+		}
+	}
+	slices.Sort(extra)
+	return append(names, extra...)
+}
+
+// Ready reports whether sandboxes can be expected to start.
+func (r Report) Ready() bool { return r.Verdict().Ready }
+
+// Failures returns the names of checks that failed, in display order.
+func (r Report) Failures() []string { return r.Verdict().Failures }
 
 // Run executes every check for the current platform.
 func Run(ctx context.Context, env Env) Report {
@@ -126,10 +189,15 @@ func Checks() []Check {
 	return append(checks, extraChecks()...)
 }
 
-// Write renders a report as an aligned table followed by remediation text.
-func (r Report) Write(w io.Writer) {
+// Write renders a report as an aligned table followed by remediation text, and returns the
+// verdict it just printed.
+//
+// The caller is meant to exit on the returned value rather than ask the report again: the
+// exit status and the closing line are then the same decision by construction, and cannot
+// contradict each other however the report was assembled.
+func (r Report) Write(w io.Writer) Verdict {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
-	for _, name := range r.Order {
+	for _, name := range r.names() {
 		res := r.Results[name]
 		line := fmt.Sprintf("%s\t%s", name, res.Status)
 		if res.Detail != "" {
@@ -140,7 +208,7 @@ func (r Report) Write(w io.Writer) {
 	tw.Flush()
 
 	var remedies []string
-	for _, name := range r.Order {
+	for _, name := range r.names() {
 		res := r.Results[name]
 		if res.Remedy != "" && (res.Status == StatusFail || res.Status == StatusWarn) {
 			remedies = append(remedies, fmt.Sprintf("%s (%s):\n  %s", name, res.Status,
@@ -155,12 +223,9 @@ func (r Report) Write(w io.Writer) {
 		}
 	}
 
-	if r.Ready() {
-		fmt.Fprintln(w, "Host looks ready to start sandboxes.")
-	} else {
-		fmt.Fprintf(w, "Not ready: %s must be fixed before sandboxes can start.\n",
-			strings.Join(r.Failures(), ", "))
-	}
+	verdict := r.Verdict()
+	fmt.Fprintln(w, verdict.Summary)
+	return verdict
 }
 
 func platformCheck() Check {
