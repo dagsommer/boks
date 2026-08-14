@@ -1,0 +1,526 @@
+From bd09c5f13a6246ea08b8b719a48b31e47db2b0ac Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 09:10:15 +0200
+Subject: [PATCH] mount/manager: verify the superblock instead of trusting the
+ file exists
+
+`mkfs.Transform` decided an image was already formatted by calling `Stat` on
+it. Where the check should have been there was a comment:
+
+    if _, err := r.Stat(subpath); err == nil {
+        // Check magic number
+    } else if os.IsNotExist(err) {
+
+That is not a harmless TODO, because of the order of the branch it guards. The
+format path creates the file, truncates it to the requested size, and only then
+runs mkfs. So every way mkfs can fail -- the binary missing, a full disk, a
+killed daemon -- leaves behind a file of exactly the size the next call expects,
+containing nothing but zeroes. The next call `Stat`s it, finds it, skips the
+format, and returns the mount. The guest is handed a zero-filled image presented
+as ext4.
+
+This is not hypothetical and it is not rare on every platform. On Windows there
+is no `mkfs.ext4` in any packaged form, so the first `ctr run` through the erofs
+snapshotter -- which asks for `mkfs/ext4` with `X-containerd.mkfs.size=67108864`
+on every active snapshot -- fails at the format step by construction, and every
+attempt after that silently "succeeds". Observed there, on the file the failing
+run left behind:
+
+    snapshots\3\rwlayer.img   exists: True   size: 67,108,864
+    ext4 magic @1080 : 0x0000        (a real ext4 superblock is 0xEF53)
+
+Two changes, and they are deliberately asymmetric about who owns the file.
+
+Read the superblock. `superblockProbes` says, per filesystem, where the magic
+lives and what it is: ext2/ext3/ext4 share EXT2_SUPER_MAGIC, a `__le16` at
+offset 0x38 of a superblock that itself starts 1024 bytes into the image, so
+1080 absolute, low byte first; XFS puts big-endian `sb_magicnum` first on the
+device, reading as "XFSB". An image carrying the right magic is accepted exactly
+as before -- deliberately placing a pre-formatted image is a supported thing to
+do, and where no mkfs exists for the filesystem it is the only way to get one.
+An image that does not carry it is refused, with an error saying so, and is left
+untouched: we did not create it, we cannot know what it is, and reformatting
+someone's data would trade a corruption bug for a data-loss one.
+
+Delete what we created and could not format. That file is unambiguously ours and
+contains only zeroes we just wrote, so leaving it is strictly worse than removing
+it -- and with the check above, leaving it would make every subsequent attempt
+fail rather than retry. `O_EXCL` replaces `O_TRUNC` on the create so that "this
+file is ours" is a fact about the open rather than an inference from the `Stat`
+several lines earlier; without it a file appearing in between would be truncated
+and then deleted. A `Remove` that itself fails is logged and not returned: the
+format error is the more useful one, and the superblock check is the backstop.
+
+One behaviour change beyond the bug: an existing image for a filesystem the
+format path cannot create -- anything but ext2/3/4 and xfs -- is now refused with
+the same `unsupported filesystem` error the format path already gives, rather
+than accepted because a file happened to be there. Accepting an image that could
+never have been created here, and whose magic is unknown so cannot be checked, is
+not a case worth preserving.
+
+Tests cover the round trip through a real `mkfs.ext4` (skipped where it is
+absent), so the constants are checked against what the formatter writes rather
+than against themselves; a zero-filled image being refused; the magic misplaced,
+byte-swapped and truncated; the failed format cleaning up after itself; and the
+retry that follows it re-attempting the format rather than inheriting the file.
+
+Signed-off-by: Dag Sommer <dagaleks@gmail.com>
+---
+ core/mount/manager/mkfs.go      | 117 ++++++++++++-
+ core/mount/manager/mkfs_test.go | 283 ++++++++++++++++++++++++++++++++
+ 2 files changed, 398 insertions(+), 2 deletions(-)
+ create mode 100644 core/mount/manager/mkfs_test.go
+
+diff --git a/core/mount/manager/mkfs.go b/core/mount/manager/mkfs.go
+index 761d4ef..767e4ea 100644
+--- a/core/mount/manager/mkfs.go
++++ b/core/mount/manager/mkfs.go
+@@ -18,7 +18,9 @@ package manager
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
++	"io"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -31,6 +33,89 @@ import (
+ 	"github.com/docker/go-units"
+ )
+ 
++// superblockProbe records where a filesystem keeps its superblock magic and
++// what that magic is, so that an image file which exists can be told apart
++// from an image file which was formatted. Offsets are from the start of the
++// image; magics are the raw bytes as they appear on disk, in that order.
++type superblockProbe struct {
++	fs     string
++	offset int64
++	magic  string
++}
++
++// One entry for every filesystem the format path below can create, and none
++// beyond: a filesystem whose magic is not listed here cannot be verified, and
++// accepting an unverifiable image is the hazard this table exists to remove.
++var superblockProbes = []superblockProbe{
++	// ext2, ext3 and ext4 share EXT2_SUPER_MAGIC. s_magic is a __le16 at
++	// offset 0x38 within the superblock, and the superblock itself starts
++	// 1024 bytes into the image -- the first 1024 bytes are reserved for a
++	// boot sector -- so 1024 + 0x38 = 1080, low byte first.
++	{fs: "ext2", offset: 1080, magic: "\x53\xef"},
++	{fs: "ext3", offset: 1080, magic: "\x53\xef"},
++	{fs: "ext4", offset: 1080, magic: "\x53\xef"},
++	// XFS puts sb_magicnum first in its superblock, and the superblock first
++	// on the device. XFS metadata magics are big-endian (__be32), so
++	// XFS_SUPER_MAGIC 0x58465342 reads as the ASCII bytes "XFSB".
++	{fs: "xfs", offset: 0, magic: "XFSB"},
++}
++
++// checkSuperblock reports whether the image at subpath is already formatted
++// with fs, by reading that filesystem's magic number -- rather than by
++// observing that a file happens to be present, which is what this used to do.
++func checkSuperblock(r *os.Root, subpath, fs string) error {
++	var probe superblockProbe
++	for _, p := range superblockProbes {
++		if p.fs == fs {
++			probe = p
++			break
++		}
++	}
++	if probe.fs == "" {
++		// Deliberately the same refusal the format path gives for a
++		// filesystem it cannot create. Accepting a pre-existing image for a
++		// filesystem we could never have made, purely because a file is
++		// there, was never a coherent thing to do.
++		return fmt.Errorf("unsupported filesystem %q: %w", fs, errdefs.ErrInvalidArgument)
++	}
++
++	f, err := r.Open(subpath)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++
++	buf := make([]byte, len(probe.magic))
++	if _, err := f.ReadAt(buf, probe.offset); err != nil {
++		if !errors.Is(err, io.EOF) {
++			return err
++		}
++		// Too short to hold the superblock it would need. Fall through to
++		// the mismatch below, which says the more useful thing.
++		buf = nil
++	}
++	if string(buf) != probe.magic {
++		return fmt.Errorf("exists but carries no %s superblock (expected % x at offset %d); "+
++			"it is not a %s image. Remove it to have one created and formatted, or replace it "+
++			"with an image that is already formatted: %w",
++			fs, probe.magic, probe.offset, fs, errdefs.ErrFailedPrecondition)
++	}
++	return nil
++}
++
++// discardUnformatted removes an image this transformer created and then failed
++// to format. It is only ever called for a path opened with O_EXCL in the same
++// call, so it cannot delete a file that was already there.
++func discardUnformatted(ctx context.Context, r *os.Root, subpath, source string) {
++	if err := r.Remove(subpath); err != nil {
++		// Not returned: the caller is holding the failure that actually
++		// explains what went wrong. Nor is it fatal -- checkSuperblock is
++		// the backstop, and an image left behind here has no magic, so the
++		// next attempt refuses it instead of trusting it.
++		log.G(ctx).WithError(err).Warnf("failed to remove unformatted image %q", source)
++	}
++}
++
+ type mkfs struct {
+ 	rootMap map[string]*os.Root
+ }
+@@ -93,7 +178,27 @@ func (t *mkfs) Transform(ctx context.Context, m mount.Mount, a []mount.ActiveMou
+ 	}
+ 
+ 	if _, err := r.Stat(subpath); err == nil {
+-		// Check magic number
++		// A file being there is not the same as it being formatted, and
++		// treating the two as equivalent silently corrupts. The format step
++		// below creates the image and truncates it to size *before* running
++		// mkfs, so a failed mkfs -- a missing mkfs.ext4, a full disk, a
++		// killed daemon -- used to leave behind a file of exactly the right
++		// size, full of zeroes, that the next attempt accepted on sight. The
++		// guest was then handed that as a filesystem.
++		//
++		// So read the superblock. An image carrying the right magic is used
++		// as it always was: placing a pre-formatted image deliberately is a
++		// supported thing to do, and on platforms with no mkfs for the
++		// filesystem in question it is the only way to get one.
++		//
++		// An image that does not carry it is refused and left untouched. We
++		// did not create this file and cannot know what it is, so removing
++		// or reformatting it would trade a corruption bug for a data-loss
++		// one. Only the failure paths below delete anything, and only a file
++		// they created themselves.
++		if err := checkSuperblock(r, subpath, fs); err != nil {
++			return mount.Mount{}, fmt.Errorf("%q: %w", m.Source, err)
++		}
+ 	} else if os.IsNotExist(err) {
+ 		createArgs := []string{"-q"}
+ 
+@@ -116,7 +221,10 @@ func (t *mkfs) Transform(ctx context.Context, m mount.Mount, a []mount.ActiveMou
+ 			return mount.Mount{}, fmt.Errorf("unsupported filesystem %q: %w", fs, errdefs.ErrInvalidArgument)
+ 		}
+ 
+-		f, err := r.OpenFile(subpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0640)
++		// O_EXCL rather than O_TRUNC: it turns "this file is ours" from an
++		// inference about the Stat above into a fact, which is what licenses
++		// the two discardUnformatted calls below to delete it.
++		f, err := r.OpenFile(subpath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0640)
+ 		if err != nil {
+ 			return mount.Mount{}, fmt.Errorf("failed to create file %q: %w", m.Source, err)
+ 		}
+@@ -126,10 +234,15 @@ func (t *mkfs) Transform(ctx context.Context, m mount.Mount, a []mount.ActiveMou
+ 		err = f.Truncate(size)
+ 		f.Close()
+ 		if err != nil {
++			discardUnformatted(ctx, r, subpath, m.Source)
+ 			return mount.Mount{}, fmt.Errorf("failed to truncate file %q: %w", m.Source, err)
+ 		}
+ 
+ 		if err := createWritableImage(ctx, binary, createArgs...); err != nil {
++			// Leaving this behind is worse than the failure that caused it:
++			// it is the exact size the next call expects and contains
++			// nothing but the zeroes we just wrote.
++			discardUnformatted(ctx, r, subpath, m.Source)
+ 			return mount.Mount{}, fmt.Errorf("failed format %q: %w", m.Source, err)
+ 		}
+ 	} else {
+diff --git a/core/mount/manager/mkfs_test.go b/core/mount/manager/mkfs_test.go
+new file mode 100644
+index 0000000..079ac2c
+--- /dev/null
++++ b/core/mount/manager/mkfs_test.go
+@@ -0,0 +1,283 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package manager
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/containerd/errdefs"
++
++	"github.com/containerd/containerd/v2/core/mount"
++)
++
++const testImageSize = 1 << 20
++
++// newMkfsRoot returns a transformer rooted at a fresh directory, and that
++// directory, mirroring how manager.go builds the rootMap.
++func newMkfsRoot(t *testing.T) (*mkfs, string) {
++	t.Helper()
++	dir := t.TempDir()
++	r, err := os.OpenRoot(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { r.Close() })
++	return &mkfs{rootMap: map[string]*os.Root{dir: r}}, dir
++}
++
++func mkfsMount(dir, name, fs string) mount.Mount {
++	return mount.Mount{
++		Source: filepath.Join(dir, name),
++		Type:   "mkfs/" + fs,
++		Options: []string{
++			prefixMkfs + "fs=" + fs,
++			prefixMkfs + "size=1MiB",
++			"rw",
++		},
++	}
++}
++
++// writeImage creates a file of testImageSize bytes with magic written at off.
++// A nil magic leaves it entirely zero-filled, which is what a failed mkfs
++// leaves behind.
++func writeImage(t *testing.T, path string, off int64, magic string) {
++	t.Helper()
++	f, err := os.Create(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	if err := f.Truncate(testImageSize); err != nil {
++		t.Fatal(err)
++	}
++	if magic != "" {
++		if _, err := f.WriteAt([]byte(magic), off); err != nil {
++			t.Fatal(err)
++		}
++	}
++}
++
++// noMkfsBinaries points PATH at an empty directory, so that any mkfs.* the
++// transformer tries to exec is guaranteed absent. That is exactly the
++// condition on Windows, where no mkfs.ext4 exists in any packaged form, and it
++// makes the failure deterministic on a Linux machine that has e2fsprogs.
++func noMkfsBinaries(t *testing.T) {
++	t.Helper()
++	t.Setenv("PATH", t.TempDir())
++}
++
++// A file that carries the filesystem's magic is accepted and left alone. This
++// is the supported "drop in a pre-formatted image" path, and the fix must not
++// break it: on Windows it is the only way a writable layer exists at all.
++func TestMkfsAcceptsFormattedImage(t *testing.T) {
++	for _, tc := range []struct {
++		fs     string
++		offset int64
++		magic  string
++	}{
++		{"ext2", 1080, "\x53\xef"},
++		{"ext3", 1080, "\x53\xef"},
++		{"ext4", 1080, "\x53\xef"},
++		{"xfs", 0, "XFSB"},
++	} {
++		t.Run(tc.fs, func(t *testing.T) {
++			noMkfsBinaries(t)
++			tr, dir := newMkfsRoot(t)
++			m := mkfsMount(dir, "rwlayer.img", tc.fs)
++			writeImage(t, m.Source, tc.offset, tc.magic)
++
++			out, err := tr.Transform(t.Context(), m, nil)
++			if err != nil {
++				t.Fatalf("a formatted %s image was rejected: %v", tc.fs, err)
++			}
++			// The mkfs options are consumed; the rest survives.
++			if len(out.Options) != 1 || out.Options[0] != "rw" {
++				t.Errorf("options = %v, want [rw]", out.Options)
++			}
++			if fi, err := os.Stat(m.Source); err != nil || fi.Size() != testImageSize {
++				t.Errorf("the image was disturbed: %v, %v", fi, err)
++			}
++		})
++	}
++}
++
++// The bug this all exists for. A previous run created the image, truncated it
++// to size, failed to format it and left it behind; the next run saw a file of
++// the right size and handed the guest a zero-filled image presented as ext4.
++func TestMkfsRejectsUnformattedImage(t *testing.T) {
++	noMkfsBinaries(t)
++	tr, dir := newMkfsRoot(t)
++	m := mkfsMount(dir, "rwlayer.img", "ext4")
++	writeImage(t, m.Source, 0, "")
++
++	_, err := tr.Transform(t.Context(), m, nil)
++	if err == nil {
++		t.Fatal("a zero-filled image was accepted as ext4")
++	}
++	if !errdefs.IsFailedPrecondition(err) {
++		t.Errorf("error is %v, want a failed-precondition", err)
++	}
++	if !strings.Contains(err.Error(), "no ext4 superblock") {
++		t.Errorf("error does not say what is wrong: %v", err)
++	}
++	// It is not ours, so it stays exactly where it is.
++	if _, err := os.Stat(m.Source); err != nil {
++		t.Errorf("an image we did not create was removed: %v", err)
++	}
++}
++
++// Near-misses must not pass: the magic has to be the right bytes in the right
++// place, not merely present somewhere.
++func TestMkfsRejectsMisplacedAndTruncatedMagic(t *testing.T) {
++	t.Run("magic at the wrong offset", func(t *testing.T) {
++		noMkfsBinaries(t)
++		tr, dir := newMkfsRoot(t)
++		m := mkfsMount(dir, "rwlayer.img", "ext4")
++		writeImage(t, m.Source, 0, "\x53\xef")
++
++		if _, err := tr.Transform(t.Context(), m, nil); err == nil {
++			t.Fatal("ext4 magic at offset 0 was accepted")
++		}
++	})
++
++	t.Run("byte order reversed", func(t *testing.T) {
++		noMkfsBinaries(t)
++		tr, dir := newMkfsRoot(t)
++		m := mkfsMount(dir, "rwlayer.img", "ext4")
++		// s_magic is a __le16, so 0xEF53 is stored 53 ef, not ef 53.
++		writeImage(t, m.Source, 1080, "\xef\x53")
++
++		if _, err := tr.Transform(t.Context(), m, nil); err == nil {
++			t.Fatal("byte-swapped ext4 magic was accepted")
++		}
++	})
++
++	t.Run("file shorter than the superblock", func(t *testing.T) {
++		noMkfsBinaries(t)
++		tr, dir := newMkfsRoot(t)
++		m := mkfsMount(dir, "rwlayer.img", "ext4")
++		if err := os.WriteFile(m.Source, []byte("short"), 0640); err != nil {
++			t.Fatal(err)
++		}
++
++		if _, err := tr.Transform(t.Context(), m, nil); err == nil {
++			t.Fatal("a five-byte image was accepted as ext4")
++		}
++	})
++}
++
++// A filesystem whose magic is not known cannot be verified, so an existing
++// image for it is refused rather than trusted -- the same refusal the format
++// path gives, which it did not previously get.
++func TestMkfsRejectsExistingImageForUnsupportedFilesystem(t *testing.T) {
++	noMkfsBinaries(t)
++	tr, dir := newMkfsRoot(t)
++	m := mkfsMount(dir, "rwlayer.img", "btrfs")
++	writeImage(t, m.Source, 0, "")
++
++	_, err := tr.Transform(t.Context(), m, nil)
++	if err == nil {
++		t.Fatal("an existing image for an unsupported filesystem was accepted")
++	}
++	if !errdefs.IsInvalidArgument(err) {
++		t.Errorf("error is %v, want an invalid-argument", err)
++	}
++}
++
++// The other half of the fix: a format that fails must not leave the image it
++// created behind, or a retry inherits it. With the superblock check in place a
++// retry would refuse it, but refusing forever is not a working system either --
++// the file has to go so the next attempt can make a real one.
++func TestMkfsRemovesImageItFailedToFormat(t *testing.T) {
++	noMkfsBinaries(t)
++	tr, dir := newMkfsRoot(t)
++	m := mkfsMount(dir, "rwlayer.img", "ext4")
++
++	_, err := tr.Transform(t.Context(), m, nil)
++	if err == nil {
++		t.Fatal("formatting succeeded with no mkfs.ext4 on PATH")
++	}
++	if !strings.Contains(err.Error(), "failed format") {
++		t.Fatalf("failed somewhere other than the format step: %v", err)
++	}
++	if _, err := os.Stat(m.Source); !os.IsNotExist(err) {
++		t.Fatalf("the unformatted image survived a failed format: %v", err)
++	}
++}
++
++// And the two composed, which is the sequence a user actually performs: the
++// run that fails, then the same call again. It must not silently succeed on a
++// file nobody formatted.
++func TestMkfsRetryAfterFailedFormatDoesNotInheritTheImage(t *testing.T) {
++	noMkfsBinaries(t)
++	tr, dir := newMkfsRoot(t)
++	m := mkfsMount(dir, "rwlayer.img", "ext4")
++
++	if _, err := tr.Transform(t.Context(), m, nil); err == nil {
++		t.Fatal("first attempt unexpectedly succeeded")
++	}
++	_, err := tr.Transform(t.Context(), m, nil)
++	if err == nil {
++		t.Fatal("the retry accepted an image that was never formatted")
++	}
++	if !strings.Contains(err.Error(), "failed format") {
++		t.Errorf("the retry did not re-attempt the format: %v", err)
++	}
++}
++
++// The constants above are worth nothing if they do not describe what mkfs
++// actually writes, so check them against it rather than against themselves:
++// format an image for real, then feed the result back in and require it to be
++// recognised. This is the test that would catch a wrong offset or a
++// byte-order slip, which every other test here would happily agree with.
++func TestMkfsRecognisesWhatItJustWrote(t *testing.T) {
++	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
++		t.Skip("mkfs.ext4 is not on PATH")
++	}
++	tr, dir := newMkfsRoot(t)
++	m := mkfsMount(dir, "rwlayer.img", "ext4")
++	// Comfortably above ext4's minimum; 1 MiB is not.
++	m.Options[1] = prefixMkfs + "size=16MiB"
++
++	if _, err := tr.Transform(t.Context(), m, nil); err != nil {
++		t.Fatalf("failed to format: %v", err)
++	}
++	if _, err := tr.Transform(t.Context(), m, nil); err != nil {
++		t.Fatalf("an image mkfs.ext4 just wrote was not recognised as ext4: %v", err)
++	}
++}
++
++// Every filesystem the format path can create must be verifiable, or the gap
++// this closes reopens for whichever one was missed.
++func TestSuperblockProbesCoverEveryCreatableFilesystem(t *testing.T) {
++	have := map[string]bool{}
++	for _, p := range superblockProbes {
++		if p.magic == "" {
++			t.Errorf("probe for %q has an empty magic", p.fs)
++		}
++		have[p.fs] = true
++	}
++	for _, fs := range []string{"ext2", "ext3", "ext4", "xfs"} {
++		if !have[fs] {
++			t.Errorf("no superblock probe for %q, which the format path can create", fs)
++		}
++	}
++}
+-- 
+2.53.0
+
