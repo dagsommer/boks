@@ -153,8 +153,8 @@ So on Linux you are assembling the stack yourself:
   needs Docker with buildx; on Linux you also want its `libkrun` bake target, since libkrun
   is not generally packaged either;
 - **erofs-utils ≥ 1.8** — Ubuntu 24.04's 1.7.1 is too old for containerd's erofs
-  snapshotter, and `boks doctor` checks that `mkfs.erofs` exists but not its version, so
-  this surfaces later as a confusing failure during an image unpack;
+  snapshotter, where it surfaces as a confusing failure partway through an image unpack;
+  `boks doctor` reads `mkfs.erofs -V` and fails on anything older;
 - **`/dev/kvm`**, and membership of the `kvm` group.
 
 `boks doctor` names each of these as it finds them missing. Here is the whole of what it
@@ -166,9 +166,9 @@ platform             ok     linux/arm64
 virtualization       fail   /dev/kvm missing
 containerd           fail   unreachable at /run/containerd/containerd.sock
 snapshotter          warn   could not list snapshotters
-snapshotter tools    ok     /usr/bin/mkfs.erofs
+snapshotter tools    ok     /usr/bin/mkfs.erofs (erofs-utils 1.9)
 vm runtime           fail   containerd-shim-nerdbox-v1 not found on PATH
-hypervisor library   warn   libkrun.so.1 not found
+hypervisor library   warn   libkrun.so not found where the shim looks
 
 Not ready: virtualization, containerd, vm runtime must be fixed before sandboxes can start.
 ```

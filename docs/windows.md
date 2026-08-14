@@ -187,9 +187,9 @@ most guides suggest and which hands VM creation to every local account. With
 command, but systemd is off by default in many images.
 
 **3. `erofs-utils` is too old on the obvious distribution.** containerd's EROFS snapshotter
-needs **≥ 1.8**; **Ubuntu 24.04 LTS ships 1.7.1**. Boks' `doctor` checks that `mkfs.erofs`
-exists but not its version, so this surfaces later as a confusing failure during an image
-unpack. Worth fixing in `snapshotterToolsCheck`, and worth knowing meanwhile.
+needs **≥ 1.8**; **Ubuntu 24.04 LTS ships 1.7.1**. Boks' `doctor` reads `mkfs.erofs -V` and
+fails on anything older, naming the version found and the minimum, so this no longer
+surfaces later as a confusing failure during an image unpack.
 
 ### Diagnosing it, and the trap in the obvious diagnosis
 
