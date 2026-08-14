@@ -1,7 +1,7 @@
 From f55235f2d71953ec56be3e7e5053eb20c8b22025 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 22:11:51 +0200
-Subject: [PATCH 31/35] windows: take CPUID exits, and make leaf 0x15 reachable
+Subject: [PATCH 31/36] windows: take CPUID exits, and make leaf 0x15 reachable
  on any host
 
 ---
