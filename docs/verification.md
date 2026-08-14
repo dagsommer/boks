@@ -19,6 +19,14 @@ The host was macOS, which makes the result unusually clear-cut: the guest runs *
 while the host runs **Darwin**, so a shared-kernel container is not a possible explanation
 for any of it.
 
+**Linux with KVM has never booted a sandbox**, which is a larger hole than it sounds: it is
+the platform Boks is designed for, built for and shipped for, and the one most users would
+reach first. Everything below is macOS. The kit for closing that gap is
+[`scripts/verify-linux.sh`](../scripts/verify-linux.sh) and
+[Verifying on Linux](verify-linux-prompt.md); on Linux the evidence is harder to read than it
+was here, because host and guest are both Linux and `boot_id` rather than kernel version has
+to carry the argument.
+
 ### Environment
 
 | | |
@@ -496,7 +504,27 @@ its own uptime, and hardware that matches what Boks asked the VMM for.
 
 ## Procedure
 
-On a host with hardware virtualisation (bare metal Linux with KVM, or Apple silicon macOS):
+On Linux — including inside WSL2 — this procedure is mechanised, and the script is the
+better starting point because it will not let itself report a pass for a machine it did not
+test:
+
+```bash
+scripts/verify-linux.sh --list      # the checks, in order, touching nothing
+scripts/verify-linux.sh
+```
+
+It works through the twelve checks in the order below, prints the evidence inline, and stops
+at the first failure that makes the rest meaningless. Check 6 is included **with its positive
+control**: the run only passes if a destination the policy allows connects end to end and
+presents the origin's own certificate, in the same sandbox and the same process as a denied
+address being refused — because a stack that refuses everything produces the same transcript
+as one that judges each flow. `VERIFIED` requires every check to have run *and* passed;
+anything unanswered is `INCOMPLETE`, which is not a pass.
+[Verifying on Linux](verify-linux-prompt.md) carries the prompt for an agent driving that
+run, and the traps that manufacture a false pass.
+
+The manual procedure, for macOS and for anything the script does not cover. On a host with
+hardware virtualisation (bare metal Linux with KVM, or Apple silicon macOS):
 
 1. **Confirm prerequisites.**
 
