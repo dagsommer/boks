@@ -21,9 +21,11 @@ snapshotter is the only one on Windows that hands nerdbox mounts the Linux guest
 
 ## The patches
 
-Four, in `patches/`. The first registers the plugins; `0002` and `0003` make them reachable,
+Five, in `patches/`. The first registers the plugins; `0002` and `0003` make them reachable,
 which turned out to be a separate problem; `0004` is about `ctr`, not the daemon, and only
-matters once you try to *run* a container rather than unpack one.
+matters once you try to *run* a container rather than unpack one. `0005` is not about EROFS at
+all — it is a silent-corruption bug in containerd's mount manager that Windows makes certain to
+hit, found on the first end-to-end run.
 
 ### `0001` — register the plugins
 
@@ -142,10 +144,77 @@ Linux spec without this patch, which is read from the source above. Whether the 
 *with* the patch is one nerdbox and its guest accept is a separate question, and is what
 `docs/windows-e2e.md` exists to answer.
 
+### `0005` — check the superblock before believing an image is formatted
+
+This one is a bug, not a port. It was found by the first end-to-end run on real hardware, and it
+silently corrupts.
+
+`core/mount/manager/mkfs.go` decided an image was already formatted by calling `Stat` on it.
+Where the check belonged there was a comment:
+
+```go
+if _, err := r.Stat(subpath); err == nil {
+    // Check magic number
+} else if os.IsNotExist(err) {
+```
+
+That is not a harmless TODO, because of the order of operations in the branch it guards. The
+format path **creates the file and truncates it to the requested size, and only then runs
+mkfs.** So every way mkfs can fail leaves behind a file of exactly the size the next call
+expects, containing nothing but zeroes. The next call `Stat`s it, finds it, skips the format,
+and returns the mount. **The guest is handed a zero-filled image presented as ext4.**
+
+Windows makes that certain rather than unlikely. There is no `mkfs.ext4` for Windows in any
+packaged form, and the erofs snapshotter asks for `mkfs/ext4` with
+`X-containerd.mkfs.size=67108864` on every active snapshot, so the format step fails by
+construction on the first `ctr run` and every attempt after it "succeeds". Measured on the
+Windows 11 machine, on the file the failing run left behind:
+
+```
+snapshots\3\rwlayer.img   exists: True   size: 67,108,864
+ext4 magic @1080 : 0x0000        (a real ext4 superblock is 0xEF53)
+=> formatted     : False
+```
+
+The tester did not hit the consequence only because the next thing they did was overwrite that
+file with a pre-formatted one. Do it in the other order and the guest mounts 64 MiB of zeroes.
+
+**The fix is deliberately asymmetric about who owns the file**, because there are two different
+dangers here and they pull in opposite directions.
+
+- **Read the superblock.** `superblockProbes` records, per filesystem, where the magic lives and
+  what it is. An image carrying the right magic is accepted exactly as before. An image that
+  does not is **refused, and left untouched** — we did not create it, we cannot know what it is,
+  and reformatting or deleting someone's data would trade a corruption bug for a data-loss one.
+  The error says what is missing and that removing the file will get one created.
+- **Delete what we created and could not format.** That file is unambiguously ours and contains
+  only zeroes we just wrote. `O_EXCL` replaces `O_TRUNC` on the create so that "this file is
+  ours" is a property of the open rather than an inference from the `Stat` several lines
+  earlier. Without the removal, the superblock check above would make a retry fail forever
+  instead of retrying.
+
+**This does not break the pre-formatted-image workflow, which is the whole reason the bundle
+ships `rwlayer-64m.img`.** That image is made by `mkfs.ext4` on the CI runner, so it carries a
+real superblock and is accepted. What no longer works is dropping in a file that is merely the
+right *size* — which never worked, it just failed silently instead of loudly.
+
+The offsets and magics, and where each was checked:
+
+| fs | magic | offset | source |
+| --- | --- | --- | --- |
+| ext2, ext3, ext4 | `53 ef` (`EXT2_SUPER_MAGIC` 0xEF53, `__le16`) | 1080 | kernel docs give `s_magic` at `0x38` of a superblock that starts 1024 bytes in, so 1024 + 56; **confirmed by running `mkfs.ext4` on a 64 MiB image here and reading offset 1080** |
+| xfs | `XFSB` (`XFS_SUPER_MAGIC` 0x58465342, big-endian) | 0 | `/usr/include/linux/magic.h`, plus XFS's documented `__be32` metadata magics; corroborated by `file(1)` recognising `XFSB` at offset 0 and not at 512. **No `mkfs.xfs` was run** — no such binary on this machine |
+
+One behaviour change beyond the bug: an existing image for a filesystem the format path cannot
+create — anything but ext2/3/4 and xfs — is now refused with the same `unsupported filesystem`
+error the format path already gives, rather than accepted because a file happened to be there.
+
 The pin is `CONTAINERD_VERSION` — **v2.3.3**, matching the containerd that the nerdbox revision
 in `packaging/nerdbox/NERDBOX_REV` vendors.
 
-**All four belong upstream, not here.** Delete this directory once containerd takes them.
+**All five belong upstream, not here.** Delete this directory once containerd takes them.
+`0005` most of all: it is a data-corruption fix that has nothing to do with Boks, Windows is
+merely where it was impossible to miss.
 
 ## What actually works on Windows, and what does not
 
@@ -162,10 +231,13 @@ container's upper directory back into an EROFS blob will fail on Windows. Pullin
 does not go through it.
 
 **Unknown — running a container.** Actually mounting the result is nerdbox's and the guest's
-problem, not containerd's, and none of it has been tried. `docs/windows-e2e.md` is the procedure
-for trying it, and it turned up two more containerd-side obstacles by reading: the OCI spec's
-platform (patch `0004` above) and the writable layer, which the erofs snapshotter asks containerd
-to format with `mkfs.ext4` — a binary that does not exist on Windows.
+problem, not containerd's, and it has been attempted once. `docs/windows-e2e.md` is the
+procedure, and it turned up three more containerd-side obstacles: the OCI spec's platform (patch
+`0004` above); the writable layer, which the erofs snapshotter asks containerd to format with
+`mkfs.ext4`, a binary that does not exist on Windows; and the way containerd handled the failure
+of that format, which is patch `0005`. There is a fourth that is not containerd's to fix —
+`NewBundle` creates a symlink for every task, which unprivileged Windows will not do. See
+"Elevation, Developer Mode, and the choice you actually have" below.
 
 ### The differ is invisible without `mkfs.erofs.exe`
 
@@ -551,14 +623,23 @@ Where a claim below was checked by running something, it says so.
 
 | Check | How | Result |
 | --- | --- | --- |
-| the three patches apply to pristine v2.3.3 | `git apply --check` | clean |
+| all five patches apply to pristine v2.3.3 | `git apply --check` | clean |
 | PE32+ x86-64 | `objdump -f` | `pei-x86-64` for `containerd.exe` and `ctr.exe` |
 | erofs plugins linked in | `strings` | `plugins/diff/erofs/plugin`, `plugins/snapshots/erofs/plugin` present, both arches |
 | existing plugins kept | `strings` | `plugins/snapshots/windows` still present |
 | **diff order names erofs, first** | `assert-diff-order.py` reads the `[]string` out of `.data` | `['erofs', 'windows', 'windows-lcow']`; an unpatched build of the same tree has `['windows', 'windows-lcow']` and fails the same check |
+| **the superblock probe table is in the PE** | `assert-mkfs-magic.py` reads the `[]superblockProbe` out of `.data` | `ext2@1080=53ef, ext3@1080=53ef, ext4@1080=53ef, xfs@0=58465342`, both arches; an unpatched build of the same tree has no such table and fails, as do a wrong offset, a byte-swapped magic and a reordered table |
+| **the pre-fix behaviour is what we said it was** | **executed** — a throwaway test against unpatched `mkfs.go` | a 64 MiB zero-filled file was accepted and returned as a formatted `mkfs/ext4` mount; a failed format left 67,108,864 bytes behind and the retry accepted them |
+| **the ext4 magic and offset are right** | **executed** — `mkfs.ext4` on a real image, then `hexdump -s 1024` | `53 ef` at offset 1080, matching the kernel's documented `s_magic` at `0x38` of a superblock starting at 1024 |
+| **a formatted image is still accepted, and an unformatted one is not** | **executed** — `go test ./core/mount/manager/...` | passes; one test formats with the real `mkfs.ext4` and feeds the result back in, so the constants are checked against the formatter rather than against themselves |
 | a skipped differ does not kill the diff service | **executed** — `go test ./plugins/services/diff/...` | passes, on Linux, with the same platform-neutral code Windows runs |
 | `config.toml` decodes to what it claims | **executed** — containerd's own `srvconfig.LoadConfig` + `Decode` | order `[erofs windows windows-lcow]`, both `unpack_config` entries, `optional=true` on erofs |
-| the Windows-only assertions type-check | `GOOS=windows go vet` | clean |
+| the Windows-only assertions type-check | `GOOS=windows go vet`, both arches | clean |
+
+The xfs row is the one gap: `mkfs.xfs` is not on this machine, so `XFSB` at offset 0 is taken
+from `/usr/include/linux/magic.h` and XFS's documented big-endian metadata magics, and
+corroborated only by `file(1)` recognising it at offset 0 and not at 512. Nothing has formatted
+an XFS image and read it back.
 
 No binary sizes are quoted. They move with the Go toolchain in the runner image and a stale
 number in a README is worse than no number; the workflow prints the real `sha256sum` and byte
@@ -569,6 +650,11 @@ count into its job summary.
 `assert-diff-order.py` proves the daemon will *start* with erofs in its diff order. It does not
 prove the erofs differ then does anything useful with a layer, and nothing here can: that
 requires Windows. Steps 5 and 6 above are the only test of it.
+
+`assert-mkfs-magic.py` is weaker still in the same way: it proves the shipped binary carries a
+table saying ext4's magic is `53 ef` at offset 1080, not that the code consulting that table
+runs, and certainly not that a real Windows daemon rejects a real corrupt image. The Go tests
+are what exercise the logic, on Linux, against platform-neutral code.
 
 Likewise `plugins ls` reporting `ok` remains a weak signal by construction, which is why step 5
 and not step 4 is the one that answers the question.
