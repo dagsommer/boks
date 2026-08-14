@@ -21,9 +21,11 @@ snapshotter is the only one on Windows that hands nerdbox mounts the Linux guest
 
 ## The patches
 
-Four, in `patches/`. The first registers the plugins; `0002` and `0003` make them reachable,
+Five, in `patches/`. The first registers the plugins; `0002` and `0003` make them reachable,
 which turned out to be a separate problem; `0004` is about `ctr`, not the daemon, and only
-matters once you try to *run* a container rather than unpack one.
+matters once you try to *run* a container rather than unpack one. `0005` is not about EROFS at
+all — it is a silent-corruption bug in containerd's mount manager that Windows makes certain to
+hit, found on the first end-to-end run.
 
 ### `0001` — register the plugins
 
@@ -142,10 +144,77 @@ Linux spec without this patch, which is read from the source above. Whether the 
 *with* the patch is one nerdbox and its guest accept is a separate question, and is what
 `docs/windows-e2e.md` exists to answer.
 
+### `0005` — check the superblock before believing an image is formatted
+
+This one is a bug, not a port. It was found by the first end-to-end run on real hardware, and it
+silently corrupts.
+
+`core/mount/manager/mkfs.go` decided an image was already formatted by calling `Stat` on it.
+Where the check belonged there was a comment:
+
+```go
+if _, err := r.Stat(subpath); err == nil {
+    // Check magic number
+} else if os.IsNotExist(err) {
+```
+
+That is not a harmless TODO, because of the order of operations in the branch it guards. The
+format path **creates the file and truncates it to the requested size, and only then runs
+mkfs.** So every way mkfs can fail leaves behind a file of exactly the size the next call
+expects, containing nothing but zeroes. The next call `Stat`s it, finds it, skips the format,
+and returns the mount. **The guest is handed a zero-filled image presented as ext4.**
+
+Windows makes that certain rather than unlikely. There is no `mkfs.ext4` for Windows in any
+packaged form, and the erofs snapshotter asks for `mkfs/ext4` with
+`X-containerd.mkfs.size=67108864` on every active snapshot, so the format step fails by
+construction on the first `ctr run` and every attempt after it "succeeds". Measured on the
+Windows 11 machine, on the file the failing run left behind:
+
+```
+snapshots\3\rwlayer.img   exists: True   size: 67,108,864
+ext4 magic @1080 : 0x0000        (a real ext4 superblock is 0xEF53)
+=> formatted     : False
+```
+
+The tester did not hit the consequence only because the next thing they did was overwrite that
+file with a pre-formatted one. Do it in the other order and the guest mounts 64 MiB of zeroes.
+
+**The fix is deliberately asymmetric about who owns the file**, because there are two different
+dangers here and they pull in opposite directions.
+
+- **Read the superblock.** `superblockProbes` records, per filesystem, where the magic lives and
+  what it is. An image carrying the right magic is accepted exactly as before. An image that
+  does not is **refused, and left untouched** — we did not create it, we cannot know what it is,
+  and reformatting or deleting someone's data would trade a corruption bug for a data-loss one.
+  The error says what is missing and that removing the file will get one created.
+- **Delete what we created and could not format.** That file is unambiguously ours and contains
+  only zeroes we just wrote. `O_EXCL` replaces `O_TRUNC` on the create so that "this file is
+  ours" is a property of the open rather than an inference from the `Stat` several lines
+  earlier. Without the removal, the superblock check above would make a retry fail forever
+  instead of retrying.
+
+**This does not break the pre-formatted-image workflow, which is the whole reason the bundle
+ships `rwlayer-64m.img`.** That image is made by `mkfs.ext4` on the CI runner, so it carries a
+real superblock and is accepted. What no longer works is dropping in a file that is merely the
+right *size* — which never worked, it just failed silently instead of loudly.
+
+The offsets and magics, and where each was checked:
+
+| fs | magic | offset | source |
+| --- | --- | --- | --- |
+| ext2, ext3, ext4 | `53 ef` (`EXT2_SUPER_MAGIC` 0xEF53, `__le16`) | 1080 | kernel docs give `s_magic` at `0x38` of a superblock that starts 1024 bytes in, so 1024 + 56; **confirmed by running `mkfs.ext4` on a 64 MiB image here and reading offset 1080** |
+| xfs | `XFSB` (`XFS_SUPER_MAGIC` 0x58465342, big-endian) | 0 | `/usr/include/linux/magic.h`, plus XFS's documented `__be32` metadata magics; corroborated by `file(1)` recognising `XFSB` at offset 0 and not at 512. **No `mkfs.xfs` was run** — no such binary on this machine |
+
+One behaviour change beyond the bug: an existing image for a filesystem the format path cannot
+create — anything but ext2/3/4 and xfs — is now refused with the same `unsupported filesystem`
+error the format path already gives, rather than accepted because a file happened to be there.
+
 The pin is `CONTAINERD_VERSION` — **v2.3.3**, matching the containerd that the nerdbox revision
 in `packaging/nerdbox/NERDBOX_REV` vendors.
 
-**All four belong upstream, not here.** Delete this directory once containerd takes them.
+**All five belong upstream, not here.** Delete this directory once containerd takes them.
+`0005` most of all: it is a data-corruption fix that has nothing to do with Boks, Windows is
+merely where it was impossible to miss.
 
 ## What actually works on Windows, and what does not
 
@@ -162,10 +231,13 @@ container's upper directory back into an EROFS blob will fail on Windows. Pullin
 does not go through it.
 
 **Unknown — running a container.** Actually mounting the result is nerdbox's and the guest's
-problem, not containerd's, and none of it has been tried. `docs/windows-e2e.md` is the procedure
-for trying it, and it turned up two more containerd-side obstacles by reading: the OCI spec's
-platform (patch `0004` above) and the writable layer, which the erofs snapshotter asks containerd
-to format with `mkfs.ext4` — a binary that does not exist on Windows.
+problem, not containerd's, and it has been attempted once. `docs/windows-e2e.md` is the
+procedure, and it turned up three more containerd-side obstacles: the OCI spec's platform (patch
+`0004` above); the writable layer, which the erofs snapshotter asks containerd to format with
+`mkfs.ext4`, a binary that does not exist on Windows; and the way containerd handled the failure
+of that format, which is patch `0005`. There is a fourth that is not containerd's to fix —
+`NewBundle` creates a symlink for every task, which unprivileged Windows will not do. See
+"Elevation, Developer Mode, and the choice you actually have" below.
 
 ### The differ is invisible without `mkfs.erofs.exe`
 
@@ -181,6 +253,128 @@ The erofs **snapshotter** has no such gate — it registers unconditionally. It 
 entirely possible to have the snapshotter present and the differ missing, which is exactly the
 confusing half-state the test commands below are designed to detect.
 
+
+## Elevation, Developer Mode, and the choice you actually have
+
+**This page used to tell you to run everything unelevated, full stop. That was wrong for
+anything that creates a task**, and the first end-to-end run on Windows 11 found out where.
+
+The line is not between "containerd" and "Boks". It is between **unpacking an image** and
+**running a container**:
+
+| What you are doing | Unelevated, no Developer Mode |
+| --- | --- |
+| everything in "Testing it on Windows" below — `plugins ls`, `images pull`, checking EROFS blobs | **works.** Measured, 2026-08-14. No task bundle is created, so nothing below is reached |
+| `ctr run`, `ctr tasks start`, or anything Boks does with a sandbox | **fails**, in containerd, before the shim is launched |
+
+### Why
+
+`core/runtime/v2/bundle.go:103`, in `NewBundle`, for **every task bundle**, unconditionally:
+
+```go
+// symlink workdir
+if err := os.Symlink(work, filepath.Join(b.Path, "work")); err != nil {
+    return nil, err
+}
+```
+
+Creating a symlink on Windows requires `SeCreateSymbolicLinkPrivilege`, which an ordinary user
+does not hold. Go already does the one thing that can help — `os/file_windows.go:371` passes
+`SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, and retries without it if that fails — but
+**Windows honours that flag only when Developer Mode is on.** Measured on the test machine:
+
+```
+New-Item -ItemType SymbolicLink   ->  "Administrator privilege required"
+mklink /J  (a junction)           ->  succeeds
+```
+
+### The junction workaround does not transfer, and it is worth saying why
+
+The root-ACL problem below is fixed by *pre-creating* a directory, because
+`MkdirAllWithACL` returns early on a path that already exists. Nothing equivalent is available
+here. The link has to appear at `b.Path\work`, and `b.Path` is created by containerd itself two
+dozen lines earlier:
+
+```go
+// bundle.go:74
+if err := os.Mkdir(b.Path, 0700); err != nil {
+    return nil, err
+}
+```
+
+`os.Mkdir`, not `MkdirAll`, and the error is returned with no `IsExist` tolerance — so `b.Path`
+**must not exist** when `NewBundle` runs. There is no moment at which you could put a junction
+inside it. That the target is a directory, and so junction-shaped, does not matter; there is
+nowhere to stand.
+
+### The three options, and what each costs
+
+**1. Run `containerd.exe` elevated.** Administrators hold `SeCreateSymbolicLinkPrivilege` by
+default, so `NewBundle` succeeds. Cost: the daemon, every shim it spawns and every VM those
+shims start run with an administrator's token. For a machine you are testing on, that is a
+defensible trade; for anything else, weigh it. **Read the security note below before doing
+this** — it changes how `--root` must be created, and getting that wrong is an escalation.
+*(That elevation makes the symlink succeed is inferred from Windows' default privilege
+assignment plus the failure measured unelevated; nobody has watched containerd create a task
+bundle elevated.)*
+
+**2. Turn on Developer Mode** (Settings → System → For developers). Cost, stated plainly
+because it is easy to wave through: Developer Mode is **machine-wide and grants unprivileged
+symlink creation to every process run by every user on that machine**, not to containerd and
+not to you. It is not scoped to an application, a directory or a session. It also switches on
+other developer features you did not ask for.
+
+On a **corporate-managed machine this may not be your decision at all.** It is commonly
+disabled by policy (`AllowDevelopmentWithoutDevLicense`), and the toggle may be greyed out or
+silently revert. If your machine is managed, ask before flipping it rather than after — and
+note that this document is in no position to tell you it is fine, because whether it is
+depends on a policy we cannot see.
+
+**3. Neither.** Perfectly reasonable, and it is what the test procedure below assumes. You get
+the whole unpack path — which is the part of this bundle that has actually been proven to work
+on Windows — and you do not get a running container.
+
+There is no fourth option that Boks can supply. A patch making the symlink optional would be a
+change to containerd's bundle layout, affecting `work` resolution on every platform, and it is
+not obviously right: the symlink exists so that a bundle under `--state` can find its working
+directory under `--root`. If containerd upstream wants a Windows answer, a junction created
+with `CreateDirectory` + a reparse point, or simply recording the path in a file, would both
+work — but that is upstream's design call, not something to fork here.
+
+### If you do run elevated: `--root` must be created by the elevated daemon
+
+**Do not point an elevated containerd at a `--root` that an unprivileged user created.** This
+is the one thing in this section that is a security boundary rather than a convenience.
+
+`MkdirAllWithACL` applies its protected DACL only to path components **it** creates, and
+returns early on anything that already exists (see the next section for the exact mechanism).
+So a root pre-created by an ordinary user keeps that user's inherited permissions, and the
+elevated daemon then fills it with the content store, the snapshotters' root filesystems and
+the bolt metadata database — all writable by that unprivileged user. They can put a binary into
+a layer a later container executes, or repoint an image's metadata at content they control,
+against a daemon running as an administrator. That is precisely the escalation the `P`
+(PROTECTED) in containerd's SDDL exists to prevent, reached by a different route.
+
+Elevated, you do not need to pre-create anything: `MkdirAllWithACL` succeeds and the ACL it
+writes names `Administrators` and `SYSTEM`, which is what the daemon is. Just start it.
+
+**`new-containerd-root.ps1` is for the unelevated case only.** Its whole job is to hand you a
+root you can write to without the ACL, and that is exactly the wrong shape for a privileged
+daemon. If you switch to running elevated, use a *different* root directory that the elevated
+daemon creates for itself — not the one the script made, which an unprivileged account still
+owns.
+
+### The `opt` and `cri` plugin failures were not unrelated
+
+Unelevated, `ctr plugins ls` shows two failures — `io.containerd.internal.v1.opt` and `cri` —
+and this project described them as known and unrelated. **Elevated, both disappear.** They were
+artefacts of running unelevated, not independent problems.
+
+That is consistent with what they want: `opt` and `cri` default to paths under
+`%ProgramData%\containerd` and `C:\Program Files\containerd`, neither of which an ordinary user
+can create — the same root cause as the `--root` problem below, arriving at two more plugins.
+Neither cascades either way, so it changes no advice; it changes what "two known unrelated
+failures" means, which was simply not true.
 
 ## The root directory must exist first
 
@@ -345,7 +539,7 @@ write there. The difference is **who decides, and how long the decision lasts.**
    permissions land on one test root on one desktop, put there deliberately. A patched binary
    applies the same relaxation on every host it is ever run on, including hosts where the root
    is later reused by a service.
-4. **We would have to carry it, and argue for it.** The other three patches in `patches/` are
+4. **We would have to carry it, and argue for it.** The other four patches in `patches/` are
    things we want upstream and expect containerd to take. "Relax a deliberate security control
    so our test setup needs one command fewer" is not that, and Boks — whose entire premise is
    isolation — is a bad place for it to originate.
@@ -367,7 +561,12 @@ ext4 image that only matters when you go on to *run* a container, and
 [`docs/windows-e2e.md`](../../docs/windows-e2e.md) explains why it has to be made on Linux.
 
 **Run all of this unelevated, pass the config, and create the directories first.** All three
-matter, and each one costs you a run if you skip it:
+matter, and each one costs you a run if you skip it.
+
+Unelevated is correct **for this test**, and only because none of it creates a task: the
+symlink in `NewBundle` that unprivileged Windows refuses is never reached. If you go on to
+`ctr run`, read "Elevation, Developer Mode, and the choice you actually have" above first — and
+if you decide to run elevated, do **not** reuse the `--root` that step 0 creates here.
 
 - **Create `root` and `state` before starting containerd** — `.\new-containerd-root.ps1`. See
   "The root directory must exist first" above for the failure this avoids and why the fix is
@@ -551,14 +750,23 @@ Where a claim below was checked by running something, it says so.
 
 | Check | How | Result |
 | --- | --- | --- |
-| the three patches apply to pristine v2.3.3 | `git apply --check` | clean |
+| all five patches apply to pristine v2.3.3 | `git apply --check` | clean |
 | PE32+ x86-64 | `objdump -f` | `pei-x86-64` for `containerd.exe` and `ctr.exe` |
 | erofs plugins linked in | `strings` | `plugins/diff/erofs/plugin`, `plugins/snapshots/erofs/plugin` present, both arches |
 | existing plugins kept | `strings` | `plugins/snapshots/windows` still present |
 | **diff order names erofs, first** | `assert-diff-order.py` reads the `[]string` out of `.data` | `['erofs', 'windows', 'windows-lcow']`; an unpatched build of the same tree has `['windows', 'windows-lcow']` and fails the same check |
+| **the superblock probe table is in the PE** | `assert-mkfs-magic.py` reads the `[]superblockProbe` out of `.data` | `ext2@1080=53ef, ext3@1080=53ef, ext4@1080=53ef, xfs@0=58465342`, both arches; an unpatched build of the same tree has no such table and fails, as do a wrong offset, a byte-swapped magic and a reordered table |
+| **the pre-fix behaviour is what we said it was** | **executed** — a throwaway test against unpatched `mkfs.go` | a 64 MiB zero-filled file was accepted and returned as a formatted `mkfs/ext4` mount; a failed format left 67,108,864 bytes behind and the retry accepted them |
+| **the ext4 magic and offset are right** | **executed** — `mkfs.ext4` on a real image, then `hexdump -s 1024` | `53 ef` at offset 1080, matching the kernel's documented `s_magic` at `0x38` of a superblock starting at 1024 |
+| **a formatted image is still accepted, and an unformatted one is not** | **executed** — `go test ./core/mount/manager/...` | passes; one test formats with the real `mkfs.ext4` and feeds the result back in, so the constants are checked against the formatter rather than against themselves |
 | a skipped differ does not kill the diff service | **executed** — `go test ./plugins/services/diff/...` | passes, on Linux, with the same platform-neutral code Windows runs |
 | `config.toml` decodes to what it claims | **executed** — containerd's own `srvconfig.LoadConfig` + `Decode` | order `[erofs windows windows-lcow]`, both `unpack_config` entries, `optional=true` on erofs |
-| the Windows-only assertions type-check | `GOOS=windows go vet` | clean |
+| the Windows-only assertions type-check | `GOOS=windows go vet`, both arches | clean |
+
+The xfs row is the one gap: `mkfs.xfs` is not on this machine, so `XFSB` at offset 0 is taken
+from `/usr/include/linux/magic.h` and XFS's documented big-endian metadata magics, and
+corroborated only by `file(1)` recognising it at offset 0 and not at 512. Nothing has formatted
+an XFS image and read it back.
 
 No binary sizes are quoted. They move with the Go toolchain in the runner image and a stale
 number in a README is worse than no number; the workflow prints the real `sha256sum` and byte
@@ -569,6 +777,11 @@ count into its job summary.
 `assert-diff-order.py` proves the daemon will *start* with erofs in its diff order. It does not
 prove the erofs differ then does anything useful with a layer, and nothing here can: that
 requires Windows. Steps 5 and 6 above are the only test of it.
+
+`assert-mkfs-magic.py` is weaker still in the same way: it proves the shipped binary carries a
+table saying ext4's magic is `53 ef` at offset 1080, not that the code consulting that table
+runs, and certainly not that a real Windows daemon rejects a real corrupt image. The Go tests
+are what exercise the logic, on Linux, against platform-neutral code.
 
 Likewise `plugins ls` reporting `ok` remains a weak signal by construction, which is why step 5
 and not step 4 is the one that answers the question.

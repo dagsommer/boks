@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
     Create containerd's --root and --state before containerd does, so that an unelevated
-    containerd does not lock itself out of its own state.
+    containerd does not lock itself out of its own state. For an UNELEVATED daemon only --
+    see .NOTES before using it with an elevated one.
 
 .DESCRIPTION
     containerd creates its root and state with a hardened ACL and no ACE for whoever is
@@ -62,9 +63,29 @@
     .\new-containerd-root.ps1 -Root D:\cd\root -State D:\cd\state
 
 .NOTES
-    Run this UNELEVATED, as the same user that will run containerd.exe. Running it
-    elevated creates directories owned by Administrators and puts you back where you
-    started.
+    THIS SCRIPT IS FOR AN UNELEVATED containerd, AND ONLY FOR THAT.
+
+    Run it UNELEVATED, as the same user that will run containerd.exe. Running it elevated
+    creates directories owned by Administrators and puts you back where you started.
+
+    If you are going to run containerd.exe ELEVATED -- which you must, or turn on
+    Developer Mode, if you want to create a task and not merely unpack an image; see
+    "Elevation, Developer Mode, and the choice you actually have" in
+    packaging/containerd-windows/README.md -- then DO NOT USE THIS SCRIPT, and do not
+    point that daemon at a root this script made.
+
+    The reason is the same MkdirAllWithACL fast path this script exploits, read the other
+    way round. An existing directory is accepted unchanged, with no ACL applied, so a root
+    pre-created by an ordinary user keeps that user's inherited permissions -- and an
+    elevated daemon then fills it with the content store, the snapshotters' root
+    filesystems and the bolt metadata database, all writable by an unprivileged account.
+    That account can put a binary into a layer a later container executes, or repoint an
+    image's metadata at content it controls, against a daemon running as an administrator.
+    That is the escalation the PROTECTED bit in containerd's SDDL exists to prevent.
+
+    An elevated daemon needs no help here: MkdirAllWithACL succeeds, and the ACL it writes
+    names Administrators and SYSTEM, which is what it is running as. Give it a root
+    directory of its own and let it create it.
 
     This script has never been executed. Nobody on this project has Windows.
 #>
