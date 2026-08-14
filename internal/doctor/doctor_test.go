@@ -2,6 +2,8 @@ package doctor
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -101,6 +103,38 @@ func TestContainerdCheckHandlesMissingSocket(t *testing.T) {
 	}
 	if res.Remedy == "" {
 		t.Error("no remedy offered for a missing containerd socket")
+	}
+}
+
+// A Windows named pipe is not a socket, and telling someone their "containerd socket" is
+// missing when the address is \\.\pipe\containerd-containerd names a thing that does not
+// exist on their machine. The address decides the noun, so this is testable anywhere.
+func TestContainerdFailureNamesTheEndpointCorrectly(t *testing.T) {
+	tests := []struct {
+		address string
+		want    string
+	}{
+		{`\\.\pipe\containerd-containerd`, "named pipe"},
+		{`npipe:////./pipe/containerd-containerd`, "named pipe"},
+		{`//./pipe/containerd-containerd`, "named pipe"},
+		{"/run/containerd/containerd.sock", "socket"},
+		{"/var/run/containerd/containerd.sock", "socket"},
+		{"/home/x/pipe/containerd.sock", "socket"},
+	}
+	for _, tt := range tests {
+		if got := containerdEndpointNoun(tt.address); got != tt.want {
+			t.Errorf("containerdEndpointNoun(%q) = %q, want %q", tt.address, got, tt.want)
+		}
+	}
+
+	// The message the user actually reads.
+	res := containerdFailure(`\\.\pipe\containerd-containerd`, errors.New("no such file"))
+	if !strings.Contains(res.Remedy, "No containerd named pipe at") {
+		t.Errorf("remedy calls a named pipe something else:\n%s", res.Remedy)
+	}
+	res = containerdFailure(filepath.Join(t.TempDir(), "containerd.sock"), errors.New("no such file"))
+	if !strings.Contains(res.Remedy, "No containerd socket at") {
+		t.Errorf("remedy does not call a Unix socket a socket:\n%s", res.Remedy)
 	}
 }
 

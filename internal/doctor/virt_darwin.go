@@ -5,7 +5,6 @@ package doctor
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -133,19 +132,4 @@ func unsignedBinary(out string) bool {
 	lower := strings.ToLower(out)
 	return strings.Contains(lower, "not signed at all") ||
 		strings.Contains(lower, "code object is not signed")
-}
-
-func hypervisorLibraryNames() []string {
-	return []string{"libkrun.dylib", "libkrun.1.dylib"}
-}
-
-func hypervisorLibrarySearchPaths() []string {
-	paths := []string{
-		"/opt/homebrew/lib", // Apple silicon Homebrew prefix
-		"/usr/local/lib",
-	}
-	if extra := os.Getenv("DYLD_LIBRARY_PATH"); extra != "" {
-		paths = append(paths, splitList(extra)...)
-	}
-	return paths
 }
