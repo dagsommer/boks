@@ -1,11 +1,16 @@
 package sandbox
 
 import (
+	"encoding/json"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
@@ -208,6 +213,119 @@ func TestPOSIXCgroupsPath(t *testing.T) {
 				t.Errorf("posixCgroupsPath(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// linuxSpecFromAWindowsHost is what oci.WithDefaultSpecForPlatform(GuestPlatform()) returns
+// when runtime.GOOS == "windows": containerd's Linux spec, plus the empty `windows` section
+// its generateDefaultSpecWithPlatform adds for LCOW. The condition is the *host's* OS, which
+// a test cannot choose, so the spec is built rather than generated — the same way
+// TestPOSIXCgroupsPath constructs the Windows spelling of a cgroups path instead of waiting
+// for a Windows machine to produce one.
+func linuxSpecFromAWindowsHost() *specs.Spec {
+	return &specs.Spec{
+		Version: specs.Version,
+		Root:    &specs.Root{Path: "rootfs"},
+		Process: &specs.Process{Cwd: "/"},
+		Linux:   &specs.Linux{CgroupsPath: `\boks\claude-myrepo`},
+		Windows: &specs.Windows{},
+	}
+}
+
+// Why `omitempty` did not save us, stated as an assertion rather than as a claim in a
+// comment. specs.Spec.Windows is tagged `json:"windows,omitempty"`, but omitempty on a
+// pointer means nil, and containerd stores a non-nil pointer to a zero struct. LayerFolders
+// has no omitempty at all, so what nerdbox forwards into the guest is the exact text crun
+// refused on 2026-08-14 — and libocispec requires layerFolders whenever `windows` is present.
+func TestAnEmptyWindowsSectionMarshalsAsTheFieldTheGuestRejects(t *testing.T) {
+	encoded, err := json.Marshal(linuxSpecFromAWindowsHost())
+	if err != nil {
+		t.Fatalf("marshalling a spec: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"windows":{"layerFolders":null}`) {
+		t.Fatalf("the spec marshals as %s; the point of the repair is that it would "+
+			"otherwise carry `\"windows\":{\"layerFolders\":null}`, which crun rejects "+
+			"with `Required field 'layerFolders' not present`", encoded)
+	}
+}
+
+// The repair itself: the section is gone, and so is every trace of it in the JSON the guest
+// reads. Nothing else in the spec moves.
+func TestWithoutWindowsSectionRemovesTheSectionAWindowsHostAdds(t *testing.T) {
+	s := linuxSpecFromAWindowsHost()
+	if err := withoutWindowsSection()(t.Context(), nil, nil, s); err != nil {
+		t.Fatalf("withoutWindowsSection: %v", err)
+	}
+	if s.Windows != nil {
+		t.Errorf("Windows = %+v, want it removed: a Linux guest has no layer folders", s.Windows)
+	}
+
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshalling a spec: %v", err)
+	}
+	if strings.Contains(string(encoded), `"windows"`) {
+		t.Errorf("the spec still names a windows section: %s", encoded)
+	}
+
+	if s.Linux == nil || s.Linux.CgroupsPath != `\boks\claude-myrepo` {
+		t.Errorf("Linux = %+v, want it untouched; this option owns one field", s.Linux)
+	}
+	if s.Root == nil || s.Root.Path != "rootfs" {
+		t.Errorf("Root = %+v, want it untouched", s.Root)
+	}
+	if s.Process == nil || s.Process.Cwd != "/" {
+		t.Errorf("Process = %+v, want it untouched", s.Process)
+	}
+}
+
+// A spec that is genuinely Windows' keeps its section. Boks generates no such spec, but the
+// option runs unconditionally on every host, and stripping the only platform section from a
+// spec would be a worse bug than the one being fixed.
+func TestWithoutWindowsSectionLeavesARealWindowsSpecAlone(t *testing.T) {
+	s := &specs.Spec{Version: specs.Version, Windows: &specs.Windows{LayerFolders: []string{`C:\layer`}}}
+	if err := withoutWindowsSection()(t.Context(), nil, nil, s); err != nil {
+		t.Fatalf("withoutWindowsSection: %v", err)
+	}
+	if s.Windows == nil {
+		t.Fatal("the Windows section was removed from a spec that has no Linux section")
+	}
+	if !slices.Equal(s.Windows.LayerFolders, []string{`C:\layer`}) {
+		t.Errorf("LayerFolders = %v, want them untouched", s.Windows.LayerFolders)
+	}
+}
+
+// And the host Boks is developed on must be provably unaffected. containerd's generator adds
+// the section only when runtime.GOOS == "windows", so on Unix the spec never has one and the
+// repair is a no-op on a real, generated spec rather than on a constructed one.
+func TestTheGeneratedSpecHasNoWindowsSectionOnUnix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the assertion is about the hosts that were already working")
+	}
+	ctx := namespaces.WithNamespace(t.Context(), "boks")
+	var s specs.Spec
+	opt := oci.WithDefaultSpecForPlatform(runtimecfg.GuestPlatform())
+	if err := opt(ctx, nil, &containers.Container{ID: "claude-myrepo"}, &s); err != nil {
+		t.Fatalf("generating the default spec: %v", err)
+	}
+	if s.Windows != nil {
+		t.Fatalf("containerd generated a Windows section on %s: %+v", runtime.GOOS, s.Windows)
+	}
+
+	before, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshalling a spec: %v", err)
+	}
+	if err := withoutWindowsSection()(ctx, nil, nil, &s); err != nil {
+		t.Fatalf("withoutWindowsSection: %v", err)
+	}
+	after, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshalling a spec: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("the repair changed a spec generated on %s:\n before %s\n after  %s",
+			runtime.GOOS, before, after)
 	}
 }
 
