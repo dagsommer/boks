@@ -1,7 +1,7 @@
 From 8cfab2850beac81641dc2f2712db84c91ddbd72b Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:33:35 +0200
-Subject: [PATCH 24/34] windows: do not re-arm the net watch after a failed
+Subject: [PATCH 24/35] windows: do not re-arm the net watch after a failed
  WSAEnumNetworkEvents
 
 Reporting an empty event set when the enumerate fails looked like a dropped

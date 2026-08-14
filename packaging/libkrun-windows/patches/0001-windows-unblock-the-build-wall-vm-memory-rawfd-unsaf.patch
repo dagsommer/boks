@@ -1,7 +1,7 @@
 From 329f62433566287f73074ddc57485210a45bf231 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 13:25:16 +0200
-Subject: [PATCH 01/34] windows: unblock the build wall (vm-memory rawfd,
+Subject: [PATCH 01/35] windows: unblock the build wall (vm-memory rawfd,
  unsafe extern, Wdk features)
 
 ---
