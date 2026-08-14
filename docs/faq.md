@@ -33,13 +33,23 @@ flags rather than the host's. A shared-kernel container cannot produce any of th
 
 ## Can I run it on Windows?
 
-Not yet, natively — it is in progress. A Windows Hypervisor Platform backend for libkrun is
-being built in this repository's patch series. Every libkrun crate now compiles for Windows
-and `krun.dll` links on a real Windows runner in CI, `virtio-net` included — so the pieces
-exist, and one of them now runs. On 2026-08-13 a Linux 6.12.44 guest booted through that backend on real Windows 11 hardware: kernel entry, device init, IOAPIC programming, virtio-blk I/O against the EROFS image, VFS mount and `execve` of userspace. **A kernel booting is not a sandbox running** — that still needs containerd and the nerdbox shim on Windows, which nothing has exercised — and the guest's clock does not advance, which is an open bug.
+Not yet, natively — though the stack underneath Boks now does. A Windows Hypervisor Platform
+backend for libkrun is being built in this repository's patch series, alongside a patched
+containerd, a patched nerdbox shim and a `mkfs.erofs` for Windows. On 2026-08-14, on real
+Windows 11 hardware, `ctr tasks start` ran a Linux container end to end through all of it:
+the container's stdout came back, `uname -a` reported the 6.12.44 guest kernel rather than the
+Windows host — which a shared-kernel container cannot do — and `/proc/uptime` advanced.
+`t_boot=1.90127s`, `t_create=121.648ms`.
 
-So the honest line has moved, but not to "yes": the hypervisor backend executes instructions
-correctly, and no Ethernet frame has yet crossed the virtio-net device.
+**A container running under `ctr` is not `boks run`.** Boks' own path stops earlier, and
+deliberately: it declines to start sandbox networking on Windows, because no Ethernet frame
+has yet crossed the virtio-net device there, and its enforcement is the network datapath.
+`boks doctor` fails its platform check on Windows for the same reason, correctly. Running a
+container also still needs an elevated shell or Developer Mode, for a symlink containerd
+creates in the task bundle.
+
+So the honest line has moved, but not to "yes": everything below Boks works on Windows, and
+the part Boks is has not been run there.
 
 Inside WSL2 it should work unchanged, with workspace paths preserved exactly, and nobody has
 run it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2).

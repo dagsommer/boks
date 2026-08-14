@@ -17,6 +17,13 @@ platform now — and untested against any VMM.
 `github.com/containers/libkrun` main; nothing has been proposed to the maintainers and no
 part of it has been executed on Windows.
 
+"Never run" narrowed but did not change on 2026-08-14. The equivalent backend is carried in
+this repository's own series ([`packaging/libkrun-windows`](../packaging/libkrun-windows/),
+patches 0019–0025), and the `krun.dll` that booted a guest and ran a container that day was
+built with all of it — so it compiles, links and loads on Windows. That run added no network
+device, because nerdbox adds one only when asked and nothing asked. Not a frame, not a
+`krun_add_net_unixstream`, has gone through this code on Windows.
+
 ## Why this was the blocker
 
 libkrun's Windows Hypervisor Platform backend was merged upstream in May–June 2026 (PRs

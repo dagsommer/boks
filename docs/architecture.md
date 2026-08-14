@@ -128,7 +128,8 @@ The one host where "the host path verbatim" is not a path at all is Windows, sin
 translation of its host path instead — `/c/Users/dag/src/foo`, the convention Docker Sandboxes
 and the rest of the Docker family use. `internal/workspace/guestpath.go` is the only code that
 knows this, and `docs/windows.md` section 4 is the reasoning. Nothing about it has run on
-Windows; Boks has no VMM there.
+Windows: a microVM boots there now, but only under `ctr`, and only `boks run` asks for a
+workspace to be mapped.
 
 *(verified 2026-08-11: `boks run shell /private/tmp/boksprobe/deep/a/b/c/project -- pwd` printed
 that exact path inside the guest; the intermediate directories were created automatically
@@ -498,10 +499,12 @@ Linux-only by construction.
 blocked by anything about Windows either. A spike ([windows.md](windows.md)) found that the
 reference product runs this exact architecture there — containerd, a nerdbox shim, a Linux
 microVM, virtio-net terminated by a userspace stack — on top of the **Windows Hypervisor
-Platform**, a user-mode hypervisor API. nerdbox already builds a Windows shim upstream, and
-libkrun's WHP backend has been landing upstream through 2026 for libkrun 2.0. **The one device
-not yet ported is virtio-net** — precisely the one Boks' enforcement depends on. That is the
-whole gap, and it is narrow.
+Platform**, a user-mode hypervisor API. That architecture now runs here too: with this
+repository's patch series for libkrun, containerd and the nerdbox shim, `ctr tasks start` ran a
+Linux container in a microVM on Windows 11 on 2026-08-14, booting in 1.9 s
+([verification.md](verification.md)). **The one device that has never carried a frame there is
+virtio-net** — precisely the one Boks' enforcement depends on. That is the whole gap, and it is
+narrow.
 
 One thing is true there regardless of how it is closed: the exact-path workspace property is
 impossible, because `C:\Users\dag\src\foo` is not a Linux path (both Boks and the reference
@@ -509,7 +512,7 @@ product would map it to `/c/Users/dag/src/foo`). The link socket is no longer on
 it used to be, because Windows' AF_UNIX is stream-only and the link was a datagram socket, and
 the link is a stream now on every platform.
 
-Until a VMM exists, the Windows answer is **WSL2 with nested virtualisation**, where Boks is
+Until that frame crosses, the Windows answer is **WSL2 with nested virtualisation**, where Boks is
 just a Linux program: `/dev/kvm` and EROFS are both in the inbox kernel, the link is a normal
 AF_UNIX stream socket inside the distro, and workspace paths are Linux paths so exact-path
 mounting holds unchanged. Untested, and not a port.

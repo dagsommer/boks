@@ -39,9 +39,11 @@ The landing page.
       <div class="platform soon">
         <p class="platform-state">In progress</p>
         <h3>Windows</h3>
-        <p>A Windows hypervisor backend is being built here, and the whole VMM now compiles
-          in CI, and on 2026-08-13 a Linux guest booted through it on real hardware. That is a
-          kernel, not yet a sandbox — so for now the route is the Linux
+        <p>A Windows hypervisor backend is being built here, and on 2026-08-14 a Linux
+          container ran in a microVM on real Windows 11 hardware through containerd, the
+          nerdbox shim and it. That is a container, not yet a Boks sandbox: Boks enforces
+          policy at the guest&rsquo;s network device, and no frame has crossed one on Windows
+          yet — so for now the route is the Linux
           build <a href="{{ '/install/' | relative_url }}#meanwhile-run-the-linux-build-inside-wsl2">inside WSL2</a>.</p>
       </div>
     </div>
