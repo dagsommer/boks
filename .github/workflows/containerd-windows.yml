@@ -409,7 +409,10 @@ jobs:
           go test ./plugins/services/diff/... ./plugins/transfer/... -count=1
           # The Windows-only assertions cannot run here, but they can at least be
           # type-checked, so a rename in the patched code fails in CI and not on a desktop.
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet ./plugins/services/diff/... ./plugins/transfer/...
+          # cmd/ctr is in the list for patch 0004, whose whole diff is in a _windows.go
+          # file: `go build ./cmd/ctr` for Linux does not compile a line of it.
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet \
+            ./plugins/services/diff/... ./plugins/transfer/... ./cmd/ctr/...
 
       # Two import lines cannot plausibly break Linux, which is exactly why it costs nothing
       # to assert instead of assume.
