@@ -108,6 +108,9 @@ type gateway struct {
 	stopped bool
 	// notices counts the link-lifecycle lines written so far. See notice.
 	notices int
+	// peers latches the first time anything attaches, so that a caller can tell "the VM
+	// has not connected yet" from "nothing ever will". See (*Network).Connected.
+	peers *peerSignal
 }
 
 // maxLinkNotices caps how many lines about connecting and disconnecting one gateway will
@@ -205,8 +208,11 @@ func (g *gateway) claim(conn net.Conn) bool {
 		return false
 	}
 	g.conn = conn
+	g.peers.attached()
 	return true
 }
+
+func (g *gateway) connected() <-chan struct{} { return g.peers.waiter() }
 
 func (g *gateway) release(conn net.Conn) {
 	g.mu.Lock()
