@@ -139,10 +139,75 @@ Nothing that works today changes: with no `--platform`, `windows-lcow` still imp
 keyed to the snapshotter), and every other invocation still gets the Windows spec plus the two
 Windows-only options — which are also still applied when `--platform` names a Windows platform.
 
-**None of this has been run.** The claim is that `ctr run --snapshotter erofs` cannot produce a
-Linux spec without this patch, which is read from the source above. Whether the spec it produces
-*with* the patch is one nerdbox and its guest accept is a separate question, and is what
-`docs/windows-e2e.md` exists to answer.
+#### The `windows` section has to come back out again
+
+That much was written before anything ran. On 2026-08-14 it ran, and the answer to the last
+paragraph's open question arrived: the guest boots, mounts the container's rootfs, and then
+`crun` refuses the spec.
+
+```
+ctr: failed to create shim task: OCI runtime create failed: load `config.json`:
+     Required field 'layerFolders' not present
+```
+
+A Linux spec generated on a Windows host carries a `windows` section.
+`generateDefaultSpecWithPlatform` (`pkg/oci/spec.go:97-100`) ends its non-Windows branch with
+
+```go
+if err == nil && runtime.GOOS == "windows" {
+    // To run LCOW we have a Linux and Windows section. Add an empty one now.
+    s.Windows = &specs.Windows{}
+}
+```
+
+— a condition on the *host's* OS that says nothing about the runtime that will read the spec.
+`omitempty` does not drop it: `specs.Spec.Windows` is a **pointer**, and to `encoding/json` a
+non-nil pointer to a zero struct is not empty. `specs.Windows.LayerFolders` has no `omitempty`
+of its own, so what is marshalled — and what nerdbox forwards into the guest verbatim
+(`internal/shim/task/bundle/bundle.go`) — is `"windows":{"layerFolders":null}`.
+
+`crun` parses that with libocispec, whose generated parser checks a schema's required fields
+whenever the object holding them is present (`src/ocispec/sources.py`, `emit_make_body`), and
+runtime-spec's `schema/config-windows.json` lists `layerFolders` as required. The `windows`
+object is optional; its contents are not. So the empty, harmless-looking object is fatal, and
+a Linux host never meets it because a Linux host never generates one.
+
+`0004` removes the section rather than filling it in: a Linux guest has no layer folders, and a
+path invented to satisfy a parser would be data the guest has to ignore — worse than the error,
+because it would not be an error. Only for a non-Windows platform with a snapshotter that is not
+`windows-lcow`; LCOW keeps its section, because the runhcs shim is what fills `LayerFolders` in.
+
+**The order is load-bearing**, and it is the opposite of the obvious one. containerd's own
+image-config options read `s.Windows != nil` as *"this is LCOW, the guest resolves users and
+groups for itself"*: `oci.WithAdditionalGIDs` returns early (`spec_opts.go:873-876`) and
+`oci.WithUser` parks the image's user string in `Process.User.Username`
+(`spec_opts.go:624-627`). Both alternatives mount the image's snapshot **on the host**, and
+`mount_windows.go` rejects any mount whose type is not `windows-layer`. Remove the section
+before `oci.WithImageConfig` has run and `Required field 'layerFolders' not present` becomes
+`invalid windows mount type: erofs`, one step earlier. So it is applied last, after every other
+spec option in `run_windows.go`.
+
+The flags that write into the Windows section and nowhere else — `--cni`, `--isolated`,
+`--cpu-count`, `--cpu-shares`, `--cpu-max`, `--device` — would be discarded along with it, so
+they are now **refused** rather than ignored on a non-Windows spec. `--memory-limit` is not
+among them: `oci.WithMemoryLimit` writes both sections when both exist, and the Linux one
+survives. Nothing could have reached this combination before `0004`, so no existing invocation
+starts failing.
+
+`withoutWindowsSection` lives in `cmd/ctr/commands/run/guestspec.go`, a file with **no build
+constraint**, purely so that it can be tested somewhere other than Windows. Its tests build the
+spec a Windows host would have produced by hand — the condition is the host's own OS, which no
+test can choose — and assert both halves: that the section marshals as the text `crun` rejected,
+and that removing it disturbs nothing else. `containerd-windows.yml` runs them by name and fails
+if any of them did not run, because `go test -run` on a pattern that matches nothing exits 0.
+
+**What is verified and what is not.** The failure was measured on real hardware; the mechanism
+is read from containerd, runtime-spec and libocispec; the removal is exercised by tests on
+Linux. That a container then *starts* has not been observed on any machine.
+
+Boks' own spec generation had the identical defect and is fixed separately, in
+`internal/sandbox`, with its own tests — the bug is in the containerd library both callers
+share, so patching `ctr` fixes only `ctr`.
 
 ### `0005` — check the superblock before believing an image is formatted
 
@@ -762,6 +827,7 @@ Where a claim below was checked by running something, it says so.
 | a skipped differ does not kill the diff service | **executed** — `go test ./plugins/services/diff/...` | passes, on Linux, with the same platform-neutral code Windows runs |
 | `config.toml` decodes to what it claims | **executed** — containerd's own `srvconfig.LoadConfig` + `Decode` | order `[erofs windows windows-lcow]`, both `unpack_config` entries, `optional=true` on erofs |
 | the Windows-only assertions type-check | `GOOS=windows go vet`, both arches | clean |
+| **the empty `windows` section is what crun rejected, and `0004` removes it** | **executed** — `go test ./cmd/ctr/commands/run/... -run WindowsSection` | passes; one test asserts a Linux spec holding an empty `specs.Windows` marshals as `"windows":{"layerFolders":null}` — so `omitempty` on a pointer field is shown not to save it — and the others that the option removes it and leaves the rest of the spec alone |
 
 The xfs row is the one gap: `mkfs.xfs` is not on this machine, so `XFSB` at offset 0 is taken
 from `/usr/include/linux/magic.h` and XFS's documented big-endian metadata magics, and

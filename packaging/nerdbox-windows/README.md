@@ -9,12 +9,13 @@ rot unnoticed.
 
 **These patches are a staging area, not a fork**, exactly like `packaging/libkrun-windows/`.
 The goal is to delete this directory: patch 0001 is someone else's unmerged upstream pull
-request that we are carrying early, and patches 0002 and 0003 belong in nerdbox. Nothing in
-Boks links against a patched nerdbox — the patches are compiled, never shipped.
+request that we are carrying early, and patches 0002, 0003 and 0004 belong in nerdbox. Nothing
+in Boks links against a patched nerdbox — the patches are compiled, never shipped.
 
 Not every patch here is about Windows. Patch 0003 fixes a plain API drift against the libkrun
-revision Boks pins, and it fails identically on Linux; it lives here because this is the only
-place Boks builds nerdbox from source.
+revision Boks pins and patch 0004 an error-path stall in the shim's IO teardown; both fail
+identically on Linux. They live here because this is the only place Boks builds nerdbox from
+source.
 
 The revision they apply to is `packaging/nerdbox/NERDBOX_REV`. There is no second pin file
 here on purpose: the guest kernel, the rootfs, and the shim that boots them all have to come
@@ -50,7 +51,7 @@ indication of which of the six it came from.
 
 ## What is in `patches/`
 
-Three patches, generated with `git format-patch` from a working branch off the pinned
+Four patches, generated with `git format-patch` from a working branch off the pinned
 revision.
 
 ### `0001-vendor-implement-the-Windows-shim-server-*`
@@ -174,6 +175,44 @@ or nothing loads at all. It has been exported since long before 1.19.0, and
 
 Upstreamable to `containerd/nerdbox` on its own. It is strictly more correct against every
 libkrun, not a workaround for our pin.
+
+### `0004-fix-shim-stop-draining-IO-that-a-failed-create-can-n`
+
+Also not a Windows bug — the code has no platform condition in it — but found on Windows, on
+2026-08-14, when a container whose spec `crun` refused took a further **30.0 s** to say so:
+
+```
+ERRO ... failed to create task
+ERRO ... failed to shutdown container after create failure: io shutdown: context deadline exceeded
+```
+
+Thirty seconds apart, at 0–3% CPU. Everything worth reporting was known at the first line.
+
+The wait is the shutdown function `forwardIO` returns (`internal/shim/task/io.go`). It waits
+for the host-side copy goroutines to drain into the destination FIFO and for stdin to reach a
+real EOF, and when the caller's context carries no deadline of its own it grants that wait 30 s.
+For a process that ran, that is right: `ioDone` is the only thing standing between the last byte
+of output and the `Delete` that discards it.
+
+For a process that never started it cannot succeed. `ioDone` closes when both the stdout and
+stderr copies return (`io_copystreams_*.go`), and those are `io.CopyBuffer` calls on a stream
+whose guest end was never attached to anything — so nothing will write to them and nothing will
+close them **except the force-close the shutdown performs after the wait it is doing**. The
+stdin side is the same: the client still holds its write end open, so `stdinDone` will not fire
+either. Both waits share one context, which is why the stall is exactly the ceiling and not
+twice it.
+
+`0004` gives the five teardowns that can only be reached by a process that never started —
+`bindSockets` failed, bad task options, the guest's `Create` failed, socket forwarding failed to
+start, `Exec` found no container — a one-second budget instead. A second rather than nothing, so
+a stdin copy caught mid-write has a moment to finish; after it the streams close and the
+goroutines unwind exactly as they do today. Every path where a process actually ran — `Delete`,
+`Wait`, the service's own shutdown callback — keeps the full budget.
+
+**Not executed.** The stall was measured on hardware; the fix is compiled for `windows` and
+`linux` and reasoned from the code above. No VM has been booted with it.
+
+Upstreamable to `containerd/nerdbox` on its own, and independent of the other three.
 
 ## The version skew, audited once instead of one boot at a time
 
@@ -369,7 +408,10 @@ and the ranked list of ways it is expected to fail.
   first people to have run it.
 - Patch 0002: an independent bug report against `containerd/nerdbox`. Small, self-contained,
   and does not depend on #13948 landing.
-- Patch 0003: likewise independent, and the easiest of the three to argue for — it adopts an
+- Patch 0003: likewise independent, and the easiest of the four to argue for — it adopts an
   API change upstream libkrun made deliberately, and because it treats `-EEXIST` as success it
   does not require nerdbox to move its own `LIBKRUN_VERSION` first. Send it with the `-ENODEV`
   return codes above as the reproduction.
+- Patch 0004: independent of all three, and of Windows. Send it with the two log lines and
+  their timestamps as the reproduction; the mechanism is entirely in nerdbox's own
+  `internal/shim/task`, so there is nothing about our pins to explain first.
