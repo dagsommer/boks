@@ -1,0 +1,120 @@
+From fa0edde353303fa82550a1883efebda5789a9bc7 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 09:41:37 +0200
+Subject: [PATCH] fix(libkrun): create the vsock device explicitly before
+ mapping ports
+
+libkrun de84d01 ("lib: remove krun_disable_implicit_vsock and implicit
+vsock creation", 2026-05-20) made vsock creation fully explicit. The
+Implicit variant of VsockConfig is gone, Disabled is now the default, and
+the heuristics that used to build a vsock device inside krun_start_enter
+were deleted along with krun_disable_implicit_vsock.
+
+The consequence for this shim is that krun_add_vsock_port2 returns -ENODEV
+for both of the ports it maps, so no VM starts at all:
+
+  krun_add_vsock_port2(ctx, 1025, ".../run_vminitd.sock", false) -> -19
+  krun_add_vsock_port2(ctx, 1026, ".../streaming.sock",   true)  -> -19
+
+Without those ports there is no ttrpc control plane and no streaming
+channel, which is to say no sandbox. Nothing here is platform-specific:
+the removed heuristic was plain Rust with no target_os condition, so a
+Linux host fails identically.
+
+Ask for the device with krun_add_vsock() and do it in newvmcontext, right
+after krun_create_ctx, so the precondition holds however the caller later
+orders AddDisk/AddFS/AddNIC and whichever ports Start ends up mapping.
+
+tsi_features is 0 -- an empty TsiFlags, meaning no TSI hijacking. This
+shim wants the vsock purely for guest IPC on ports 1025/1026 and does its
+networking with a virtio-net device added through
+krun_add_net_unix{stream,gram}; it never calls krun_set_port_map or
+krun_set_passt_fd. That is exactly the combination the deleted heuristic
+arrived at for this configuration -- a non-empty net list selected
+enable_tsi=false, giving empty TSI flags and no host port map -- so the
+VsockDeviceConfig libkrun builds is unchanged. Only the way it is asked
+for has changed.
+
+-EEXIST is accepted as success. On libkrun <= 1.19.x the context still
+carries the implicit device, VsockConfig is Implicit rather than Disabled,
+and krun_add_vsock reports -EEXIST on the first call. Both answers leave
+the context holding the device this code needs, so tolerating it keeps one
+source tree working against libkrun on either side of the change rather
+than pinning the shim to one of them.
+
+Adding the binding is not free: the loader reflects over the whole struct
+and resolves every C tag eagerly at dlopen, so krun_add_vsock now has to
+be exported by the library or nothing loads. It has been exported since
+well before 1.19.0.
+
+Signed-off-by: Dag Sommer <dagaleks@gmail.com>
+---
+ internal/vm/libkrun/krun.go | 41 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/internal/vm/libkrun/krun.go b/internal/vm/libkrun/krun.go
+index ef68e7d..5606b35 100644
+--- a/internal/vm/libkrun/krun.go
++++ b/internal/vm/libkrun/krun.go
+@@ -48,6 +48,13 @@ const (
+ 	warnLevel logLevel = 2
+ )
+ 
++// krunErrEEXIST is -EEXIST as libkrun returns it. errno 17 is EEXIST on Linux,
++// on macOS and in the MSVC CRT alike, so the one constant covers every host we
++// load libkrun on. Spelled out rather than taken from syscall because
++// syscall.EEXIST is not the same numeric type on every GOOS, and libkrun hands
++// back a plain negative int32.
++const krunErrEEXIST = -17
++
+ type vmcontext struct {
+ 	ctxID uint32
+ 	lib   *libkrun
+@@ -63,6 +70,32 @@ func newvmcontext(lib *libkrun) (*vmcontext, error) {
+ 		return nil, fmt.Errorf("krun_create_ctx failed: %d", ctxId)
+ 	}
+ 
++	// Ask for the vsock device explicitly, before any port is mapped onto it.
++	//
++	// libkrun used to create the device implicitly, inferring its TSI feature
++	// bits from whether a network device had been configured. That heuristic
++	// was removed upstream (libkrun de84d01, "lib: remove
++	// krun_disable_implicit_vsock and implicit vsock creation"): VsockConfig
++	// now defaults to Disabled, and krun_add_vsock_port2 answers -ENODEV until
++	// krun_add_vsock has been called. Ports are added in Start, so doing this
++	// here keeps the ordering right no matter what the caller configures.
++	//
++	// tsi_features is 0 -- no TSI hijacking. The device is wanted purely for
++	// guest IPC on ports 1025/1026; networking is a separate virtio-net device
++	// added through krun_add_net_unix{stream,gram}. That is precisely what the
++	// old heuristic decided for this configuration (a non-empty net list took
++	// the enable_tsi=false branch, giving empty TSI flags and no host port
++	// map), so the VsockDeviceConfig libkrun ends up building is unchanged.
++	//
++	// -EEXIST means the context already has a vsock device, which is what a
++	// libkrun still creating the implicit one (<= 1.19.x) reports here. Either
++	// answer leaves the context with the device this code needs, so accept both
++	// and keep working against both libkruns.
++	if ret := lib.AddVsock(uint32(ctxId), 0); ret != 0 && ret != krunErrEEXIST {
++		lib.FreeCtx(uint32(ctxId))
++		return nil, fmt.Errorf("krun_add_vsock failed: %d", ret)
++	}
++
+ 	return &vmcontext{
+ 		ctxID: uint32(ctxId),
+ 		lib:   lib,
+@@ -263,7 +296,13 @@ type libkrun struct {
+ 	SetExec          func(ctxID uint32, path string, args unsafe.Pointer, env unsafe.Pointer) int32                 `C:"krun_set_exec"`
+ 	SetConsoleOutput func(ctxID uint32, path string) int32                                                          `C:"krun_set_console_output"`
+ 	StartEnter       func(ctxID uint32) int32                                                                       `C:"krun_start_enter"`
+-	AddVsockPort     func(ctxID, port uint32, path string, listen bool) int32                                       `C:"krun_add_vsock_port2"`
++	// AddVsock creates the vsock device that AddVsockPort maps ports onto. It
++	// must be called first: since libkrun de84d01 there is no implicit device
++	// and krun_add_vsock_port2 returns -ENODEV without it. tsiFeatures is a
++	// TsiFlags bitmask; 0 means a plain guest-IPC vsock with no TSI hijacking,
++	// which is what this shim wants.
++	AddVsock     func(ctxID uint32, tsiFeatures uint32) int32             `C:"krun_add_vsock"`
++	AddVsockPort func(ctxID, port uint32, path string, listen bool) int32 `C:"krun_add_vsock_port2"`
+ 	// AddVirtiofs3 forwards a virtio-fs share with explicit flags. shmSize
+ 	// requests a DAX window size in bytes for the share; 0 means "use the
+ 	// libkrun default" (which is what every call site here passes). Plumb a
