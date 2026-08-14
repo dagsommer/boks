@@ -181,16 +181,18 @@ func platformCheck() Check {
 				}
 				return Result{Status: StatusOK, Detail: detail}
 			case "windows":
-				// Not "blocked on runtime support", and not a platform limitation
-				// either — Windows supports this design and the reference product
-				// ships on it. See virt_windows.go and docs/windows.md.
+				// Not "blocked on runtime support", and not a platform
+				// limitation either — the stack under Boks runs a container on
+				// Windows today. What is missing is Boks' own enforcement
+				// boundary. See virt_windows.go and docs/windows.md.
 				return Result{
 					Status: StatusFail, Detail: detail,
-					Remedy: "Boks does not run sandboxes on Windows yet. The platform can host them, and\n" +
-						"a Windows Hypervisor Platform backend for libkrun is being built in this\n" +
-						"project — every crate compiles and krun.dll links in CI — but no sandbox has\n" +
-						"ever booted on Windows, so there is nothing here to start yet.\n" +
-						"Run Boks inside WSL2 in the meantime. See docs/windows.md.",
+					Remedy: "Boks does not run sandboxes on Windows yet, and the platform is not the\n" +
+						"reason: on 2026-08-14 a Linux container ran in a microVM here, through\n" +
+						"containerd, the nerdbox shim and this project's krun.dll. That is ctr, not\n" +
+						"Boks. Boks enforces network policy at the guest's virtio-net device, no frame\n" +
+						"has yet crossed one on Windows, and it will not start a sandbox it cannot\n" +
+						"enforce. Run Boks inside WSL2 in the meantime. See docs/windows.md.",
 				}
 			default:
 				return Result{

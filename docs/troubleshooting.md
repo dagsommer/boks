@@ -208,8 +208,10 @@ there produces the same loud failure for an entirely unrelated reason.
 ## WSL2
 
 Boks inside WSL2 is the only route to Boks on a Windows machine today; a native Windows build
-does not exist. **Nobody has run it.** Every ingredient below is traced to WSL's source, its
-issue tracker or its kernel config, and none of it has been executed — the full analysis is in
+exists but stops at its own network refusal, and the stack under it — containerd, the shim,
+`krun.dll` — runs a container natively without Boks ([windows-e2e.md](windows-e2e.md)).
+**Nobody has run the WSL2 route.** Every ingredient below is traced to WSL's source, its issue
+tracker or its kernel config, and none of it has been executed — the full analysis is in
 [Windows](windows.md). `doctor` detects WSL through `/bin/wslinfo` and gives WSL-specific
 remedies for the KVM failures.
 

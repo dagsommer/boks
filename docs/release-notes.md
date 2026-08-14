@@ -112,11 +112,13 @@ nothing about isolation.
 
 macOS on Apple silicon is the platform everything above was measured on. Linux with KVM is
 built and designed for and has not been exercised end to end. Native Windows support is in
-progress and no sandbox has yet booted there: a Windows Hypervisor Platform backend for
-libkrun is being built in this repository's patch series, and every libkrun crate — including
-`virtio-net`, the device Boks' enforcement depends on — now compiles for Windows, with
-`krun.dll` linking on a real Windows runner in CI. That is the artifact existing, not the
-artifact working. Running inside WSL2 should work unchanged and nobody has tried it.
+progress: on 2026-08-14 a Linux container ran in a microVM on real Windows 11 hardware,
+through containerd, a patched nerdbox shim and this repository's `krun.dll` on the Windows
+Hypervisor Platform — but through `ctr`, not `boks run`. Boks' own path stops before it starts
+a VM there, at the network refusal in `internal/network/vmm_windows.go`: its enforcement is the
+guest's virtio-net device and no Ethernet frame has yet crossed one on Windows. So the stack
+underneath Boks works there and Boks does not. Running inside WSL2 should work unchanged and
+nobody has tried it.
 
 ### Known at the time of writing
 
