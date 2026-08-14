@@ -1,0 +1,153 @@
+From 843fc9c4172919fefdd06f1240a73650781153c0 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Fri, 14 Aug 2026 08:03:08 +0200
+Subject: [PATCH] ctr: let --platform choose the spec's platform on Windows
+
+`ctr run --runtime io.containerd.nerdbox.v1 --snapshotter erofs <linux image>`
+on a Windows host produces a **Windows** OCI spec for a Linux image, and no
+flag changes that.
+
+cmd/ctr/commands/run/run_windows.go picks the spec's platform from the
+snapshotter name and nothing else:
+
+    if snapshotter == "windows-lcow" {
+        opts = append(opts, oci.WithDefaultSpecForPlatform("linux/amd64"))
+        // Clear the rootfs section.
+        opts = append(opts, oci.WithRootFSPath(""))
+    } else {
+        opts = append(opts, oci.WithDefaultSpec())
+        opts = append(opts, oci.WithWindowNetworksAllowUnqualifiedDNSQuery())
+        opts = append(opts, oci.WithWindowsIgnoreFlushesDuringBoot())
+    }
+
+The --platform flag `ctr run` advertises -- "Run image for specific platform"
+-- is read only by run_unix.go, for the spec (lines 104-119, 141) and for image
+resolution (lines 162-168). On Windows it is accepted and silently ignored for
+both.
+
+That was reasonable while the only Linux guest on a Windows host was LCOW,
+whose snapshotter name doubles as a declaration of intent. It stops being
+reasonable as soon as a runtime runs Linux guests from some other snapshotter.
+A microVM runtime backed by the erofs snapshotter gets a spec with
+`s.Windows != nil, s.Linux == nil`, so oci.WithImageConfigArgs takes its
+Windows branch and the guest is handed a config.json with no `linux` section
+for a Linux image.
+
+There is no way to ask for anything else. `ctr run --config <spec.json>` is the
+only other route to a chosen spec, and on this path it skips
+containerd.WithNewSnapshot entirely, so the task is created with an empty
+Rootfs -- client/container.go's handleMounts returns without adding any mount
+when SnapshotKey is "". A correct spec and a rootfs are mutually exclusive
+today.
+
+So --platform now selects the spec's platform here as it does on Unix, and
+constrains image resolution the same way run_unix.go does: client.GetImage
+matches the host platform, and a linux/amd64 image pulled onto a Windows host
+has no windows/amd64 manifest for it to find.
+
+Nothing that works today changes. With no --platform, windows-lcow still
+implies linux/amd64 and still clears the rootfs path -- that is an LCOW
+property, not a Linux one, so it stays keyed to the snapshotter -- and every
+other invocation still gets the Windows spec plus the two Windows-only spec
+options, which are also still applied when --platform names a Windows platform.
+---
+ cmd/ctr/commands/run/run_windows.go | 62 +++++++++++++++++++++++++----
+ 1 file changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/cmd/ctr/commands/run/run_windows.go b/cmd/ctr/commands/run/run_windows.go
+index 26620b4..4a8b6bc 100644
+--- a/cmd/ctr/commands/run/run_windows.go
++++ b/cmd/ctr/commands/run/run_windows.go
+@@ -19,6 +19,7 @@ package run
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"strings"
+ 
+ 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
+@@ -30,6 +31,7 @@ import (
+ 	"github.com/containerd/containerd/v2/pkg/netns"
+ 	"github.com/containerd/containerd/v2/pkg/oci"
+ 	"github.com/containerd/log"
++	"github.com/containerd/platforms"
+ 	specs "github.com/opencontainers/runtime-spec/specs-go"
+ 	"github.com/urfave/cli/v2"
+ )
+@@ -68,14 +70,44 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
+ 
+ 		id = cliContext.Args().Get(1)
+ 		snapshotter := cliContext.String("snapshotter")
+-		if snapshotter == "windows-lcow" {
+-			opts = append(opts, oci.WithDefaultSpecForPlatform("linux/amd64"))
+-			// Clear the rootfs section.
+-			opts = append(opts, oci.WithRootFSPath(""))
+-		} else {
++
++		// Which platform's spec to generate. Unlike run_unix.go, this used to be
++		// derived solely from the snapshotter name, so the only way to get a Linux
++		// spec on a Windows host was to ask for the windows-lcow snapshotter. Any
++		// other guest-VM runtime -- one backed by an erofs snapshotter, say -- got a
++		// Windows spec for a Linux image and no way to say otherwise, because the
++		// --platform flag this command already advertises was ignored here.
++		//
++		// --platform now selects it, and windows-lcow keeps implying linux/amd64 when
++		// --platform is absent, so no existing invocation changes behaviour.
++		specPlatform := cliContext.String("platform")
++		if specPlatform == "" && snapshotter == "windows-lcow" {
++			specPlatform = "linux/amd64"
++		}
++		var imgPlatform platforms.MatchComparer
++		if specPlatform == "" {
+ 			opts = append(opts, oci.WithDefaultSpec())
+ 			opts = append(opts, oci.WithWindowNetworksAllowUnqualifiedDNSQuery())
+ 			opts = append(opts, oci.WithWindowsIgnoreFlushesDuringBoot())
++		} else {
++			p, err := platforms.Parse(specPlatform)
++			if err != nil {
++				return nil, fmt.Errorf("invalid platform %q: %w", specPlatform, err)
++			}
++			// Only constrain image resolution when it was asked for explicitly. The
++			// windows-lcow default above must keep resolving the image the way it
++			// always has.
++			if cliContext.String("platform") != "" {
++				imgPlatform = platforms.Only(p)
++			}
++			opts = append(opts, oci.WithDefaultSpecForPlatform(specPlatform))
++			if p.OS == "windows" {
++				opts = append(opts, oci.WithWindowNetworksAllowUnqualifiedDNSQuery())
++				opts = append(opts, oci.WithWindowsIgnoreFlushesDuringBoot())
++			} else if snapshotter == "windows-lcow" {
++				// LCOW's guest brings its own rootfs; the spec must not name one.
++				opts = append(opts, oci.WithRootFSPath(""))
++			}
+ 		}
+ 		if ef := cliContext.String("env-file"); ef != "" {
+ 			opts = append(opts, oci.WithEnvFile(ef))
+@@ -83,9 +115,23 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
+ 		opts = append(opts, oci.WithEnv(cliContext.StringSlice("env")))
+ 		opts = append(opts, withMounts(cliContext))
+ 
+-		image, err := client.GetImage(ctx, ref)
+-		if err != nil {
+-			return nil, err
++		// With an explicit --platform, resolve the image for that platform too, the
++		// way run_unix.go does. client.GetImage matches the host platform, so a
++		// Linux image on a Windows host would otherwise fail to find a manifest --
++		// the config and the layers it wants are not the ones in the content store.
++		var image containerd.Image
++		if imgPlatform != nil {
++			i, err := client.ImageService().Get(ctx, ref)
++			if err != nil {
++				return nil, err
++			}
++			image = containerd.NewImageWithPlatform(client, i, imgPlatform)
++		} else {
++			var err error
++			image, err = client.GetImage(ctx, ref)
++			if err != nil {
++				return nil, err
++			}
+ 		}
+ 		unpacked, err := image.IsUnpacked(ctx, snapshotter)
+ 		if err != nil {

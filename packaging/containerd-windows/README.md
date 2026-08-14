@@ -21,8 +21,9 @@ snapshotter is the only one on Windows that hands nerdbox mounts the Linux guest
 
 ## The patches
 
-Three, in `patches/`. The first registers the plugins; the other two make them reachable, which
-turned out to be a separate problem.
+Four, in `patches/`. The first registers the plugins; `0002` and `0003` make them reachable,
+which turned out to be a separate problem; `0004` is about `ctr`, not the daemon, and only
+matters once you try to *run* a container rather than unpack one.
 
 ### `0001` — register the plugins
 
@@ -93,10 +94,58 @@ Note this is *not* the "snapshotter `windows/amd64` versus differ `linux/amd64`"
 earlier revision of this README guessed at. containerd paired those two fine. The mismatch is in
 `unpack_config`, and it is a different one.
 
+### `0004` — let `--platform` choose the spec's platform in `ctr run` on Windows
+
+`0001`–`0003` get a Linux image unpacked. `0004` is about the next command, and it was found by
+reading `ctr`, not by running it.
+
+On a Windows host, `ctr run` decides which platform's OCI spec to generate from the
+**snapshotter name**, and from nothing else — `cmd/ctr/commands/run/run_windows.go`:
+
+```go
+snapshotter := cliContext.String("snapshotter")
+if snapshotter == "windows-lcow" {
+    opts = append(opts, oci.WithDefaultSpecForPlatform("linux/amd64"))
+    opts = append(opts, oci.WithRootFSPath(""))     // clear the rootfs section
+} else {
+    opts = append(opts, oci.WithDefaultSpec())
+    opts = append(opts, oci.WithWindowNetworksAllowUnqualifiedDNSQuery())
+    opts = append(opts, oci.WithWindowsIgnoreFlushesDuringBoot())
+}
+```
+
+`--snapshotter erofs` takes the `else`. The container gets a spec with `s.Windows != nil` and
+`s.Linux == nil`, so `oci.WithImageConfigArgs` takes its **Windows** branch for a Linux image,
+and the shim is handed a `config.json` with no `linux` section at all.
+
+The `--platform` flag `ctr run` advertises — *"Run image for specific platform"* — does not
+help: it is read only by `run_unix.go` (for the spec at lines 104–119 and 141, and for image
+resolution at 162–168). `run_windows.go` never mentions it. It is accepted and ignored.
+
+Nor is there a way around it. `ctr run --config <spec.json>` is the only other route to a spec
+of your choosing, and on the Windows path it does not apply `containerd.WithNewSnapshot`, so the
+task is created with **no rootfs mounts** — `client/container.go`'s `handleMounts` adds nothing
+when `SnapshotKey` is `""`. A correct spec and a rootfs are mutually exclusive on Windows today.
+
+So `0004` makes `--platform` select the spec's platform here as it already does on Unix, and
+constrain image resolution the same way — `client.GetImage` matches the *host* platform, and a
+`linux/amd64` image pulled onto a Windows host has no `windows/amd64` manifest to find, so
+without that the run fails at `image.Config` instead.
+
+Nothing that works today changes: with no `--platform`, `windows-lcow` still implies
+`linux/amd64` and still clears the rootfs path (an LCOW property, not a Linux one, so it stays
+keyed to the snapshotter), and every other invocation still gets the Windows spec plus the two
+Windows-only options — which are also still applied when `--platform` names a Windows platform.
+
+**None of this has been run.** The claim is that `ctr run --snapshotter erofs` cannot produce a
+Linux spec without this patch, which is read from the source above. Whether the spec it produces
+*with* the patch is one nerdbox and its guest accept is a separate question, and is what
+`docs/windows-e2e.md` exists to answer.
+
 The pin is `CONTAINERD_VERSION` — **v2.3.3**, matching the containerd that the nerdbox revision
 in `packaging/nerdbox/NERDBOX_REV` vendors.
 
-**All three belong upstream, not here.** Delete this directory once containerd takes them.
+**All four belong upstream, not here.** Delete this directory once containerd takes them.
 
 ## What actually works on Windows, and what does not
 
