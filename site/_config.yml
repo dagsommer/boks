@@ -91,6 +91,9 @@ boks_docs:
   - source: docs/verification.md
     url: /verification/
     nav: Verification
+  - source: docs/verify-linux-prompt.md
+    url: /verify-linux-prompt/
+    nav: Verifying on Linux
   - source: docs/docker-sandbox-parity.md
     url: /docker-sandbox-parity/
     nav: Docker Sandbox parity

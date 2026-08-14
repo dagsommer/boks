@@ -113,6 +113,19 @@ The KVM path is built and designed for, and nobody on this project has exercised
 end. If something fails there that this page does not cover, that is the expected state
 rather than a surprise — see [Get started](get-started.md#which-platforms-work).
 
+If you are the person about to run it, there is a kit for exactly that:
+
+```bash
+scripts/verify-linux.sh --list      # what it checks, in order, touching nothing
+scripts/verify-linux.sh
+```
+
+It works through the checks in [Verification](verification.md) in order, prints the evidence
+inline, stops at the first failure that makes the rest meaningless, and modifies nothing. It
+detects WSL2 and says so. The prompt to give an agent driving it, and the traps that
+manufacture a false pass, are in
+[Verifying on Linux](verify-linux-prompt.md).
+
 ---
 
 ## WSL2
@@ -125,6 +138,11 @@ remedies for the KVM failures.
 
 **WSL 2.5.1 is a hard floor**, because it introduced the modules image that makes any
 loadable module loadable at all, and clean cgroups v2.
+
+`scripts/verify-linux.sh` runs inside WSL2 as well as on a plain Linux host, detects which
+it is on, and prints the right one of the three KVM diagnoses below. Start there, and read
+[Verifying on Linux](verify-linux-prompt.md) first — it carries the prompt for an agent
+driving the run and the traps that make a broken sandbox look like a working one.
 
 ### First, do not start with `nestedVirtualization=true`
 
