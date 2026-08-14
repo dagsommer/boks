@@ -1,7 +1,7 @@
 From 42f07841eb083f8ae40427b301f1ed66ee02028f Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Fri, 14 Aug 2026 08:28:07 +0200
-Subject: [PATCH 33/36] windows: start application processors from the VMM, not
+Subject: [PATCH 33/37] windows: start application processors from the VMM, not
  from a guest halt loop
 
 This backend claimed that "WHP starts every virtual processor runnable, so the
@@ -1073,6 +1073,3 @@ index 12fb5d9..907bfbf 100644
              WHvRunVpExitReasonX64InterruptWindow => VcpuExitReason::InterruptWindow,
              WHvRunVpExitReasonUnrecoverableException => VcpuExitReason::UnrecoverableException,
              WHvRunVpExitReasonInvalidVpRegisterValue => VcpuExitReason::InvalidVpRegisterValue,
--- 
-2.53.0
-

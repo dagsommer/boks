@@ -1,7 +1,7 @@
 From ea3bc6e773b2f11b94f14a5bc7ba180e5c753a52 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 15:11:25 +0200
-Subject: [PATCH 15/36] windows: let the epoll shim cross a thread boundary
+Subject: [PATCH 15/37] windows: let the epoll shim cross a thread boundary
 
 `Epoll` holds `entries: Vec<OVERLAPPED_ENTRY>`, and `OVERLAPPED_ENTRY` contains
 a raw `*mut OVERLAPPED`, so the derived auto-trait makes `Epoll` `!Send`. Device
@@ -44,6 +44,3 @@ index d880cf0..b9e26a9 100644
  impl Clone for Epoll {
      fn clone(&self) -> Self {
          Epoll {
--- 
-2.53.0
-
