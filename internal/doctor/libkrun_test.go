@@ -344,9 +344,11 @@ func TestHypervisorLibraryAlwaysExplainsItself(t *testing.T) {
 	}
 }
 
-// Windows gets no verdict on libkrun. The platform check already reports that Boks has no
-// Windows backend, and a second line about a file it would not use is noise.
-func TestHypervisorLibraryIsSkippedWhereBoksHasNoBackend(t *testing.T) {
+// Windows gets no verdict on libkrun. krun.dll exists — this project builds one, and on
+// 2026-08-14 it booted a guest under containerd's shim — but Boks itself never loads it there,
+// because the platform check fails first. A second line about a file this process would not
+// open is noise.
+func TestHypervisorLibraryIsSkippedWhereBoksLoadsNoLibrary(t *testing.T) {
 	for _, goos := range []string{"windows", "plan9"} {
 		res := hypervisorLibraryResult(goos, "amd64",
 			envOf(map[string][]string{"PATH": {"/usr/bin"}}), fakeFS("/usr/lib/libkrun.so"))

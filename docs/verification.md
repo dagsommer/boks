@@ -1069,6 +1069,16 @@ shutdown: context deadline exceeded` at 12:47:38.089. Output is already complete
 it is cosmetic, but every container takes thirty seconds to reap. The create-failure path
 was fixed; this is a second call site.
 
+A fix has since been written — `packaging/nerdbox-windows/patches/0005` — and **not executed**.
+The mechanism it names is a Windows-only one: the shim's stdin copy reads a named-pipe
+connection that nothing ever closes, because containerd's own client-side stdio leaves the
+accepted connection out of its closers and its Windows `cio` has no cancel function, so the
+shim's `stdinEOF` had nothing to end the read with. On Unix the equivalent close does happen,
+which is why only Windows stalls. The patch makes `stdinEOF` disconnect the client, and — for
+the case where that reading is wrong — makes the shim log *which* of its two waits expired,
+`output drain` or `stdin drain`, so one line of the next run settles it. Until that run, the
+30 s is measured and the cause is inferred.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
