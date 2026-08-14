@@ -284,8 +284,13 @@ func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 		line, err := bufio.NewReader(stdout).ReadString('\n')
 		switch {
 		case err != nil:
-			ready <- fmt.Errorf("the network supervisor exited before it was ready; see %s",
-				filepath.Join(dir, logFile))
+			// The supervisor's own error went to its log, not to this pipe, and the
+			// log is where every previous version of this message left it: "see
+			// stack.log" is a correct sentence that costs the reader a file they
+			// have to find, open and interpret, at the exact moment they are
+			// confused. The reason is quoted here instead.
+			ready <- fmt.Errorf("the network supervisor exited before it was ready%s",
+				logTail(filepath.Join(dir, logFile)))
 		case strings.TrimSpace(line) != readyMarker:
 			ready <- fmt.Errorf("the network supervisor said %q instead of %q", strings.TrimSpace(line), readyMarker)
 		default:
@@ -301,8 +306,8 @@ func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 		}
 	case <-time.After(readyTimeout):
 		_ = terminate(cmd.Process.Pid)
-		return State{}, fmt.Errorf("enforce: the network supervisor did not come up within %s; see %s",
-			readyTimeout, filepath.Join(dir, logFile))
+		return State{}, fmt.Errorf("enforce: the network supervisor did not come up within %s%s",
+			readyTimeout, logTail(filepath.Join(dir, logFile)))
 	case <-ctx.Done():
 		_ = terminate(cmd.Process.Pid)
 		return State{}, ctx.Err()
@@ -327,6 +332,51 @@ func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 	return st, nil
 }
 
+// logTail quotes the end of a supervisor's log, for an error that would otherwise send the
+// reader to find it.
+//
+// It is bounded twice — by bytes read and by lines quoted — because the log is written by a
+// process that failed in an unknown way, and an error message is not a place to paste a
+// megabyte of stack traces. What it is for is the common case: a supervisor that died on its
+// first real action and said why in one or two lines.
+//
+// The path is always given as well as the tail. The tail is a hint, not the record.
+func logTail(path string) string {
+	const (
+		maxBytes = 8 << 10
+		maxLines = 8
+	)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("; its log %s could not be read (%v)", path, err)
+	}
+	if len(data) > maxBytes {
+		data = data[len(data)-maxBytes:]
+	}
+	var lines []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimRight(line, "\r \t"); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return fmt.Sprintf(" and wrote nothing to %s", path)
+	}
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return fmt.Sprintf(". Its last words, from %s:\n    %s", path, strings.Join(lines, "\n    "))
+}
+
+// Watch is how the supervisor learns about the sandbox's task: it blocks until the task has
+// run and stopped, and calls started the first time it observes the task running.
+//
+// The callback exists for the link watchdog, which needs to know when a VM should have dialled
+// the link socket by (see link.go). It is passed rather than discovered because containerd is
+// deliberately not a dependency of this package: the supervisor is told what the task is doing
+// by whoever already knows.
+type Watch func(ctx context.Context, started func()) error
+
 // Serve is the supervisor process itself: `boks net serve`, reading its spec from stdin.
 //
 // It is not meant to be typed by a human, but it is a plain command rather than a hidden
@@ -337,7 +387,7 @@ func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 // because the VM connects to it while it boots; so the socket is bound, the state written
 // and readiness reported, and only then does the supervisor start watching the task it is
 // bound to.
-func Serve(ctx context.Context, spec Spec, ready io.Writer, watch func(context.Context) error) error {
+func Serve(ctx context.Context, spec Spec, ready io.Writer, watch Watch) error {
 	if spec.Sandbox == "" {
 		return errors.New("boks net serve: the spec names no sandbox")
 	}
@@ -399,18 +449,32 @@ func Serve(ctx context.Context, spec Spec, ready io.Writer, watch func(context.C
 	if spec.Plan.Mode != network.ModeNone {
 		published := &publishedState{dir: dir, state: st}
 		session.forwarder.OnChange(published.write)
-		control, err := serveControl(controlPath(spec.StateDir, spec.Sandbox), os.Stderr,
-			func(req controlRequest) controlResponse { return handleControl(session, req) })
-		if err != nil {
-			return err
+		// Not bound where the two things that protect it cannot be enforced. This is a
+		// missing feature rather than a failure — the ports this sandbox was started
+		// with are already bound, and only *changing* them later needs the socket — so
+		// it is said once and the sandbox comes up. See control_windows.go.
+		if refusal := controlSocketSecurable(); refusal != nil {
+			fmt.Fprintf(os.Stderr, "network: %v\n", refusal)
+		} else {
+			control, err := serveControl(controlPath(spec.StateDir, spec.Sandbox), os.Stderr,
+				func(req controlRequest) controlResponse { return handleControl(session, req) })
+			if err != nil {
+				return err
+			}
+			defer func() { _ = control.Close() }()
 		}
-		defer func() { _ = control.Close() }()
 	}
+
+	// Armed only where nothing has ever been seen putting a frame on this link, which today
+	// means Windows; inert everywhere else, down to having no goroutine and a nil channel
+	// in the select below. See link.go.
+	link := watchLink(ctx, network.Unexercised(), spec.Sandbox, spec.Plan.Socket,
+		session.Network().Connected(), linkPeerGrace, os.Stderr)
 
 	fmt.Fprintln(ready, readyMarker)
 
 	watched := make(chan error, 1)
-	go func() { watched <- watch(ctx) }()
+	go func() { watched <- watch(ctx, link.taskStarted) }()
 
 	select {
 	case sig := <-signals:
@@ -421,6 +485,12 @@ func Serve(ctx context.Context, spec Spec, ready io.Writer, watch func(context.C
 		} else {
 			fmt.Fprintf(os.Stderr, "network: sandbox %s stopped, tearing down the stack\n", spec.Sandbox)
 		}
+	case err := <-link.failure():
+		// Returned as well as logged: this supervisor is holding a stack that nothing
+		// is attached to, and exiting non-zero is the difference between a network that
+		// is missing and a network that is quietly pretending.
+		fmt.Fprintf(os.Stderr, "network: %v\n", err)
+		return fmt.Errorf("boks net serve: %w", err)
 	case <-ctx.Done():
 	}
 	return nil

@@ -129,6 +129,25 @@ func controlPath(stateDir, sandbox string) string {
 	return filepath.Join(dirFor(stateDir, sandbox), controlSocket)
 }
 
+// controlSocketRefusal is why this socket is not bound on a platform that can enforce neither
+// the mode it is created with nor the identity of whoever connects to it.
+//
+// The text lives here, in a file with no build constraint, so that a test can read it on the
+// machine the tests run on; control_windows.go holds the argument and is the only caller. It
+// is deliberately phrased for two audiences at once, because both see it: the supervisor logs
+// it once at startup, and `boks ports` prints it to whoever asks a running Windows sandbox to
+// change its ports.
+func controlSocketRefusal() error {
+	return errors.New("the supervisor's control socket is not bound on Windows, so the ports of a " +
+		"running sandbox cannot be changed there.\nNeither protection it relies on exists on this " +
+		"platform: the 0700 directory and 0600 socket are permission bits Windows ignores, and " +
+		"AF_UNIX there carries no peer credentials, so the supervisor cannot check who connected " +
+		"(GetNamedPipeClientProcessId answers that only for a named pipe). A socket that can open a " +
+		"hole into a running VM is not worth binding on an argument boks cannot assert.\n" +
+		"Ports given at creation time are unaffected: start the sandbox with the ports it needs " +
+		"(boks run --publish ...)")
+}
+
 // controlServer answers control requests for one sandbox.
 type controlServer struct {
 	listener net.Listener
@@ -287,6 +306,13 @@ func call(ctx context.Context, stateDir, sandbox string, req controlRequest) (co
 		return controlResponse{}, fmt.Errorf("sandbox %q was created with -net none, so it has no "+
 			"virtual network to publish a port into.\nRecreate it without -net none: boks rm %s",
 			sandbox, sandbox)
+	}
+	// Asked before dialling, so that the answer names the reason rather than the symptom.
+	// Without this the user of a platform where the socket is deliberately not bound gets
+	// "this sandbox has no running network stack (connect: no such file or directory)" for a
+	// sandbox that is running perfectly well.
+	if refusal := controlSocketSecurable(); refusal != nil {
+		return controlResponse{}, refusal
 	}
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", controlPath(stateDir, sandbox))

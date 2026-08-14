@@ -1,8 +1,14 @@
 # Upstream: virtio-net on Windows (libkrun)
 
 Boks enforces network policy at the virtio-net boundary. Upstream libkrun cannot provide
-that boundary on Windows, which is why `boks run` cannot work there — see
-`internal/network/vmm_windows.go`, which says so and fails early.
+that boundary on Windows, which is why `boks run` had nothing to attach to there.
+
+> **Later.** `packaging/libkrun-windows/` now carries the backend described here, `krun.dll`
+> links with `--features blk,net`, and `boks run` no longer refuses on Windows — it binds the
+> link socket and attempts the sandbox, with a bounded wait that fails legibly if nothing
+> connects (`internal/network/vmm_windows.go`, `internal/enforce/link.go`). **No frame has
+> crossed the device on Windows even so.** The refusal was removed because refusing guarantees
+> the question stays unanswered, not because it was answered.
 
 Not because it is impossible: a shipping product drives a virtio NIC on Windows through
 libkrun's own ABI today (below). Because upstream has no virtio-net backend for it.
@@ -129,8 +135,8 @@ libkrun's virtio-net is necessary, not sufficient. Still outstanding for Windows
 - **containerd on Windows** running Linux guests the way the Boks stack assumes.
 - **Our own Windows path**: nothing in `internal/network` any more — the stream transport is
   in, `stack.go` and `gateway.go` build for `windows/amd64`, and the only Windows-specific
-  file left is `vmm_windows.go`, whose job is to refuse. What is untested is everything: no
-  frame has crossed this link on Windows, and none can until the VMM exists.
+  file left is `vmm_windows.go`, which since this was written holds a warning rather than a
+  refusal. What is untested is everything: no frame has crossed this link on Windows.
 
 So the realistic reading is: this removes one blocker of several. Its value is that the
 blocker is now a patch in front of libkrun's maintainers rather than an unasked question,
