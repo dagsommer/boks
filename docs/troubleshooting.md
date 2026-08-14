@@ -207,11 +207,16 @@ there produces the same loud failure for an entirely unrelated reason.
 
 ## WSL2
 
-Boks inside WSL2 is the only route to Boks on a Windows machine today; a native Windows build
-exists but stops at its own network refusal, and the stack under it — containerd, the shim,
-`krun.dll` — runs a container natively without Boks ([windows-e2e.md](windows-e2e.md)).
-**Nobody has run the WSL2 route.** Every ingredient below is traced to WSL's source, its issue
-tracker or its kernel config, and none of it has been executed — the full analysis is in
+Boks inside WSL2 is the route to Boks on a Windows machine that is expected to work today.
+A native Windows build exists and is no longer refused — `boks run` binds the sandbox's link
+socket and attempts it — but **no Ethernet frame has ever crossed libkrun's virtio-net device
+on Windows, and nobody has run `boks run` there at all.** If you try it, expect the network
+supervisor to exit about half a minute after the task starts with an error saying nothing
+connected to the link socket; the sandbox's `stack.log` holds it, and it names what to check.
+A guest that comes up with no stack attached is *not* contained — it falls back to libkrun's
+TSI, where its `127.0.0.1` is the host's — so do not trust such a sandbox because it appeared
+to work. **Nobody has run it.** Every ingredient below is traced to WSL's source, its
+issue tracker or its kernel config, and none of it has been executed — the full analysis is in
 [Windows](windows.md). `doctor` detects WSL through `/bin/wslinfo` and gives WSL-specific
 remedies for the KVM failures.
 

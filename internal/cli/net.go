@@ -118,12 +118,14 @@ proxy attaches to requests and those must not be visible in the process table.`,
 			if err != nil {
 				return err
 			}
-			return enforce.Serve(cmd.Context(), spec, env.Stdout, func(ctx context.Context) error {
+			return enforce.Serve(cmd.Context(), spec, env.Stdout, func(ctx context.Context, started func()) error {
 				// The stack's life is the VM's life. Watching the task is what
 				// makes that true without a second supervision mechanism:
-				// containerd already knows.
-				return sandbox.WaitUntilStopped(ctx, spec.Address, spec.Sandbox,
-					enforce.TaskAppearTimeout, enforce.TaskPollInterval)
+				// containerd already knows. The same watch reports the moment
+				// the task starts, which is when a VM that is going to attach
+				// to the link socket has to do so.
+				return sandbox.WatchTask(ctx, spec.Address, spec.Sandbox,
+					enforce.TaskAppearTimeout, enforce.TaskPollInterval, started)
 			})
 		},
 	}
@@ -278,11 +280,40 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 	if running {
 		fmt.Fprint(stderr, orphanedStackWarning(spec.Sandbox))
 	}
+	// Said before the sandbox is created, on the platform where the link has never carried
+	// a frame, and said regardless of --quiet: asking for less output is not consent to a
+	// network that may be enforcing nothing.
+	if unexercised := network.Unexercised(); unexercised != nil {
+		fmt.Fprint(stderr, unexercisedNetworkWarning(unexercised))
+	}
 	state, err := enforce.Ensure(ctx, spec, stderr)
 	if err != nil {
 		return enforce.State{}, false, err
 	}
 	return state, true, nil
+}
+
+// unexercisedNetworkWarning is printed before a sandbox is created on a platform where
+// nothing has ever been seen putting a guest's frames on the link socket — today, Windows.
+//
+// It is a WARNING rather than a note, and it is not suppressed by --quiet, for the same reason
+// the interception notice is not: the thing being announced is a way in which the sandbox may
+// not be doing what the user believes it is doing. The failure it describes is silent by
+// nature. A shim that does not carry the external network provider ignores the annotations and
+// leaves the guest on libkrun's TSI, where its 127.0.0.1 is the *host's* and no policy is in
+// the path at all — and from outside, that sandbox looks like one that works.
+//
+// It takes the reason as an argument rather than reading it, so that the Windows text can be
+// rendered and read by a test on a machine that is not Windows.
+func unexercisedNetworkWarning(reason error) string {
+	return fmt.Sprintf(
+		"WARNING: boks is attempting a sandbox network on a platform where it has never been\n"+
+			"         shown to work. This is an attempt, not a claim.\n"+
+			"         %v\n"+
+			"         If nothing connects to the link socket shortly after the task starts, the\n"+
+			"         network supervisor exits and says so in the sandbox's stack.log. A guest that\n"+
+			"         comes up anyway is not contained: check `boks policy log` for a decision from\n"+
+			"         this sandbox before trusting it with anything.\n\n", reason)
 }
 
 // orphanedStackWarning covers a sandbox that is running while the process serving its
