@@ -299,6 +299,32 @@ Boks could bundle the CA with a public root store, since pointing `SSL_CERT_FILE
 Boks-only file would break every host Boks does *not* intercept; and the placeholder a guest
 holds for a credential is set from the credential's own configuration, never the secret.
 
+**Where those public roots come from is per-host, and Windows is the awkward one**
+(`internal/enforce/roots.go`). On Unix the root store is a PEM file at one of four well-known
+paths — the same list Go's own `crypto/x509` walks — and Boks passes it to the guest verbatim,
+because the distribution's curated answer is the host's own answer and re-deriving it could
+only produce a guest that trusts a different set from its host. Windows has no such file, and
+Go cannot supply one either: `x509.SystemCertPool` there returns an opaque pool that defers to
+`CertGetCertificateChain` and cannot be enumerated. So the `ROOT` store is read through
+CryptoAPI and encoded as PEM, with the `Disallowed` store subtracted from it (a PEM file
+cannot express distrust, so a certificate the host has stopped trusting has to be left out
+rather than marked) and the `CA` intermediate store deliberately left alone (every certificate
+in a PEM bundle is loaded as a *trust anchor*, so copying cached intermediates in would
+promote them to roots inside the guest).
+
+**A Windows host that cannot produce that bundle does not get a sandbox.** This is the one
+place the guest-environment machinery fails closed rather than degrading, and the reason is
+what "no bundle" actually means: not "no trust", but *partial* trust. `NODE_EXTRA_CA_CERTS` is
+additive and is set regardless, so Node would trust the Boks CA while curl, python and git —
+all on OpenSSL — would not. Half the tools in the sandbox work, half fail with certificate
+errors, and the universally documented cure for a certificate error is to stop verifying:
+`curl -k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, `verify=False`. Those switches do not disable
+verification only for the intercepted hosts; they disable it for the real origins too. A
+sandbox that refuses to start, and says why, is the cheaper failure. The refusal is narrow —
+it is only reachable when the sandbox intercepts something in the first place. Unix keeps its
+existing behaviour of leaving the three replacing variables unset, since a Unix host with none
+of the four paths is a host on which Go itself has no roots.
+
 ### The stack has to outlive the command, so it lives in its own process
 
 A persistent sandbox outlives the command that created it — that is the point of it. But

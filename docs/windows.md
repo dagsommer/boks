@@ -1438,6 +1438,71 @@ rather than a mode. That is a new dependency edge and code that can only be veri
 Windows machine, so it is deliberately not attempted before there is a Windows backend for it to
 protect.
 
+### The guest's trust bundle is now built on Windows too
+
+Unlike the gap above, this one is closed in code — but the code has never run, and the
+distinction between "closed" and "verified" is the whole point of this document.
+
+**What was broken.** When a sandbox intercepts TLS, the guest is shown certificates minted by
+the Boks CA and must trust it, while still trusting the public roots for every destination Boks
+does *not* intercept. Boks satisfies both by writing one bundle — the host's public roots with
+the Boks CA appended — and pointing `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`
+at it. Those roots were read from a list of Unix PEM paths, so on Windows there were none, and
+the three variables were silently left unset. `NODE_EXTRA_CA_CERTS` is additive and was set
+regardless, which made the failure *partial*: Node would trust the Boks CA and everything on
+OpenSSL — curl, python, git — would not.
+
+Partial is the worst of the three states. The sandbox's occupant is an untrusted coding agent,
+and the answer the internet gives to "certificate verify failed" is to stop verifying. `curl
+-k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, `verify=False` and `http.sslVerify false` are each one
+turn away, and none of them are scoped to the intercepted hosts — they switch verification off
+for the real origins too, where Boks is not in the path and the end-to-end guarantee was
+genuine. So the bug was not "curl fails on Windows"; it was a standing incentive to disable TLS
+verification inside the sandbox.
+
+**What was built** (`internal/enforce/roots.go`, `roots_windows.go`):
+
+- The `ROOT` system store is enumerated through `CertOpenSystemStore` /
+  `CertEnumCertificatesInStore` and each `CERT_CONTEXT`'s DER is encoded as PEM. Go cannot be
+  asked for this: `x509.SystemCertPool` on Windows returns an opaque pool that defers to
+  `CertGetCertificateChain` at verification time and cannot be enumerated, by design.
+  `CertOpenSystemStore` opens `ROOT` as a *collection* — per-user, machine-wide, group policy
+  and enterprise — which is what picks up a corporate root pushed by an organisation that
+  inspects TLS.
+- The `Disallowed` store is enumerated too and subtracted by exact DER equality. A PEM bundle
+  has no way to express distrust, so a root the host has stopped trusting has to be left out or
+  it would be re-trusted inside the guest. The known limitation: Microsoft also distributes
+  distrust as a hash-keyed certificate trust list with no certificate body to match against,
+  and those entries cannot be seen this way.
+- The `CA` intermediate store is **not** read, deliberately. OpenSSL, Python and curl load every
+  certificate in a `SSL_CERT_FILE` bundle as a *trust anchor*, so including cached intermediates
+  would promote them to roots inside the guest — trusting more than the host does, and making a
+  guest's trust depend on which sites the host has visited.
+- Failure is loud. If the store cannot be read, or yields nothing usable, `Prepare` returns an
+  error and no sandbox is created, with a message that says what the bundle is for and offers
+  running without interception. The refusal is only reachable when the sandbox intercepts
+  something.
+- No new module: `golang.org/x/sys` is already a direct dependency, used by
+  `internal/enforce/peeruid_*.go` and `internal/sandbox/terminal_*.go` for its `unix` package.
+
+**Unix is untouched, and that is asserted rather than asserted-to.** The Unix lookup still
+reads the same four paths in the same order and hands the file over verbatim;
+`roots_unix_test.go` compares `hostRoots` byte-for-byte against the file it locates
+independently, and compares the written guest bundle against that file followed by the CA. Both
+were confirmed to fail against a deliberately mutated Unix path that routed it through the new
+encoder.
+
+**What has not been verified, and cannot be here.** Nothing in `roots_windows.go` has been
+executed. No machine on this project runs Windows, so the store enumeration itself — that
+`CertOpenSystemStore(0, "ROOT")` returns the collection described above, that the loop
+terminates on `CRYPT_E_NOT_FOUND` rather than hanging or erroring, that `Disallowed` opens on a
+machine where it is empty, that the resulting bundle is one OpenSSL accepts, and that a guest
+given it can reach both an intercepted and an ordinary host — is unproven. What *is* established
+is that it compiles for `windows/amd64` and `windows/arm64` including the test binary, and that
+every decision downstream of the syscalls (`rootsPEM`, `windowsRootBundle`) is tested on Linux
+with synthetic DER, which is why those two functions are in the untagged file. The verification
+checklist below is the place to record a real run.
+
 ---
 
 ## What is unknown
@@ -1485,10 +1550,13 @@ For someone with a Windows 11 machine and hardware virtualisation. Written in th
 [verification.md](verification.md): each step says what would count as evidence, and none of it
 has been run.
 
-Four parts, in descending order of value:
+Five parts, in descending order of value:
 
 - **Part D (steps 15–17) — Boks inside WSL2.** The only steps here that could produce a
   *working* Boks sandbox on a Windows machine, and the cheapest to run. Start here.
+- **Part E (steps 19–21) — the guest trust bundle.** The only Windows-specific Boks code that
+  can be exercised today: it needs a Go toolchain and nothing else, no hypervisor and no
+  sandbox. Cheapest of the lot.
 - **Part A (steps 1–4) — corroborate section 7.** That section reverses this document's
   original verdict on the strength of an import table; an afternoon would make it an
   observation.
@@ -1745,6 +1813,46 @@ a working Boks sandbox on a Windows machine.
     To identify the substrate rather than the guest, look from the Windows side instead:
     `wsl -l -v` for the distributions in play, and Task Manager / `Get-VM` for whether a
     separate Hyper-V VM exists per sandbox.
+
+### Part E — the guest trust bundle on Windows
+
+The one piece of Windows-specific Boks code that could be exercised today, on a Windows machine
+with no hypervisor and no sandbox at all. It needs only the Go toolchain.
+
+19. **Confirm the `ROOT` store enumerates.** With a checkout on a Windows host:
+
+    ```
+    go test ./internal/enforce/ -run RootsPEM -count=1
+    ```
+
+    That much is expected to pass anywhere. The store enumeration itself has no test, because
+    it cannot have a meaningful one — write a five-line `main` that calls `systemStoreDER`
+    (or copy it) and print the count and the subjects.
+
+    Evidence: a count in the low hundreds, matching `certutil -store -user ROOT | findstr
+    /c:"Serial Number" | measure`, and PEM that `openssl crl2pkcs7 -nocrl -certfile bundle.pem
+    | openssl pkcs7 -print_certs -noout` reads without complaint.
+
+    **A count of zero is the interesting result**, since it is the case that now refuses to
+    start a sandbox. Report it with the store name and the error.
+
+20. **Confirm `Disallowed` opens on a machine that has never had one.** The same program
+    against `"Disallowed"`. An error here is currently fatal to `Prepare`, and that choice was
+    made without knowing whether a never-populated untrusted store opens cleanly.
+
+    Evidence: it opens and enumerates, possibly to zero certificates. If it *errors* on a stock
+    machine, the fatal treatment is wrong and should become a warning — report it.
+
+21. **Confirm the bundle works inside a guest.** Only possible once there is a Windows backend,
+    or by copying the generated bundle into a Linux container by hand:
+
+    ```
+    docker run --rm -v "$PWD/bundle.pem:/b.pem" -e SSL_CERT_FILE=/b.pem alpine \
+        sh -c "apk add -q curl && curl -sS -o /dev/null -w '%{http_code}\n' https://example.com"
+    ```
+
+    Evidence: `200`. This is what proves the file is one OpenSSL accepts as a whole trust store,
+    which is the property that would be lost if a single malformed entry made it into the file.
 
 ### Recording results
 
