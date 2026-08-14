@@ -1029,6 +1029,46 @@ a process that never started now get a second instead
 Every failure mode ranked ahead of this one is now cleared on that machine. Elevation is
 still required, for the task-bundle symlink.
 
+### A container runs in a microVM on Windows, 2026-08-14
+
+`ctr tasks start` on real Windows 11 hardware, through the whole stack — containerd, the
+nerdbox shim over ttrpc, `krun.dll`, the Windows Hypervisor Platform:
+
+```
+HELLO-FROM-THE-VM
+Linux (none) 6.12.44 #1 SMP Thu Aug 13 14:58:57 UTC 2026 x86_64 Linux
+1.22 0.56
+```
+
+Three lines, and each is load-bearing:
+
+- **`HELLO-FROM-THE-VM`** — the container's own process ran and its stdout reached the host.
+- **`uname -a`** reports **6.12.44**, the guest kernel this project builds, not the Windows
+  host. A shared-kernel container cannot produce that line.
+- **`/proc/uptime` = `1.22 0.56`** — non-zero and self-consistent, so the clock advances
+  under the shim and not only under a bare probe. That is the CPUID crystal fix holding in
+  production.
+
+`t_boot=1.90127s`, `t_create=121.648ms`, boot to exited container in about 2.2 s.
+
+The spec that reached the guest has no `windows` key anywhere, and containerd's stored spec
+reports `windows: ABSENT` — the `layerFolders` fix confirmed from both ends.
+
+The console baseline held exactly: `activate event`, `Device is ready`, `Port ready 0`,
+`Starting port io for port 0`, once each in order, handshake in 11 ms.
+
+**What this does not mean.** This is `ctr`, not `boks run`. Boks' own path still stops
+earlier, at the network refusal in `internal/network/vmm_windows.go`, and no Ethernet frame
+has yet crossed the virtio-net device on Windows. Elevation is still required, for the
+task-bundle symlink at `bundle.go:103`. So: the stack underneath Boks works on Windows; Boks
+on Windows does not yet.
+
+**Still open, measured in the same run.** The delete path stalls a fixed 30.009 s —
+`reaped child process` at 12:47:08.080, then `failed to shutdown io after delete: io
+shutdown: context deadline exceeded` at 12:47:38.089. Output is already complete by then, so
+it is cosmetic, but every container takes thirty seconds to reap. The create-failure path
+was fixed; this is a second call site.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
