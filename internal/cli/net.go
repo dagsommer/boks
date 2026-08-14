@@ -132,28 +132,45 @@ proxy attaches to requests and those must not be visible in the process table.`,
 }
 
 // networkFor decides which network a sandbox gets, honouring what an existing sandbox was
-// already wired for, and tells the user when the two differ.
+// already wired for, and refusing to run when this invocation asked for a different one.
 //
 // The mode is fixed when a sandbox is created, because it lives in annotations the runtime
 // reads at boot. Silently applying `-net none` to a sandbox created with a network would be
 // the worst kind of wrong: the flag would appear to be obeyed while the container stayed
-// connected.
-func networkFor(inv invocation, requested network.Mode, explicit bool, stderr io.Writer) (mode network.Mode, wired bool) {
+// connected. That is what used to happen — the disagreement was printed as a `note:` and then
+// the sandbox ran with its original mode anyway, so a user who typed `-net none` got NAT and
+// a line of prose saying so, several lines above whatever they were actually reading.
+//
+// So it is an error. A flag that cannot be honoured must not be silently discarded, and the
+// message already said the right thing; only the behaviour was wrong. The refusal is on any
+// disagreement, in either direction: `-net none` against a NAT sandbox is a containment
+// failure, and `-net nat` against a none sandbox is not, but it is still a request that will
+// not be met, and the user finds out either way before anything runs rather than from a
+// connection that mysteriously fails inside the guest.
+//
+// This is deliberately stricter than the policy flags on the same path, which are applied.
+// The difference is whether the request can be met at all: `--allow`/`--deny`/`--policy`
+// resolve into the stack this run is about to start, so they take effect now even though they
+// are not recorded on the sandbox, and they can only narrow what a later `boks start` will
+// serve. The network mode cannot be applied at all — the annotations are already on the
+// container — so there is nothing to do with the flag except refuse it.
+func networkFor(inv invocation, requested network.Mode, explicit bool, stderr io.Writer) (mode network.Mode, wired bool, err error) {
 	if !inv.exists {
-		return requested, true
+		return requested, true, nil
 	}
 	existing, wired := network.ModeFromAnnotations(inv.info.Annotations)
 	if !wired {
 		fmt.Fprintf(stderr, "%s", unwiredSandboxWarning(inv.name))
-		return existing, false
+		return existing, false, nil
 	}
 	if explicit && existing != requested {
-		fmt.Fprintf(stderr,
-			"note: sandbox %q is wired for -net %s, which is fixed when a sandbox is created.\n"+
-				"      Remove it and run again to change it: boks rm %s\n",
-			inv.name, existing, inv.name)
+		return existing, true, fmt.Errorf(
+			"sandbox %q is wired for -net %s, and the mode is fixed when a sandbox is created.\n"+
+				"This run asked for -net %s, which cannot be applied to a sandbox that already exists.\n"+
+				"Remove it and run again to change it: boks rm %s",
+			inv.name, existing, requested, inv.name)
 	}
-	return existing, true
+	return existing, true, nil
 }
 
 // unwiredSandboxWarning covers a sandbox created before Boks wired networking, or by
@@ -178,7 +195,10 @@ func unwiredSandboxWarning(name string) string {
 func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocation, cfg *sandbox.Config,
 	requested network.Mode, quiet bool, env Env) (bool, error) {
 
-	mode, wired := networkFor(inv, requested, flags.mode != "", env.Stderr)
+	mode, wired, err := networkFor(inv, requested, flags.mode != "", env.Stderr)
+	if err != nil {
+		return false, err
+	}
 	if !wired {
 		// A sandbox Boks did not wire has no link socket to hold and no stack that
 		// could reach it. networkFor has already said so, loudly.
@@ -283,7 +303,7 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 	// Said before the sandbox is created, on the platform where the link has never carried
 	// a frame, and said regardless of --quiet: asking for less output is not consent to a
 	// network that may be enforcing nothing.
-	if unexercised := network.Unexercised(); unexercised != nil {
+	if unexercised := network.Unexercised(); warnUnexercisedNetwork(unexercised, spec.Plan.Mode) {
 		fmt.Fprint(stderr, unexercisedNetworkWarning(unexercised))
 	}
 	state, err := enforce.Ensure(ctx, spec, stderr)
@@ -291,6 +311,27 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 		return enforce.State{}, false, err
 	}
 	return state, true, nil
+}
+
+// warnUnexercisedNetwork answers whether this run should warn that the sandbox network has
+// never been shown to work. Two things have to be true, and the second one is the point.
+//
+// The platform must be one where nothing has been seen putting a frame on the link, which is
+// what unexercised reports. But there must also be a link the guest could dial, and under
+// -net none there is not. The VM is still given a NIC — that is exactly what turns the
+// runtime's own transport off, and with it the guest's route to host loopback — but the host
+// end of it is a blackhole that accepts the connection and discards everything: no stack, no
+// proxy, no listener, no policy. Every claim the warning makes is then false. It says boks is
+// "attempting a sandbox network" when boks is attempting the opposite; it tells the reader to
+// check `boks policy log` for a decision, when nothing in this mode ever reaches a decision;
+// and it says a guest that comes up anyway "is not contained", when -net none is the most
+// contained a sandbox gets and the only mode whose containment does not rest on the
+// unexercised code. Warning here would teach the user to distrust the one thing that works.
+//
+// It takes the platform answer as an argument, rather than reading it, so a test can construct
+// the Windows case on a machine that is not Windows.
+func warnUnexercisedNetwork(unexercised error, mode network.Mode) bool {
+	return unexercised != nil && mode != network.ModeNone
 }
 
 // unexercisedNetworkWarning is printed before a sandbox is created on a platform where
