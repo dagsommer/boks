@@ -176,8 +176,11 @@ each one leaves you holding. The short version:
 - **Linux** — a tarball, a `.deb` or an `.rpm`, each containing the CLI alone. No
   distribution packages a containerd new enough or nerdbox at all, so the rest is yours to
   assemble. Untested end to end.
-- **Windows** — no binary, deliberately. Run the Linux build inside WSL2; see
-  [docs/windows.md](docs/windows.md).
+- **Windows** — no binary, deliberately: `boks run` stops at its own network refusal there,
+  and a binary whose only output is a refusal would make the platform look done. The stack
+  under it does run a container, through `ctr` rather than `boks`
+  ([docs/windows-e2e.md](docs/windows-e2e.md)). For actual use, run the Linux build inside
+  WSL2; see [docs/windows.md](docs/windows.md).
 
 ## Quick start
 
@@ -447,12 +450,15 @@ enforces — what matters most is watching it work against a real guest.
 6. UDP port publishing, which needs the link filter to carry a datagram's return path without
    becoming a general hole
 8. Kits / declarative configuration
-9. Windows — **investigated; the obstacle is one device driver, not the platform.** libkrun's
-   Windows Hypervisor Platform backend is in progress upstream for libkrun 2.0, and nerdbox
-   already builds a Windows shim for it. **virtio-net is the single device not yet ported** —
-   which is exactly the one Boks' enforcement depends on. In the meantime Boks should run
-   **inside WSL2** with nested virtualisation: unchanged, with workspace paths preserved
-   exactly. Untested, but every ingredient is there. See [docs/windows.md](docs/windows.md)
+9. Windows — **the stack underneath Boks runs a container there; `boks run` does not.** On
+   2026-08-14, on real Windows 11 hardware, `ctr tasks start` carried a Linux container end to
+   end through containerd, a patched nerdbox shim, `krun.dll` and the Windows Hypervisor
+   Platform, booting in 1.9 s. What is left for Boks is **virtio-net** — exactly the device its
+   enforcement depends on — across which no Ethernet frame has yet passed on Windows, so
+   `boks run` refuses to start sandbox networking there rather than pretend. In the meantime
+   Boks should run **inside WSL2** with nested virtualisation: unchanged, with workspace paths
+   preserved exactly. Untested, but every ingredient is there. See
+   [docs/windows.md](docs/windows.md)
 
 ## Development
 
