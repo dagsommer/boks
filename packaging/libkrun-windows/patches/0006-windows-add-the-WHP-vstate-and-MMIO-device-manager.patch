@@ -1,7 +1,7 @@
 From 96ea8a432dc32d963ffa2336e67a5a544fe91851 Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:16:05 +0200
-Subject: [PATCH 06/36] windows: add the WHP vstate and MMIO device manager
+Subject: [PATCH 06/37] windows: add the WHP vstate and MMIO device manager
 
 Adds the two modules whose absence accounted for essentially all of the
 krun-vmm Windows build failures: `src/vmm/src/windows/` (Vm, Vcpu, the run
@@ -1455,6 +1455,3 @@ index 735c290..d01bc5b 100644
      pub fn vm(&self) -> &Arc<WhpVm> {
          &self.vm
      }
--- 
-2.53.0
-

@@ -1,7 +1,7 @@
 From 3ce2d615541860a5916ef90b24388d64a57aecff Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Fri, 14 Aug 2026 09:07:48 +0200
-Subject: [PATCH 35/36] libkrun: restore krun_set_exec() for non-nitro builds
+Subject: [PATCH 35/37] libkrun: restore krun_set_exec() for non-nitro builds
 
 Driving a real containerd through the nerdbox shim on Windows 11 gets as far as
 CreateTask with the right erofs/ext4/overlay mounts and then dies 48 ms into VM
@@ -352,6 +352,3 @@ index 4a77bf5..c162222 100644
      };
  
      if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
--- 
-2.53.0
-

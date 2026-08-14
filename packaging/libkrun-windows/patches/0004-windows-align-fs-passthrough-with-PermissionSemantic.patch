@@ -1,7 +1,7 @@
 From 2555b7b44640d21112152d0be154b86b8539ba4f Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 13:39:51 +0200
-Subject: [PATCH 04/36] windows: align fs passthrough with PermissionSemantics,
+Subject: [PATCH 04/37] windows: align fs passthrough with PermissionSemantics,
  poll serial input by HANDLE
 
 The in-tree Windows virtio-fs passthrough predates the PermissionSemantics
@@ -140,6 +140,3 @@ index 7a9fb12..1de7387 100644
  /// A thin wrapper around a raw `HANDLE` that implements [`Send`].
  ///
  /// Raw pointers do not implement `Send`, but Windows kernel handles are safe
--- 
-2.53.0
-

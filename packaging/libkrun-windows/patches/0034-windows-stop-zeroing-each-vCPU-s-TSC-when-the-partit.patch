@@ -1,7 +1,7 @@
 From a187e12a395566fd60c7a8b6b28124d60e11b43e Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Fri, 14 Aug 2026 08:28:38 +0200
-Subject: [PATCH 34/36] windows: stop zeroing each vCPU's TSC when the
+Subject: [PATCH 34/37] windows: stop zeroing each vCPU's TSC when the
  partition has several
 
 `setup_msrs` wrote `WHvX64RegisterTsc = 0` on every vCPU, which is exact parity
@@ -181,6 +181,3 @@ index 2b67d40..5581774 100644
              arch::x86_64::regs::setup_regs(whp_vcpu, kernel_start_addr.raw_value())
                  .map_err(Error::REGSConfiguration)?;
              arch::x86_64::regs::setup_sregs(guest_mem, whp_vcpu)
--- 
-2.53.0
-

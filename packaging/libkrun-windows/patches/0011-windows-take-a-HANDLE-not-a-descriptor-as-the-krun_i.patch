@@ -1,7 +1,7 @@
 From 767eb801fe3fc8b7673c31499eaea3c2e2ae4f5f Mon Sep 17 00:00:00 2001
 From: Dag Sommer <dagaleks@gmail.com>
 Date: Thu, 13 Aug 2026 14:39:07 +0200
-Subject: [PATCH 11/36] windows: take a HANDLE, not a descriptor, as the
+Subject: [PATCH 11/37] windows: take a HANDLE, not a descriptor, as the
  krun_init_log target
 
 A CRT file descriptor is private to the CRT instance that created it, and
@@ -188,6 +188,3 @@ index ac92dcb..b6a3b65 100644
  
          let filter = log_level_to_filter_str(level);
  
--- 
-2.53.0
-
