@@ -241,6 +241,34 @@ func Forget(stateDir, sandbox string) error {
 	return nil
 }
 
+// supervisorFailure is the reason a supervisor gave for not coming up, taken from its log,
+// or "" if it wrote nothing usable.
+//
+// The supervisor's stderr is the log, and the last thing a failing one writes there is the
+// error the CLI prints for it, prefixed with "boks: ". Starting from that prefix keeps a
+// multi-line explanation whole, instead of quoting its final fragment; anything else falls
+// back to the last line written. Reading it costs nothing and turns "look in this file" into
+// the answer the file contains.
+func supervisorFailure(logPath string) string {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return ""
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return ""
+	}
+	if i := strings.LastIndex(text, cliErrorPrefix); i >= 0 {
+		text = text[i+len(cliErrorPrefix):]
+	} else if i := strings.LastIndexByte(text, '\n'); i >= 0 {
+		text = text[i+1:]
+	}
+	return strings.TrimSpace(text)
+}
+
+// cliErrorPrefix is what cmd/boks puts in front of an error on its way out; see cli.Main.
+const cliErrorPrefix = "boks: "
+
 // spawn starts a supervisor process and waits for it to report the link socket bound.
 func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 	self, err := os.Executable()
@@ -279,13 +307,25 @@ func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 	// so we do not leave a zombie for the lifetime of this command.
 	defer func() { _ = cmd.Process.Release() }()
 
+	logPath := filepath.Join(dir, logFile)
 	ready := make(chan error, 1)
 	go func() {
 		line, err := bufio.NewReader(stdout).ReadString('\n')
 		switch {
 		case err != nil:
-			ready <- fmt.Errorf("the network supervisor exited before it was ready; see %s",
-				filepath.Join(dir, logFile))
+			// The supervisor's stdout carries nothing but the ready marker, so end
+			// of file here means the process is gone. *Why* it is gone is in its
+			// log, and the difference between "it crashed" and "it declined to
+			// start" is the whole content of the message: a supervisor that refused
+			// deliberately is not one that died, and a user told it died goes
+			// looking for a crash that never happened.
+			if reason := supervisorFailure(logPath); reason != "" {
+				ready <- fmt.Errorf("the network supervisor did not start: %s\n(its full log is %s)",
+					reason, logPath)
+				return
+			}
+			ready <- fmt.Errorf("the network supervisor exited before it was ready, saying nothing; see %s",
+				logPath)
 		case strings.TrimSpace(line) != readyMarker:
 			ready <- fmt.Errorf("the network supervisor said %q instead of %q", strings.TrimSpace(line), readyMarker)
 		default:
@@ -302,7 +342,7 @@ func spawn(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 	case <-time.After(readyTimeout):
 		_ = terminate(cmd.Process.Pid)
 		return State{}, fmt.Errorf("enforce: the network supervisor did not come up within %s; see %s",
-			readyTimeout, filepath.Join(dir, logFile))
+			readyTimeout, logPath)
 	case <-ctx.Done():
 		_ = terminate(cmd.Process.Pid)
 		return State{}, ctx.Err()
@@ -350,7 +390,16 @@ func Serve(ctx context.Context, spec Spec, ready io.Writer, watch func(context.C
 	// sandbox's network alive" answerable without trusting a PID.
 	release, err := acquire(filepath.Join(dir, lockFile))
 	if err != nil {
-		return fmt.Errorf("boks net serve: sandbox %q already has a network supervisor: %w", spec.Sandbox, err)
+		if errors.Is(err, errLockHeld) {
+			return fmt.Errorf("boks net serve: sandbox %q already has a network supervisor: %w",
+				spec.Sandbox, err)
+		}
+		// The lock was not taken, and nothing here knows why — so nothing here may
+		// invent a reason. Anything but a held lock is reported as itself: a platform
+		// that refuses to run a supervisor at all says that, and a state directory
+		// that cannot be written says that, instead of both being announced as a
+		// supervisor that is already running.
+		return fmt.Errorf("boks net serve: sandbox %q: %w", spec.Sandbox, err)
 	}
 	defer release()
 
