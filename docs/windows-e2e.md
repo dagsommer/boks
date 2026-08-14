@@ -3,16 +3,26 @@
 The procedure for the first `ctr run` on Windows: containerd, the nerdbox shim, `krun.dll`, a
 Linux guest kernel and an EROFS rootfs, composed into one container.
 
-> **Steps 0–3 have been executed on Windows 11. Steps 4–7 have not.** This document was written
-> entirely by reading source — containerd v2.3.3, nerdbox v0.2.3 (`cd2c23f`), and the Boks patch
-> series in `packaging/` — and every expectation is labelled **source** (traced to a specific
-> file and line), **inference** (reasoned from one), or **unknown**. Where a step *was* measured
-> on the Windows 11 test machine, it says so and gives the date.
+> **All of it has now been executed on Windows 11, on 2026-08-14, and it works.** `ctr tasks
+> start` printed the container's stdout, the guest kernel's own `uname -a` and a non-zero
+> `/proc/uptime`, booting in `t_boot=1.90127s` — see [verification.md](verification.md).
 >
-> The first run through it found two things reading had missed, and both are now folded in: a
-> silent-corruption trap in containerd's `mkfs` handling (`patches/0005`, and the note in step 5)
-> and the fact that **creating a task needs elevation or Developer Mode** ("Before step 0"). The
-> version of this document that said to run all of it unelevated was wrong.
+> That changes how to read the rest of this page. It was written entirely from source —
+> containerd v2.3.3, nerdbox v0.2.3 (`cd2c23f`), and the Boks patch series in `packaging/` — and
+> every expectation is labelled **source** (traced to a specific file and line), **inference**
+> (reasoned from one), or **unknown**. Those labels are kept as written, because they record how
+> each claim was arrived at and that is worth more than flattening them all to "measured" after
+> the fact. Where a step's *outcome* has since been observed, it says so and gives the date.
+>
+> Running it found four things reading had missed, all folded in: a silent-corruption trap in
+> containerd's `mkfs` handling (`patches/0005`, and the note in step 5); that **creating a task
+> needs elevation or Developer Mode** ("Before step 0"); a `windows` section in the OCI spec that
+> `crun` refused; and a 30-second stall on every container's delete
+> (`packaging/nerdbox-windows/patches/0005`). The version of this document that said to run all
+> of it unelevated was wrong.
+>
+> One thing this page still does not do is start a **Boks** sandbox. `boks run` stops earlier,
+> at the network refusal in `internal/network/vmm_windows.go`, and nothing here changes that.
 
 The command this is all for:
 
@@ -36,12 +46,15 @@ nobody else's — so the procedure splits it in two.
 | the nerdbox shim starts, serves its ttrpc and log pipes, emits valid bootstrap params | **measured**, 2026-08-14 |
 | containerd unpacks a Linux image with the EROFS snapshotter | **measured**, 2026-08-14 |
 | containerd creates a usable `--root` unelevated | **fixed by a documented prerequisite** — see `packaging/containerd-windows/README.md` |
-| `ctr run` can produce a Linux OCI spec on Windows | **patched**, never run — `patches/0004` |
+| `ctr run` can produce a Linux OCI spec on Windows | **measured**, 2026-08-14 — `patches/0004`, plus a follow-up that stopped a `windows` section being written into a Linux spec. The spec that reached the guest has no `windows` key and containerd's stored copy reports `windows: ABSENT` |
 | a failed `mkfs.ext4` cannot be mistaken for a formatted image | **patched** — `patches/0005`. Before it, the file a failed format left behind was accepted by the next attempt and the guest would have been handed 64 MiB of zeroes as ext4 |
 | creating a task bundle at all | **blocked without elevation or Developer Mode.** `NewBundle` symlinks unconditionally; measured 2026-08-14. See "Before step 0" below |
-| any of the above composed into one container | **never attempted.** This document. |
+| all of the above composed into one container | **measured**, 2026-08-14 — `HELLO-FROM-THE-VM`, `uname -a` naming the 6.12.44 guest kernel, `/proc/uptime` advancing. This document. |
+| the same, with a NIC | **never attempted.** No `krun_add_net_*` call has been made on Windows |
+| deleting the task promptly | **stalls 30 s**, measured 2026-08-14. Fixed by `packaging/nerdbox-windows/patches/0005`, which has not been run |
 
-Each stage works alone. Nothing has ever been run in sequence.
+Every stage has now been run in sequence, once, on one machine. What has never been run is any
+of it with a network device attached — which is the only part Boks itself needs.
 
 ## 1. What you need, and where each piece comes from
 
@@ -204,9 +217,9 @@ the elevated daemon a fresh root of its own and let it create it; `new-container
 for the unelevated case only. Full reasoning in `packaging/containerd-windows/README.md`,
 "Elevation, Developer Mode, and the choice you actually have".
 
-*That elevation makes the symlink succeed is inferred from Windows' default privilege
-assignment plus the unelevated failure measured above; nobody has watched containerd create a
-task bundle elevated.*
+*That elevation makes the symlink succeed was inferred from Windows' default privilege
+assignment plus the unelevated failure measured above. It is now measured too: containerd
+created the task bundle, and the container ran, on 2026-08-14.*
 
 ### Step 0 — create containerd's root and state
 
@@ -435,8 +448,9 @@ failure means "the VM did not run a container" rather than "something about I/O"
 **Success:** exit status 0 from `/bin/true`, and in the containerd console a shim log showing
 the VM starting.
 
-This is the step where everything unexercised lives. What is *supposed* to happen, read out of
-nerdbox:
+This was the step where everything unexercised lived, and on 2026-08-14 all fourteen points
+below happened. They are kept in the tense they were written in — what is *supposed* to happen,
+read out of nerdbox — because that is what makes a deviation on your machine legible:
 
 1. containerd creates the bundle at `C:\cdtest\state\io.containerd.runtime.v2.task\boks\e2e`
    and execs `containerd-shim-nerdbox-v1.exe ... start` with that as its **working directory**
@@ -489,8 +503,8 @@ nerdbox:
 `Kernel panic - not syncing: Attempted to kill init!`, and the reason is now legible: that probe
 configured no vsock at all, so `vminitd`'s dial-back to host CID 2 had nothing to reach and PID 1
 exited. Through this path both ports are configured before `krun_start_enter`. So the **expected
-behaviour is that vminitd survives** — that is an **inference from source**, and the single most
-informative thing this step can tell us either way.
+behaviour is that vminitd survives** — that was an **inference from source**, and the single most
+informative thing this step could tell us either way. It survived, on 2026-08-14.
 
 Read the guest kernel's own output while diagnosing: `console=hvc0` is wired to a named pipe at
 `\\.\pipe\krun-console-<shim pid>-<vm id>` (`internal/vm/libkrun/console_windows.go:40`), which
@@ -513,7 +527,16 @@ ctr.exe -n boks tasks start e2e2
 ```
 
 **Success:** `hello` on your console. That exercises vsock port 1026, the length-prefixed
-stream-ID handshake with echo ack (`instance.go:387-431`) and the Windows stdio pipes.
+stream-ID handshake with echo ack (`instance.go:387-431`) and the Windows stdio pipes. Measured
+2026-08-14.
+
+**Expect a 30-second pause after the output, before the command returns.** The container has
+already exited and everything it printed is already on your console; the shim is waiting for a
+stdin copy that cannot end, because containerd's Windows client never closes its end of the
+stdin pipe. It gives up after 30 s and logs `failed to shutdown io after delete: io shutdown:
+context deadline exceeded`. Cosmetic, and fixed by
+`packaging/nerdbox-windows/patches/0005` — which has not itself been run. With `--null-io` the
+pause does not happen at all, because there is no stdio to tear down.
 
 Then, and only then, a terminal:
 
@@ -591,6 +614,11 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
 
 ## 6. Failure modes, most likely first
 
+**Every one of these has now been cleared on one machine**, on 2026-08-14 — the container ran, so
+by definition none of them fired at the end. They are kept in rank order because the ranking is
+for *your* first run, not for that one, and items 1, 2, 3, 5 and 6 each fired at least once on
+the way there. Where a mode was predicted and then observed, it now says which.
+
 1. **`NewBundle` cannot create its symlink** — certain from step 4 onwards on an unelevated
    machine without Developer Mode, and it lands before the shim is ever launched. Measured,
    2026-08-14. *Fix: elevate, or Developer Mode, or stop after step 3. See "Before step 0".*
@@ -615,34 +643,40 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
    *Fix: step 4's check, which now requires `$null -eq $s.windows` too.*
 6. **containerd locked out of its own root.** Certain on a clean machine without step 0.
    Measured. Reported as a content-store `mkdir` denial with 43 plugin failures.
-7. **The five shim stubs that have never executed.** PR #13948 implements `newServer`,
-   `serveListener`, `reap`, `openLog` and `subreaper` for Windows; `setupSignals` is the only one
-   that has ever run, and only because it is the first. A real containerd driving a real ttrpc
-   TaskService over `serveListener`'s pipe is new ground, and #13948 is unmerged upstream and has
-   never been run against nerdbox by anyone, including its author.
-   `packaging/nerdbox-windows/README.md` lists four specific things in it that look wrong.
-   Symptom shape: the shim starting and then failing to serve, or a 10 s hang followed by
-   `waitForShimPipe` giving up.
-8. **The vsock link between Go's AF_UNIX and libkrun's Winsock backend.** Never exercised in
-   either direction. Both ends are ours, both are new, and they must meet on a relative path with
-   backslashes (`vm\run_vminitd.sock`). Symptom: `VM did not connect within 30s`, with the guest
-   either never having dialled or having dialled somewhere else. The libkrun side is
-   `packaging/libkrun-windows/patches/0017`, whose own message says "Not executed."
+7. **The five shim stubs that had never executed.** **Cleared, 2026-08-14.** PR #13948
+   implements `newServer`, `serveListener`, `reap`, `openLog` and `subreaper` for Windows; before
+   that run `setupSignals` was the only one that had ever executed, and only because it is the
+   first. A real containerd has now driven a real ttrpc TaskService over `serveListener`'s pipe,
+   through a container's whole lifecycle, and nothing in #13948 needed fixing. `openLog` is still
+   unexercised — nerdbox sets `NoSetupLogger` — and `packaging/nerdbox-windows/README.md` lists
+   four things in the PR that look wrong regardless. Symptom shape if it does fail for you: the
+   shim starting and then failing to serve, or a 10 s hang followed by `waitForShimPipe` giving
+   up.
+8. **The vsock link between Go's AF_UNIX and libkrun's Winsock backend.** **Cleared,
+   2026-08-14**, in both directions: ttrpc on 1025 and the stdio streams on 1026. Both ends are
+   ours and they meet on a relative path with backslashes (`vm\run_vminitd.sock`). Symptom if it
+   fails: `VM did not connect within 30s`, with the guest either never having dialled or having
+   dialled somewhere else. The libkrun side is `packaging/libkrun-windows/patches/0017`, whose
+   own message still says "Not executed"; that message is now out of date, and the patch is
+   regenerated rather than edited, so trust this line over it.
 9. **The VM failing to boot under the shim although it boots under a bare probe.** The shim's VM
    has strictly more in it: two or more virtio-blk disks, two vsock ports, a console pipe, and a
    guest kernel cmdline the probe did not use. nerdbox's own `integration/test.ps1` records that
    **Windows allows only one VM partition per process with the current libkrun build**, which
    also means a shim that leaks a partition poisons every later container in that shim.
-10. **`vminitd` exiting.** The panic seen before was caused by a probe with no vsock; this path
-   configures both ports, so it should survive (**inference**). Everything after the dial-back —
-   the tmpfs overlays over `/etc`, `/run`, `/tmp` on a read-only erofs root, mounting the
-   container layers, invoking crun — has never run on a Windows-hosted VM. Watch the console pipe.
+10. **`vminitd` exiting.** **Cleared, 2026-08-14.** The panic seen before was caused by a probe
+   with no vsock; this path configures both ports, and the inference that vminitd would survive
+   held. Everything after the dial-back — the tmpfs overlays over `/etc`, `/run`, `/tmp` on a
+   read-only erofs root, mounting the container layers, invoking crun — ran. Watch the console
+   pipe if yours does not.
 11. **crun rejecting the spec.** Two candidates, both from containerd's spec generation rather
    than from nerdbox. The first is no longer a candidate: the empty `"windows": {}` object that
    nerdbox forwards verbatim **is** rejected — measured 2026-08-14, `Required field 'layerFolders'
    not present` — and `patches/0004` now removes it. The second, any other Windows-shaped field
    that survives, remains **unknown**; crun is still not in either tree, and the flags that write
-   into that section are now refused rather than silently dropped.
+   into that section are now refused rather than silently dropped. **On 2026-08-14 crun accepted
+   the spec**, so no such field survived that run — which is evidence about one image and one
+   flag set, not a proof that none can.
 12. **The overlay mount inside the guest.** Requires `{{ mount 0 }}` templates in `upperdir=` and
     `workdir=`, which block mode supplies. If `default_size = 0` is ever set in `config.toml`,
     this becomes `cannot use virtiofs for upper dir in overlay: not implemented` with **no
@@ -663,8 +697,10 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
 
 ## 7. What this procedure cannot tell you
 
-- **Nothing here has been run.** Steps 0–3 rest on measurements from 2026-08-14; steps 4–7 rest
-  entirely on reading.
+- **It has been run once, on one machine.** Every step was executed on 2026-08-14 on a single
+  Windows 11 x86_64 host, with one image, one container at a time and no network device. One
+  successful run is not a supported platform, and the labels on each step still say whether the
+  claim came from reading or from watching.
 - **A container running proves nothing about isolation.** It proves a Linux process executed
   behind WHP. Boks' claims about what a sandbox contains are answered by
   [verification.md](verification.md), and none of that has been re-established on Windows.
@@ -682,7 +718,8 @@ fields survive into the guest: `NoPivotRoot` and `NoNewKeyring`
   skip-if-exists, where a file that merely existed was good enough.
 - **Whether elevation is acceptable is not this document's call.** Steps 4 onwards need an
   elevated daemon or a machine-wide Developer Mode, and both are decisions with costs outside
-  this procedure. Nothing here has been run elevated end to end either.
+  this procedure. The 2026-08-14 run cleared that bar rather than removing it: it is the one
+  prerequisite here that a user cannot satisfy quietly.
 - **The `-info` / `plugins ls` weak-signal warning still applies.** A shim that reports its
   runtime id is a shim that parsed its flags.
 

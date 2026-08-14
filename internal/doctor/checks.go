@@ -237,9 +237,11 @@ func hypervisorLibraryCheck() Check {
 
 func hypervisorLibraryResult(goos, goarch string, getenv func(string) string, fsys libraryFS) Result {
 	if goos != "linux" && goos != "darwin" {
-		// Windows and everything else: the platform check already says why sandboxes
-		// cannot start there, and a libkrun verdict on top of it would be noise about a
-		// backend that does not exist yet. See virt_windows.go.
+		// Windows and everything else: the platform check already says why Boks does
+		// not start a sandbox there, and a libkrun verdict on top of it would be noise
+		// about a library no Boks code path opens on this platform. krun.dll does
+		// exist, and this project builds one that boots a guest — but only containerd's
+		// shim loads it, and Boks never gets that far on Windows. See virt_windows.go.
 		return Result{Status: StatusSkip, Detail: "not applicable on this platform"}
 	}
 
