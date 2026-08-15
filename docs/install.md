@@ -54,8 +54,8 @@ yet) to run containers on this build of containerd."* That plugin is exactly wha
 before Homebrew will load Ruby from it. Naming a formula in full on the command line trusts
 that formula implicitly, so `brew install dagsommer/boks/nerdbox dagsommer/boks/boks` also
 works — but only for the names you actually type. `libkrun/krun/libkrun` is always reached
-as a dependency and so always needs saying out loud. `sbx` has the same requirement, which
-is why its install line begins `brew trust docker/tap`.
+as a dependency and so always needs saying out loud. Any tap-based install has the same
+requirement; it is a Homebrew rule, not something specific to this project.
 
 ### Then three things Homebrew cannot do for you
 
@@ -170,14 +170,18 @@ sudo install -m0755 boks_0.1.0_linux_amd64/boks /usr/local/bin/boks
 > files above are what it names — but no release has been cut, so there is nothing to
 > download until the first tag. Until then, [build from source](#building-from-source).
 
-The packages contain the CLI, its licence and shell completions. They install no
-dependencies beyond a `Recommends: erofs-utils`, and the reason is in their own description:
-**no distribution ships a containerd new enough**, and nerdbox is packaged nowhere. A
-package that declared `Depends: containerd` would install 1.7.x on Ubuntu 24.04 and produce
-a machine that looks provisioned and cannot start a sandbox. So on Linux you are assembling
-the rest of the stack yourself — the list is under
-[What a sandbox needs](#what-a-sandbox-needs) below, and `boks doctor` names each piece as
-it finds it missing.
+The packages carry the runtime as well as the CLI: `boks` in `/usr/bin`, and containerd, the
+nerdbox shim, `libkrun.so` and the guest kernel and root filesystem under
+`/usr/libexec/boks`. They are vendored rather than depended on because **no distribution
+ships a containerd new enough** — Ubuntu 24.04 has 1.7.x and 26.04 has 2.2.2, and a 2.2
+daemon fails at task start — so a package declaring `Depends: containerd` would produce a
+machine that looks provisioned and cannot start a sandbox. `mkfs.erofs` stays a
+`Recommends`, being the one piece distributions package properly.
+
+`boks doctor` currently under-reports a correctly installed package: its `vm runtime`,
+`hypervisor library` and `guest image` checks look on the invoking shell's `PATH` rather than
+in the bundle, so they call the vendored files missing while `runtime skew` finds the same
+shim in the same directory on the same run.
 
 ### `apt-get install boks` — planned, not yet live
 

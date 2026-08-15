@@ -3,145 +3,42 @@
 Run coding agents and other untrusted developer tooling inside isolated microVMs, on your
 own machine.
 
-Boks is a local-first, open-source alternative to Docker Sandboxes (`docker sbx`). No
-account, no cloud service, no telemetry.
+Point Boks at a directory and the code you do not trust gets a virtual machine of its own:
+its own Linux kernel, its own network, and none of your filesystem but the directory you
+named. Your API keys stay on the host and are attached to outbound requests there, so they
+never enter the sandbox. Everything runs locally — no account, no cloud service, no
+telemetry.
 
 > [!WARNING]
-> **Boks is experimental.** The VM boundary and the network policy have both been measured
-> against a real guest (see [Status](#status)), and both hold — but this is a young project
-> with one verified platform, one verified hypervisor, and plenty still unbuilt. Judge it on
-> what the verification document says was observed, not on what the feature list implies.
+> **Boks is experimental.** The VM boundary and the network policy have each been measured
+> against a real guest on macOS, Windows and Linux, and both hold on all three — but the
+> Linux run was inside WSL2 rather than on bare metal, a single hypervisor sits behind all
+> of it, and plenty is still unbuilt. Judge it on what
+> [the verification record](docs/verification.md) says was observed, not on what the feature
+> list implies.
 
-## Status
+## Where it stands
 
-The VM boundary is **verified**. On 2026-08-11, on an Apple M5 Pro running macOS 26.5.2,
-`boks run` booted a real microVM: the guest reported **Linux 6.12.44 aarch64** while the
-host ran **Darwin 25.5.0**, with its own `boot_id`, an uptime of 0.03 s against the host's
-28 days, and vCPU and memory counts matching `--cpus`/`--memory` rather than the host's 18
-cores and 48 GiB. A shared-kernel container cannot produce any of that. Full evidence and
-procedure: [docs/verification.md](docs/verification.md).
+Boks boots a real microVM per sandbox and enforces its network policy outside the guest.
+Both of those have been watched from inside a real guest on three platforms — not simulated,
+and not inferred from the code:
 
-What works, tested locally:
+| Platform | What has been observed there |
+|---|---|
+| **macOS on Apple silicon** | The most thoroughly measured. The VM boundary on 2026-08-11 — a Linux guest against a Darwin host, its own `boot_id`, an uptime of hundredths of a second, vCPU and memory counts tracking the flags rather than the host. Network policy, credential injection and the sandbox lifecycle against a real guest on 2026-08-13. |
+| **Windows 11 on x64** | `boks run` boots a sandbox natively through the Windows Hypervisor Platform, from an ordinary unelevated terminal. On 2026-08-15 an allowed host returned HTTP 200 through Boks' own network stack while a denied one was refused, and workspace write-through, persistence across `stop`, eight-vCPU SMP and clean teardown were all confirmed. One machine, x64 only — there is no arm64 build, and no release you can install yet. |
+| **Linux with `/dev/kvm`** | Verified end to end for the first time on 2026-08-15, in WSL2 on Ubuntu 26.04: 25 of 26 checks passed, three distinct `boot_id`s, and the network boundary held with its positive control — an allowed address completed TLS against the origin's own certificate while a denied one was refused in the same sandbox. |
 
-- `boks doctor` — inspects containerd, the VM runtime, virtualisation, snapshotter and its
-  host tooling, and explains how to fix what is missing.
-- `boks run [agent] [workspace...]` — agent-first, like `sbx run`. Creates a sandbox
-  through containerd or re-attaches to the one that agent and directory already have, runs
-  the agent (or a command after `--`), streams its output, and returns its exit code.
-  `--rm` makes it ephemeral instead.
-- **Agents with prepared images** — `claude`, `codex`, `copilot`, `cursor`, `docker-agent`,
-  `droid`, `gemini`, `opencode` and `shell` each resolve to an image at
-  `ghcr.io/dagsommer/boks/`, built from [`images/`](images/): a shared Debian base with the
-  toolchain preinstalled, plus one thin layer per agent. `kiro` is registered without an
-  image and needs an explicit `--template`. Published to GHCR and public. The base image has
-  since run inside a microVM; the agent CLIs on top of it have not. See
-  [images/README.md](images/README.md), including why nothing in them is installed by a
-  package manager.
-- **The sandbox lifecycle** — `create`, `ls`, `inspect`, `start`, `stop`, `exec`, `rm`, `cp`.
-  Sandboxes persist until removed, and files written inside one survive stop/start —
-  confirmed behind a real microVM, where `start` boots a *new* VM (the `boot_id` changes)
-  over the same writable snapshot.
-- **Exact-path workspace sharing** — the workspace appears inside the guest at its absolute
-  host path, writes reach the host, `:ro` is honoured, and directories above the workspace
-  are not exposed.
-- Cleanup leaves no containers, tasks, shim processes or mounts behind, including after
-  Ctrl-C.
+Two limits worth reading before you count Linux as done: that run was **inside WSL2, not on
+bare metal**, and **creating a sandbox on Linux still needs more privilege than an ordinary
+user has** — `boks` mounts the image overlay on the host to read the image config, which
+fails with `operation not permitted`. Windows no longer has an equivalent requirement, which
+is the wrong way round and is being worked on.
 
-- **Symlinks do not escape.** A symlink inside the workspace pointing at `/etc` or `~/.ssh`
-  resolves inside the guest, not on the host.
-
-- **Network policy is applied to a sandbox.** `boks run` gives the sandbox a virtual NIC
-  whose far end is a userspace network stack in a Boks process, and points the guest at a
-  filtering proxy *inside* that virtual network. Verified against a real guest: an allowed
-  host is fetched, a denied one is refused with a reason, DNS is mediated, and the host's
-  own loopback services — which the old TSI transport exposed — are now unreachable.
-  The stack itself judges every TCP connection the guest opens, by address and port, before
-  it dials anything, so a guest that ignores the proxy is judged rather than unfiltered; UDP
-  and ICMP are dropped. **Verified against a real guest on 2026-08-13**: with every proxy
-  variable unset, a denied address is refused before anything is dialled, while an address
-  the policy permits connects end to end — so the stack judges each flow rather than simply
-  dropping what does not use the proxy. `--net none` gives a sandbox no network at all. The
-  stack lives in a small
-  per-sandbox process so that it lasts as long as the sandbox's VM rather than as long as
-  your command — a build running in a sandbox does not lose the network when you press
-  Ctrl-C. `boks net ls` shows them, `boks stop` takes them down.
-- **Port publishing.** `boks run -p 3000` publishes a sandbox port on the host, and
-  `boks ports <name> --publish/--unpublish/--json` changes a sandbox that is already running,
-  which is the case a dev server needs: you start the server after the sandbox is up.
-  **Bound to loopback, never `0.0.0.0`**: a published port is a hole from your machine into a
-  VM running code you have not audited, and on all interfaces it would be a hole from the
-  local network into it. Omit the host port to get an ephemeral one. The service inside the
-  sandbox has to listen on the VM's external interface (`0.0.0.0`, not only `127.0.0.1`), and
-  `boks ports` says so when nothing answers. TCP only — see [what is not done](#status).
-  `boks ls` shows the mappings. It is also what an OAuth login with a `127.0.0.1` redirect
-  would need, since the browser is on the host and the listener is in the guest — though the
-  one flow Boks has actually measured, Claude Code's, turned out to be paste-a-code and needs
-  no port at all.
-- **Credential injection in a sandbox**, over HTTP and HTTPS. The guest holds a placeholder
-  in the environment variable its tooling reads; the real secret stays on the host and is
-  attached to requests for the hosts you named. Those hosts — and only those — have their
-  TLS terminated, which `boks run` says out loud the first time a sandbox meets each one.
-  A forgotten passphrase is not a dead end: `boks secret reset` deletes the store without
-  needing to decrypt it, and the failure that sends you there says what that costs.
-- **The name is the whole configuration**, for the services Boks knows: `boks secret set
-  anthropic` and nothing else. Boks already has each vendor's hosts, header, guest variable
-  and key shape, so no `--inject` is needed and nobody has to know Anthropic's header name to
-  put a key in a sandbox. Only vendor-documented rules are in the list; two of the eleven
-  names carry none, and say so, because a guessed header fails in a way you cannot diagnose.
-- **Each agent brings the destinations it cannot work without**, so `boks run claude` works
-  under the default deny-by-default preset without anyone reading a hostname out of a log.
-  They are an ordinary allow layer — a deny in any scope still beats them — and only
-  vendor-documented hosts are in them. Telemetry endpoints are not.
-
-What is **not** done:
-
-- **A hostname-only policy denies raw connections, including to the allowed host.** A raw
-  socket carries no name, so it is judged on the address; `--allow example.com` therefore does
-  not permit a direct connection to example.com's address. That fails closed, which is the
-  safe direction, but "allowed through the proxy" and "allowed on a raw socket" are different
-  questions and the CLI does not say so at the point you write the rule.
-- **UDP and ICMP drops are silent.** TCP denials are logged with a reason; a guest probing
-  UDP or ICMP leaves nothing in `boks policy log`. An observability gap, not a containment
-  one.
-- **No policy over names, and no UDP.** DNS is mediated by the sandbox's own resolver and
-  cannot be sent anywhere else, but the names themselves are not filtered. UDP and ICMP are
-  dropped with no way to ask for them, which costs QUIC and `ping`.
-- **No nested Docker** and no kits.
-- **Published ports are TCP only.** The grammar accepts `udp`, `udp4` and `udp6` because
-  sbx's does, and refuses them with the reason: the sandbox's network stack drops UDP at the
-  link, so a datagram has no way back. Publishing UDP would mean widening that filter, which
-  is a change to the stack's closed posture rather than a port flag.
-- **Publishing has never been driven by a real guest.** The datapath is exercised end to end
-  against a simulated one — a second gvisor stack on the far end of the real link socket —
-  which proves the host side works. A real VM reaching it through libkrun's virtio-net device
-  has not been tried.
-- **No host-side OAuth login.** `boks secret set NAME --oauth` is recognised and refused,
-  because every flow that could acquire a token starts by identifying the program to the
-  vendor with a client id issued to a registered application, and Boks holds none. `boks
-  secret adopt` takes over a login you have already performed, which covers the same case on
-  a machine you have used the agent on and nothing at all on a fresh one.
-- **Two of the eleven known services have no rule.** Neither Cursor nor Factory documents the
-  host their CLI sends its API key to, so `boks secret set cursor` and `boks secret set droid`
-  refuse and explain rather than guessing.
-- **A credential cannot be scoped to one sandbox.** A stored credential applies to every
-  sandbox; `--no-secrets` turns all of them off for a run, and there is nothing in between.
-- **Only the base image has run in a microVM.** The agent layers were exercised with
-  `docker run`, which proves each CLI is installed and starts — and nothing about isolation.
-  `kiro` has no image (see [images/README.md](images/README.md) for why), and there is still
-  no way to define an agent in a file rather than in code.
-- **No terminal dashboard** for bare `boks`, and no `--kit`. See the CLI surface section of
-  the parity matrix. `--clone` exists, but has only been exercised against runc, so nothing
-  about it has been measured behind a hypervisor.
-- **A crashed network supervisor is unrecoverable without a restart.** The running VM does
-  not re-attach to a fresh stack on the same socket — measured on 2026-08-12 — so the
-  sandbox keeps running with no network at all. Boks now says exactly that when it meets
-  one, and gives the `stop && start` that fixes it; it does not restart the sandbox itself,
-  because that kills whatever is running inside.
-- **Linux is untested in practice.** The boundary was verified on macOS/Apple silicon;
-  the Linux/KVM path is designed for but has not been exercised end to end.
-
-See [docs/verification.md](docs/verification.md) for exactly what has been observed and the
-procedure to confirm the VM boundary on capable hardware.
+The evidence behind every claim above — hardware, dates, commands, and the checks that
+failed — is in [docs/verification.md](docs/verification.md). What is still missing, stated
+the way it will be measured rather than the way it would sell, is in
+[docs/roadmap.md](docs/roadmap.md).
 
 ## Requirements
 
@@ -149,14 +46,15 @@ procedure to confirm the VM boundary on capable hardware.
   macOS on Apple silicon (Hypervisor.framework). macOS additionally needs the nerdbox shim
   codesigned with the `com.apple.security.hypervisor` entitlement and a user-writable
   `/var/run/containerd` — see [docs/verification.md](docs/verification.md#macos-setup-notes).
-- [containerd](https://containerd.io/) 2.2 or later, running
+- [containerd](https://containerd.io/) 2.3 or later, running — not 2.2, which cannot decode
+  the shim's bootstrap parameters
 - [nerdbox](https://github.com/containerd/nerdbox) — the VM runtime shim
   (`containerd-shim-nerdbox-v1`) on containerd's `PATH`
 - [libkrun](https://github.com/containers/libkrun) 1.18 or later
 - `erofs-utils` (for `mkfs.erofs`)
 - Go 1.26+ to build
 
-Docker Desktop is not required. Docker Sandboxes is not required.
+Docker Desktop is not required.
 
 Run `boks doctor` — it checks all of the above and tells you what to do about each gap.
 Nothing should be `fail`. On macOS one check warns on a perfectly good host and always will:
@@ -173,14 +71,15 @@ each one leaves you holding. The short version:
   cannot install, nerdbox's guest kernel and root filesystem, are built by
   `scripts/build-nerdbox-guest.sh`. `boks doctor` reports those two as `guest image` and
   fails when they are missing, so a green `doctor` is worth more than it used to be.
-- **Linux** — a tarball, a `.deb` or an `.rpm`, each containing the CLI alone. No
-  distribution packages a containerd new enough or nerdbox at all, so the rest is yours to
-  assemble. Untested end to end.
-- **Windows** — no binary, deliberately: `boks run` stops at its own network refusal there,
-  and a binary whose only output is a refusal would make the platform look done. The stack
-  under it does run a container, through `ctr` rather than `boks`
-  ([docs/windows-e2e.md](docs/windows-e2e.md)). For actual use, run the Linux build inside
-  WSL2; see [docs/windows.md](docs/windows.md).
+- **Linux** — a tarball, a `.deb` or an `.rpm`. The packages vendor the runtime alongside the
+  CLI, because no distribution ships a containerd new enough and nerdbox is packaged nowhere.
+  Expect to run as root for now: sandbox creation still needs more privilege than an ordinary
+  user has.
+- **Windows** — a winget manifest and a zip, for the native Windows Hypervisor Platform
+  route. No release has been cut yet, so building from source is the way in today.
+
+Nothing has been published to a package repository yet — the first release tag is what turns
+any of the above from a described route into a downloadable file.
 
 ## Quick start
 
@@ -230,7 +129,7 @@ workspace gets several sandboxes, and how a sandbox is reached from anywhere:
 ./bin/boks run --name shell-boks  # re-attach by name, from any directory
 ```
 
-Useful flags, named after sbx's:
+Useful flags:
 
 | Flag | Meaning |
 |---|---|
@@ -256,7 +155,7 @@ one way to say a thing is enough:
 ./bin/boks run shell ~/src/foo ~/src/lib:ro
 ```
 
-Flags follow the usual conventions: `--long`, `-s` for the short forms sbx has, and
+Flags follow the usual conventions — `--long` with short forms for the common ones — and
 `boks completion bash|zsh|fish|powershell` prints a completion script. `boks <command>
 --help` lists what that command takes.
 
@@ -350,8 +249,8 @@ agents with no vendor source have an empty list, which their user fills with one
 ./bin/boks policy log --sandbox claude-myproject --since 30m   # narrow the decision log
 ```
 
-The `--policy`, `--allow`, `--deny` and `--net` flags are a Boks addition rather than sbx parity:
-they override the stored policy for one run. `--policy` and `--allow` replace the posture and the
+The `--policy`, `--allow`, `--deny` and `--net` flags override the stored policy for one
+run. `--policy` and `--allow` replace the posture and the
 allow list; `--deny` is *added* to what the sandbox already denies, because a prohibition must
 not disappear because this invocation typed a different one. A sandbox remembers the selection
 it was created with, so a later `boks start` serves the same containment.
@@ -377,8 +276,9 @@ Boks is the orchestration layer, not a hypervisor. It uses containerd's Go API t
 container whose runtime handler is `io.containerd.nerdbox.v1`, which boots a microVM per
 sandbox. Everything below that line is existing open-source software.
 
-Full detail, including what each layer provides and what Boks still has to build:
-[docs/architecture.md](docs/architecture.md).
+A short tour of how the pieces fit — the boundary, where policy is enforced, what persists:
+[docs/how-it-works.md](docs/how-it-works.md). Full detail, including what each layer
+provides and what Boks still has to build: [docs/architecture.md](docs/architecture.md).
 
 ## Security model
 
@@ -407,60 +307,24 @@ Boks will never mount the host's Docker or containerd socket into a guest.
 Full analysis, including trust boundaries and ranked escape surfaces:
 [docs/security-model.md](docs/security-model.md).
 
-## Docker Sandbox comparison
-
-Docker Sandboxes is the behavioural reference. Boks reproduces observable behaviour from
-public documentation using open-source components; it is not derived from Docker's code.
-
-| | Docker Sandboxes | Boks |
-|---|---|---|
-| microVM per sandbox | yes | **yes**, verified on macOS |
-| exact-path workspace | yes | **yes**, verified |
-| workspace `:ro`, no parent exposure | yes | **yes**, verified |
-| sandbox lifecycle (`ls`/`exec`/`stop`/`rm`/`cp`) | yes | **yes**, not yet exercised behind a VM |
-| agent-first CLI, readable sandbox names | yes | **yes** — same grammar, same naming rule |
-| prepared agent images | yes, ten of them | **nine of ten**, multi-arch on a shared base; `kiro` needs `--template` |
-| terminal dashboard for bare `sbx` | yes | no — see the parity matrix |
-| network policy enforced outside the guest | yes | **yes** — the host stack judges every TCP connection by address before dialling; verified against a real guest |
-| UDP and ICMP blocked at the network layer | yes | **yes**, except DNS to the sandbox's own resolver |
-| credential injection by host proxy | yes | **yes**, HTTP and HTTPS, verified inside a real guest |
-| port publishing, loopback by default | yes | **yes**, TCP; same grammar, same flags, same default. Exercised against a simulated guest only |
-| credentials keyed by a known service name | yes, eleven of them | **nine of eleven** — same names, only vendor-documented rules; `cursor` and `droid` are known and unconfigured |
-| host-side OAuth login (`--oauth`) | yes | no — needs a client id the vendor issues to a registered app; `boks secret adopt` takes a login you already have instead |
-| Docker daemon inside the sandbox | yes | planned |
-| kits / declarative config | yes | planned |
-| account required | yes | **never** |
-| telemetry | yes, opt-out | **none** |
-| org governance, audit control plane | yes, paid | won't replicate |
-
-Feature-by-feature detail with priorities:
-[docs/docker-sandbox-parity.md](docs/docker-sandbox-parity.md).
-
 ## Roadmap
 
-Ordered by what unblocks the most. The VM boundary is done and the network datapath now
-enforces — what matters most is watching it work against a real guest.
+Ordered by what unblocks the most. The VM boundary holds and the network datapath enforces
+on all three platforms; what is left is mostly reach and repair rather than the core.
 
 1. A repair path for a crashed network supervisor: the VM does not re-attach to a restarted
    stack, so today the sandbox loses its network until it is restarted
-2. Policy over names for raw flows, so that `--allow example.com` can authorise a direct
+2. Sandbox creation on Linux without root, which today needs a host mount an ordinary user
+   cannot make
+3. Policy over names for raw flows, so that `--allow example.com` can authorise a direct
    connection to the address it resolves to rather than denying it
-3. The interactive dashboard that bare `boks` should open
-4. Clone mode measured behind a hypervisor — it is built and verified on runc, where the
+4. The interactive dashboard that bare `boks` should open
+5. Clone mode measured behind a hypervisor — it is built and verified on runc, where the
    read-only source share is a bind mount rather than virtiofs
-5. Docker daemon inside the guest
-6. UDP port publishing, which needs the link filter to carry a datagram's return path without
-   becoming a general hole
-8. Kits / declarative configuration
-9. Windows — **the stack underneath Boks runs a container there; `boks run` does not.** On
-   2026-08-14, on real Windows 11 hardware, `ctr tasks start` carried a Linux container end to
-   end through containerd, a patched nerdbox shim, `krun.dll` and the Windows Hypervisor
-   Platform, booting in 1.9 s. What is left for Boks is **virtio-net** — exactly the device its
-   enforcement depends on — across which no Ethernet frame has yet passed on Windows, so
-   `boks run` refuses to start sandbox networking there rather than pretend. In the meantime
-   Boks should run **inside WSL2** with nested virtualisation: unchanged, with workspace paths
-   preserved exactly. Untested, but every ingredient is there. See
-   [docs/windows.md](docs/windows.md)
+6. Docker daemon inside the guest, UDP port publishing, and kits / declarative configuration
+
+The full list, grouped by what each gap costs you, is
+[docs/roadmap.md](docs/roadmap.md).
 
 ## Development
 

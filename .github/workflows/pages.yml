@@ -159,10 +159,14 @@ jobs:
           # Platform support, stated on the landing page, where someone decides whether to
           # spend an hour on the setup. These are the facts a redesign is most tempted to
           # round off.
-          # "In progress" is Windows: being built, and no sandbox has ever booted there.
-          # A redesign may reword the card, but the page must keep distinguishing the one
-          # verified platform from the ones that are not.
-          for phrase in 'macOS on Apple silicon' 'Not verified' 'In progress'; do
+          #
+          # All three platforms have now run a sandbox end to end, so the thing worth
+          # protecting is no longer "which one is verified" but the *limits* on the two
+          # newest results, which are what a reader would otherwise over-read. "Verified in
+          # WSL2" is Linux: not bare metal, and still needing root to create a sandbox. "one
+          # machine" is Windows: a single x64 host, no arm64 build. A redesign may reword the
+          # cards, but it may not drop either qualifier and leave a bare "verified" standing.
+          for phrase in 'macOS on Apple silicon' 'Verified in WSL2' 'one machine'; do
             grep -qF "$phrase" _site/index.html \
               || { echo "the landing page no longer states platform support: '$phrase'" >&2; exit 1; }
           done
