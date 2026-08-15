@@ -31,7 +31,10 @@
 # starting one.
 #
 # Triggers: only a change to the patches, the pin, or this file. Plus workflow_dispatch, for
-# when you want to know whether the series still applies to a nerdbox that has moved.
+# when you want to know whether the series still applies to a nerdbox that has moved, and
+# workflow_call, so release.yml builds the shim at the tag rather than fetching one built from
+# some other commit. A `paths:` filter constrains only the event it is written under, so it
+# does not reach workflow_call.
 name: nerdbox-windows
 
 on:
@@ -47,12 +50,16 @@ on:
       - "packaging/nerdbox/NERDBOX_REV"
       - ".github/workflows/nerdbox-windows.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` is the CALLER's workflow name under workflow_call, which keeps a release
+# build and a direct run on the same ref out of one another's group. With `cancel-in-progress`
+# on, sharing one would let a push to `main` cancel a release.
 concurrency:
-  group: nerdbox-windows-${{ github.ref }}
+  group: ${{ github.workflow }}-nerdbox-windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -191,13 +198,26 @@ jobs:
           set -euo pipefail
           GOOS=linux GOARCH=amd64 go build ./...
 
+      # SHA256SUMS travels inside the artifact because release.yml checks it on the far side
+      # of the artifact transport, before laying the amd64 shim into a release archive. A file
+      # that arrives truncated is perfectly plausible right up until a machine runs it.
+      - name: Checksums
+        working-directory: nerdbox/_out
+        run: |
+          set -euo pipefail
+          # Redirect rather than `| tee` into the directory the glob covers: in a pipeline the
+          # shell may create the output file before the glob is expanded, and SHA256SUMS would
+          # then list itself as empty.
+          sha256sum -- *.exe >SHA256SUMS
+          cat SHA256SUMS
+
       # Uploaded so someone with a Windows machine can test the thing this job cannot: whether
       # it starts. packaging/nerdbox-windows/README.md has the commands and what to look for.
       - name: Upload the shim binaries
         uses: actions/upload-artifact@v4
         with:
           name: containerd-shim-nerdbox-v1-windows
-          path: nerdbox/_out/*.exe
+          path: nerdbox/_out/*
           if-no-files-found: error
 
       - name: Record what was built

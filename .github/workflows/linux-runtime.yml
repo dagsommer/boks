@@ -46,12 +46,19 @@
 #
 # It proves NOTHING about whether a sandbox runs. No VM is started here — GitHub's runners are
 # themselves virtualised and /dev/kvm is not available, so nerdbox's own kvm.CheckKVM() would
-# refuse before libkrun was reached. A symbol can be exported and return -ENOSYS. Boks has
-# never been verified end-to-end on Linux; that is the work this bundle exists to make
-# possible, not work this workflow does.
+# refuse before libkrun was reached. A symbol can be exported and return -ENOSYS.
+#
+# Boks HAS since been verified end to end on Linux — 2026-08-15, in WSL2 on Ubuntu 26.04, 25
+# of 26 checks including the network boundary with its positive control (docs/verification.md).
+# That run was done by hand, on hardware this workflow does not have, and it was done with
+# binaries this workflow produced. Neither fact makes a green run here evidence about a
+# sandbox. No bare-metal Linux run is recorded, and nothing has ever been run on arm64.
 #
 # Triggers: the pins, the packaging directory, or this file. Plus workflow_dispatch, because
-# "does upstream still build" is a question worth being able to ask on demand.
+# "does upstream still build" is a question worth being able to ask on demand, and
+# workflow_call, because release.yml builds these at the tag rather than fetching a binary
+# built from some other commit. A `paths:` filter constrains only the event it is written
+# under, so it does not reach workflow_call.
 name: linux-runtime
 
 on:
@@ -67,12 +74,16 @@ on:
       - "packaging/nerdbox/NERDBOX_REV"
       - ".github/workflows/linux-runtime.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` is the CALLER's workflow name when this runs as a reusable workflow, which
+# keeps a release build and a direct run on the same ref out of one another's group. With
+# `cancel-in-progress` on, sharing a group would let a push to `main` cancel a release.
 concurrency:
-  group: linux-runtime-${{ github.ref }}
+  group: ${{ github.workflow }}-linux-runtime-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -537,6 +548,10 @@ jobs:
             echo "\`kvm.CheckKVM()\` would refuse before libkrun was reached. What is proven is"
             echo "that the files are ELF objects of the right architecture and that"
             echo "\`libkrun.so\` exports every symbol the shim binds eagerly at \`dlopen\` — a"
-            echo "load-time contract, not a working sandbox. Boks has never been verified"
-            echo "end-to-end on Linux."
+            echo "load-time contract, not a working sandbox."
+            echo
+            echo "Boks itself HAS been verified end to end on Linux, on 2026-08-15, in WSL2 on"
+            echo "Ubuntu 26.04, using binaries from this workflow — by hand, not here. No"
+            echo "bare-metal run is recorded, and the \`arm64\` half of this bundle has never"
+            echo "been run at all."
           } >>"$GITHUB_STEP_SUMMARY"
