@@ -182,6 +182,7 @@ func Checks() []Check {
 		snapshotterCheck(),
 		snapshotterToolsCheck(),
 		runtimeShimCheck(),
+		runtimeSkewCheck(),
 		hypervisorLibraryCheck(),
 		guestImageCheck(),
 	}

@@ -357,6 +357,129 @@ boks create shell .
 | `-q`, `--quiet` |  | suppress the network summary (a new TLS-interception host is still announced) |
 | `-t`, `--template string` |  | OCI image for the guest root filesystem (default: the agent's image) |
 
+## boks daemon
+
+Run the containerd that Boks drives
+
+```
+boks daemon
+```
+
+Starts, stops and inspects a containerd that Boks manages.
+
+A boks binary on its own cannot start a sandbox: it orchestrates containerd, a VM shim, a
+hypervisor library and a filesystem tool. containerd is the piece with the most ways to be
+present but wrong, and none of them announce themselves — a diff-service order that omits the
+erofs differ fails during an image unpack naming a differ, and a ttrpc socket containerd tries
+to chown to uid 0 fails at startup naming a file. 'boks daemon start' writes a configuration
+that has neither problem and runs containerd with it.
+
+The daemon is Boks' own. Its root, its state and its endpoint are under your state directory,
+so it cannot disturb — or be disturbed by — a containerd that Docker or your distribution is
+running. Nothing is installed as a service and nothing runs at boot: a host that has not run
+'boks daemon start' runs no Boks process at all.
+
+Once it is running, Boks talks to it by default. An explicit --containerd-address, or
+BOKS_CONTAINERD_ADDRESS, still wins.
+
+### boks daemon config
+
+Print the containerd configuration Boks would write
+
+```
+boks daemon config
+```
+
+Prints the containerd configuration for this host, with the reason for every setting.
+
+It is generated rather than shipped, because three of the settings cannot be written down
+ahead of time: the uid and gid are yours, the paths are under your state directory, and
+whether the erofs differ may be named at all depends on whether mkfs.erofs is installed —
+naming it when it is absent takes the whole daemon down.
+
+This prints what 'boks daemon start' would write now, which is not necessarily what a running
+daemon was started with. 'boks daemon status' names that file.
+
+### boks daemon logs
+
+Print the managed containerd's log
+
+```
+boks daemon logs
+```
+
+Prints what the managed containerd has written, which is everything it logs plus anything
+the supervisor said on its way up.
+
+The log belongs to the daemon rather than to a run of this command, so it survives the daemon
+exiting: a containerd that died is exactly when this is worth reading, and it is truncated
+only when a new one starts.
+
+### boks daemon serve
+
+Run the managed containerd in the foreground
+
+```
+boks daemon serve
+```
+
+Runs the managed containerd in the foreground and exits when it does. This is the process
+'boks daemon start' puts in the background.
+
+Run it by hand to watch a daemon that will not start: containerd's own output arrives on
+stderr as it happens, rather than in a log file after the fact. Ctrl-C stops both.
+
+stdout carries one line and nothing else — the marker that says containerd is serving — because
+'boks daemon start' reads it.
+
+### boks daemon start
+
+Start the containerd Boks manages, if it is not already running
+
+```
+boks daemon start
+```
+
+Starts a containerd configured for Boks, and waits until it answers its own API before
+reporting success — a socket that exists is not a daemon that is serving.
+
+Starting one that is already running is not an error and does not restart it: this command
+means "make sure it is up", and a restart would take down every sandbox the daemon is serving.
+
+If containerd refuses to start, what it said is printed here rather than left in a log file
+for you to find.
+
+### boks daemon status
+
+Report on the containerd Boks manages
+
+```
+boks daemon status
+```
+
+Reports whether a Boks-managed containerd is running, and asks it for its version.
+
+Those are two questions, and this command asks both on purpose. A supervisor holding its lock
+says a process is alive; a version returned over the socket says containerd is actually
+serving. They can disagree, and a status that collapsed them would call a daemon that answers
+nothing "running".
+
+Exits non-zero when no managed daemon is serving, so it can gate a script.
+
+### boks daemon stop
+
+Stop the containerd Boks manages
+
+```
+boks daemon stop
+```
+
+Stops the managed containerd. Stopping one that is not running is not an error.
+
+containerd's root is left alone, so the images it has already pulled are still there when it
+is started again. Only 'boks daemon' state — the socket and the record of the running process
+— is removed.
+
 ## boks doctor
 
 Check host prerequisites for running sandboxes

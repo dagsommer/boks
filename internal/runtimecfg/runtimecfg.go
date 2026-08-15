@@ -44,10 +44,23 @@ const (
 // /run at all), and a named pipe on Windows. Hardcoding the Linux path made every macOS
 // run fail to connect.
 func DefaultAddress() string {
-	if addr := os.Getenv("BOKS_CONTAINERD_ADDRESS"); addr != "" {
+	if addr, ok := AddressOverride(); ok {
 		return addr
 	}
 	return defaults.DefaultAddress
+}
+
+// AddressOverride returns the address the user pinned through the environment, and whether
+// they pinned one.
+//
+// It is separate from DefaultAddress because there is now a third answer between the two —
+// the endpoint of a containerd that `boks daemon` is managing, which internal/daemon supplies
+// — and it must sit *below* an explicit override rather than above it. Asking this question
+// directly is what lets that ordering be written once, in daemon.DefaultAddress, instead of
+// being re-derived by comparing DefaultAddress's result against the platform constant.
+func AddressOverride() (string, bool) {
+	addr := os.Getenv("BOKS_CONTAINERD_ADDRESS")
+	return addr, addr != ""
 }
 
 // guestOS is the operating system inside every Boks sandbox.
