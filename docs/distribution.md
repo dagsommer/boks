@@ -332,7 +332,7 @@ locally is what lets brew ad-hoc sign it.
 
 | Piece | Built by | Published as |
 |---|---|---|
-| guest kernel + EROFS rootfs, per guest arch | `guest-image.yml` | `boks-guest_<v>_x86_64.tar.gz`, `boks-guest_<v>_aarch64.tar.gz` |
+| guest kernel + EROFS rootfs, per guest arch | `guest-image.yml` | `boks-guest_<v>_x86_64.tar.gz`, `boks-guest_<v>_arm64.tar.gz` |
 | Linux `libkrun.so` + `containerd-shim-nerdbox-v1`, per arch | `linux-runtime.yml` | `boks-runtime_<v>_linux_amd64.tar.gz`, `…_linux_arm64.tar.gz` |
 | `krun.dll` | `libkrun-windows.yml` | inside `boks-runtime_<v>_windows_amd64.zip`, and inside `boks_<v>_windows_amd64.zip` |
 | Windows nerdbox shim | `nerdbox-windows.yml` | the same two zips, **renamed** to `containerd-shim-nerdbox-v1.exe` |
@@ -571,7 +571,7 @@ bottle.
   `brew install boks` still produce `guest image  fail`.
 
 **The guest half of that gap is closed on the release side.** `release.yml` publishes
-`boks-guest_<v>_aarch64.tar.gz`, which is the file a Mac needs; what remains is the `resource`
+`boks-guest_<v>_arm64.tar.gz`, which is the file a Mac needs; what remains is the `resource`
 block in the formula, spelled out in `packaging/homebrew/README.md`, and that is a formula
 change rather than a CI one.
 
