@@ -15,11 +15,13 @@ AGENT_IMAGES := $(filter-out base,$(notdir $(wildcard images/*)))
 # `docker-agent version`, not `docker-agent --version`; everything else takes the flag.
 VERSION_ARG_docker-agent := version
 
-# The platforms a release ships. darwin/arm64 is the verified one; Linux builds and has
-# never booted a sandbox. There is no darwin/amd64 target on purpose — see the comment at
-# the top of .github/workflows/release.yml. Windows cross-builds cleanly and is checked in
-# CI, but it cannot run a sandbox until libkrun has a WHP backend, so it is not shipped.
-RELEASE_TARGETS := darwin/arm64 linux/amd64 linux/arm64
+# The platforms a release ships, and it must stay the same set as the build matrix in
+# .github/workflows/release.yml — `make dist` exists so a release can be reproduced off
+# GitHub, which it cannot do if it builds a different set. All three of these have booted a
+# sandbox: darwin/arm64 on 2026-08-13, linux/amd64 and windows/amd64 on 2026-08-15. See
+# docs/verification.md, and the comment at the top of release.yml for why darwin/amd64 and
+# windows/arm64 are absent.
+RELEASE_TARGETS := darwin/arm64 linux/amd64 linux/arm64 windows/amd64
 
 .PHONY: build test check integration vet fmt clean dist docs docs-check release-notes images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
 
