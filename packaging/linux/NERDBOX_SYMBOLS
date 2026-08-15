@@ -1,0 +1,43 @@
+# The libkrun entry points the nerdbox shim binds, one per line, comments ignored.
+#
+# THIS IS A LOAD-TIME CONTRACT, NOT A WISH LIST. nerdbox's loader reflects over its whole
+# binding table and calls purego.RegisterLibFunc on every `C:"krun_*"` tag EAGERLY at dlopen
+# (internal/vm/libkrun/instance.go, openLibkrun in krun.go). One missing symbol does not fail
+# later at the call site — it fails the load, so no VM starts at all and the message names
+# the one symbol it tripped over rather than the nineteen it wanted.
+#
+# Nineteen names, from nerdbox at packaging/nerdbox/NERDBOX_REV (v0.2.3). They are the
+# libkrun 1.x ABI. libkrun 2.0.0-dev — which is what packaging/libkrun-windows/UPSTREAM_REV
+# pins, and which Windows only survives by re-exporting them in patches 0014 and 0026 —
+# dropped four of them: krun_set_log_level, krun_set_console_output, krun_set_gvproxy_path
+# and krun_set_net_mac. That is why packaging/linux/LIBKRUN_REV is a different revision, and
+# it is why this check earns its keep: a libkrun.so built from the Windows pin is the right
+# architecture, is a valid ELF shared object, and cannot be loaded on any machine.
+#
+# Consumers: scripts/package-linux.sh checks the libkrun.so it is about to package against
+# this list, and packaging/linux/README.md documents the same command for someone building
+# by hand. .github/workflows/linux-runtime.yml currently repeats the list inline; it should
+# read this file instead, so that moving the nerdbox pin has one place to update.
+#
+# To regenerate after moving NERDBOX_REV, from a nerdbox checkout:
+#
+#     grep -o 'C:"krun_[a-z0-9_]*"' internal/vm/libkrun/krun.go | cut -d'"' -f2 | sort -u
+krun_set_log_level
+krun_init_log
+krun_create_ctx
+krun_free_ctx
+krun_set_vm_config
+krun_set_kernel
+krun_set_exec
+krun_set_console_output
+krun_start_enter
+krun_add_vsock_port2
+krun_add_virtiofs3
+krun_get_shutdown_eventfd
+krun_set_gpu_options
+krun_set_gvproxy_path
+krun_set_net_mac
+krun_add_disk
+krun_add_disk2
+krun_add_net_unixstream
+krun_add_net_unixgram
