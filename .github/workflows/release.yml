@@ -51,6 +51,25 @@
 # The `paths:` filters on those workflows are not an obstacle: a path filter constrains the
 # event it is written under, and `workflow_call` is a different event with no filter.
 # ---------------------------------------------------------------------------------------
+# THE WINDOWS ARCHIVE IS ONE FILE, AND THREE THINGS DEPEND ON ITS SHAPE
+#
+# `boks_<v>_windows_amd64.zip` carries the CLI, the runtime AND the guest kernel and rootfs
+# in one flat directory. It is the winget target and the recommended Windows download, and
+# there is deliberately no Windows CLI-only tarball beside it — that would be a strict
+# subset whose only distinguishing property is that it cannot start a sandbox.
+#
+#   packaging/winget/manifests declares RelativeFilePath as
+#   `boks_<v>_windows_amd64/boks.exe`. The `assemble` job asserts that path exists rather
+#   than letting a bot in someone else's repository find out.
+#
+#   .zip, not .tar.gz, because winget's InstallerType has no tar.gz — zip is the only
+#   archive it unpacks. Windows 10+ does ship `tar`, which is why the Windows CLI used to
+#   be a tarball; that reason does not survive winget needing a zip anyway.
+#
+#   The guest is in it, so a winget install boots with no further download. That makes the
+#   kernel travel in two kinds of archive, so `assemble` writes the GPL-2.0 SOURCE.txt into
+#   both. See docs/distribution.md, "What goes in the Windows archive, and the guest".
+# ---------------------------------------------------------------------------------------
 name: release
 
 on:
@@ -180,9 +199,17 @@ jobs:
           set -euo pipefail
           for sum in *.sha256; do sha256sum -c "$sum"; done
 
+      # The Windows leg is named OUT of the `dist-*` pattern that `publish` collects, because
+      # its tarball is an input to `assemble` rather than a release asset. The Windows CLI
+      # ships inside boks_<v>_windows_amd64.zip together with the runtime and guest it cannot
+      # start a sandbox without; publishing a CLI-only tarball beside that bundle would offer
+      # a smaller download whose only distinguishing property is that it does not work. It is
+      # still BUILT here, by the same script and the same matrix entry as every other target,
+      # so `make dist` and RELEASE_TARGETS stay honest and internal/release's test still
+      # compares like with like.
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: ${{ matrix.goos == 'windows' && 'cli-windows-amd64' || format('dist-{0}-{1}', matrix.goos, matrix.goarch) }}
           path: dist/*
           retention-days: 7
           compression-level: 0 # tarballs, debs and rpms are already compressed
@@ -256,6 +283,7 @@ jobs:
     needs:
       [
         version,
+        build,
         runtime-linux,
         runtime-guest,
         runtime-krun-dll,
@@ -301,22 +329,39 @@ jobs:
         with:
           name: containerd-windows-amd64-bundle
           path: in/windows-containerd
+      # The Windows CLI, from this workflow's own `build` job. It is the one incoming piece
+      # that is not a runtime artifact: boks_<v>_windows_amd64.zip is the CLI and the stack
+      # under it in one archive, so the CLI has to reach this job to be put in it.
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-windows-amd64
+          path: in/windows-cli
 
-      # Not ceremony. Seven artifacts from five workflows and eight separate runners are being
-      # merged here for the first time, and a truncated download or a mixed-up architecture is
-      # invisible afterwards — an amd64 libkrun.so in the arm64 archive looks perfectly
-      # well-formed and fails at `dlopen` on a user's machine. Each producing workflow wrote a
-      # SHA256SUMS next to its own output; this checks all of them before a byte is copied.
+      # Not ceremony. Eight artifacts — seven from five called workflows, one from this
+      # workflow's own `build` job — are being merged here for the first time, and a truncated
+      # download or a mixed-up architecture is invisible afterwards: an amd64 libkrun.so in the
+      # arm64 archive looks perfectly well-formed and fails at `dlopen` on a user's machine.
+      # Every one of them arrived with a checksum its producer wrote, in one of two shapes;
+      # this checks all of them before a byte is copied.
       - name: Verify every incoming artifact against the checksums its builder wrote
         run: |
           set -euo pipefail
+          # Two shapes, because two kinds of producer. The runtime workflows each write a
+          # SHA256SUMS covering their own output. The `build` job in this workflow writes a
+          # per-file `.sha256` beside each tarball instead, which build-release.sh has done
+          # since before any of this existed. Both are checked; a directory carrying neither
+          # is a mistake to fail on rather than a case to skip, because a skip here is
+          # indistinguishable from a check that passed.
           for d in in/*/; do
-            if [ ! -f "$d/SHA256SUMS" ]; then
-              echo "$d has no SHA256SUMS — its producing workflow must write one" >&2
+            echo "::group::$d"
+            if [ -f "$d/SHA256SUMS" ]; then
+              (cd "$d" && sha256sum -c SHA256SUMS)
+            elif compgen -G "$d*.sha256" >/dev/null; then
+              (cd "$d" && for sum in *.sha256; do sha256sum -c "$sum"; done)
+            else
+              echo "$d has neither a SHA256SUMS nor a *.sha256 — nothing vouches for it" >&2
               exit 1
             fi
-            echo "::group::$d"
-            (cd "$d" && sha256sum -c SHA256SUMS)
             echo "::endgroup::"
           done
 
@@ -333,20 +378,17 @@ jobs:
             cp -a "in/linux-$arch/." "$d/"
           done
 
-          # The guest. The file names are NOT hardcoded: nerdbox's own bake recipe decides
-          # them, they have been spelled at least two ways in this repository's own notes
-          # (nerdbox-rootfs.erofs and nerdbox-rootfs-<arch>.erofs), and getting the guess
-          # wrong here would silently ship an archive missing the rootfs. Whatever the
-          # producing workflow put in the artifact is what goes in.
+          # The guest kernel is Linux, so it is GPL-2.0, and nerdbox patches it. Shipping the
+          # compiled result carries a corresponding-source obligation; the recipe is entirely
+          # public, so the obligation is met by saying precisely which recipe. This is a
+          # function rather than an inline heredoc because the kernel now travels in TWO
+          # kinds of archive — the guest archives, and the Windows bundle that carries the
+          # guest so a winget install boots without a second download. Every archive
+          # containing the kernel gets this file. One that did not would be a genuinely new
+          # obligation rather than the same one, which is the whole reason it exists.
           rev="$(grep -v '^[[:space:]]*#' boks/packaging/nerdbox/NERDBOX_REV | tr -d '[:space:]')"
-          for arch in x86_64 aarch64; do
-            d="stage/boks-guest_${VERSION}_${arch}"
-            mkdir -p "$d"
-            cp -a "in/guest-$arch/." "$d/"
-            # The guest kernel is Linux, so it is GPL-2.0, and nerdbox patches it. Shipping
-            # the compiled result carries a corresponding-source obligation; the recipe is
-            # entirely public, so the obligation is met by saying precisely which recipe.
-            cat >"$d/SOURCE.txt" <<SRC
+          write_source_txt() {
+            cat >"$1/SOURCE.txt" <<SRC
           The kernel in this archive is Linux, licensed GPL-2.0, built from the recipe in
           containerd/nerdbox at revision:
 
@@ -355,13 +397,25 @@ jobs:
 
           Reproduce it with, from a checkout of that revision:
 
-            KERNEL_ARCH=$arch DESTDIR=./_output docker buildx bake kernel
-            KERNEL_ARCH=$arch DESTDIR=./_output docker buildx bake rootfs
+            KERNEL_ARCH=$2 DESTDIR=./_output docker buildx bake kernel
+            KERNEL_ARCH=$2 DESTDIR=./_output docker buildx bake rootfs
 
           That recipe names the exact kernel tarball, configuration and patch series used.
           The pin is recorded in packaging/nerdbox/NERDBOX_REV in dagsommer/boks, and this
-          archive was built by .github/workflows/guest-image.yml.
+          kernel was built by .github/workflows/guest-image.yml.
           SRC
+          }
+
+          # The guest. The file names are NOT hardcoded: nerdbox's own bake recipe decides
+          # them, they have been spelled at least two ways in this repository's own notes
+          # (nerdbox-rootfs.erofs and nerdbox-rootfs-<arch>.erofs), and getting the guess
+          # wrong here would silently ship an archive missing the rootfs. Whatever the
+          # producing workflow put in the artifact is what goes in.
+          for arch in x86_64 aarch64; do
+            d="stage/boks-guest_${VERSION}_${arch}"
+            mkdir -p "$d"
+            cp -a "in/guest-$arch/." "$d/"
+            write_source_txt "$d" "$arch"
             ls -l "$d"
           done
 
@@ -369,6 +423,10 @@ jobs:
           # tester collecting them from three artifacts spends the session debugging a
           # missing file. containerd's bundle already carries the config, the root-creation
           # script and the pre-formatted writable layer.
+          #
+          # This is the runtime WITHOUT the CLI — the complement, for someone who built boks
+          # from source on Windows or who is driving containerd and `ctr` by hand the way
+          # docs/windows-e2e.md does. The all-in-one archive is built from it below.
           d="stage/boks-runtime_${VERSION}_windows_amd64"
           mkdir -p "$d"
           cp -a in/windows-containerd/. "$d/"
@@ -380,6 +438,56 @@ jobs:
           cp in/windows-shim/containerd-shim-nerdbox-v1-amd64.exe \
             "$d/containerd-shim-nerdbox-v1.exe"
           ls -l "$d"
+
+          # ---------------------------------------------------------------------------------
+          # boks_<v>_windows_amd64.zip — the Windows install, in one file.
+          #
+          # This is the winget target and the recommended Windows download, and it is a
+          # SUPERSET of the runtime directory above: the CLI, everything a sandbox needs to
+          # run, and the guest kernel and rootfs it boots. There is deliberately no CLI-only
+          # Windows tarball to pick instead; see the `build` job's upload step.
+          #
+          # FLAT, everything beside boks.exe, and that is load-bearing twice over:
+          #
+          #   1. packaging/winget/manifests declares
+          #      NestedInstallerFiles.RelativeFilePath: boks_<v>_windows_amd64/boks.exe.
+          #      The check below is that contract, asserted here rather than discovered by a
+          #      winget-pkgs bot in someone else's repository.
+          #   2. internal/daemon/locate.go's RuntimeDirs() searches the directory the boks
+          #      executable resolves to (symlinks followed, which is what winget's portable
+          #      alias is), and daemonPath() PREPENDS those directories to the PATH it starts
+          #      containerd with. The shim then finds krun.dll, the guest kernel and the
+          #      rootfs by scanning that same PATH. So a flat directory needs no PATH entry,
+          #      no environment variable and no configuration — provided containerd is
+          #      started by `boks daemon start`. Starting the bundled containerd.exe by hand
+          #      gets none of it, and docs/install.md says so.
+          # ---------------------------------------------------------------------------------
+          cli="stage/boks_${VERSION}_windows_amd64"
+          tar -xzf "in/windows-cli/boks_${VERSION}_windows_amd64.tar.gz" -C stage
+          if [ ! -f "$cli/boks.exe" ]; then
+            echo "$cli/boks.exe is missing — the winget manifest's RelativeFilePath names" >&2
+            echo "exactly that path, so this layout is a contract and not a convention" >&2
+            exit 1
+          fi
+          # One name collides, and it would collide silently: the CLI tarball carries the
+          # repository's README.md and the containerd bundle carries
+          # packaging/containerd-windows/README.md under that same name. A plain copy would
+          # replace the document a user opens first with one about driving containerd by
+          # hand. The runtime's keeps its content under a name that says what it is.
+          for f in "$d"/*; do
+            case "$(basename "$f")" in
+            README.md) cp -a "$f" "$cli/README-windows-runtime.md" ;;
+            *) cp -a "$f" "$cli/" ;;
+            esac
+          done
+          # The guest, x86_64 only: there is no aarch64 Windows runtime to boot it with.
+          cp -a in/guest-x86_64/. "$cli/"
+          write_source_txt "$cli" x86_64
+          # Each incoming directory brought its producing workflow's SHA256SUMS along. They
+          # are all wrong for this directory and one has just overwritten another; the loop
+          # below regenerates it over what is actually here.
+          rm -f "$cli/SHA256SUMS"
+          ls -l "$cli"
 
           # Every archive carries a SHA256SUMS covering everything actually in it, replacing
           # whichever partial one came in with an artifact. The incoming ones are wrong by
@@ -409,7 +517,11 @@ jobs:
           # reproducible — zip records real mtimes and directory order — and nothing here
           # claims it is. The SHA256SUMS inside the archive is what a suspicious reader
           # checks, and it is over the files rather than over the container.
-          for d in boks-runtime_*_windows_*; do
+          # Both Windows archives: the all-in-one boks_*_windows_amd64.zip that winget
+          # installs, and the runtime-only boks-runtime_*_windows_amd64.zip it is a superset
+          # of. `boks_` cannot match `boks-runtime_` — the separator differs — so the two
+          # globs do not overlap.
+          for d in boks_*_windows_* boks-runtime_*_windows_*; do
             TZ=UTC zip -qrX "../dist/$d.zip" "$d"
           done
           cd ../dist
@@ -526,7 +638,8 @@ jobs:
           See [docs/install.md](https://github.com/dagsommer/boks/blob/main/docs/install.md).
           Read it before downloading: a `boks` binary on its own cannot start a sandbox. This
           release carries the rest — the shim, libkrun, the guest kernel and rootfs, and on
-          Windows a containerd — as separate archives, listed below.
+          Windows a containerd. On Windows all of it is in one archive; elsewhere the pieces
+          are listed separately below.
 
           Run `boks doctor` first. It checks every prerequisite and prints what to do about
           each gap. `boks daemon start` writes containerd's configuration and supervises it.
@@ -535,16 +648,22 @@ jobs:
 
           | Asset | What it is |
           |---|---|
-          | `boks_*.tar.gz` for `linux_amd64`, `linux_arm64`, `darwin_arm64` and `windows_amd64` | the CLI |
-          | `boks_*.deb`, `boks_*.rpm` | the CLI, packaged. `docs/install.md` says what a package puts on the machine. |
+          | **`boks_*_windows_amd64.zip`** | **the whole Windows install in one file**: the CLI, the runtime, and the guest kernel and rootfs. Unzip it anywhere. This is what `winget install boks` fetches. |
+          | `boks_*.tar.gz` for `linux_amd64`, `linux_arm64` and `darwin_arm64` | the CLI |
+          | `boks_*.deb`, `boks_*.rpm` | the CLI **and the Linux runtime**, packaged. `docs/install.md` says what a package puts on the machine. |
           | `boks-runtime_*_linux_amd64.tar.gz`, `_linux_arm64.tar.gz` | `containerd-shim-nerdbox-v1` and `libkrun.so` |
-          | `boks-runtime_*_windows_amd64.zip` | `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer |
+          | `boks-runtime_*_windows_amd64.zip` | the Windows runtime **without** the CLI: `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer. For a `boks.exe` you built yourself, or for driving containerd by hand. |
           | `boks-guest_*_x86_64.tar.gz`, `_aarch64.tar.gz` | the guest kernel and EROFS rootfs a sandbox boots |
 
-          The Windows **CLI** comes as a `.tar.gz` like every other platform's, because
-          Windows 10 and later ship `tar`: `tar -xf boks_*_windows_amd64.tar.gz` works in an
-          ordinary shell. The Windows **runtime** is a `.zip`, because it is the archive a
-          Windows machine opens without being told how.
+          **There is no Windows CLI-only archive, deliberately.** It would be a strict subset
+          of `boks_*_windows_amd64.zip` — a smaller download whose only distinguishing
+          property is that it cannot start a sandbox. Everything in the Windows zip sits in
+          one flat directory beside `boks.exe`, which is where `boks daemon start` looks: it
+          prepends that directory to the `PATH` it starts containerd with, and the shim finds
+          `krun.dll`, the kernel and the rootfs by scanning that same `PATH`. So there is
+          nothing to put on `PATH` and nothing to configure — as long as containerd is the one
+          `boks daemon start` runs. Start the bundled `containerd.exe` yourself and you are
+          back to setting `PATH` by hand.
 
           **macOS has no runtime archive, on purpose.** libkrun needs the
           `com.apple.security.hypervisor` entitlement, and Homebrew's source build is what
@@ -605,9 +724,11 @@ jobs:
 
           ## Source for the guest kernel
 
-          The guest archives contain a Linux kernel, which is GPL-2.0, patched by nerdbox. Each
-          carries a `SOURCE.txt` naming the exact upstream revision and the two `docker buildx
-          bake` commands that reproduce it.
+          The guest archives — and `boks_*_windows_amd64.zip`, which carries the guest so a
+          `winget install` boots without a second download — contain a Linux kernel, which is
+          GPL-2.0 and is patched by nerdbox. Every archive that contains it carries a
+          `SOURCE.txt` naming the exact upstream revision and the two `docker buildx bake`
+          commands that reproduce it.
           EOF
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
