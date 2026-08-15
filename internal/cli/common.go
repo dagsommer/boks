@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/dagsommer/boks/internal/agent"
+	"github.com/dagsommer/boks/internal/daemon"
+	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/runtimecfg"
 	"github.com/dagsommer/boks/internal/sandbox"
 	"github.com/dagsommer/boks/internal/workspace"
@@ -37,7 +39,13 @@ type devFlags struct {
 func (d *devFlags) register(fs *pflag.FlagSet) {
 	fs.StringVar(&d.runtimeID, "runtime", runtimecfg.Runtime, "containerd runtime handler")
 	fs.StringVar(&d.snapshotter, "snapshotter", runtimecfg.Snapshotter, "containerd snapshotter")
-	fs.StringVar(&d.address, "containerd-address", runtimecfg.DefaultAddress(), "containerd socket")
+	// The default is resolved rather than constant: a containerd started by `boks daemon`
+	// is the one the user meant, and having that command succeed while every other command
+	// carried on talking to a socket in /run would be the most confusing outcome available.
+	// daemon.DefaultAddress keeps the ordering — an explicit BOKS_CONTAINERD_ADDRESS above
+	// the managed daemon, the managed daemon above the platform constant — in one place,
+	// and this flag sits above all three by being a flag.
+	fs.StringVar(&d.address, "containerd-address", daemon.DefaultAddress(policy.StateDir()), "containerd socket")
 	fs.BoolVar(&d.insecure, "i-know-this-is-not-isolated", false,
 		"permit a non-VM runtime; for developing Boks itself, never for running untrusted code")
 	for _, name := range []string{"runtime", "snapshotter", "containerd-address", "i-know-this-is-not-isolated"} {
