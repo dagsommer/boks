@@ -110,44 +110,24 @@ func TestNetworkForHonoursHowTheSandboxWasWired(t *testing.T) {
 	}
 	var errOut bytes.Buffer
 
-	// An explicit -net none against a sandbox wired for NAT must stop the run. This used
-	// to print a note and then carry on with NAT, which is the failure the note itself
-	// described: the flag appeared to be obeyed while the container stayed connected.
-	mode, ok, err := networkFor(wired, network.ModeNone, true, &errOut)
-	if err == nil {
-		t.Fatalf("an explicit -net none against a NAT sandbox was accepted (mode=%v, wired=%v); "+
-			"a flag that cannot be applied must not be silently discarded", mode, ok)
-	}
-	for _, want := range []string{"fixed when a sandbox is created", "boks rm shell-proj"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal does not contain %q:\n%s", want, err)
-		}
+	// The sandbox's own wiring wins, whatever this run asked for, and nothing is said
+	// about it: the disagreement is refused earlier, by checkFixedAtCreation, which is
+	// where every other flag a sandbox fixes at creation is refused too. See
+	// TestReAttachRefusesANetworkModeItCannotApply for the refusal itself.
+	mode, ok := networkFor(wired, network.ModeNone, &errOut)
+	if !ok || mode != network.ModeNAT {
+		t.Errorf("networkFor = %v, %v; an existing sandbox keeps the network it was created with", mode, ok)
 	}
 	if errOut.Len() != 0 {
-		t.Errorf("the refusal was also written to stderr, so it will be reported twice:\n%s", errOut.String())
-	}
-
-	// The refusal is on disagreement, not on the flag being present. Asking for the mode
-	// the sandbox already has is a request that *is* met, so it must not error.
-	errOut.Reset()
-	mode, ok, err = networkFor(wired, network.ModeNAT, true, &errOut)
-	if err != nil || !ok || mode != network.ModeNAT {
-		t.Errorf("networkFor(-net nat on a nat sandbox) = %v, %v, %v; want nat, true, nil", mode, ok, err)
-	}
-
-	// And silence still means "use what the sandbox has", with nothing said.
-	errOut.Reset()
-	mode, ok, err = networkFor(wired, network.ModeNone, false, &errOut)
-	if err != nil || !ok || mode != network.ModeNAT {
-		t.Errorf("networkFor(no -net flag) = %v, %v, %v; want nat, true, nil", mode, ok, err)
+		t.Errorf("a re-attach was told about a mode it never asked to change:\n%s", errOut.String())
 	}
 
 	// A sandbox with no network annotations at all is not "no network": it is on the
 	// runtime's default transport, which reaches host loopback. That has to be said.
 	errOut.Reset()
 	legacy := invocation{name: "old", exists: true, info: sandbox.Info{}}
-	if _, ok, err := networkFor(legacy, network.ModeNAT, false, &errOut); ok || err != nil {
-		t.Errorf("a sandbox with no network annotations: wired=%v err=%v; want false, nil", ok, err)
+	if _, ok := networkFor(legacy, network.ModeNAT, &errOut); ok {
+		t.Error("a sandbox with no network annotations was reported as wired")
 	}
 	if !strings.Contains(errOut.String(), "TSI") {
 		t.Errorf("the warning does not name the transport such a sandbox actually uses:\n%s", errOut.String())
@@ -161,10 +141,9 @@ func TestNetworkForHonoursAnExplicitFlagOnANewSandbox(t *testing.T) {
 	fresh := invocation{name: "shell-new", exists: false}
 	for _, mode := range []network.Mode{network.ModeNone, network.ModeNAT} {
 		var errOut bytes.Buffer
-		got, ok, err := networkFor(fresh, mode, true, &errOut)
-		if err != nil || !ok || got != mode {
-			t.Errorf("networkFor(new sandbox, -net %v) = %v, %v, %v; want %v, true, nil",
-				mode, got, ok, err, mode)
+		got, ok := networkFor(fresh, mode, &errOut)
+		if !ok || got != mode {
+			t.Errorf("networkFor(new sandbox, -net %v) = %v, %v; want %v, true", mode, got, ok, mode)
 		}
 		if errOut.Len() != 0 {
 			t.Errorf("a new sandbox was warned about its own -net flag:\n%s", errOut.String())
