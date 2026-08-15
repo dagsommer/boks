@@ -1,0 +1,10 @@
+#| Lines beginning "#|" are stripped by render.sh. This is the version manifest: five
+#| fields, all of them required, and nothing optional exists to add.
+# Created by packaging/winget/render.sh in github.com/dagsommer/boks
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json
+
+PackageIdentifier: dagsommer.boks
+PackageVersion: {{VERSION}}
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.12.0

@@ -33,6 +33,15 @@ class Nerdbox < Formula
   # libkrun lives in a third-party tap. Because it is a *dependency* rather than something
   # you typed, Homebrew will not trust it implicitly — see the trust note in
   # packaging/homebrew/README.md and docs/install.md.
+  #
+  # Checked against the tap rather than assumed, on 2026-08-15. The GitHub organisation is
+  # `libkrun` and the repository is `homebrew-krun`, so the tap is `libkrun/krun` and the
+  # fully-qualified formula is `libkrun/krun/libkrun` — the spelling below. It ships
+  # libkrun 1.19.4 (over the 1.18 floor) against libkrunfw 5.5.0, carries the same
+  # `depends_on arch: :arm64` this formula does, and bottles only arm64_tahoe and
+  # arm64_sequoia. Neither `libkrun` nor `krunvm` exists in homebrew-core — both 404 on
+  # formulae.brew.sh — so this tap is the only source, which is why the trust step cannot
+  # be skipped.
   depends_on "libkrun/krun/libkrun"
 
   def install
