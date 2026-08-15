@@ -150,6 +150,48 @@ carries a corresponding-source obligation. It is built unmodified from a `cdn.ke
 tarball at a version nerdbox pins, with a config from nerdbox's repository, so satisfying
 it is a matter of publishing that recipe alongside — but it is a decision, not a detail.
 
+## Every dependency these formulae declare, checked against reality
+
+Recorded because "containerd is a Linux daemon, so it is probably not packaged for macOS,
+so `depends_on "containerd"` is a release blocker" is a reasonable suspicion, it was raised,
+and it is **wrong**. Checked 2026-08-15 against `formulae.brew.sh`'s JSON API and the
+formula sources in `Homebrew/homebrew-core`, so that nobody has to re-litigate it:
+
+| Declared by | Dependency | Exists? | Version | macOS arm64 bottles? |
+|---|---|---|---|---|
+| `boks.rb` | `containerd` (homebrew-core) | yes, since 2026-02-28 | **2.3.4** | yes — `arm64_tahoe`, `arm64_sequoia`, `arm64_sonoma`, `sonoma` |
+| `boks.rb` | `erofs-utils` (homebrew-core) | yes | **1.9.3** | yes |
+| `boks.rb` | `dagsommer/boks/nerdbox` | this tap | — | n/a |
+| `nerdbox.rb` | `libkrun/krun/libkrun` | yes, `libkrun/homebrew-krun` | **1.19.4** (libkrunfw 5.5.0) | `arm64_tahoe`, `arm64_sequoia` only |
+
+Three things fall out of that table and each is worth stating:
+
+- **`containerd` carries no `depends_on :linux`.** Four of its six bottle platforms are
+  macOS. Upstream's *release binaries* really are Linux and Windows only — there are no
+  darwin assets on a containerd release — but Homebrew builds darwin from source itself, so
+  the conclusion people draw from the missing assets does not follow.
+- **The version floor is 2.3, not 2.2**, and Homebrew cannot express a minimum version on a
+  dependency. homebrew-core is at 2.3.4, so this is fine today and is not guaranteed by
+  anything; `boks doctor`'s `runtime skew` line is the check that catches a machine which is
+  behind anyway. The failure it prevents is `unsupported protocol: Yunix`, which names
+  neither a version nor a shim.
+- **`libkrun/krun/libkrun` is the right spelling.** The GitHub organisation is `libkrun`
+  and the repository is `homebrew-krun`, so the tap is `libkrun/krun`. Neither `libkrun` nor
+  `krunvm` exists in homebrew-core — both 404 — so the tap is the only source, which is why
+  the trust step above is not optional.
+
+`brew trust` was checked too, since a documented command that does not exist would be worse
+than no documentation: it is real, it is `Library/Homebrew/cmd/trust.rb`, and non-official
+taps have required explicit trust since Homebrew **6.0.0** (2026-06-11; current release
+6.0.17). Homebrew's own `Tap-Trust.md` prefers item-level trust
+(`brew trust --formula libkrun/krun/libkrun`) over whole-tap trust, because trusting a tap
+"allows Homebrew to load every current and future formula, cask and external command" from
+it.
+
+**None of this means the formulae work.** No macOS machine has run either of them; see the
+caveat at the top of this file. It means the dependency edges resolve to formulae that exist
+at usable versions, which is a different and smaller claim.
+
 ## If homebrew-core ever packages nerdbox
 
 It may. `containerd`'s own formula carries the caveat *"You need to install an additional
