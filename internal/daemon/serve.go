@@ -104,6 +104,29 @@ func Serve(ctx context.Context, stateDir string, stdout, stderr io.Writer) error
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 
+	// Nothing below may return while containerd is still running.
+	//
+	// A supervisor that gave up — because containerd never answered, because the state file
+	// could not be written, because its context was cancelled — would otherwise release the
+	// lock and exit with a live containerd behind it, holding the socket. Nothing would then
+	// be tracking that process: `boks daemon status` would report nothing running, and
+	// `boks daemon start` would try to bind a socket somebody else already has. An orphan is
+	// the one outcome worse than a failure to start, because it cannot be cleaned up by the
+	// command that caused it.
+	//
+	// The flag is set only where containerd is known to have exited.
+	containerdGone := false
+	defer func() {
+		if containerdGone {
+			return
+		}
+		_ = proclock.Terminate(cmd.Process.Pid)
+		select {
+		case <-exited:
+		case <-time.After(stopGrace):
+		}
+	}()
+
 	st := State{
 		Address:       address,
 		Binary:        binary,
@@ -116,6 +139,9 @@ func Serve(ctx context.Context, stateDir string, stdout, stderr io.Writer) error
 
 	version, err := waitReady(ctx, address, exited)
 	if err != nil {
+		// waitReady reports a containerd that exited on its own as such, and the
+		// deferred cleanup must not then wait stopGrace for a process that is gone.
+		containerdGone = errors.Is(err, errContainerdExited)
 		return err
 	}
 	st.Version = version
@@ -141,18 +167,21 @@ func Serve(ctx context.Context, stateDir string, stdout, stderr io.Writer) error
 
 	select {
 	case err := <-exited:
+		containerdGone = true
 		return containerdExit(err, st.LogPath)
 	case <-signals:
-		_ = proclock.Terminate(cmd.Process.Pid)
 	case <-ctx.Done():
-		_ = proclock.Terminate(cmd.Process.Pid)
 	}
-	select {
-	case <-exited:
-	case <-time.After(stopGrace):
-	}
+	// A shutdown request. The deferred cleanup above does the terminating and the waiting,
+	// so there is nothing to repeat here — and having one place that ends containerd is what
+	// makes "the supervisor never returns while containerd runs" checkable by reading.
 	return nil
 }
+
+// errContainerdExited marks the case where the wait ended because containerd died, as opposed
+// to timing out or being cancelled. The difference decides whether the caller still has a
+// process to clean up.
+var errContainerdExited = errors.New("containerd exited before it was ready")
 
 // containerdExit turns containerd's exit into an error naming what it said.
 //
@@ -182,9 +211,9 @@ func waitReady(ctx context.Context, address string, exited <-chan error) (string
 		select {
 		case err := <-exited:
 			if err != nil {
-				return "", fmt.Errorf("containerd exited before it was ready: %w", err)
+				return "", fmt.Errorf("%w: %v", errContainerdExited, err)
 			}
-			return "", errors.New("containerd exited before it was ready")
+			return "", errContainerdExited
 		case <-ctx.Done():
 			return "", ctx.Err()
 		default:
