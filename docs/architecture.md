@@ -492,7 +492,7 @@ authoritative, and deleting them while the sandbox is stopped costs the sandbox 
 ## Platform direction
 
 Linux first (KVM). macOS second — libkrun and nerdbox both support it via
-Hypervisor.framework, and containerd 2.2+ runs natively there, so nothing in the design is
+Hypervisor.framework, and containerd 2.3+ runs natively there, so nothing in the design is
 Linux-only by construction.
 
 **Windows does not wait for nerdbox**, which is what this document used to say, and it is not
