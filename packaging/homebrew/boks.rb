@@ -33,8 +33,25 @@ class Boks < Formula
   # that installed one of five and left the user to discover the other four from failing
   # checks would not be much of an install.
   #
-  # containerd 2.2+ (homebrew-core is at 2.3.4) and erofs-utils, for mkfs.erofs, which the
-  # snapshotter shells out to when unpacking an image.
+  # Both of these were checked against homebrew-core rather than assumed, on 2026-08-15,
+  # because "containerd is a Linux daemon, so it is probably not packaged for macOS" is a
+  # reasonable guess and it is wrong:
+  #
+  #   containerd    2.3.4, added to homebrew-core 2026-02-28. No `depends_on :linux`, and
+  #                 bottles for arm64_tahoe, arm64_sequoia, arm64_sonoma and sonoma as well
+  #                 as the two Linux ones. Its own macOS caveat says the daemon "does not
+  #                 natively support running containers" without a runtime plugin such as
+  #                 nerdbox — which is precisely what the dependency below installs.
+  #   erofs-utils   1.9.3, arm64 macOS bottles, comfortably over the 1.8 floor.
+  #
+  # The floor is containerd 2.3, not 2.2. A shim linking containerd 2.3.3 emits version-3
+  # bootstrap parameters that a 2.2 daemon cannot decode; it reads the whole protobuf reply
+  # as an address and dies with `unsupported protocol: Yunix`, naming no version and no
+  # shim. Measured 2026-08-15, docs/verification.md. Homebrew has no way to express a
+  # minimum version on a dependency, so this relies on homebrew-core being at 2.3+ — it is,
+  # at 2.3.4 since 2026-08-12, though the formula was first added at 2.2.1 — and on
+  # `boks doctor`'s `runtime skew` line to catch a machine that is nonetheless behind,
+  # which a user who pinned an older containerd could still be.
   depends_on "containerd"
   depends_on "erofs-utils"
   # The VM shim, from this same tap, because it is packaged nowhere else. Read its caveats:

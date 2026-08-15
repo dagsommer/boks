@@ -12,12 +12,19 @@ with its honest, current status — and the status to know first is this one:
 
 Whichever route you take, run `boks doctor` immediately afterwards. It is the only thing
 that knows whether your machine can actually start a sandbox, and it prints a remedy for
-every gap. There is one thing it does *not* check, called out under macOS below.
+every gap.
+
+**Three platforms have now run a sandbox**, and they did not all get there at the same time.
+macOS on Apple silicon was first and is the most thoroughly measured; Windows and Linux both
+followed on 2026-08-14 and 2026-08-15. Each section below says what was observed on that
+platform and what was not, and [verification.md](verification.md) is the record every one of
+those claims is taken from.
 
 ## macOS on Apple silicon — Homebrew
 
-**The only platform where Boks has been shown to work.** The VM boundary and the network
-policy were both measured here; see [verification.md](verification.md).
+**The first platform Boks was shown to work on, and still the most measured.** The VM
+boundary and the network policy were both established here; see
+[verification.md](verification.md).
 
 ```sh
 brew tap dagsommer/boks
@@ -36,6 +43,12 @@ brew install boks
 That installs the whole stack — containerd, erofs-utils, libkrun and a nerdbox shim signed
 with the entitlement libkrun needs — rather than the CLI alone, because a CLI alone would
 land on a machine where every check fails.
+
+Homebrew's own `containerd` formula makes the same point from the other side. Its macOS
+caveat reads: *"The macOS version of containerd does not natively support running containers.
+You need to install an additional runtime plugin such as nerdbox (not packaged in Homebrew
+yet) to run containers on this build of containerd."* That plugin is exactly what
+`dagsommer/boks/nerdbox` supplies, and it is why the tap has two formulae rather than one.
 
 **Why the two `brew trust` lines.** Since Homebrew 6.0.0 a non-official tap must be trusted
 before Homebrew will load Ruby from it. Naming a formula in full on the command line trusts
@@ -72,8 +85,8 @@ launchd job or a `brew services` plist, that `PATH` is probably minimal and will
 > described under point 1 — the `[ttrpc]` section with a `uid`/`gid` — so that half is no
 > longer something to get right by hand either.
 
-**3. Build the guest kernel and root filesystem.** This is the gap, and it is the one
-`boks doctor` will not warn you about.
+**3. Build the guest kernel and root filesystem.** This is the gap, and the one thing on
+this page that no package on any platform installs for you.
 
 ```sh
 git clone https://github.com/dagsommer/boks && cd boks
@@ -102,11 +115,12 @@ the recipe, not about these two files.
 directory on containerd's `PATH` or on `LIBKRUN_PATH` works too — the shim scans both.
 
 > [!NOTE]
-> `boks doctor` checks for these two files, as `guest image`, and scans the same `PATH`
-> and `LIBKRUN_PATH` the shim does. It used to report ready on a machine that then failed
-> at boot with `nerdbox-kernel not found in PATH or LIBKRUN_PATH`; a `fail` on that line
-> now says so up front. One caveat remains: `doctor` scans *your* `PATH`, and what
-> matters is the containerd daemon's.
+> **`boks doctor` does check for these two files**, as `guest image`, scanning the same
+> `PATH` and `LIBKRUN_PATH` the shim does. It used to report ready on a machine that then
+> failed at boot with `nerdbox-kernel not found in PATH or LIBKRUN_PATH`; a `fail` on that
+> line now says so up front. One caveat remains: `doctor` scans *your* `PATH`, and what
+> matters is the containerd daemon's — which is one more reason to let `boks daemon start`
+> be the thing that starts containerd, since then Boks sets that `PATH` itself.
 
 ### What "installed" gets you
 
@@ -119,9 +133,25 @@ or lacks the entitlement, a sandbox will die inside libkrun with `krun_start_ent
 
 ## Linux — `.deb`, `.rpm`, tarball
 
-**The KVM path is built and designed for, and has not been verified end to end**: no sandbox
-has yet booted on Linux. The binaries build and pass their tests, and that is the whole of
-the claim today. See [which platforms work](get-started.md#which-platforms-work).
+**A sandbox boots on Linux, and its network policy is enforced.** Verified for the first
+time on 2026-08-15, in WSL2 on Ubuntu 26.04: 25 of 26 checks passed, with three distinct
+guest `boot_id`s, `nproc` following `--cpus` downward on an eight-core host, and — with all
+eight proxy variables cleared — an allowed address completing TLS against the origin's own
+Cloudflare certificate while `1.1.1.1:443` was refused in the same sandbox
+([verification.md](verification.md)).
+
+> [!IMPORTANT]
+> **Two things about that result you need before you install.** It was measured *in WSL2*,
+> not on bare metal, and while KVM is KVM either way, nothing on this project has run on a
+> bare-metal Linux host. And **Linux today needs more privilege than Windows does**: as an
+> ordinary user, sandbox creation fails with `mount source: "overlay", err: operation not
+> permitted` — that is Boks itself host-mounting the image overlay to read the image config.
+> Windows no longer has an equivalent requirement, which is the wrong way round and is being
+> worked on. Until it is, expect to run as root on Linux.
+
+The single failed check was the tester's own and was proved so: a workspace left `root:root`
+by a root client is not writable by the guest's uid 1000, and changing only the ownership —
+same binaries, same daemon — produced a successful write-through.
 
 ```sh
 # Debian, Ubuntu
@@ -159,49 +189,110 @@ static files over HTTPS, which GitHub Pages can serve — and an index-and-sign 
 
 It is deliberately not being rushed. An apt repository is a standing commitment — indices
 that must stay consistent, a URL that must keep working — and its whole benefit is
-upgrades, which matter once Linux is verified and someone is upgrading. Publishing a `.deb`
-on each release is the right size for where the project is; when the repository goes live,
-this page will carry the `signed-by` setup lines.
+upgrades, which matter once there is a release to upgrade *from*. There is not yet.
+Publishing a `.deb` on each release is the right size for where the project is; when the
+repository goes live, this page will carry the `signed-by` setup lines.
 
-## Windows — in progress
+## Windows — winget
 
-**A container runs in a microVM on Windows; `boks run` does not.** Both halves of that
-sentence matter. The stack underneath Boks is there: a Windows Hypervisor Platform backend for
-libkrun is being developed in this repository's [patch series](../packaging/libkrun-windows/),
-a patched nerdbox shim starts and serves ttrpc over a named pipe
-([`packaging/nerdbox-windows`](../packaging/nerdbox-windows/)), and on 2026-08-14
-`ctr tasks start` ran a Linux container end to end on real Windows 11 hardware — output
-returned, guest kernel 6.12.44, boot in 1.9 s ([Verification](verification.md)).
+**Boks runs a sandbox natively on Windows, with its network policy enforced, from an
+ordinary unelevated terminal.** This is not WSL2 and it is not Hyper-V's management stack: it
+is the **Windows Hypervisor Platform**, a user-mode hypervisor API, driven by a `krun.dll`
+this project builds from a [37-patch series](../packaging/libkrun-windows/) against libkrun.
 
-What remains for Boks is `virtio-net`, the one device its enforcement depends on: no Ethernet
-frame has crossed one on Windows, so `boks run` refuses to start sandbox networking there.
-Until that changes no Windows binary is shipped — a binary whose only possible output is a
-refusal would make the platform look done and move the disappointment to a later, more
-annoying point. [windows.md](windows.md) has the full picture, and
-[windows-e2e.md](windows-e2e.md) the procedure that does work today, which is `ctr` rather than
-`boks`.
+What was observed on real Windows 11 hardware, and the dates, because the platform changed
+quickly ([verification.md](verification.md) has all of it):
 
-### winget — waits on the above
+| | |
+|---|---|
+| 2026-08-14 | `boks run --net nat shell <workspace> -- uname -a` exits 0 in 12.2 s and reports `Linux 6.12.44 … x86_64`. The guest attaches to Boks' own link socket, and the policy engine judges real traffic: `github.com:443` allowed, `example.com:443` denied at CONNECT |
+| 2026-08-15 | The guest's wall clock is correct to the second against the host, and the allowed request returns **HTTP 200 from github.com** — fetched by a Linux container in a microVM on Windows, through Boks' own network stack. The denied host still fails `403` |
+| 2026-08-15 | **No elevation, and no UAC prompt anywhere.** Every step from a shell reporting `elevated = False`, with Developer Mode proven *off* first. `A required privilege is not held` appears zero times in 565 KB of debug log |
+| 2026-08-15 | Workspace write-through in both directions at the exact host path, LF preserved; `boks stop` / `boks rm` leave nothing behind; 2, 4 and 8 vCPUs all boot and `nproc` agrees |
 
 ```powershell
-winget install boks   # not published — nothing to install yet
+winget install boks
 ```
 
-A winget manifest needs something that works to install. The native binary cannot start a
-sandbox yet — it stops at the network refusal, not at the hypervisor — and winget installs
-packages *on Windows*, not inside a WSL distribution, so it cannot deliver the one Windows
-story Boks has today either. The manifest gets written when `boks run` completes on Windows,
-which is a stricter bar than a microVM booting there, and one the 2026-08-14 run did not
-clear.
+> [!NOTE]
+> **Not published yet.** The manifests are written and schema-checked — they are in
+> [`packaging/winget/`](../packaging/winget/) — but no release exists to install, nothing has
+> been submitted to `microsoft/winget-pkgs`, and no one has run `winget` against any of it.
+> That directory's README says exactly what has and has not been checked. Until it is live,
+> [build from source](#building-from-source) or use the WSL2 route below.
 
-### Meanwhile: run the Linux build inside WSL2
+### Elevation is not required, and this page used to say it was
 
+Worth stating plainly because earlier revisions of this document, and of
+[windows-e2e.md](windows-e2e.md), told you to open an elevated terminal or to switch on
+Developer Mode. That was true and is no longer.
+
+The requirement was never Boks'. containerd's `NewBundle` created a **symlink** for every
+task bundle, and unprivileged Windows will not create a symlink without
+`SeCreateSymbolicLinkPrivilege` — which Windows grants only under Developer Mode.
+[`packaging/containerd-windows/patches/0006`](../packaging/containerd-windows/) makes that
+link a **junction** instead, which an ordinary user can create, keeping the symlink as a
+fallback. Measured on 2026-08-15: the link is a junction (reparse tag `0xa0000003`), the
+fallback never fired, `symlink` appears nowhere in the log, and teardown leaves neither the
+bundle nor its target behind.
+
+Nothing in the stack needs a service, an installer that writes to `Program Files`, or a
+kernel driver. There is no `.sys` file anywhere in it.
+
+### About that SmartScreen warning
+
+**Boks ships unsigned, and Windows will say so.** If you download the archive with a browser
+and run `boks.exe` from it, Microsoft Defender SmartScreen is likely to show *"Windows
+protected your PC"* and require **More info → Run anyway**. Nothing is wrong with your
+download when that happens. SmartScreen fires on a file carrying the Mark of the Web —
+metadata Windows attaches to anything it considers downloaded — and it judges the file on the
+reputation of the certificate that signed it. An unsigned binary has no certificate, so there
+is nothing for a reputation to accrue against, and it does not improve with time the way a
+signed one does.
+
+Whether `winget install` trips it too depends on how winget marks what it fetched, and we
+have not measured that on a real machine. Expect the dialog rather than being surprised by
+it.
+
+This is a deliberate decision rather than an oversight. Code-signing certificates cost money
+per year and an OV certificate still earns its reputation slowly over download volume; an EV
+certificate clears SmartScreen immediately but needs a hardware token or a cloud HSM, which
+complicates signing in CI. Neither winget nor Homebrew requires signing, so the cost buys
+exactly one thing: a first-run dialog. For a project at this stage that is not yet worth
+paying for, and the honest consequence is the paragraph you are reading rather than silence.
+
+**What to do instead of trusting the dialog**: verify the download.
+[Verifying what you downloaded](#verifying-what-you-downloaded) covers it. That is a stronger
+check than a signature would give you, because it tells you which workflow at which commit
+produced the file, rather than only that somebody paid for a certificate.
+
+### What is not on Windows yet
+
+- **`mkfs.ext4`**, which containerd wants for a container's writable layer, has no Windows
+  build anywhere. The bundle ships a pre-formatted 64 MiB image instead. That is a workaround
+  and is labelled as one.
+- **One machine.** Every Windows result above comes from a single Windows 11 x64 host. There
+  is no Windows arm64 build at all — the WHP backend and the guest kernel are both x86_64.
+- **Nothing is packaged.** `krun.dll` is built in CI and then discarded; the patched
+  containerd, the shim and the guest images are artifacts with an expiry rather than release
+  assets. See [distribution.md](distribution.md).
+
+[windows.md](windows.md) has the full architectural picture and
+[windows-e2e.md](windows-e2e.md) the by-hand procedure using `ctr` rather than `boks`.
+
+### The WSL2 route still works
+
+If you would rather run the Linux build inside WSL2, that is still a supported answer, and
+since 2026-08-15 it is the *verified* one: the end-to-end Linux run above happened in WSL2.
 Boks is then an ordinary Linux program on an ordinary Linux kernel, and the exact-path
 workspace behaviour is preserved because a WSL2 workspace is already a Linux path. It needs
 WSL ≥ 2.5.1, `kvm` and `erofs` modules loaded, and `/dev/kvm` made group-accessible —
 `boks doctor` diagnoses each of those specifically, and
-[Troubleshooting](troubleshooting.md#wsl2) has the fixes. Designed for, not yet run by
-anyone on this project.
+[Troubleshooting](troubleshooting.md#wsl2) has the fixes.
+
+Choosing between them: the native route needs no elevation, and the WSL2 route currently does
+need root inside the distribution (see the Linux section above). That is the reverse of what
+anyone would guess, and it is the current state rather than the intended one.
 
 ## What a sandbox needs
 
@@ -220,7 +311,7 @@ boks daemon config    # the configuration, with the reason for every setting
 boks daemon logs      # what containerd wrote
 ```
 
-It does not install containerd — you still need one, version 2.2 or later — and it does not
+It does not install containerd — you still need one, version 2.3 or later — and it does not
 touch a containerd you already run. The daemon it starts has its own root, its own state and
 its own endpoint under your state directory, so a machine running containerd for Docker keeps
 doing so and the two never see each other. Nothing is installed as a service and nothing runs
@@ -236,7 +327,7 @@ are settings, and `boks daemon config` prints them with the failure each one pre
 
 | Piece | Why | macOS/arm64 | Linux | Windows |
 |---|---|---|---|---|
-| `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | in progress — see above |
+| `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | winget, or a zip |
 | containerd ≥ 2.3 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | **not packaged at a usable version** — Ubuntu 24.04 has 1.7.x | **patched build from source** |
 | `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build from source | **patched build from source** |
 | nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker** | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build with Docker | **build with Docker**, on a Linux machine or in CI |
@@ -245,12 +336,13 @@ are settings, and `boks daemon config` prints them with the failure each one pre
 
 The cells in bold are why this page is longer than one install command.
 
-The Windows column changed on 2026-08-14 from "—" to "build it": every one of those pieces has
-now been built for Windows and run together, which is what carried a container through `ctr`.
-None of it is packaged, all four patch series live in [`packaging/`](../packaging/), and
-`mkfs.ext4` — which containerd wants for a container's writable layer — still has no Windows
-build at all, so [windows-e2e.md](windows-e2e.md) supplies that image by hand. `boks` itself
-cannot yet drive any of it.
+The Windows column changed on 2026-08-14 from "—" to "build it": every one of those pieces
+has now been built for Windows and run together — and, since 2026-08-15, driven by `boks`
+itself rather than by `ctr`. It takes 48 carried patches to get there: 37 against libkrun, 6
+against containerd and 5 against nerdbox, all in [`packaging/`](../packaging/). None of it is
+packaged yet, and `mkfs.ext4` — which containerd wants for a container's writable layer —
+still has no Windows build at all, so the bundle ships a pre-formatted image and
+[windows-e2e.md](windows-e2e.md) supplies one by hand.
 
 **nerdbox is packaged nowhere.** Not homebrew-core, not the AUR, not nixpkgs, not Debian,
 and not by Repology in any of the ~400 repositories it tracks. Its own release workflow has
@@ -286,9 +378,10 @@ the dynamic linker.
 > **Downloading these is not the same as them working.** CI proves the files are ELF objects
 > of the right architecture and that `libkrun.so` exports every symbol the shim resolves at
 > `dlopen` — a load-time contract, and a real one, since libkrun 2.x drops four of them. It
-> does not start a VM: GitHub's runners have no `/dev/kvm`. Boks has not been verified end to
-> end on Linux, and these artifacts exist to make that verification possible without a
-> two-project build first.
+> does not start a VM: GitHub's runners have no `/dev/kvm`. These artifacts exist to make an
+> end-to-end Linux run possible without a two-project build first, and that is what they were
+> used for on 2026-08-15 — but the run that verified Linux is not the same thing as CI
+> verifying these files, and CI still only checks the load-time contract.
 
 ### Or build it yourself
 
@@ -329,18 +422,34 @@ Not ready: virtualization, containerd, vm runtime, guest image must be fixed bef
 
 ## Verifying what you downloaded
 
-Every release carries a `SHA256SUMS` covering every artifact, and each artifact carries a
-build provenance attestation.
+**The binaries are not code-signed on any platform.** Nothing carries an Authenticode
+signature on Windows or a Developer ID signature on macOS, and the packaging routes do not
+require one — neither winget nor Homebrew asks for a signature. What each release carries
+instead is a `SHA256SUMS` covering every artifact, and a build provenance attestation per
+artifact.
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify boks_0.1.0_darwin_arm64.tar.gz --repo dagsommer/boks
 ```
 
-The attestation says which workflow, at which commit, produced the file. The tarballs are
-also byte-reproducible: `scripts/build-release.sh` sorts the archive, zeroes ownership and
-takes timestamps from the commit date, so building the same tag on your own machine gives
-the same checksum rather than merely a working binary.
+The attestation says which workflow, at which commit, produced the file — which is more than
+a code-signing certificate tells you, since a certificate says only that somebody paid for
+one. The tarballs are also byte-reproducible: `scripts/build-release.sh` sorts the archive,
+zeroes ownership and takes timestamps from the commit date, so building the same tag on your
+own machine gives the same checksum rather than merely a working binary.
+
+> [!NOTE]
+> **The `SHA256SUMS` is to be GPG-signed, and is not yet.** The decision is made — the
+> signature is what lets you check the checksum file itself rather than trusting whatever the
+> download page served you — but `release.yml` does not sign it today, and the key it would
+> sign with is the archive key committed at
+> [`packaging/apt/boks-archive-keyring.asc`](../packaging/apt/boks-archive-keyring.asc).
+> Until the workflow does it, `SHA256SUMS` is only as trustworthy as the connection you
+> fetched it over, and the attestation is the stronger of the two checks.
+
+On Windows this is also the answer to the SmartScreen dialog: see
+[About that SmartScreen warning](#about-that-smartscreen-warning).
 
 There is deliberately no `curl | sh` installer. Boks refuses to install agent CLIs that
 way and pins every download it makes with a checksum; installing Boks itself is a poor
@@ -379,7 +488,9 @@ machine is still missing, and [What a sandbox needs](#what-a-sandbox-needs) is t
 | Homebrew tap | formulae written, tap not created | a `dagsommer/homebrew-boks` repository, and the release tarball's checksum |
 | Homebrew bottles | none | a `brew bottle` run per macOS version on Apple silicon, and somewhere to host them |
 | apt repository | signing key created; not hosted | hosting for the static repository, and an index-and-sign job in CI |
-| winget | none | a Windows binary that can start a sandbox — see [Windows](#windows--in-progress) |
+| winget | manifests written and schema-checked; nothing submitted | a Windows release artifact, then a pull request to `microsoft/winget-pkgs` and a human moderator's approval — [`packaging/winget/README.md`](../packaging/winget/) has the whole list |
+| a GPG signature on `SHA256SUMS` | decided, not implemented | a signing step in `release.yml` and the private key as a CI secret |
+| code signing | **deliberately not offered** | money, and — for the EV certificate that clears SmartScreen at once — a hardware token or cloud HSM in CI |
 | nerdbox guest assets on the release | buildable, not published | a decision about distributing a GPL-2.0 kernel binary |
 
 The last row is the one that matters most: it is the difference between an install that
