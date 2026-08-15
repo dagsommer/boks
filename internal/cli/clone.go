@@ -23,8 +23,15 @@ func applyCloneMode(f *sandboxFlags, inv invocation, cfg *sandbox.Config, env En
 	if !f.clone {
 		return nil
 	}
+	// A sandbox already in clone mode is a harmless no-op worth acknowledging. One in
+	// direct mode never reaches here: checkFixedAtCreation refuses it, alongside every
+	// other flag that is fixed when a sandbox is created, because silently ignoring
+	// --clone hands the guest a read-write share of the repository the flag exists to
+	// keep it out of.
 	if inv.exists {
-		fmt.Fprint(env.Stderr, cloneIgnoredNote(inv))
+		if inv.info.Filesystem.IsClone() {
+			fmt.Fprint(env.Stderr, cloneIgnoredNote(inv))
+		}
 		return nil
 	}
 	if len(inv.workspaces) == 0 {
@@ -68,6 +75,10 @@ func cloneIgnoredNote(inv invocation) string {
 			"note: sandbox %q is already in clone mode; --clone does nothing on a re-attach.\n",
 			inv.name)
 	}
+	// Unreachable since 2026-08-15: a direct-mode sandbox is refused by
+	// checkFixedAtCreation before this is called. Kept so the caller has a total
+	// function, and because a future caller reaching it would be a bug worth seeing
+	// rather than an empty string.
 	return fmt.Sprintf(
 		"warning: --clone is ignored: sandbox %q exists and is in DIRECT mode, so the guest\n"+
 			"         writes to %s on your disk. The mode is fixed when a sandbox is created.\n"+

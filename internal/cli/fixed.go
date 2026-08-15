@@ -123,6 +123,7 @@ func checkFixedAtCreation(f *sandboxFlags, net *policyFlags, inv invocation) err
 	checkAnnotations(f, inv, &c)
 	checkNetworkMode(net, inv, &c)
 	checkRuntimeFlags(f, inv, &c)
+	checkCloneMode(f, inv, &c)
 	return c.err()
 }
 
@@ -324,4 +325,25 @@ func checkRuntimeIsolation(dev *devFlags, inv invocation) error {
 			"Remove it and run again to get a real sandbox: boks rm %s\n"+
 			"If you are developing Boks itself, pass --i-know-this-is-not-isolated.",
 		inv.name, inv.info.Runtime, runtimecfg.Runtime, inv.name)
+}
+
+// checkCloneMode compares a --clone request with how the sandbox's workspace actually
+// reaches its guest.
+//
+// This one was a note until 2026-08-15, and the note was the wrong call by this file's own
+// rule. Every other flag here is judged by asking which way the silence errs: ignoring
+// --publish shares fewer ports, ignoring a workspace shares fewer directories, and a user
+// who ends up more contained than they asked for is not harmed by the difference.
+// --clone is the opposite shape. Its whole purpose is that guest writes never touch the
+// user's disk, so a --clone that is quietly ignored hands the guest a read-write share of
+// the very repository the flag was reached for to protect — the same failure --net none
+// has, and that one has been an error for exactly this reason.
+//
+// The mode lives in the container's OCI mounts, written once when the sandbox is created,
+// so it cannot be changed on a re-attach; recreating is the only way to get it.
+func checkCloneMode(f *sandboxFlags, inv invocation, c *fixedConflicts) {
+	if !f.clone || inv.info.Filesystem.IsClone() {
+		return
+	}
+	c.add("--clone", "the sandbox's workspace is shared read-write ("+inv.info.Filesystem.Mode+")")
 }
