@@ -46,9 +46,11 @@ func containerdFailure(address string, err error) Result {
 	res := Result{Status: StatusFail, Detail: "unreachable at " + address}
 
 	if _, statErr := os.Stat(address); errors.Is(statErr, fs.ErrNotExist) {
-		res.Remedy = fmt.Sprintf("No containerd %s at %s.\n"+
-			"Install and start containerd, or point Boks elsewhere with\n"+
-			"--containerd-address / BOKS_CONTAINERD_ADDRESS.",
+		res.Remedy = fmt.Sprintf("No containerd %s at %s.\n\n"+
+			"    boks daemon start\n\n"+
+			"starts one configured for Boks — its own root, state and endpoint, so it cannot\n"+
+			"disturb a containerd that Docker or your distribution is running. Or start your\n"+
+			"own and point Boks at it with --containerd-address / BOKS_CONTAINERD_ADDRESS.",
 			containerdEndpointNoun(address), address)
 		return res
 	}
