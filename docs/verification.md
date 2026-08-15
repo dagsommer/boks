@@ -1589,3 +1589,57 @@ test about network *modes* failed on a path length and advised using a shorter s
 The daemon package had already met this and answered it with a `shortStateDir` helper;
 `internal/cli` now has the same one. The path it produces measures 73 bytes against the same
 runner layout.
+
+### The first release, built and installed, 2026-08-15
+
+`release.yml` ran for the first time, dispatched rather than tagged so it produced a draft.
+Run 31884221317, green end to end: twenty jobs, fifteen assets.
+
+**The assumption the design rested on is now measured.** `docs/distribution.md` recorded that a
+called workflow's artifacts being visible to a later job in the caller was "a conclusion from
+two documented facts rather than a documented fact", and named it the first place to look if
+`assemble` could not find an artifact. `assemble` found all of them. Reusable workflows do
+share the caller's run and its artifact scope.
+
+**The first arm64 guest ever built.** `boks-guest_0.1.0_arm64.tar.gz` contains
+`nerdbox-kernel-arm64` and `nerdbox-rootfs.erofs` — the names the shim looks for. The naming
+fix earlier the same day was correct, and the leg that had never executed now does.
+
+**Installed from the `.deb`, on arm64 Linux.** `sudo dpkg -i boks_0.1.0_arm64.deb`, then:
+
+```
+vm runtime           ok     /usr/libexec/boks/containerd-shim-nerdbox-v1
+hypervisor library   ok     /usr/libexec/boks/libkrun.so
+```
+
+which is the doctor PATH fix holding on a real package rather than a synthetic layout — both
+files are in a directory on no `PATH`.
+
+#### `boks daemon start` ran the wrong containerd
+
+The first run of the installed package reported `containerd v2.2.6` from `/usr/bin`. The
+package had just installed 2.3.3 into `/usr/libexec/boks`, and 2.2.6 is *below* the measured
+floor — it is the version that fails at task start with `unsupported protocol: Yunix`. Every
+part of the stack was correct and the daemon ran the distribution's binary anyway, which is
+precisely the failure vendoring exists to prevent.
+
+`RuntimeDirs()` searched the executable's own directory before the bundle. For a tarball those
+are the same directory and the order never mattered; for a package the executable's directory
+is `/usr/bin`, which on any real machine holds the distribution's containerd. The bundle is now
+searched first.
+
+Measured on the same installed package, before and after:
+
+| | `boks daemon status` |
+|---|---|
+| before | `binary /usr/bin/containerd`, `containerd v2.2.6` |
+| after | `binary /usr/libexec/boks/containerd`, `containerd v2.3.3` |
+
+and `runtime skew` moved from unchecked to `ok (containerd v2.3.3, shim built against
+v2.3.3)`. With the guest archive unpacked into the same directory, every check passes except
+`virtualization`, which fails because this host has no `/dev/kvm`.
+
+**Not proven, and it is the important one.** No sandbox was started. This host has no KVM, so
+nothing here shows the packaged stack boots a VM — only that every component is present, the
+right version, and found. The release is a draft; `boks version --check` against it correctly
+reports "no release has been published yet", because GitHub's releases-latest excludes drafts.
