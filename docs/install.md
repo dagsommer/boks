@@ -207,7 +207,7 @@ anyone on this project.
 | Piece | Why | macOS/arm64 | Linux | Windows |
 |---|---|---|---|---|
 | `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | in progress — see above |
-| containerd ≥ 2.2 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | **not packaged at a usable version** — Ubuntu 24.04 has 1.7.x | **patched build from source** |
+| containerd ≥ 2.3 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | **not packaged at a usable version** — Ubuntu 24.04 has 1.7.x | **patched build from source** |
 | `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build from source | **patched build from source** |
 | nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker** | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build with Docker | **build with Docker**, on a Linux machine or in CI |
 | libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build from source | **`krun.dll`, patched build from source** |
@@ -265,7 +265,11 @@ the dynamic linker.
 The build route still works and is not going away; it is simply no longer the only one.
 Concretely, on Linux:
 
-- **containerd ≥ 2.2** from upstream's static binaries or from source;
+- **containerd ≥ 2.3** from upstream's static binaries or from source. Not 2.2:
+  the nerdbox shim emits version-3 bootstrap parameters, which a 2.2 daemon cannot
+  decode — it falls back to reading the whole protobuf reply as an address and fails
+  with `unsupported protocol: Yunix`, the three leading control bytes rendering as
+  letters. Measured on Ubuntu 26.04's containerd 2.2.2, 2026-08-15;
 - **nerdbox**, built from source — `task build` builds everything including the guest, and
   needs Docker with buildx; on Linux you also want its `libkrun` bake target, since libkrun
   is not generally packaged either. [`packaging/linux/README.md`](../packaging/linux/README.md)
