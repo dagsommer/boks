@@ -20,11 +20,19 @@ to a primary source), **inferred** (reasoned from one), or **unknown**.
 > where they are historical reasoning, because this document's value is the reasoning and not
 > its status line.
 >
-> **What is still true is the part that matters to Boks**: `virtio-net`. Boks enforces network
-> policy at that device, no Ethernet frame has crossed one on Windows, and
-> `internal/network/vmm_windows.go` still refuses to start sandbox networking there. `boks run`
-> does not work on Windows. The WSL2 route below remains the only way to use Boks on a Windows
-> machine, and nobody on this project has run that either.
+> **And the last thing this document held out on has happened too.** `virtio-net` was the one
+> device Boks' enforcement depends on, and for a week this banner said no Ethernet frame had
+> crossed one on Windows. On **2026-08-14** a guest attached to Boks' own link socket and the
+> policy engine judged real traffic; on **2026-08-15** a container in a microVM on Windows
+> fetched **HTTP 200 from github.com** through Boks' own network stack while a denied host was
+> refused, and every step of that ran from an **unelevated** shell. `boks run` works on
+> Windows.
+>
+> **So: to install and use Boks on Windows, read [install.md](install.md), not this file.**
+> Every paragraph below that describes WSL2 as the only route, says `boks run` does not work,
+> or says nobody has run something, is preserved as the reasoning of the spike and is
+> superseded by [verification.md](verification.md). This document is now history plus
+> architecture; the install instructions live in one place and it is not here.
 
 Of the decisions this spike produced, one has been implemented — the workspace path mapping in
 section 4, which is pure path arithmetic and needs no Windows to be correct — and it has still
@@ -55,8 +63,10 @@ therefore worth refuting explicitly rather than deleting.
 > changed its mind. If you are reading it to make a decision rather than to follow the
 > reasoning:
 >
-> - **Where a Windows user should start today** (immediately below) — the WSL2 route, which
->   needs no new code and is the only one that works now.
+> - **[install.md](install.md)** — how to actually install and run Boks on Windows. That is
+>   the native route, it needs no elevated terminal, and it is not in this document.
+> - **Where a Windows user should start today** (immediately below) — the WSL2 route, kept
+>   because it still works and is now the *verified* Linux route, and no longer the only one.
 > - **Section 7** — what the reference product actually does on Windows. This is the finding
 >   that matters, and it overturned the rest of the document.
 > - **Section 8** — the VMM candidates, the only remaining question for a native port.
@@ -139,7 +149,20 @@ waiting.
 
 ### And there is an answer for Windows users today
 
-**Run Boks inside WSL2.** It needs no new code: Boks is then an ordinary Linux program on an
+**Two, now.** When this was written there was one, and it was WSL2. The native one arrived
+later and is the one to reach for.
+
+**1. Native.** `winget install boks`, once a release exists — the manifests are in
+[`packaging/winget/`](../packaging/winget/) and nothing is published yet. It runs on the
+Windows Hypervisor Platform through this project's `krun.dll`, it needs **no elevated
+terminal and no Developer Mode**, and it enforces network policy at `virtio-net` exactly as
+on macOS. [install.md](install.md) is the instructions; [verification.md](verification.md) is
+what was measured. The elevation requirement that used to sit here was containerd's, not
+Boks': `NewBundle` symlinked unconditionally, and
+[`packaging/containerd-windows/patches/0006`](../packaging/containerd-windows/) makes that
+link a junction instead.
+
+**2. WSL2.** It needs no new code: Boks is then an ordinary Linux program on an
 ordinary Linux kernel, using `/dev/kvm` and its existing netstack, with none of the problems
 above. Nested virtualisation is on by default on Windows 11 x64, and the inbox WSL kernel
 carries both KVM and EROFS.
@@ -151,14 +174,16 @@ It will not work out of the box — the kvm and erofs modules are not loaded at 
 `/dev/kvm` is `root:root 0600` because WSL runs no udev. `boks doctor` now diagnoses both, and
 the section below has the fixes.
 
-This is not a Windows port and must not be described as one, and nobody here has run it. But it
-is a real answer to "can I use Boks on my Windows machine", it is available now, and it should
-be offered rather than buried.
+This is not a Windows port and must not be described as one. It **has** now been run: the
+first end-to-end verification of Boks on Linux, on 2026-08-15, happened in WSL2 on Ubuntu
+26.04 — 25 of 26 checks passing, with the network boundary holding against its positive
+control. So the sentence that used to sit here, that nobody had run it, is retired. What it
+cost was three host-configuration fixes and running as root, none of which the native route
+needs; [install.md](install.md) has both, side by side.
 
 What has *not* changed is the honesty requirement. When this was written, none of it had been
-run; since 2026-08-14 the container half has, and the WSL2 route recommended just above still
-has not, by anyone here. "Docker does it, so it is possible" was a strong existence proof and a
-weak implementation plan — the plan only became real when something ran.
+run. "Docker does it, so it is possible" was a strong existence proof and a weak
+implementation plan — the plan only became real when something ran.
 
 ## Why the earlier answers were wrong
 
@@ -179,13 +204,18 @@ implementation actually links against.
 
 ---
 
-## Where a Windows user should start today: Boks inside WSL2
+## The WSL2 route: still supported, no longer the only one
 
-**There is a Windows story Boks can offer right now, and it needs no new code: run Boks inside
-WSL2, where it is an ordinary Linux program on an ordinary Linux kernel.**
+**Run Boks inside WSL2, where it is an ordinary Linux program on an ordinary Linux kernel.**
+It needs no new code, and it is the configuration Boks on Linux was first verified in.
 
-This is not a Windows port and should never be described as one. But a developer on Windows 11
-who wants Boks can plausibly have it today, and that is worth more than a roadmap entry.
+This is not a Windows port and should never be described as one. It was written when it was
+the only thing a developer on Windows 11 could have; the native route in
+[install.md](install.md) is now the one to reach for, and this is the alternative. Two
+practical differences decide between them: the native route needs no elevation and no
+Developer Mode, while WSL2 currently needs root inside the distribution — and WSL2 preserves
+the exact-path workspace invariant trivially, because a WSL2 workspace is already a Linux
+path, whereas the native route derives a guest path (section 4).
 
 ### Why it should work
 
@@ -320,20 +350,30 @@ Linux path, so exact-path preservation is literally true there too.
 
 ### What is unverified
 
-**All of it, in combination.** Each ingredient is traced to WSL's source, its issue tracker or
-its kernel config; **nobody on this project has run Boks inside WSL2.** (Plenty has since been
-run on Windows *natively* — see the banner at the top — but nothing in a WSL distribution, which
-is a different kernel, a different `/dev/kvm` and a different set of failures.) The `doctor`
-logic added for this is tested, but only its logic — the values it reads have never been read on
-a real WSL system.
+**Much less than when this was written.** On **2026-08-15** Boks ran end to end inside WSL2
+on Ubuntu 26.04 — a real guest with its own `boot_id`, `nproc` tracking `--cpus`, and the
+network boundary passing with its positive control. 25 of 26 checks passed, and the one
+failure was the tester's file ownership rather than a defect
+([verification.md](verification.md)).
 
-The specific thing most worth testing first is **`/dev/kvm` on an AMD machine**. Nested
-virtualisation is vendor-agnostic in WSL's source, but the empirical record for AMD bare metal
-is thinner than for Intel, and if it fails there this answer covers substantially fewer users
-than it appears to.
+What that run cost, and what therefore remains a caveat rather than a claim:
 
-That test is cheap — `ls -l /dev/kvm`, `modprobe kvm_amd`, `boks doctor` — and it is the
-highest-value single experiment named anywhere in this document.
+- **Three host-configuration fixes**, none of them Boks bugs: containerd will not start
+  unprivileged with a default config; the Linux diff-service default of `['walking']` cannot
+  unpack a stacked EROFS snapshot; and the shim needs containerd **≥ 2.3**, not the 2.2 this
+  repository documented — a 2.2 daemon fails with `unsupported protocol: Yunix`. `boks daemon`
+  now writes the first two settings itself.
+- **Root.** Sandbox creation as an ordinary user fails on `mount source: "overlay", err:
+  operation not permitted`, which is Boks host-mounting the image overlay to read the image
+  config. Windows no longer needs elevation and Linux still needs root, which is the wrong way
+  round and is being worked on.
+- **One distribution, one machine, Intel.** The specific thing still most worth testing is
+  **`/dev/kvm` on an AMD machine**. Nested virtualisation is vendor-agnostic in WSL's source,
+  but the empirical record for AMD bare metal is thinner than for Intel, and if it fails there
+  this answer covers substantially fewer users than it appears to. That test is cheap —
+  `ls -l /dev/kvm`, `modprobe kvm_amd`, `boks doctor`.
+- **Bare-metal Linux has still never run a sandbox.** Every Linux result to date is from
+  inside WSL2.
 
 ---
 
