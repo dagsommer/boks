@@ -56,11 +56,27 @@ a sandbox is reached from anywhere:
 boks run --name shell-boks   # re-attach by name, from any directory
 ```
 
-Some things are fixed when a sandbox is created, because they are expressed in annotations the
-runtime reads at boot: the agent, and `--net`. Passing either with a value the sandbox was not
-created with is refused and nothing runs, rather than being quietly dropped — a `--net none`
-that was ignored would hand you a network while appearing to have been obeyed. Remove the
-sandbox and run again to change either.
+Some things are fixed when a sandbox is created, because they live in the container's OCI spec
+and in the annotations the runtime reads when it builds the VM: the agent, `--net`,
+`--template`, `--cpus`, `--memory`, `--env` and `--annotation`. Passing one of them with a
+value the sandbox was not created with is refused and nothing runs, rather than being quietly
+dropped — a `--cpus 2` that was ignored would hand you the eight-vCPU sandbox you already had,
+and a `--net none` that was ignored would hand you a network while appearing to have been
+obeyed. One run names all of them at once, with the value the sandbox actually has. Remove the
+sandbox and run again, or give a second one a `--name` of its own.
+
+Asking for what the sandbox already has is not a disagreement: re-running the same command
+line re-attaches in silence.
+
+Two things are reported rather than refused, because ignoring them leaves the guest with
+*less* than was asked for rather than more: `--publish` (the sandbox keeps the ports it has;
+`boks ports` changes a running one) and extra workspace arguments (a directory that is not
+shared is one the guest cannot reach). `--clone` on a sandbox that already exists is a
+warning, not a refusal, and says which mode you are actually getting.
+
+The policy flags are the opposite case and are *applied* on a re-attach: `--policy`,
+`--profile`, `--allow`, `--deny` and `--inject` resolve into the network stack this run starts
+rather than into the container, and they can only narrow what the sandbox reaches.
 
 ## Workspaces
 
@@ -95,6 +111,10 @@ boks run --cpus 4 -m 8g shell .
 
 `--cpus 0` means all host CPUs. `--memory` takes binary units and defaults to half the host's
 memory, capped at 32g.
+
+Both size the VM when it is built, so both are fixed when the sandbox is created: passing a
+different value to a sandbox that already exists is refused rather than ignored. `boks rm` and
+run again to resize one.
 
 ## The network a sandbox gets
 

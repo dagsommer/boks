@@ -86,6 +86,39 @@ func TestResourceAnnotations(t *testing.T) {
 	}
 }
 
+// The resources a sandbox was built with have to be readable again, because a re-attach that
+// names --cpus or --memory is refused against them and the refusal has to print the number
+// the sandbox actually has. They round-trip through the same annotations the runtime reads,
+// so this drives the pair together rather than asserting a getter against a literal.
+func TestInfoReadsBackTheResourcesItWasCreatedWith(t *testing.T) {
+	info := Info{Annotations: resourceAnnotations(Config{CPUs: 8, MemoryMiB: 8192})}
+
+	if cpus, ok := info.CPUs(); !ok || cpus != 8 {
+		t.Errorf("Info.CPUs() = %d, %v; want 8, true", cpus, ok)
+	}
+	if mib, ok := info.MemoryMiB(); !ok || mib != 8192 {
+		t.Errorf("Info.MemoryMiB() = %d, %v; want 8192, true", mib, ok)
+	}
+
+	// A sandbox created before Boks wrote these — or by something that wrote nonsense —
+	// has nothing to compare against. Reporting false is what stops a caller refusing a
+	// run over a number nobody recorded.
+	for name, annotations := range map[string]map[string]string{
+		"none":         nil,
+		"empty":        {annotationCPU: "", annotationMemory: ""},
+		"not a number": {annotationCPU: "many", annotationMemory: "8g"},
+		"zero":         {annotationCPU: "0", annotationMemory: "0"},
+	} {
+		unknown := Info{Annotations: annotations}
+		if _, ok := unknown.CPUs(); ok {
+			t.Errorf("%s: Info.CPUs() reported a value it does not have", name)
+		}
+		if _, ok := unknown.MemoryMiB(); ok {
+			t.Errorf("%s: Info.MemoryMiB() reported a value it does not have", name)
+		}
+	}
+}
+
 // Regression: the shim guidance used to be chosen by looking the shim up on Boks' own PATH,
 // which containerd does not use. Any task failure — here a runtime annotation the shim
 // rejected — was then blamed on a missing shim, and the real cause, printed directly above
