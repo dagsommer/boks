@@ -40,12 +40,18 @@
 # It proves NOTHING about whether the Windows binaries run. No Windows binary is executed here —
 # this is a Linux runner. Registering a plugin, linking it in, and naming it in a default list
 # are all necessary and none of them is sufficient; the first real Windows run needed four
-# separate fixes past "the plugins load". In particular, nobody has yet watched an unelevated
-# containerd create a task bundle with the junction patch 0006 adds. Download the bundle and
+# separate fixes past "the plugins load". Binaries from this workflow have since run through
+# `boks run` on real Windows 11 hardware, unelevated, with the junction patch 0006 adds
+# creating the task bundle and the symlink fallback never firing (2026-08-15,
+# docs/verification.md) — by hand, on one machine, not by this job. Download the bundle and
 # run the commands in packaging/containerd-windows/README.md to learn anything at all about
 # whether it works.
 name: containerd-windows
 
+#
+# `workflow_call` is here so release.yml builds these at the tag rather than fetching binaries
+# built from some other commit. A `paths:` filter constrains only the event it is written
+# under, so it does not reach workflow_call.
 on:
   push:
     branches: [main]
@@ -59,12 +65,16 @@ on:
       - "packaging/mkfs-erofs-windows/**"
       - ".github/workflows/containerd-windows.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` is the CALLER's workflow name under workflow_call, which keeps a release
+# build and a direct run on the same ref out of one another's group. With `cancel-in-progress`
+# on, sharing one would let a push to `main` cancel a release.
 concurrency:
-  group: containerd-windows-${{ github.ref }}
+  group: ${{ github.workflow }}-containerd-windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -689,6 +699,23 @@ jobs:
             || { echo "no ext4 superblock magic at offset 1080 — containerd will refuse this image" >&2; exit 1; }
           echo "  rwlayer-64m.img: $(file -b staging/rwlayer-64m.img), magic 53 ef at 1080"
 
+      # Every file, not only the executables, and inside the artifact rather than only in the
+      # step summary. release.yml checks this on the far side of the artifact transport before
+      # laying the bundle into a release archive, and `config.toml`, `new-containerd-root.ps1`
+      # and the pre-formatted writable layer are as load-bearing as the binaries: a truncated
+      # rwlayer-64m.img has no ext4 superblock and containerd will refuse it, and a truncated
+      # config.toml takes roughly forty plugins down.
+      - name: Checksums
+        working-directory: staging
+        run: |
+          set -euo pipefail
+          # Redirect rather than `| tee` into the directory the glob covers: in a pipeline the
+          # shell may create the output file before the glob is expanded, and SHA256SUMS would
+          # then list itself as empty.
+          files=(*)
+          sha256sum -- "${files[@]}" >SHA256SUMS
+          cat SHA256SUMS
+
       - uses: actions/upload-artifact@v4
         with:
           name: containerd-windows-amd64-bundle
@@ -696,17 +723,18 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Checksums and how to test
+      - name: How to test
         run: |
           set -euo pipefail
           {
             echo "## Windows test bundle (amd64)"
             echo
             echo "Artifact \`containerd-windows-amd64-bundle\` — three binaries, a \`config.toml\`,"
-            echo "\`new-containerd-root.ps1\`, a pre-formatted \`rwlayer-64m.img\` and the README."
+            echo "\`new-containerd-root.ps1\`, a pre-formatted \`rwlayer-64m.img\`, the README and"
+            echo "a \`SHA256SUMS\` covering all of it."
             echo
             echo '```'
-            (cd staging && sha256sum ./*.exe | sed 's|\./||')
+            cat staging/SHA256SUMS
             echo '```'
             echo
             echo "Unzip all of it into one directory and put that directory on \`PATH\` **before**"
@@ -718,10 +746,11 @@ jobs:
             echo "and one thing only — creating a *task bundle*, because \`NewBundle\` symlinked"
             echo "unconditionally (\`core/runtime/v2/bundle.go:103\`) and unprivileged Windows"
             echo "will not create a symlink without machine-wide Developer Mode. Patch \`0006\`"
-            echo "makes that link a **junction**, which needs no privilege. Nothing below"
-            echo "reaches a task anyway — these steps unpack an image and stop — but \`ctr run\`"
-            echo "should no longer need an elevated daemon either. **That has not been run on"
-            echo "Windows by anyone.** If you do run elevated, give the daemon a **fresh"
+            echo "makes that link a **junction**, which needs no privilege. That HAS now been"
+            echo "run: on 2026-08-15 every step from creating the root through \`boks run\`"
+            echo "completed from an ordinary shell with no UAC prompt, the link was a junction"
+            echo "and the symlink fallback never fired (docs/verification.md). One machine, one"
+            echo "round. If you do run elevated, give the daemon a **fresh"
             echo "\`--root\` it creates itself**: an elevated daemon pointed at a root an"
             echo "unprivileged user made hands that user its content store. See \`README.md\`"
             echo "in the artifact."
@@ -748,8 +777,11 @@ jobs:
             echo 'ctr.exe -n test images pull --platform linux/amd64 --snapshotter erofs docker.io/library/alpine:latest'
             echo '```'
             echo
-            echo "**No Windows binary here has been run.** Everything was cross-compiled and"
-            echo "inspected on a Linux runner. \`ctr plugins ls\` saying \`ok\` is a weak signal by"
-            echo "construction — it means a plugin initialised, not that anything calls it — so"
-            echo "the pull, not the plugin table, is what answers the question."
+            echo "**No Windows binary was run by this job.** Everything here was cross-compiled"
+            echo "and inspected on a Linux runner. Binaries from this workflow have since run on"
+            echo "real Windows 11 hardware, unelevated, all the way through \`boks run\` — by"
+            echo "hand, not here, and the runs found four defects that every green build before"
+            echo "them had passed. \`ctr plugins ls\` saying \`ok\` is a weak signal by construction"
+            echo "— it means a plugin initialised, not that anything calls it — so the pull, not"
+            echo "the plugin table, is what answers the question."
           } >>"$GITHUB_STEP_SUMMARY"
