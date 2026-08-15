@@ -68,11 +68,14 @@
     Run it UNELEVATED, as the same user that will run containerd.exe. Running it elevated
     creates directories owned by Administrators and puts you back where you started.
 
-    If you are going to run containerd.exe ELEVATED -- which you must, or turn on
-    Developer Mode, if you want to create a task and not merely unpack an image; see
-    "Elevation, Developer Mode, and the choice you actually have" in
-    packaging/containerd-windows/README.md -- then DO NOT USE THIS SCRIPT, and do not
-    point that daemon at a root this script made.
+    Elevating used to be compulsory for anything that creates a task, because containerd's
+    NewBundle symlinked unconditionally and unprivileged Windows will not create a symlink.
+    Patch 0006 makes that link a junction, which needs no privilege, so unelevated should
+    now be enough for a task too -- unverified on Windows; see "Elevation, and the choice
+    you no longer have to make" in packaging/containerd-windows/README.md.
+
+    If you are going to run containerd.exe ELEVATED anyway, DO NOT USE THIS SCRIPT, and do
+    not point that daemon at a root this script made.
 
     The reason is the same MkdirAllWithACL fast path this script exploits, read the other
     way round. An existing directory is accepted unchanged, with no ACL applied, so a root
