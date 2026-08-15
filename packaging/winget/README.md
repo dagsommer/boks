@@ -76,15 +76,21 @@ the Windows artifact is a **bundle**: Boks orchestrates containerd, the nerdbox 
 packaged anywhere on Windows. A lone `boks.exe` would install a binary that cannot start a
 sandbox — the thing `docs/install.md` spends its length warning about.
 
+**`release.yml` now builds exactly that archive.** When this file was first written it did not,
+and the manifest named an asset that would have 404'd on the first tag. The `assemble` job
+produces `boks_<version>_windows_amd64.zip` as a single top-level directory
+`boks_<version>_windows_amd64/` holding `boks.exe`, the runtime beside it, and the guest kernel
+and rootfs — and it **asserts that `boks.exe` is at that path** before archiving, so the
+contract between this manifest and that workflow fails in our CI rather than in someone else's
+repository.
+
 > [!WARNING]
-> **The manifest assumes a release artifact that does not exist yet.** It names
-> `boks_<version>_windows_amd64.zip` on the release, containing a single top-level directory
-> `boks_<version>_windows_amd64/` with `boks.exe` at its root and the runtime beside it. That
-> mirrors what `scripts/build-release.sh` already produces for the Unix tarballs, but
-> `release.yml` builds no Windows target today. **If the release names or lays out the archive
-> differently, the manifest is wrong**, and the two lines to change are `InstallerUrl` and
-> `RelativeFilePath` in `manifests/dagsommer.boks.installer.yaml.in`. Nothing else in this
-> directory depends on the layout.
+> **The assertion is the only thing holding the two files together, and it is one-directional.**
+> It catches `release.yml` laying the archive out differently. Nothing catches someone editing
+> `RelativeFilePath` here to a path the workflow does not produce. If the layout has to change,
+> the two lines are `InstallerUrl` and `RelativeFilePath` in
+> `manifests/dagsommer.boks.installer.yaml.in`, and the check in `release.yml`'s `assemble` job
+> has to move with them. Nothing else in this directory depends on the layout.
 
 Why the runtime sitting beside `boks.exe` is the right layout and not a convenience:
 `internal/daemon/locate.go` resolves the running executable, follows symlinks, and searches
@@ -105,9 +111,12 @@ which is already on `PATH`, and leave everything else invisible. Read from
 when `CreateSymlink` fails, winget falls back to adding the package directory to `PATH`
 rather than failing the install. **The consequence worth naming: on a machine where symlink
 creation fails, the fallback puts the bundle directory on `PATH` and the shadowing above
-happens anyway.** If that turns out to matter, the fix needs no manifest change at all — lay
-the archive out as `bin/boks.exe` beside `libexec/boks/`, which `locate.go` already searches
-as `<exe dir>/../libexec/boks`, and only `RelativeFilePath` moves.
+happens anyway.** If that turns out to matter, the fix is small and already supported at the
+other end — lay the archive out as `bin/boks.exe` beside `libexec/boks/`, which `locate.go`
+already searches as `<exe dir>/../libexec/boks`. Three lines move together: `RelativeFilePath`
+here, the layout in `release.yml`'s `assemble` job, and the assertion in it that checks the
+path. The flat layout is what ships because it is what this manifest already declared, and
+because the shadowing needs a symlink failure first.
 
 ### Other choices
 
@@ -215,17 +224,20 @@ identity of the submitter.
 
 Not opinions — things that do not exist:
 
-1. **A Windows release artifact.** `release.yml` builds darwin/arm64 and linux/{amd64,arm64}
-   and explicitly does not build windows/amd64. Until it produces
-   `boks_<version>_windows_amd64.zip`, the `InstallerUrl` here points at nothing.
-2. **The runtime pieces as release assets.** `krun.dll` is built by `libkrun-windows.yml` and
-   then discarded; the Windows containerd bundle and the nerdbox shim are artifacts with an
-   expiry rather than release assets. A bundle cannot be assembled from files that expire.
-   See `docs/distribution.md`, "The CI gap nobody has written down".
-3. **The guest kernel and root filesystem**, which are GPL-2.0 and whose distribution is an
-   unresolved owner decision. Without them the install produces a passing `boks doctor` and a
-   sandbox that will not boot.
-4. **`mkfs.ext4` for Windows**, which has no build anywhere. containerd wants it for a
-   container's writable layer.
+1. **A tag.** `release.yml` assembles `boks_<version>_windows_amd64.zip` and the four items
+   that used to be on this list are all in it — the CLI, `krun.dll`, the Windows containerd
+   bundle and the nerdbox shim, and the guest kernel and root filesystem. But no tag has ever
+   run that workflow, so there is no `InstallerUrl` that resolves and no digest to compute.
+   Step 2 of the sequence above is not a formality: the submission pipeline re-downloads the
+   archive and compares its hash, and a draft release is not publicly downloadable.
+2. **`mkfs.ext4` for Windows**, which has no build anywhere. containerd wants it for a
+   container's writable layer; the archive ships a pre-formatted 64 MiB image instead, which
+   is a workaround and is labelled as one in `docs/install.md`.
 
-Items 2–4 are not this directory's to solve and are tracked in `docs/distribution.md`.
+Item 2 is not this directory's to solve and is tracked in `docs/distribution.md`.
+
+**The guest is in the archive**, which is what makes a `winget install` boot a sandbox with no
+further download and is why this package is worth submitting at all. The kernel is GPL-2.0, so
+the archive carries a `SOURCE.txt` naming the exact nerdbox revision and the commands that
+reproduce it; the reasoning, including what that does and does not settle, is in
+`docs/distribution.md` under "What goes in the Windows archive, and the guest".
