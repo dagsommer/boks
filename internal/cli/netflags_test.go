@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -11,10 +12,27 @@ import (
 	"github.com/dagsommer/boks/internal/sandbox"
 )
 
+// shortStateDir is t.TempDir() without the test's name in the path.
+//
+// t.TempDir() embeds the test function's name, and these names are long. On Windows the
+// runner's temp root is long too, and the two together push a sandbox's link socket past the
+// 104-byte sun_path limit Boks enforces — so a test about network *modes* failed on a path
+// length, on Windows only, saying "use a shorter sandbox name". The limit is real and the
+// check is right to be there; it is the fixture that was wrong.
+func shortStateDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "bks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // TestRunRejectsAMalformedRule: a rule that cannot work must cost a message, not a sandbox.
 // The check runs before anything is created, pulled or started.
 func TestRunRejectsAMalformedRule(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 	dir := t.TempDir()
 
 	_, _, err := runCLI(t, "", "run", dir, "--allow", "*.*.example.com")
@@ -31,7 +49,7 @@ func TestRunRejectsAMalformedRule(t *testing.T) {
 // enforced by the stack rather than by an environment variable, and — the one that used to
 // be missing entirely — which hosts boks is about to decrypt.
 func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 
 	flags := &policyFlags{
 		allow:  []string{"example.com:443"},
@@ -77,7 +95,7 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 // TestDescribeNetworkForNoNetwork: -net none has no policy to describe and must not imply
 // one, but it must say what it is, because it is the strongest containment on offer.
 func TestDescribeNetworkForNoNetwork(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 
 	flags := &policyFlags{mode: "none", allow: []string{"example.com"}}
 	var errOut bytes.Buffer
@@ -182,7 +200,7 @@ func TestUnexercisedWarningIsNotSaidWhenThereIsNoLinkToDial(t *testing.T) {
 	// The gate reads spec.Plan.Mode, so the predicate being right is only half of it:
 	// the mode has to survive the trip from the flag through planFor into the Plan the
 	// call site actually holds. Walk that chain rather than trusting it.
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 	for _, mode := range []network.Mode{network.ModeNone, network.ModeNAT} {
 		plan, err := (&policyFlags{}).planFor("shell-proj", mode)
 		if err != nil {
