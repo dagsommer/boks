@@ -1,0 +1,36 @@
+# The containers/libkrun commit the LINUX artifacts are built from.
+#
+# This is deliberately NOT packaging/libkrun-windows/UPSTREAM_REV, and the difference is not
+# tidiness — the two pins are on opposite sides of a libkrun ABI break.
+#
+# WHY LINUX NEEDS ITS OWN PIN. nerdbox's loader resolves every symbol in its binding table
+# EAGERLY at dlopen (internal/vm/libkrun/openLibkrun reflects over the whole struct and calls
+# purego.RegisterLibFunc on each `C:"krun_*"` tag). One missing symbol does not fail late at
+# the call site; it fails the load, so no VM starts at all.
+#
+# nerdbox v0.2.3 binds 19 symbols, and they are the libkrun 1.x ABI. The Windows pin
+# (07fd40d) is libkrun 2.0.0-dev, ABI_VERSION=2, which dropped four of them. Measured, not
+# assumed — built on 2026-08-15 from 07fd40d for aarch64-unknown-linux-gnu with
+# `--features blk,net` and read out of .dynsym:
+#
+#     krun_set_log_level      ABSENT at 07fd40d, present at v1.19.4
+#     krun_set_console_output ABSENT at 07fd40d, present at v1.19.4
+#     krun_set_gvproxy_path   ABSENT at 07fd40d, present at v1.19.4
+#     krun_set_net_mac        ABSENT at 07fd40d, present at v1.19.4
+#
+# The other 15 are present at both. So a Linux artifact built from the Windows pin would be a
+# libkrun.so that nerdbox cannot dlopen — it would fail on every machine, at load, before any
+# of the interesting failure modes were reachable.
+#
+# The Windows series does not hit this because it patches its way around it: patch 0014
+# ("windows: export the libkrun-1.x ABI symbols nerdbox binds") adds the missing exports back
+# under `#[cfg(windows)]`, and patch 0026 restores krun_set_console_output outside the
+# aws-nitro feature. Linux gets them for free by staying on the 1.x line instead.
+#
+# NO PATCHES ARE APPLIED ON TOP OF THIS. packaging/libkrun-windows/patches/ is generated
+# against the 2.0 tree and would not apply here even if it were wanted. See README.md for the
+# five patches in that series that are NOT Windows-only, and why Linux still does without them.
+#
+# A full SHA rather than the tag, so the build cannot move under us if the tag is ever
+# repointed. This is v1.19.4, the newest 1.x release, from containers/libkrun.
+728df8125077d0db44265f6e997c72b81b65c015

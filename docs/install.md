@@ -208,9 +208,9 @@ anyone on this project.
 |---|---|---|---|---|
 | `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | in progress — see above |
 | containerd ≥ 2.2 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | **not packaged at a usable version** — Ubuntu 24.04 has 1.7.x | **patched build from source** |
-| `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | **build from source** | **patched build from source** |
-| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker** | **build with Docker** | **build with Docker**, on a Linux machine or in CI |
-| libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | build from source, or a distro that has it | **`krun.dll`, patched build from source** |
+| `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build from source | **patched build from source** |
+| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker** | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build with Docker | **build with Docker**, on a Linux machine or in CI |
+| libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build from source | **`krun.dll`, patched build from source** |
 | `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | **patched build from source** |
 
 The cells in bold are why this page is longer than one install command.
@@ -224,16 +224,53 @@ cannot yet drive any of it.
 
 **nerdbox is packaged nowhere.** Not homebrew-core, not the AUR, not nixpkgs, not Debian,
 and not by Repology in any of the ~400 repositories it tracks. Its own release workflow has
-failed on every tag since v0.2.0, so all ten of its GitHub releases carry zero assets —
-there is no prebuilt shim, kernel or rootfs to download for any platform. Everything above
-that involves nerdbox involves building it.
+failed on every tag since v0.2.0, so all ten of its GitHub releases carry zero assets — there
+is no prebuilt shim, kernel or rootfs to download *from upstream*, for any platform.
 
-On Linux, concretely, that means:
+### Prebuilt shim and libkrun for Linux
+
+Because upstream publishes nothing, this repository builds them. Two workflows between them
+cover everything on the list above except containerd and `mkfs.erofs`:
+
+| Workflow | Artifact | Contents |
+|---|---|---|
+| [`linux-runtime`](../.github/workflows/linux-runtime.yml) | `boks-runtime-linux-<arch>` | `containerd-shim-nerdbox-v1`, `libkrun.so` |
+| [`guest-image`](../.github/workflows/guest-image.yml) | `nerdbox-guest-<arch>` | `nerdbox-kernel-<arch>`, `nerdbox-rootfs-<arch>.erofs` |
+
+Download the artifacts from a run's summary page, then:
+
+```sh
+sudo install -m0755 containerd-shim-nerdbox-v1 /usr/local/bin/
+sudo install -m0644 libkrun.so /usr/local/lib/
+sudo install -m0644 nerdbox-kernel-* nerdbox-rootfs-*.erofs /usr/local/lib/
+```
+
+Both binaries are **unpatched upstream**, built from the SHAs pinned in
+[`packaging/nerdbox/NERDBOX_REV`](../packaging/nerdbox/NERDBOX_REV) and
+[`packaging/linux/LIBKRUN_REV`](../packaging/linux/LIBKRUN_REV), for amd64 and arm64.
+[`packaging/linux/README.md`](../packaging/linux/README.md) covers where each file has to go
+and why `libkrun.so`'s filename matters — the shim stats for two exact names and never asks
+the dynamic linker.
+
+> [!NOTE]
+> **Downloading these is not the same as them working.** CI proves the files are ELF objects
+> of the right architecture and that `libkrun.so` exports every symbol the shim resolves at
+> `dlopen` — a load-time contract, and a real one, since libkrun 2.x drops four of them. It
+> does not start a VM: GitHub's runners have no `/dev/kvm`. Boks has not been verified end to
+> end on Linux, and these artifacts exist to make that verification possible without a
+> two-project build first.
+
+### Or build it yourself
+
+The build route still works and is not going away; it is simply no longer the only one.
+Concretely, on Linux:
 
 - **containerd ≥ 2.2** from upstream's static binaries or from source;
 - **nerdbox**, built from source — `task build` builds everything including the guest, and
   needs Docker with buildx; on Linux you also want its `libkrun` bake target, since libkrun
-  is not generally packaged either;
+  is not generally packaged either. [`packaging/linux/README.md`](../packaging/linux/README.md)
+  has the two short commands if you want only the shim and the library rather than the whole
+  `task build`, and the assertion script to check what you built;
 - **erofs-utils ≥ 1.8** — Ubuntu 24.04's 1.7.1 is too old for containerd's erofs
   snapshotter, where it surfaces as a confusing failure partway through an image unpack;
   `boks doctor` reads `mkfs.erofs -V` and fails on anything older;
