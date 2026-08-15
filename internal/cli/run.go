@@ -35,6 +35,11 @@ the same directory re-attaches to it, so packages installed and files written in
 still there; remove it with 'boks rm'. Pass --rm for a sandbox destroyed when the command
 exits, or --name to reach a sandbox from anywhere.
 
+What a sandbox is made of is fixed when it is created — the agent, the image, the vCPUs, the
+memory, the environment and the network mode all live in the container the runtime builds the
+VM from. Passing one of those to a sandbox that already exists is refused rather than quietly
+dropped, and the refusal names the value the sandbox has. Remove it, or name a new one.
+
 Arguments after '--' are passed to the agent. For the shell agent they are the command to
 run, since that is what arguments to a shell are.
 
@@ -119,6 +124,14 @@ Agents:
 				return err
 			}
 			inv.exists = false
+		}
+		// Everything a sandbox fixes when it is created is decided here, before anything
+		// is pulled, created or started: a flag that cannot be honoured costs a message
+		// rather than a sandbox that is not the one the command line described. An
+		// ephemeral run has just been given a name of its own, so it creates and this
+		// says nothing.
+		if err := checkFixedAtCreation(flags, &netFlags, inv); err != nil {
+			return err
 		}
 
 		cfg, err := flags.config(inv, agentArgs)

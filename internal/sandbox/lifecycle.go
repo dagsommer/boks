@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -67,6 +68,31 @@ func (i Info) Workspace() string {
 		return ""
 	}
 	return i.Workspaces[0].HostPath
+}
+
+// CPUs and MemoryMiB report the resources a sandbox was built with, and whether it recorded
+// them at all.
+//
+// They are read back from the runtime's own annotations rather than from a label of our own,
+// because those annotations *are* the request: the VM is sized from them when it is built.
+// Reading the same strings the runtime reads is what keeps "what the sandbox has" from
+// drifting away from what it was given. A sandbox created before Boks set them — or one
+// whose annotation is not a number — reports false, and a caller must then say nothing
+// rather than guess.
+func (i Info) CPUs() (int, bool) { return intAnnotation(i.Annotations, annotationCPU) }
+
+func (i Info) MemoryMiB() (int, bool) { return intAnnotation(i.Annotations, annotationMemory) }
+
+func intAnnotation(annotations map[string]string, key string) (int, bool) {
+	value, ok := annotations[key]
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // Create registers a sandbox without starting it, so that a slow image pull can happen
