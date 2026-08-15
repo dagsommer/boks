@@ -176,3 +176,37 @@ func containsString(list []string, want string) bool {
 	}
 	return false
 }
+
+// A package install puts boks in /usr/bin and the runtime in /usr/libexec/boks. /usr/bin
+// holds the distribution's own containerd on any real machine, so if the executable's own
+// directory is searched first the system binary wins and vendoring has bought nothing.
+//
+// Measured from an installed .deb on 2026-08-15, before the fix: `boks daemon start` reported
+// containerd v2.2.6 out of /usr/bin — below the 2.3 floor, the version that fails at task
+// start with `unsupported protocol: Yunix` — while the 2.3.3 the package had just installed
+// sat unused in /usr/libexec/boks.
+func TestBundleIsSearchedBeforeTheExecutablesOwnDirectory(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "usr", "bin")
+	libexec := filepath.Join(root, "usr", "libexec", "boks")
+	for _, d := range []string{bin, libexec} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The layout a package produces: a containerd in both places.
+	for _, d := range []string{bin, libexec} {
+		if err := os.WriteFile(filepath.Join(d, "containerd"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dirs := runtimeDirsFrom(filepath.Join(bin, "boks"))
+	if len(dirs) < 2 {
+		t.Fatalf("expected both directories, got %v", dirs)
+	}
+	if dirs[0] != libexec {
+		t.Errorf("searched %q first; the bundle %q must come first or a package install "+
+			"runs the distribution's containerd instead of its own", dirs[0], libexec)
+	}
+}
