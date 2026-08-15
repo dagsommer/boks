@@ -25,7 +25,7 @@
 #                  in a configuration that needs Apple silicon.
 #   windows/arm64  not shipped. The CLI cross-builds, but there is no runtime under it:
 #                  krun.dll is built for x86_64-pc-windows-msvc only, and mkfs.erofs.exe
-#                  has no aarch64 recipe (go-erofs cross-compiles for x86-64 alone). A
+#                  has no arm64 recipe (go-erofs cross-compiles for x86-64 alone). A
 #                  binary whose only possible output is a refusal makes the platform look
 #                  supported and moves the disappointment later.
 #
@@ -240,7 +240,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        arch: [x86_64, arm64]
     uses: ./.github/workflows/guest-image.yml
     with:
       arch: ${{ matrix.arch }}
@@ -315,8 +315,8 @@ jobs:
           path: in/guest-x86_64
       - uses: actions/download-artifact@v4
         with:
-          name: nerdbox-guest-aarch64
-          path: in/guest-aarch64
+          name: nerdbox-guest-arm64
+          path: in/guest-arm64
       - uses: actions/download-artifact@v4
         with:
           name: krun-dll-windows-amd64
@@ -411,7 +411,7 @@ jobs:
           # (nerdbox-rootfs.erofs and nerdbox-rootfs-<arch>.erofs), and getting the guess
           # wrong here would silently ship an archive missing the rootfs. Whatever the
           # producing workflow put in the artifact is what goes in.
-          for arch in x86_64 aarch64; do
+          for arch in x86_64 arm64; do
             d="stage/boks-guest_${VERSION}_${arch}"
             mkdir -p "$d"
             cp -a "in/guest-$arch/." "$d/"
@@ -480,7 +480,7 @@ jobs:
             *) cp -a "$f" "$cli/" ;;
             esac
           done
-          # The guest, x86_64 only: there is no aarch64 Windows runtime to boot it with.
+          # The guest, x86_64 only: there is no arm64 Windows runtime to boot it with.
           cp -a in/guest-x86_64/. "$cli/"
           write_source_txt "$cli" x86_64
           # Each incoming directory brought its producing workflow's SHA256SUMS along. They
@@ -653,7 +653,7 @@ jobs:
           | `boks_*.deb`, `boks_*.rpm` | the CLI **and the Linux runtime**, packaged. `docs/install.md` says what a package puts on the machine. |
           | `boks-runtime_*_linux_amd64.tar.gz`, `_linux_arm64.tar.gz` | `containerd-shim-nerdbox-v1` and `libkrun.so` |
           | `boks-runtime_*_windows_amd64.zip` | the Windows runtime **without** the CLI: `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer. For a `boks.exe` you built yourself, or for driving containerd by hand. |
-          | `boks-guest_*_x86_64.tar.gz`, `_aarch64.tar.gz` | the guest kernel and EROFS rootfs a sandbox boots |
+          | `boks-guest_*_x86_64.tar.gz`, `_arm64.tar.gz` | the guest kernel and EROFS rootfs a sandbox boots |
 
           **There is no Windows CLI-only archive, deliberately.** It would be a strict subset
           of `boks_*_windows_amd64.zip` — a smaller download whose only distinguishing
@@ -670,7 +670,7 @@ jobs:
           re-signs the shim after relocating it — a pre-built binary would arrive without the
           entitlement and die inside libkrun with `krun_start_enter failed: -22`, an error
           naming neither code signing nor the entitlement. Use `brew install boks`. The
-          `aarch64` guest archive above is the same file a Mac needs.
+          `arm64` guest archive above is the same file a Mac needs.
 
           ## Platforms — what has actually been run
 
@@ -697,7 +697,7 @@ jobs:
             `unsupported protocol: Yunix`, which names no version, no shim and no protocol.
             This was measured against Ubuntu's 2.2.2. `boks doctor` now warns about the skew.
           - **`windows_arm64` and Intel macOS are not shipped at all**, and cannot be: there is
-            no `krun.dll` or `mkfs.erofs.exe` for aarch64 Windows, and libkrun on macOS needs
+            no `krun.dll` or `mkfs.erofs.exe` for arm64 Windows, and libkrun on macOS needs
             Apple silicon.
           - **Nothing in the runtime archives was executed by CI.** The workflows compile,
             link, and read the built binaries back — architectures, exported symbols, linked
