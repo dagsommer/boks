@@ -4,8 +4,10 @@ What is not built, and what gets built next. This is a list of gaps rather than 
 dates: nothing here is scheduled, and the order is what unblocks the most rather than what is
 most wanted.
 
-The VM boundary is done and the network datapath enforces. What matters most now is watching
-that work against a real guest on more than one platform.
+The VM boundary is done and the network datapath enforces, and both have now been watched
+from inside a real guest on macOS, Windows and Linux. What matters most now is closing the
+gaps those runs exposed — Linux still needs root to create a sandbox — and getting a release
+out that people can actually install.
 
 ## Next
 
@@ -14,18 +16,19 @@ that work against a real guest on more than one platform.
    is restarted. Boks says exactly that when it meets one and gives the `stop && start` that
    fixes it; it does not restart the sandbox itself, because that kills whatever is running
    inside.
-2. **Policy over names for raw flows**, so that `--allow example.com` can authorise a direct
+2. **Sandbox creation on Linux without root**, which today fails for an ordinary user on a
+   host mount Boks makes to read the image config — see below.
+3. **Policy over names for raw flows**, so that `--allow example.com` can authorise a direct
    connection to the address it resolves to rather than denying it.
-3. **The interactive dashboard** that bare `boks` should open.
-4. **Clone mode measured behind a hypervisor.** `--clone` is built and verified against runc,
+4. **The interactive dashboard** that bare `boks` should open.
+5. **Clone mode measured behind a hypervisor.** `--clone` is built and verified against runc,
    where the read-only source share is a bind mount rather than virtiofs; nothing about it
    has been measured behind a VM boundary yet.
-5. **Docker daemon inside the guest.**
-6. **UDP port publishing**, which needs the link filter to carry a datagram's return path
+6. **Docker daemon inside the guest.**
+7. **UDP port publishing**, which needs the link filter to carry a datagram's return path
    without becoming a general hole.
-7. **Kits / declarative configuration**, which is also what would let an agent be defined in a
+8. **Kits / declarative configuration**, which is also what would let an agent be defined in a
    file rather than in code.
-8. **Windows** — see below.
 
 ## What is not done
 
@@ -34,22 +37,24 @@ would sell.
 
 ### Platforms
 
-- **Linux is untested in practice.** The boundary was verified on macOS on Apple silicon; the
-  Linux/KVM path is designed for but has not been exercised end to end.
-- **Native Windows support is in progress: the stack underneath Boks runs a container there,
-  `boks run` does not.** A Windows Hypervisor Platform backend for libkrun is being built in
-  this repository's [patch series](../packaging/libkrun-windows/), and on 2026-08-14
-  `ctr tasks start` carried a Linux container end to end on real Windows 11 hardware —
-  containerd, the [nerdbox shim](../packaging/nerdbox-windows/), `krun.dll`, WHP — booting in
-  1.9 s and printing the guest kernel's own `uname`. What remains for Boks is **`virtio-net`**,
-  which is exactly the device its enforcement depends on: no Ethernet frame has crossed one on
-  Windows, so `boks run` declines to start sandbox networking there rather than pretend
-  otherwise, and `boks doctor` fails its platform check. Elevation of the **containerd
-  daemon** (or Developer Mode) was also needed, for a symlink containerd makes in every task
-  bundle; [`patches/0006`](../packaging/containerd-windows/patches/) makes that a junction
-  instead and has not been run on Windows. In the meantime Boks
-  should run **inside WSL2** with nested virtualisation: unchanged, with workspace paths
-  preserved exactly. Untested, but every ingredient is there — see [Windows](windows.md).
+- **Linux needs root to create a sandbox.** The platform was verified end to end for the
+  first time on 2026-08-15, in WSL2 on Ubuntu 26.04, and the boundary and the network policy
+  both held. But as an ordinary user, creation fails with `mount source: "overlay", err:
+  operation not permitted` — that is Boks itself host-mounting the image overlay to read the
+  image config. Windows no longer has an equivalent requirement, which is the wrong way
+  round. Whether the metadata-only path that answered it on Windows transfers to Linux is
+  under investigation.
+- **No bare-metal Linux run.** The Linux verification happened inside WSL2. KVM is KVM
+  either way, but nothing on this project has run on a bare-metal Linux host, and the shim
+  also turned out to need containerd ≥ 2.3 rather than the 2.2 this page used to claim.
+- **Windows is one machine, and x64 only.** `boks run` boots a sandbox natively through the
+  Windows Hypervisor Platform from an ordinary unelevated terminal, with policy enforced and
+  teardown clean — but every Windows result comes from a single Windows 11 x64 host. There is
+  no Windows arm64 build at all: the WHP backend and the guest kernel are both x86_64. The
+  WHP backend lives in this repository's [patch series](../packaging/libkrun-windows/)
+  against libkrun rather than upstream. See [Windows](windows.md).
+- **No release exists on any platform.** The packaging is built and the manifests are
+  written, but no tag has been cut, so every install route is source-built today.
 
 ### Network
 
@@ -67,10 +72,11 @@ would sell.
 
 ### Ports
 
-- **Published ports are TCP only.** The grammar accepts `udp`, `udp4` and `udp6` because
-  Docker Sandboxes' does, and refuses them with the reason: the sandbox's network stack drops
-  UDP at the link, so a datagram has no way back. Publishing UDP would mean widening that
-  filter, which is a change to the stack's closed posture rather than a port flag.
+- **Published ports are TCP only.** The grammar accepts `udp`, `udp4` and `udp6`, because
+  that is the port syntax people already type, and refuses them with the reason: the
+  sandbox's network stack drops UDP at the link, so a datagram has no way back. Publishing
+  UDP would mean widening that filter, which is a change to the stack's closed posture rather
+  than a port flag.
 - **Publishing has never been driven by a real guest.** The datapath is exercised end to end
   against a simulated one — a second gvisor stack on the far end of the real link socket —
   which proves the host side works. A real VM reaching it through libkrun's virtio-net device
@@ -103,21 +109,19 @@ would sell.
 
 - **No terminal dashboard** for bare `boks`, and no `--kit`. See the CLI surface section of
   the [parity matrix](docker-sandbox-parity.md). `--clone` exists, and has only been
-  exercised against runc — see item 4 above.
+  exercised against runc — see item 5 above.
 - **No nested Docker** and no kits.
 - **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather than
   exiting 130 silently.
 
 ## Not planned
 
-- **Org governance and an audit control plane.** Docker Sandboxes has this, as a paid
-  offering. Boks will not replicate it.
+- **Org governance and an audit control plane.** A fleet-management layer is a product in its
+  own right, and a different one from this. Boks will not grow one.
 - **Telemetry of any kind**, opt-out or otherwise.
 - **An account.**
 
 ---
 
 If you find something on this page that is no longer true, that is a bug in the page. The
-feature-by-feature comparison with the reference implementation is the
-[Docker Sandbox parity matrix](docker-sandbox-parity.md), and the evidence behind every
-"verified" above is in [Verification](verification.md).
+evidence behind every "verified" above is in [Verification](verification.md).

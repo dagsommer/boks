@@ -4,9 +4,10 @@ Boks runs a coding agent inside a microVM of its own, on your machine. This page
 from nothing to a shell inside one.
 
 > [!WARNING]
-> **Boks is experimental.** The VM boundary and the network policy have both been measured
-> against a real guest, and both hold — but this is a young project with one verified
-> platform, one verified hypervisor, and plenty still unbuilt. Read
+> **Boks is experimental.** The VM boundary and the network policy have each been measured
+> against a real guest on macOS, Windows and Linux, and both hold on all three — but the
+> Linux run was inside WSL2 rather than on bare metal, a single hypervisor sits behind all of
+> it, and plenty is still unbuilt. Read
 > [Which platforms work](#which-platforms-work) before you spend an hour on this, and
 > [what is not built yet](roadmap.md) before you rely on it.
 
@@ -17,11 +18,13 @@ worth your time.
 
 | Platform | State |
 |---|---|
-| **macOS on Apple silicon** | **Works.** This is the platform the VM boundary and the network policy were measured on. |
-| **Linux with `/dev/kvm`** | **Built, not yet verified.** The KVM path is designed for and built, and has not been exercised end to end by anyone on this project. Expect to be the first. |
+| **macOS on Apple silicon** | **Verified.** The most thoroughly measured platform, and where the VM boundary and the network policy were first established. |
+| **Windows 11 on x64** | **Verified**, natively, through the Windows Hypervisor Platform and from an ordinary unelevated terminal. One machine so far; there is no Windows arm64 build. See [Windows](windows.md). |
+| **Linux with `/dev/kvm`** | **Verified, with two caveats.** The 2026-08-15 run was in WSL2 rather than on bare metal, and creating a sandbox still needs more privilege than an ordinary user has — expect to run as root for now. |
+| **Windows via WSL2** | **Verified** — this is where the Linux run above happened. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2). |
 | **macOS on Intel** | No. There is no VM backend for it, and none is planned. |
-| **Windows, natively** | **In progress: the stack underneath Boks runs a container there; Boks itself does not.** A Windows Hypervisor Platform backend for libkrun is being built here. On 2026-08-14, on real Windows 11 hardware, `ctr tasks start` ran a Linux container end to end through containerd, the nerdbox shim and `krun.dll` — the container's output reached the host, `uname -a` named the 6.12.44 guest kernel rather than the host, and the guest clock advanced. What that is *not* is `boks run`, which still stops before starting: Boks declines to bring up sandbox networking on Windows, and no Ethernet frame has crossed the virtio-net device there. `boks doctor` still fails its platform check, correctly. See [Windows](windows.md). |
-| **Windows via WSL2** | **Designed for, not yet run.** Every ingredient is present in a stock WSL2 and `boks doctor` diagnoses the two things that go wrong, but nobody on this project has executed it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2). |
+
+No release has been cut on any platform, so every route means building from source today.
 
 "Verified" here means a specific thing, and [Verification](verification.md) is where the
 evidence is: what was observed, on what hardware, on what date, and what each observation
@@ -31,7 +34,9 @@ does and does not establish.
 
 - **Hardware virtualisation.** Linux with `/dev/kvm`, and membership of the `kvm` group; or
   macOS on Apple silicon, which uses Hypervisor.framework.
-- **[containerd](https://containerd.io/) 2.2 or later**, running.
+- **[containerd](https://containerd.io/) 2.3 or later**, running. Not 2.2: the shim emits
+  version-3 bootstrap parameters a 2.2 daemon cannot decode, and task start fails with
+  `unsupported protocol: Yunix`.
 - **[nerdbox](https://github.com/containerd/nerdbox)** — the VM runtime shim. The binary
   `containerd-shim-nerdbox-v1` must be on *containerd's* `PATH`, which is the daemon's, not
   your shell's.
@@ -39,8 +44,7 @@ does and does not establish.
 - **`erofs-utils`**, for `mkfs.erofs`.
 - **Go 1.26 or later**, to build Boks.
 
-Docker Desktop is not required. Docker Sandboxes is not required. There is no account to
-create and nothing to sign in to.
+Docker Desktop is not required. There is no account to create and nothing to sign in to.
 
 On macOS there are two further steps that are easy to miss and fail opaquely when skipped —
 the shim has to be codesigned with the `com.apple.security.hypervisor` entitlement, and

@@ -326,8 +326,8 @@ never widen past a prohibition someone wrote down. Only the base preset — chos
 rule mentions, so no stored rule can turn a deny-by-default machine into an allow-by-default
 one. Every ordered pair of scopes is tested for this.
 
-The per-run `--policy`, `--allow` and `--deny` flags are a **Boks addition**, not something sbx
-has, and they are overrides rather than a second policy: `--policy` and `--allow` replace the
+The per-run `--policy`, `--allow` and `--deny` flags are **overrides** rather than a second
+policy: `--policy` and `--allow` replace the
 posture and the allow list, while `--deny` is *added* to what the sandbox already denies. A run
 therefore cannot drop a prohibition by typing a different one.
 
@@ -436,8 +436,7 @@ like.
   replaces the key and everything issued under the old one stops chaining to anything
   trusted. Anything holding the old certificate must be given the new one.
 
-**Transparency.** Every logged flow records how it was carried, using Docker Sandboxes' own
-vocabulary: `forward` (Boks handled it at the HTTP level and could read it — plaintext HTTP,
+**Transparency.** Every logged flow records how it was carried: `forward` (Boks handled it at the HTTP level and could read it — plaintext HTTP,
 or HTTPS it terminated), `forward-bypass` (tunnelled, ciphertext only), `transparent` (judged
 in the network stack by address and port, with the proxy not involved at all — Boks saw a
 destination and nothing else). `boks policy ls` and `boks proxy` both state, unprompted,
@@ -505,8 +504,9 @@ which hosts will be decrypted.
   and gets no credential. The log records the downgrade rather than leaving a `forward` entry
   standing for a flow Boks never read.
 - Host patterns come in one wildcard form (`*.example.com`, matching any depth of subdomain
-  but not the apex). Docker Sandboxes' v2 permission grammar distinguishes single-label from
-  multi-label wildcards; Boks cannot express "exactly one label". See the parity matrix.
+  but not the apex). **Boks cannot express "exactly one label"** — a grammar that separates
+  single-label from multi-label wildcards can draw a distinction Boks cannot. See the parity
+  matrix.
 
 ### The measured baseline today
 
@@ -622,9 +622,8 @@ Most people running the flagship agent have no API key at all. `claude /login` l
 OAuth **pair** — an access token and a refresh token — in the macOS Keychain under
 `Claude Code-credentials`, and nothing else. A credential model that only knows how to set a
 header cannot carry that, so `boks run claude` could not work for them by any route. The
-`oauth` mechanism in `internal/secret` is that route, and it follows Docker Sandboxes' kit v2
-`oauth` block: sentinels in the guest, substitution on the resource hosts, refresh on the
-host.
+`oauth` mechanism in `internal/secret` is that route: sentinels in the guest, substitution on
+the resource hosts, refresh on the host.
 
 `boks secret adopt` reads what the agent already wrote and stores it. The guest is given
 **sentinels** — fakes carrying the real prefix and the real length, because Claude Code checks
@@ -640,11 +639,10 @@ an OAuth flow of its own — every one begins by identifying *this program* to t
 a client id issued to a registered application, and Boks holds none. That refusal stands, and
 `boks secret set --oauth` still explains it.
 
-What Boks does instead is what Docker Sandboxes does for the same vendor: **let the agent log
-itself in, inside the sandbox, and keep the result.** sbx's own host-side `--oauth` is
-documented for one vendor only; its answer for Anthropic is `sbx run claude … -- auth login`.
-The agent performs its own OAuth with its own client id, which is legitimate because it *is*
-that program, and the sandbox's proxy already terminates TLS for the token endpoint.
+What Boks does instead is **let the agent log itself in, inside the sandbox, and keep the
+result.** The agent performs its own OAuth with its own client id, which is legitimate
+because it *is* that program, and the sandbox's proxy already terminates TLS for the token
+endpoint.
 
     boks secret login claude-code       # arms a credential-shaped hole: no tokens
     boks run claude -- auth login       # the agent logs in; boks keeps what comes back
