@@ -311,10 +311,16 @@ Two entries deserve their own note:
 
 ### The CI gap nobody has written down
 
-`.github/workflows/` builds every Windows piece and the guest images. It builds **nothing for
-Linux**: there is no workflow producing `libkrun.so`, and none producing a Linux
-`containerd-shim-nerdbox-v1`. `libkrun-windows.yml` builds `krun.dll`, prints its size, checks
-its twenty exported symbols — and uploads no artifact at all.
+`.github/workflows/` builds every Windows piece, the guest images, and — since
+2026-08-15 — the Linux runtime too: `linux-runtime.yml` publishes `libkrun.so` and a Linux
+`containerd-shim-nerdbox-v1` for amd64 and arm64, with a bundle job and `SHA256SUMS`. It was
+added because the first attempt to verify Boks on Linux found that neither piece exists as a
+binary anywhere: nerdbox ships zero release assets and neither project is packaged in apt, the
+AUR or nixpkgs.
+
+What remains true is the **retention** problem. `libkrun-windows.yml` builds `krun.dll`, prints
+its size and checks its exported symbols — and uploads no artifact at all. Everything else is
+an artifact with an expiry rather than a release asset.
 
 So the honest state of the pipeline is:
 
@@ -324,13 +330,13 @@ So the honest state of the pipeline is:
 | Windows containerd + `ctr` + `mkfs.erofs.exe` + bundle | yes | 30–90 days | **no** |
 | Windows nerdbox shim | yes | 90 days | **no** |
 | `krun.dll` | built, then **discarded** | — | **no** |
-| Linux `libkrun.so` | **not built** | — | no |
-| Linux nerdbox shim | **not built** | — | no |
+| Linux `libkrun.so` | yes, per arch (`linux-runtime.yml`) | 90 days | **no** |
+| Linux nerdbox shim | yes, both arches | 90 days | **no** |
 | `boks` tarballs, `.deb`, `.rpm` | yes | 7 days | yes, on a tag |
 
 Everything except `boks` itself expires. A bundle cannot be assembled from artifacts that
-expire, so **making these release assets is a prerequisite to every packaging item below**, and
-two of them have to be built for the first time.
+expire, so **making these release assets is a prerequisite to every packaging item below**.
+The building is done; the publishing is not.
 
 ---
 
@@ -409,7 +415,7 @@ produce a machine that looks provisioned and cannot start a sandbox.
 
 **What we do not have:**
 
-- the runtime pieces to put in the package: no CI builds a Linux `libkrun.so` or a Linux
+- the runtime pieces to put in the package: CI builds a Linux `libkrun.so` and a Linux
   nerdbox shim (see the gap table above). This is the largest single omission in the whole plan
   and it is not tracked anywhere else;
 - the apt repository. The signing key exists — `packaging/apt/boks-archive-keyring.asc`,
