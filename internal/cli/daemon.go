@@ -69,8 +69,7 @@ for you to find.`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stateDir := policy.StateDir()
-			if _, running := daemon.Lookup(stateDir); running {
-				st, _ := daemon.Lookup(stateDir)
+			if st, running := daemon.Lookup(stateDir); running {
 				fmt.Fprintf(env.Stderr, "containerd is already running on %s\n", st.Address)
 				return nil
 			}
