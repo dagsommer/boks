@@ -170,14 +170,19 @@ sudo install -m0755 boks_0.1.0_linux_amd64/boks /usr/local/bin/boks
 > files above are what it names — but no release has been cut, so there is nothing to
 > download until the first tag. Until then, [build from source](#building-from-source).
 
-The packages contain the CLI, its licence and shell completions. They install no
-dependencies beyond a `Recommends: erofs-utils`, and the reason is in their own description:
-**no distribution ships a containerd new enough**, and nerdbox is packaged nowhere. A
-package that declared `Depends: containerd` would install 1.7.x on Ubuntu 24.04 and produce
-a machine that looks provisioned and cannot start a sandbox. So on Linux you are assembling
-the rest of the stack yourself — the list is under
-[What a sandbox needs](#what-a-sandbox-needs) below, and `boks doctor` names each piece as
-it finds it missing.
+The packages contain the CLI, its licence and shell completions, **and the runtime** —
+`containerd`, `containerd-shim-nerdbox-v1` and `libkrun.so` in `/usr/libexec/boks/`, which is
+where `boks daemon` looks and is deliberately not on your `PATH`, so a containerd you installed
+on purpose is neither shadowed nor collided with. They install no dependencies beyond a
+`Recommends: erofs-utils`, and the reason is in their own description: **no distribution ships
+a containerd new enough**, and nerdbox is packaged nowhere. A package that declared
+`Depends: containerd` would install 1.7.x on Ubuntu 24.04 and produce a machine that looks
+provisioned and cannot start a sandbox.
+
+What the packages do **not** yet carry is the guest kernel and rootfs. Those are published
+separately as `boks-guest_<version>_x86_64.tar.gz` and `_aarch64.tar.gz`;
+[What a sandbox needs](#what-a-sandbox-needs) below is the full list, and `boks doctor` names
+each piece as it finds it missing.
 
 ### `apt-get install boks` — planned, not yet live
 
@@ -220,6 +225,44 @@ winget install boks
 > been submitted to `microsoft/winget-pkgs`, and no one has run `winget` against any of it.
 > That directory's README says exactly what has and has not been checked. Until it is live,
 > [build from source](#building-from-source) or use the WSL2 route below.
+
+### What the Windows download contains
+
+Windows is the one platform where the whole stack arrives in a single file.
+`boks_<version>_windows_amd64.zip` is what `winget install` fetches and what to download by
+hand until it is live, and it holds:
+
+| | |
+|---|---|
+| `boks.exe` | the CLI |
+| `containerd.exe`, `ctr.exe` | the patched containerd this project builds, and its client |
+| `containerd-shim-nerdbox-v1.exe` | turns a container into a microVM |
+| `krun.dll` | the VMM, built from the 37-patch libkrun series |
+| `mkfs.erofs.exe` | unpacking images for the guest |
+| `nerdbox-kernel-x86_64`, `nerdbox-rootfs-x86_64.erofs` | **the guest the microVM boots** |
+| `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | the configuration and the pre-created root an unelevated containerd does not work without, and the writable layer Windows cannot format for itself |
+| `SHA256SUMS`, `SOURCE.txt`, `LICENSE`, `README.md`, `README-windows-runtime.md` | checksums over everything above, the guest kernel's GPL-2.0 source pointer, and the two READMEs |
+
+Unzip it anywhere. Everything sits in one flat directory beside `boks.exe`, and **nothing needs
+to go on your `PATH`**: `boks daemon start` prepends that directory to the `PATH` it starts
+containerd with, and the shim finds `krun.dll`, the kernel and the rootfs by scanning that same
+`PATH`.
+
+> [!IMPORTANT]
+> That only holds for the containerd `boks daemon start` runs. If you start the bundled
+> `containerd.exe` yourself — which [windows-e2e.md](windows-e2e.md) does deliberately — its
+> `PATH` is whatever your shell gave it, and you have to put the directory on `PATH` by hand.
+
+**None of this has been through a tagged release.** The archive is assembled by
+[`release.yml`](../.github/workflows/release.yml) from five other workflows' outputs plus its
+own build of the CLI, and the layout above is what that job produces; no tag has run it, so
+treat the first download as the test.
+
+There is deliberately **no Windows CLI-only archive**. It would be a strict subset of the zip
+above — the same `boks.exe` — differing only in that it cannot start a sandbox.
+`boks-runtime_<version>_windows_amd64.zip` is published for the opposite case: everything above
+*except* the CLI and the guest, for a `boks.exe` you built yourself or for driving containerd by
+hand.
 
 ### Elevation is not required, and this page used to say it was
 
@@ -273,9 +316,10 @@ produced the file, rather than only that somebody paid for a certificate.
   and is labelled as one.
 - **One machine.** Every Windows result above comes from a single Windows 11 x64 host. There
   is no Windows arm64 build at all — the WHP backend and the guest kernel are both x86_64.
-- **Nothing is packaged.** `krun.dll` is built in CI and then discarded; the patched
-  containerd, the shim and the guest images are artifacts with an expiry rather than release
-  assets. See [distribution.md](distribution.md).
+- **No release has been cut.** Every Windows piece is now a *release asset* rather than an
+  expiring artifact — `release.yml` calls the five workflows that build them and assembles the
+  zip described above — but that workflow has never run on a tag. See
+  [distribution.md](distribution.md).
 
 [windows.md](windows.md) has the full architectural picture and
 [windows-e2e.md](windows-e2e.md) the by-hand procedure using `ctr` rather than `boks`.
@@ -327,17 +371,22 @@ are settings, and `boks daemon config` prints them with the failure each one pre
 
 | Piece | Why | macOS/arm64 | Linux | Windows |
 |---|---|---|---|---|
-| `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | winget, or a zip |
-| containerd ≥ 2.3 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | **not packaged at a usable version** — Ubuntu 24.04 has 1.7.x | **patched build from source** |
-| `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build from source | **patched build from source** |
-| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker** | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build with Docker | **build with Docker**, on a Linux machine or in CI |
-| libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | **[download from CI](#prebuilt-shim-and-libkrun-for-linux)**, or build from source | **`krun.dll`, patched build from source** |
-| `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | **patched build from source** |
+| `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | in the zip |
+| containerd ≥ 2.3 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | in the `.deb`/`.rpm` | in the zip, patched |
+| `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | in the `.deb`/`.rpm`, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip, patched |
+| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker**, or the `aarch64` guest archive by hand | the guest archive, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip |
+| libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | in the `.deb`/`.rpm`, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip, as `krun.dll` |
+| `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | in the zip, patched |
 
-The cells in bold are why this page is longer than one install command.
+The one cell still in bold is why this page is longer than one install command — and note what
+the rest of the table says now: **the Windows column is the only one with no gap in it**, which
+is the reverse of where this project started. "In the zip" means
+`boks_<version>_windows_amd64.zip`, described under [What the Windows download
+contains](#what-the-windows-download-contains). None of it has been through a tagged release.
 
-The Windows column changed on 2026-08-14 from "—" to "build it": every one of those pieces
-has now been built for Windows and run together — and, since 2026-08-15, driven by `boks`
+The Windows column went from "—" to "build it yourself" on 2026-08-14, and to "in the zip"
+when `release.yml` learned to assemble one: every one of those pieces has been built for
+Windows and run together — and, since 2026-08-15, driven by `boks`
 itself rather than by `ctr`. It takes 48 carried patches to get there: 37 against libkrun, 6
 against containerd and 5 against nerdbox, all in [`packaging/`](../packaging/). None of it is
 packaged yet, and `mkfs.ext4` — which containerd wants for a container's writable layer —
@@ -435,18 +484,31 @@ gh attestation verify boks_0.1.0_darwin_arm64.tar.gz --repo dagsommer/boks
 
 The attestation says which workflow, at which commit, produced the file — which is more than
 a code-signing certificate tells you, since a certificate says only that somebody paid for
-one. The tarballs are also byte-reproducible: `scripts/build-release.sh` sorts the archive,
-zeroes ownership and takes timestamps from the commit date, so building the same tag on your
-own machine gives the same checksum rather than merely a working binary.
+one. The **CLI tarballs** are also byte-reproducible: `scripts/build-release.sh` sorts the
+archive, zeroes ownership and takes timestamps from the commit date, so building the same tag
+on your own machine gives the same checksum rather than merely a working binary. The zips are
+not, and are not claimed to be — zip records real mtimes and directory order, and neither
+libkrun nor the guest kernel is a reproducible build. For those, the `SHA256SUMS` **inside**
+the archive is the thing to check: it covers the files rather than the container.
+
+**`SHA256SUMS` is GPG-signed**, with the archive key committed at
+[`packaging/apt/boks-archive-keyring.asc`](../packaging/apt/boks-archive-keyring.asc)
+(fingerprint `D5DD07C0F9589C164F7361C20EB93D3C39471E1E`) — the same key the apt repository will
+use, so there is one key to trust rather than two. A detached signature over the checksum file
+covers every asset transitively.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dagsommer/boks/main/packaging/apt/boks-archive-keyring.asc | gpg --import
+gpg --verify SHA256SUMS.asc SHA256SUMS
+```
 
 > [!NOTE]
-> **The `SHA256SUMS` is to be GPG-signed, and is not yet.** The decision is made — the
-> signature is what lets you check the checksum file itself rather than trusting whatever the
-> download page served you — but `release.yml` does not sign it today, and the key it would
-> sign with is the archive key committed at
-> [`packaging/apt/boks-archive-keyring.asc`](../packaging/apt/boks-archive-keyring.asc).
-> Until the workflow does it, `SHA256SUMS` is only as trustworthy as the connection you
-> fetched it over, and the attestation is the stronger of the two checks.
+> **The signing step exists in `release.yml`; no tag has ever run it.** A tag that cannot reach
+> the key fails rather than publishing an unsigned checksum file, and a manually dispatched dry
+> run warns and continues — but "the workflow contains the step" is a claim about the file, and
+> whether GPG signs cleanly on a runner is a claim about a run that has not happened. The
+> attestation is the stronger of the two checks either way, because it does not require
+> trusting a key at all.
 
 On Windows this is also the answer to the SmartScreen dialog: see
 [About that SmartScreen warning](#about-that-smartscreen-warning).
@@ -469,8 +531,14 @@ Go 1.26 or later. Nothing in Boks uses cgo, so `make dist` cross-compiles every 
 target from any host:
 
 ```sh
-make dist        # tarballs + checksums for darwin/arm64 and linux/{amd64,arm64}
+make dist        # tarballs + checksums for darwin/arm64, linux/{amd64,arm64} and windows/amd64
 ```
+
+`make dist` and `release.yml`'s build matrix name the same four platforms, and a test in
+`internal/release/` fails if they ever stop doing so. The one difference is what happens to the
+Windows tarball afterwards: a release does not publish it, because the Windows CLI ships inside
+`boks_<version>_windows_amd64.zip` together with the runtime and guest it cannot start a
+sandbox without. Locally it is just a tarball with a `boks.exe` in it.
 
 `.deb` and `.rpm` additionally need `dpkg-deb` and `rpmbuild`:
 
@@ -488,22 +556,24 @@ machine is still missing, and [What a sandbox needs](#what-a-sandbox-needs) is t
 | Homebrew tap | formulae written, tap not created | a `dagsommer/homebrew-boks` repository, and the release tarball's checksum |
 | Homebrew bottles | none | a `brew bottle` run per macOS version on Apple silicon, and somewhere to host them |
 | apt repository | signing key created; not hosted | hosting for the static repository, and an index-and-sign job in CI |
-| winget | manifests written and schema-checked; nothing submitted | a Windows release artifact, then a pull request to `microsoft/winget-pkgs` and a human moderator's approval — [`packaging/winget/README.md`](../packaging/winget/) has the whole list |
-| a GPG signature on `SHA256SUMS` | decided, not implemented | a signing step in `release.yml` and the private key as a CI secret |
+| winget | manifests written and schema-checked; nothing submitted | a tag, so the `InstallerUrl` resolves, then a pull request to `microsoft/winget-pkgs` behind a signed CLA and a human moderator's approval — [`packaging/winget/README.md`](../packaging/winget/) has the whole list |
 | code signing | **deliberately not offered** | money, and — for the EV certificate that clears SmartScreen at once — a hardware token or cloud HSM in CI |
-| nerdbox guest assets on the release | buildable, not published | a decision about distributing a GPL-2.0 kernel binary |
+| a `mkfs.ext4` for Windows | no build exists anywhere | someone to port it. The Windows archive ships a pre-formatted 64 MiB image instead, which is a workaround and is labelled as one |
+| an aarch64 Windows build | not possible today | a `krun.dll` and an `mkfs.erofs.exe` for aarch64 Windows; neither recipe cross-compiles beyond x86-64 |
 
-The last row is the one that matters most: it is the difference between an install that
-works and an install that gets you to a passing `doctor` and a sandbox that will not boot.
-It is also no longer a technical problem. `scripts/build-nerdbox-guest.sh` produces both
-files in about four minutes on an ordinary Linux runner, so a release job could attach them
-and `packaging/homebrew/nerdbox.rb` could then fetch them pinned by SHA-256 — the formula
-change is a `resource` block and one `lib.install`, spelled out in
+**The guest kernel and rootfs used to be the row that mattered most here**, because they are
+the difference between an install that works and one that reaches a passing `doctor` and a
+sandbox that will not boot. `release.yml` now publishes them — as `boks-guest_*_x86_64.tar.gz`
+and `_aarch64.tar.gz`, and inside `boks_*_windows_amd64.zip` — so on Windows there is nothing
+left to fetch. macOS is the platform still waiting: the `aarch64` guest archive is the file a
+Mac needs, and what remains is a `resource` block and one `lib.install` in
+`packaging/homebrew/nerdbox.rb`, spelled out in
 [packaging/homebrew/README.md](../packaging/homebrew/README.md).
 
-What stands in the way is a decision rather than an obstacle. The kernel is GPL-2.0 and
-nerdbox patches it before building, so distributing the compiled result carries a
-corresponding-source obligation. The recipe is entirely public — a pinned `cdn.kernel.org`
-tarball, a config and a patch set from nerdbox's repository — so satisfying it is a matter
-of publishing that alongside. But it is the owner's call to make deliberately, which is why
-this repository builds those files and does not ship them.
+The kernel is GPL-2.0 and nerdbox patches it before building, so distributing the compiled
+result carries a corresponding-source obligation. Every archive that contains it ships a
+`SOURCE.txt` naming the exact nerdbox revision and the two `docker buildx bake` commands that
+reproduce it, on the reading that a wholly public recipe plus a precise pointer to it satisfies
+the obligation. **That reading was implemented in CI rather than ruled on by the owner**, and
+[distribution.md](distribution.md#the-one-decision-blocking-the-most) is where it is stated and
+where reversing it would start.
