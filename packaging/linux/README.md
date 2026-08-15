@@ -206,6 +206,12 @@ python3 packaging/linux/assert-elf.py libkrun.so --require \
 If you build libkrun from a different revision than the pin, that second command is the one
 that tells you whether the result is usable at all.
 
+Those nineteen names are also kept, one per line, in [`NERDBOX_SYMBOLS`](NERDBOX_SYMBOLS),
+which is the canonical list: `scripts/package-linux.sh` reads it and refuses to put a
+`libkrun.so` into a `.deb` or `.rpm` that does not export all of them. The command above and
+the workflow both still spell the list out inline; both should read the file instead, so that
+moving `../nerdbox/NERDBOX_REV` has one place to update rather than three.
+
 ## Moving the pins forward
 
 `LIBKRUN_REV` is a full SHA, not a tag, so a repointed tag cannot change what gets built.

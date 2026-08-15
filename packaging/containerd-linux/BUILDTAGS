@@ -1,0 +1,37 @@
+# The Go build tags build.sh compiles containerd with, one per line, comments ignored.
+#
+# Each is a `no_*` tag, so each REMOVES a plugin from the daemon. Nothing here is an
+# optimisation of the "probably fine" kind: every removal below is a plugin Boks provably
+# never reaches, and the sizes are measured, not estimated.
+#
+# Measured 2026-08-15, containerd v2.3.3, linux/arm64, CGO_ENABLED=0 -trimpath -ldflags "-s -w":
+#
+#     urfave_cli_no_docs                                  35,717,282 bytes   (upstream's own set)
+#     + no_cri                                            29,950,114 bytes   -5.8 MB
+#     + no_cri no_devmapper no_zfs                        29,753,506 bytes   -6.0 MB
+#     + no_cri no_devmapper no_zfs no_tracing             28,901,538 bytes   -6.8 MB
+#
+# WHY NOT no_tracing, when it is the largest remaining saving. It removes containerd's
+# OpenTelemetry plugin, and with it `--log-level debug` traces. Every result in
+# docs/verification.md on both platforms was obtained by driving containerd by hand and
+# reading what it said; docs/distribution.md's Part 1 chose to supervise rather than embed
+# specifically to keep that possible. Trading 0.9 MB for the daemon's ability to explain
+# itself is the wrong side of that trade while Linux has been verified end to end exactly
+# once.
+#
+# urfave_cli_no_docs is upstream's own default (see containerd's Makefile) and drops the
+# CLI framework's docs generator. It is not a Boks decision; it is what `make` does.
+urfave_cli_no_docs
+
+# CRI is Kubernetes' interface. Boks drives containerd through its Go client API in the
+# `boks` namespace and never speaks CRI; nothing in internal/ imports it. This tag also
+# removes the CNI dependency that comes with it, which is the bulk of the 5.8 MB.
+no_cri
+
+# devmapper and zfs are snapshotters Boks does not use — internal/runtimecfg pins
+# Snapshotter = "erofs" and nothing else is reachable — and both need host tooling
+# (lvm2, zfsutils) that a vendored daemon has no way to ensure. The overlay, native,
+# blockfile and erofs snapshotters are NOT removed: erofs is the one Boks needs, and the
+# others cost little and are what somebody debugging with `ctr` would reach for.
+no_devmapper
+no_zfs
