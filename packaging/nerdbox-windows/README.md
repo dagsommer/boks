@@ -407,9 +407,10 @@ implemented and five of them — `setupSignals`, `newServer`, `serveListener`, `
 
 The limits are worth stating in the same breath. This is `ctr`, not `boks run`; Boks' own path
 still stops earlier, at the network refusal in `internal/network/vmm_windows.go`. No network
-device has been added on Windows and no Ethernet frame has crossed one. Elevation is still
-required, for containerd's task-bundle symlink. The runs to date used no NIC, one container at
-a time, and a hand-made writable layer — `mkfs.ext4` still does not exist for Windows.
+device has been added on Windows and no Ethernet frame has crossed one. The runs to date used
+an elevated containerd, for its task-bundle symlink — `packaging/containerd-windows/patches/0006`
+replaces that with a junction and has not been run — and they used no NIC, one container at a
+time, and a hand-made writable layer, since `mkfs.ext4` still does not exist for Windows.
 
 The build claim and the run claim remain separate: compiling a shim is not starting one, and
 patch 0005 exists because a defect survived every compile and every review in this file until

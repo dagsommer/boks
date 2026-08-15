@@ -16,10 +16,17 @@ Linux guest kernel and an EROFS rootfs, composed into one container.
 >
 > Running it found four things reading had missed, all folded in: a silent-corruption trap in
 > containerd's `mkfs` handling (`patches/0005`, and the note in step 5); that **creating a task
-> needs elevation or Developer Mode** ("Before step 0"); a `windows` section in the OCI spec that
+> needed elevation or Developer Mode** ("Before step 0"); a `windows` section in the OCI spec that
 > `crun` refused; and a 30-second stall on every container's delete
 > (`packaging/nerdbox-windows/patches/0005`). The version of this document that said to run all
-> of it unelevated was wrong.
+> of it unelevated was wrong at the time.
+>
+> **The elevation requirement has since been patched out** — `patches/0006` makes containerd's
+> task-bundle link a junction rather than a symlink, which an ordinary user can create. It has
+> not been run on Windows. Step 4 onwards is where it would show, and until someone gets there
+> "run unelevated" is a prediction, not a measurement. Note also what it was ever about: the
+> **containerd daemon**, because the daemon creates task bundles. `boks create`, `ls`, `inspect`
+> and `rm` never needed elevation and never stopped working.
 >
 > One thing this page still does not do is start a **Boks** sandbox. `boks run` stops earlier,
 > at the network refusal in `internal/network/vmm_windows.go`, and nothing here changes that.
@@ -48,7 +55,7 @@ nobody else's — so the procedure splits it in two.
 | containerd creates a usable `--root` unelevated | **fixed by a documented prerequisite** — see `packaging/containerd-windows/README.md` |
 | `ctr run` can produce a Linux OCI spec on Windows | **measured**, 2026-08-14 — `patches/0004`, plus a follow-up that stopped a `windows` section being written into a Linux spec. The spec that reached the guest has no `windows` key and containerd's stored copy reports `windows: ABSENT` |
 | a failed `mkfs.ext4` cannot be mistaken for a formatted image | **patched** — `patches/0005`. Before it, the file a failed format left behind was accepted by the next attempt and the guest would have been handed 64 MiB of zeroes as ext4 |
-| creating a task bundle at all | **blocked without elevation or Developer Mode.** `NewBundle` symlinks unconditionally; measured 2026-08-14. See "Before step 0" below |
+| creating a task bundle at all | **was blocked without elevation or Developer Mode** — `NewBundle` symlinks unconditionally; measured 2026-08-14. **Patched** by `patches/0006`, which links with a junction instead; **not run on Windows**. See "Before step 0" below |
 | all of the above composed into one container | **measured**, 2026-08-14 — `HELLO-FROM-THE-VM`, `uname -a` naming the 6.12.44 guest kernel, `/proc/uptime` advancing. This document. |
 | the same, with a NIC | **never attempted.** No `krun_add_net_*` call has been made on Windows |
 | deleting the task promptly | **stalls 30 s**, measured 2026-08-14. Fixed by `packaging/nerdbox-windows/patches/0005`, which has not been run |
@@ -171,37 +178,49 @@ container.
 Every step says what success looks like and what the likeliest failure means. Run all of it as
 one user, from one console.
 
-### Before step 0: this needs elevation, or Developer Mode
+### Before step 0: run unelevated — but the reason has changed twice
 
-**This document used to say "run all of it unelevated". That was wrong, and the first
-end-to-end run on hardware is what found out.**
+**Run all of this unelevated, and read this section anyway if you have run an earlier bundle.**
 
-Steps 0–3 are fine unelevated — they were measured that way on 2026-08-14, and they create no
-task. **Steps 4, 6 and 7 create a task, and unprivileged Windows cannot.**
-`core/runtime/v2/bundle.go:103` does, in `NewBundle`, for every task bundle:
+- The first version of this page said "run all of it unelevated". That was wrong, and the
+  first end-to-end run on hardware found out.
+- It then said steps 4 onwards need an elevated daemon or machine-wide Developer Mode. That
+  was right for the binaries it described.
+- `packaging/containerd-windows/patches/0006` removes the requirement. **It has never been run
+  on Windows**, so what follows is a prediction. If step 4 fails with a privilege error, that
+  is the news, and the fallbacks below still exist.
+
+Steps 0–3 were measured unelevated on 2026-08-14 and create no task, so they are unaffected
+either way. Steps 4, 6 and 7 create a task, and that is where the requirement lived:
+`core/runtime/v2/bundle.go:103`, in `NewBundle`, for every task bundle:
 
 ```go
 if err := os.Symlink(work, filepath.Join(b.Path, "work")); err != nil {
 ```
 
 Creating a symlink needs `SeCreateSymbolicLinkPrivilege`. Go already passes
-`SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` (`os/file_windows.go:371`), which Windows
+`SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` (`os/file_windows.go`), which Windows
 honours **only under Developer Mode**. Measured on the test machine:
 `New-Item -ItemType SymbolicLink` → *"Administrator privilege required"*; `mklink /J` succeeds.
 
-**The junction trick used for the root-ACL blocker does not apply here.** That one works
-because `MkdirAllWithACL` accepts a directory that already exists. Here the link must land
-inside `b.Path`, and `b.Path` is created by containerd itself with `os.Mkdir(b.Path, 0700)`
-(`bundle.go:74`) whose error is returned unconditionally — so `b.Path` must *not* pre-exist,
-and there is no moment at which a junction could be placed inside it.
+`0006` takes the second line at its word: on Windows it creates the link as a **junction**
+(`CreateFile` + `DeviceIoControl(FSCTL_SET_REPARSE_POINT)` with `IO_REPARSE_TAG_MOUNT_POINT`),
+falling back to `os.Symlink` if the junction cannot be made — a junction's target has to be a
+fully qualified local path, so a `--root` on a UNC share still needs the symlink. Nothing about
+`!windows` changes.
 
-So, three options, and their costs:
+An earlier revision of this page said the junction trick "does not apply here", because the
+link must land inside `b.Path` and `b.Path` must not pre-exist. That was about *pre-creating*
+the link from outside containerd, which is still impossible; it never ruled out containerd
+creating the junction itself.
+
+If step 4 does fail on privilege, the old options are unchanged:
 
 | | What it costs |
 | --- | --- |
 | **Run `containerd.exe` elevated** | the daemon, every shim and every VM run with an administrator's token. **Its `--root` must then be created by the elevated daemon itself** — see below |
 | **Turn on Developer Mode** | machine-wide. It grants unprivileged symlink creation to **every process run by every user on that machine**, not to containerd and not to you, and switches on other developer features besides |
-| **Neither** | steps 0–3 work; steps 4 onwards do not. This is a real option, and it is what the containerd bundle's own test procedure assumes |
+| **Neither** | steps 0–3 work; steps 4 onwards do not |
 
 **On a corporate-managed machine, Developer Mode may not be your call.** It is commonly
 disabled by policy (`AllowDevelopmentWithoutDevLicense`) and the toggle may be greyed out or
@@ -215,11 +234,35 @@ fills it with the content store, the snapshotters and the bolt database, all wri
 unprivileged account. That account can put a binary into a layer a later container runs. Give
 the elevated daemon a fresh root of its own and let it create it; `new-containerd-root.ps1` is
 for the unelevated case only. Full reasoning in `packaging/containerd-windows/README.md`,
-"Elevation, Developer Mode, and the choice you actually have".
+"Elevation, and the choice you no longer have to make". That section is also where the
+argument lives for why a junction cannot silently stop `Bundle.Delete` from removing working
+directories, which is the failure mode `0006` had to avoid.
 
-*That elevation makes the symlink succeed was inferred from Windows' default privilege
-assignment plus the unelevated failure measured above. It is now measured too: containerd
-created the task bundle, and the container ran, on 2026-08-14.*
+*That elevation made the symlink succeed was inferred from Windows' default privilege
+assignment plus the unelevated failure measured above, and then measured: containerd created
+the task bundle, elevated, and the container ran, on 2026-08-14. Nothing equivalent has been
+measured for the junction.*
+
+#### If you are testing `0006`, this is what would settle it
+
+Run steps 0–4 unelevated, from a shell that has never been elevated, on a machine with
+Developer Mode **off** (Settings → System → For developers; confirm rather than assume). Then:
+
+```powershell
+# Developer Mode really is off — this must fail before you conclude anything from step 4:
+New-Item -ItemType SymbolicLink -Path $env:TEMP\symprobe -Target $env:TEMP | Out-Null
+
+# After step 4 has created a task, the bundle's link is a junction, not a symlink:
+$b = "C:\cdtest\state\boks\e2e"      # <state>\<namespace>\<task-id>
+Get-Item $b\work | Format-List Name, Attributes, LinkType, Target
+fsutil reparsepoint query $b\work    # expect tag 0xa0000003, "Mount Point"
+```
+
+`LinkType` should read `Junction` and the tag `0xa0000003`. A `SymbolicLink` there means the
+fallback fired and the junction did not — which is worth reporting, with the error containerd
+logged. Then complete step 7 and check that `<root>\<namespace>\<task-id>` is **gone**
+afterwards: that is `Bundle.Delete` reading the junction back with `os.Readlink`, and it is the
+half of this patch that fails quietly rather than loudly if it is wrong.
 
 ### Step 0 — create containerd's root and state
 
@@ -625,9 +668,12 @@ by definition none of them fired at the end. They are kept in rank order because
 for *your* first run, not for that one, and items 1, 2, 3, 5 and 6 each fired at least once on
 the way there. Where a mode was predicted and then observed, it now says which.
 
-1. **`NewBundle` cannot create its symlink** — certain from step 4 onwards on an unelevated
+1. **`NewBundle` cannot create its symlink** — was certain from step 4 onwards on an unelevated
    machine without Developer Mode, and it lands before the shim is ever launched. Measured,
-   2026-08-14. *Fix: elevate, or Developer Mode, or stop after step 3. See "Before step 0".*
+   2026-08-14. *Fix: `patches/0006`, which links with a junction instead — untested on
+   Windows. Failing that: elevate, or Developer Mode, or stop after step 3. See "Before step
+   0".* If you see this on a binary built from the current patch series, that is the most
+   interesting failure on this page and worth reporting with containerd's exact error.
 2. **`mkfs.ext4` not found** — certain on any single-command `ctr run`, which is why step 4 is
    written as a deliberate failure. `failed format "…rwlayer.img": mkfs.ext4 failed: …
    executable file not found`. Deterministic from source; there is no branch that avoids it.
@@ -722,10 +768,12 @@ the way there. Where a mode was predicted and then observed, it now says which.
   as `patches/0005` — and it does **not** defeat this: a genuinely formatted image passes it,
   which is what `rwlayer-64m.img` is. What the check ends is the *other* reading of
   skip-if-exists, where a file that merely existed was good enough.
-- **Whether elevation is acceptable is not this document's call.** Steps 4 onwards need an
-  elevated daemon or a machine-wide Developer Mode, and both are decisions with costs outside
-  this procedure. The 2026-08-14 run cleared that bar rather than removing it: it is the one
-  prerequisite here that a user cannot satisfy quietly.
+- **Elevation was a prerequisite this procedure could not satisfy quietly, and it should now
+  be gone.** Steps 4 onwards needed an elevated daemon or a machine-wide Developer Mode; the
+  2026-08-14 run cleared that bar rather than removing it. `patches/0006` removes it, in
+  containerd, by making the task-bundle link a junction. **Nobody has run that on Windows**,
+  so treat "unelevated works" as the thing this procedure is now testing rather than the thing
+  it assumes.
 - **The `-info` / `plugins ls` weak-signal warning still applies.** A shim that reports its
   runtime id is a shim that parsed its flags.
 
