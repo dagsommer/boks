@@ -375,7 +375,24 @@ runtime came from an unknown commit is a permanent problem.
 **The `paths:` filters were not an obstacle**, contrary to the initial worry. A path filter
 constrains only the event it is written under; `workflow_call` is a separate event with no
 filter, so `libkrun-windows.yml` is fully callable even though its push trigger fires only when
-its own patch directory changes.
+its own patch directory changes. GitHub's syntax reference scopes `paths`/`paths-ignore` to the
+`push` and `pull_request` events and defines them nowhere else — an affirmative scoping rather
+than an explicit statement that `workflow_call` ignores them, which is as close as the
+documentation comes.
+
+**What the design rests on, checked against GitHub's documentation rather than assumed.** These
+were written down as unverified when the workflows were built, and then looked up:
+
+| Assumption | State |
+|---|---|
+| A called workflow's artifacts are visible to a later job in the caller by plain name | **Established, not stated in one sentence.** "The entire called workflow is used, just as if it was part of the caller workflow", and `download-artifact` defaults to "the current repo and the current workflow run". The compound claim is a conclusion from the two, and it is the load-bearing one. |
+| `github.workflow` inside a called workflow is the *caller's* name | **Verified, explicitly.** The reusable-workflow reference states it, and warns about exactly the concurrency-group collision the change was made to avoid. |
+| `strategy.matrix` may be used on a `uses:` job | **Verified.** `strategy` is on the documented list of keywords permitted on a job that calls a reusable workflow, with no restriction on its sub-keys; matrix calls arrived in the August 2022 reusable-workflow improvements. |
+| A ~100 MB asset among fourteen is within limits | **Verified.** Each file in a release must be under 2 GiB, with no documented limit on a release's total size and a ceiling of 1000 assets. |
+
+The first row is the one to watch. It is a sound conclusion from two documented facts rather
+than a documented fact, so if a tag build fails at `assemble` with an artifact it cannot find,
+that row is the first place to look and not the artifact names.
 
 Two things did have to change to make (a) safe, and both are in the runtime workflows:
 
