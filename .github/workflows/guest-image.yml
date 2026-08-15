@@ -31,7 +31,7 @@ on:
         required: false
         default: x86_64
         type: choice
-        options: [x86_64, aarch64]
+        options: [x86_64, arm64]
   workflow_call:
     inputs:
       arch:
@@ -87,6 +87,41 @@ jobs:
       # The kernel is an ELF vmlinux rather than a bzImage — that is the format
       # `krun_set_kernel` takes, and it is what nerdbox's own instance.go looks for under the
       # name `nerdbox-kernel-<arch>`. Do not "fix" it into a bzImage.
+      # nerdbox spells this architecture `arm64`, not `aarch64`, in three places that must
+      # agree: the kernel config it ships (kernel/config-<version>-arm64), the ARCH it hands
+      # to Linux's kbuild, and — decisively — the name the shim looks the kernel up by at
+      # boot, which is Go's GOARCH with only amd64 rewritten to x86_64.
+      #
+      # This workflow passed `aarch64` until 2026-08-15. Nothing caught it because the
+      # matrix that calls this twice lives in release.yml, which had never run: a standalone
+      # guest-image run builds the default x86_64 only. The failure would have been
+      # `COPY kernel/config-6.12.44-aarch64` naming a file nerdbox does not ship — a build
+      # error about a missing config, several layers away from the word that caused it.
+      #
+      # linux-runtime.yml documents this same trap and avoids it. Hence the check: an
+      # architecture this recipe has no config for stops here, saying so.
+      - name: Reject an architecture nerdbox has no kernel config for
+        run: |
+          set -euo pipefail
+          arch='${{ inputs.arch || 'x86_64' }}'
+          # Globbed rather than built from the pinned kernel version, so that a version bump
+          # in nerdbox does not silently turn this check into one that rejects everything.
+          # An earlier attempt parsed the version out of docker-bake.hcl with `grep -oP`,
+          # which is line-based and so never matched the multi-line HCL block: every
+          # architecture, including the correct ones, was rejected for want of
+          # `config--x86_64`. Tested against nerdbox's real filenames this time.
+          shopt -s nullglob
+          configs=(nerdbox/kernel/config-*-"${arch}")
+          if [ ${#configs[@]} -eq 0 ]; then
+            echo "nerdbox ships no kernel config for architecture '${arch}'." >&2
+            echo "It ships:" >&2
+            ls nerdbox/kernel/config-* >&2
+            echo "Note that nerdbox names 64-bit ARM 'arm64', not 'aarch64' — the shim looks" >&2
+            echo "the kernel up by Go's GOARCH, so a guest built as 'aarch64' is never found." >&2
+            exit 1
+          fi
+          echo "using ${configs[*]}"
+
       - name: Build the guest kernel and rootfs
         working-directory: nerdbox
         env:
