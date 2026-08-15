@@ -54,8 +54,8 @@ yet) to run containers on this build of containerd."* That plugin is exactly wha
 before Homebrew will load Ruby from it. Naming a formula in full on the command line trusts
 that formula implicitly, so `brew install dagsommer/boks/nerdbox dagsommer/boks/boks` also
 works — but only for the names you actually type. `libkrun/krun/libkrun` is always reached
-as a dependency and so always needs saying out loud. `sbx` has the same requirement, which
-is why its install line begins `brew trust docker/tap`.
+as a dependency and so always needs saying out loud. Any tap-based install has the same
+requirement; it is a Homebrew rule, not something specific to this project.
 
 ### Then three things Homebrew cannot do for you
 
@@ -170,19 +170,20 @@ sudo install -m0755 boks_0.1.0_linux_amd64/boks /usr/local/bin/boks
 > files above are what it names — but no release has been cut, so there is nothing to
 > download until the first tag. Until then, [build from source](#building-from-source).
 
-The packages contain the CLI, its licence and shell completions, **and the runtime** —
-`containerd`, `containerd-shim-nerdbox-v1` and `libkrun.so` in `/usr/libexec/boks/`, which is
-where `boks daemon` looks and is deliberately not on your `PATH`, so a containerd you installed
-on purpose is neither shadowed nor collided with. They install no dependencies beyond a
-`Recommends: erofs-utils`, and the reason is in their own description: **no distribution ships
-a containerd new enough**, and nerdbox is packaged nowhere. A package that declared
-`Depends: containerd` would install 1.7.x on Ubuntu 24.04 and produce a machine that looks
-provisioned and cannot start a sandbox.
+The packages carry the runtime as well as the CLI: `boks` in `/usr/bin`, and `containerd`,
+`containerd-shim-nerdbox-v1` and `libkrun.so` under `/usr/libexec/boks`. That directory is
+where `boks daemon` looks and is deliberately not on your `PATH`, so a containerd you
+installed on purpose is neither shadowed nor collided with. The runtime is vendored rather
+than depended on because **no distribution ships a containerd new enough** — Ubuntu 24.04 has
+1.7.x and 26.04 has 2.2.2, and a 2.2 daemon fails at task start — so a package declaring
+`Depends: containerd` would produce a machine that looks provisioned and cannot start a
+sandbox. `mkfs.erofs` stays a `Recommends`, being the one piece distributions package
+properly.
 
-What the packages do **not** yet carry is the guest kernel and rootfs. Those are published
-separately as `boks-guest_<version>_x86_64.tar.gz` and `_aarch64.tar.gz`;
-[What a sandbox needs](#what-a-sandbox-needs) below is the full list, and `boks doctor` names
-each piece as it finds it missing.
+What the Linux packages do **not** yet carry is the guest kernel and rootfs, which the Windows
+archive does. They are published separately as `boks-guest_<version>_x86_64.tar.gz` and
+`_arm64.tar.gz`; [What a sandbox needs](#what-a-sandbox-needs) below is the full list, and
+`boks doctor` names each piece as it finds it missing.
 
 ### `apt-get install boks` — planned, not yet live
 
@@ -374,7 +375,7 @@ are settings, and `boks daemon config` prints them with the failure each one pre
 | `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | in the zip |
 | containerd ≥ 2.3 | Boks drives it through its Go API | `brew install containerd` (2.3.4) | in the `.deb`/`.rpm` | in the zip, patched |
 | `containerd-shim-nerdbox-v1` | turns a container into a microVM | built from source by the tap's formula | in the `.deb`/`.rpm`, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip, patched |
-| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker**, or the `aarch64` guest archive by hand | the guest archive, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip |
+| nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker**, or the `arm64` guest archive by hand | the guest archive, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip |
 | libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | in the `.deb`/`.rpm`, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip, as `krun.dll` |
 | `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | in the zip, patched |
 
