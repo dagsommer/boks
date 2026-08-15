@@ -74,6 +74,9 @@ boks_docs:
     nav: Agents
 
   - section: Reference
+  - source: docs/how-it-works.md
+    url: /how-it-works/
+    nav: How it works
   - source: docs/architecture.md
     url: /architecture/
     nav: Architecture

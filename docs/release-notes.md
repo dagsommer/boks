@@ -110,15 +110,19 @@ nothing about isolation.
 
 ### Platforms
 
-macOS on Apple silicon is the platform everything above was measured on. Linux with KVM is
-built and designed for and has not been exercised end to end. Native Windows support is in
-progress: on 2026-08-14 a Linux container ran in a microVM on real Windows 11 hardware,
-through containerd, a patched nerdbox shim and this repository's `krun.dll` on the Windows
-Hypervisor Platform — but through `ctr`, not `boks run`. Boks' own path stops before it starts
-a VM there, at the network refusal in `internal/network/vmm_windows.go`: its enforcement is the
-guest's virtio-net device and no Ethernet frame has yet crossed one on Windows. So the stack
-underneath Boks works there and Boks does not. Running inside WSL2 should work unchanged and
-nobody has tried it.
+All three supported platforms have now run a sandbox end to end against a real guest.
+
+**macOS on Apple silicon** is the most thoroughly measured, and where the VM boundary and the
+network policy were first established. **Windows 11 on x64** runs a sandbox natively through
+the Windows Hypervisor Platform from an ordinary unelevated terminal, with policy enforced,
+workspace write-through in both directions, persistence across `stop`, eight-vCPU SMP and
+clean teardown — all on 2026-08-15, and all on a single machine; there is no Windows arm64
+build. **Linux** was verified for the first time on 2026-08-15, in WSL2 on Ubuntu 26.04, with
+25 of 26 checks passing; that run was not on bare metal, and creating a sandbox on Linux still
+needs more privilege than an ordinary user has.
+
+The shim also turned out to need containerd 2.3 or later rather than the 2.2 previously
+documented: a 2.2 daemon cannot decode its bootstrap parameters and fails at task start.
 
 ### Known at the time of writing
 
