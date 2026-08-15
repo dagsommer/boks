@@ -1,0 +1,66 @@
+#| Lines beginning "#|" are stripped by render.sh.
+#|
+#| `Copyright` is deliberately absent. The repository's LICENSE is the plain Apache-2.0 text
+#| with no copyright line in it, and inventing one for a package manifest would assert
+#| something no file in this project asserts. The field is optional.
+#|
+#| `Icons` is absent because winget-pkgs populates it in its own validation pipeline; it is
+#| not authorable in a pull request.
+# Created by packaging/winget/render.sh in github.com/dagsommer/boks
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+
+PackageIdentifier: dagsommer.boks
+PackageVersion: {{VERSION}}
+PackageLocale: en-US
+Publisher: Dag Sommer
+PublisherUrl: https://github.com/dagsommer
+PublisherSupportUrl: https://github.com/dagsommer/boks/issues
+Author: Dag Sommer
+PackageName: Boks
+PackageUrl: https://github.com/dagsommer/boks
+License: Apache-2.0
+LicenseUrl: https://github.com/dagsommer/boks/blob/main/LICENSE
+ShortDescription: Run coding agents and other untrusted developer tooling in local microVMs
+Description: >-
+  Boks runs coding agents and other untrusted developer tooling inside isolated microVMs on
+  your own machine. It is a local-first, open-source alternative to Docker Sandboxes — no
+  account, no cloud service, no telemetry.
+
+  Each sandbox is a real virtual machine with its own kernel, not a container sharing yours,
+  and every network flow out of it is judged against a policy you set before it is dialled.
+  Your workspace is shared into the guest at its exact host path; nothing else is.
+
+  On Windows the microVM runs on the Windows Hypervisor Platform. This is not WSL2 and needs
+  no elevated terminal. Boks is experimental: read the project's verification record for what
+  has been measured rather than what the feature list implies.
+Moniker: boks
+Tags:
+- agent
+- cli
+- containerd
+- developer-tools
+- hypervisor
+- isolation
+- microvm
+- sandbox
+- security
+- virtualization
+ReleaseNotesUrl: https://github.com/dagsommer/boks/releases/tag/v{{VERSION}}
+Documentations:
+- DocumentLabel: Installing Boks
+  DocumentUrl: https://github.com/dagsommer/boks/blob/main/docs/install.md
+- DocumentLabel: What has actually been verified
+  DocumentUrl: https://github.com/dagsommer/boks/blob/main/docs/verification.md
+- DocumentLabel: Boks on Windows
+  DocumentUrl: https://github.com/dagsommer/boks/blob/main/docs/windows.md
+InstallationNotes: |-
+  Open a new terminal so the `boks` alias is on PATH, then:
+
+    boks doctor          check every prerequisite and print a remedy for each gap
+    boks daemon start    start the containerd this package ships, configured for Boks
+    boks run shell .     run a sandbox over the current directory
+
+  This package is not code-signed. Windows SmartScreen may warn the first time you run
+  boks.exe; see docs/install.md for why, and for how to verify the download instead.
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0
