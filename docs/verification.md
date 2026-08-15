@@ -1281,6 +1281,49 @@ being the interesting question, because the same code can be made not to need th
 user can create. Whether sbx does that, patches the link out, or carries its own bundle
 layout, is unexamined and no longer blocking.
 
+### Windows needs no elevation, 2026-08-15
+
+The last structural blocker is gone. Every step — creating the containerd root, running
+the daemon, `boks create`, `boks run` — from an ordinary shell reporting
+`elevated = False`, with no UAC prompt anywhere in the round:
+
+```
+elevated: False
+Linux (none) 6.12.44 #1 SMP Thu Aug 13 14:58:57 UTC 2026 x86_64 GNU/Linux
+RUN EXIT = 0   ELAPSED = 3.15s
+```
+
+Faster than any elevated round, and `A required privilege is not held` appears zero times
+in 565 KB of debug log.
+
+**Developer Mode was proven off first**, which is what makes the result mean anything:
+creating a symlink failed with "Administrator privilege required" while creating a
+junction succeeded, and `AppModelUnlock` has no `AllowDevelopmentWithoutDevLicense` value.
+That is exactly the asymmetry the patch relies on.
+
+**The link is a junction and the fallback never fired:**
+
+```
+Name       : work
+Attributes : Directory, ReparsePoint
+LinkType   : Junction
+Reparse Tag Value : 0xa0000003     Microsoft / Name Surrogate / Mount Point
+Substitute Name:  \??\C:\bokstest15\root\io.containerd.runtime.v2.task\boks\shell-boks
+```
+
+`symlink` appears zero times in the log. Sibling `rootfs` and `vm` are plain directories,
+so only `work` is a reparse point.
+
+**And teardown does not leak**, which is the check that would have failed silently:
+after `boks stop` and `boks rm`, both the state bundle and the work target under `root`
+are gone, with nothing orphaned on either side. A junction Windows creates but
+`os.Readlink` cannot resolve would have left work directories accumulating with nothing
+visibly wrong.
+
+The create-time-fixed flags are hard errors now, each naming the requested value and the
+actual one — `--cpus 2` against an 8-vCPU sandbox, `--net none` against one wired for
+`nat`, `--memory 4g` against 2048 MiB.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
