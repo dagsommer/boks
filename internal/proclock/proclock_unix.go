@@ -1,6 +1,6 @@
 //go:build !windows
 
-package enforce
+package proclock
 
 import (
 	"errors"
@@ -10,28 +10,24 @@ import (
 	"syscall"
 )
 
-// A supervisor's liveness is a held file lock, not a PID.
-//
-// A PID recorded in a file is a claim about the past: between a crash and the next command
-// the number can belong to somebody else's process, and signalling a stranger is a worse
-// failure than leaving a socket behind. An flock is held by the kernel and released when
-// the holder dies however it dies, so "can I take this lock" answers "is that supervisor
-// gone" with no window and no ambiguity.
+// The Unix primitives. An flock is held by the kernel and released when the holder dies
+// however it dies, so "can I take this lock" answers "is that process gone" with no window
+// and no ambiguity. See proclock.go for why that is the liveness test rather than a PID.
 
-// acquire takes the supervisor lock for the life of the process. The returned function
-// releases it; the kernel releases it anyway if the process dies.
+// acquire takes the lock for the life of the process. The returned function releases it; the
+// kernel releases it anyway if the process dies.
 func acquire(path string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		// Not a held lock: the file could not be opened at all. Saying so here is
-		// what keeps the caller from reporting it as a running supervisor.
-		return nil, fmt.Errorf("opening the supervisor lock %s: %w", path, err)
+		// what keeps the caller from reporting it as a live holder.
+		return nil, fmt.Errorf("opening the lock %s: %w", path, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		// Only this branch means somebody else is holding it, and only this branch
 		// may claim so.
-		return nil, fmt.Errorf("%w: %s (%v)", errLockHeld, path, err)
+		return nil, fmt.Errorf("%w: %s (%v)", ErrHeld, path, err)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
@@ -39,7 +35,7 @@ func acquire(path string) (func(), error) {
 	}, nil
 }
 
-// locked reports whether a supervisor is holding the lock.
+// locked reports whether some live process is holding the lock.
 func locked(path string) bool {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
@@ -53,8 +49,10 @@ func locked(path string) bool {
 	return false
 }
 
-// terminate asks a supervisor to shut down. SIGTERM only: the supervisor's teardown removes
-// the link socket and closes the stack, and SIGKILL would leave both behind.
+// terminate asks a process to shut down. SIGTERM only, never SIGKILL: everything Boks runs
+// this way has teardown that matters — the network supervisor removes its link socket and
+// closes the stack, containerd unmounts and closes its database — and SIGKILL would leave all
+// of it behind.
 func terminate(pid int) error {
 	p, err := os.FindProcess(pid)
 	if err != nil {
@@ -69,7 +67,7 @@ func terminate(pid int) error {
 	return nil
 }
 
-// detach puts the supervisor in its own session, so that the Ctrl-C for the command that
+// detach puts the process in its own session, so that the Ctrl-C for the command that
 // spawned it, and the closing of the terminal it was started from, do not reach it.
 func detach(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
