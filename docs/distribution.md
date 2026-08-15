@@ -305,9 +305,10 @@ Two entries deserve their own note:
 - **The guest kernel is GPL-2.0 and nerdbox patches it.** Distributing the compiled result
   carries a corresponding-source obligation. The recipe is entirely public — a pinned
   `cdn.kernel.org` tarball, a config and a patch set — so satisfying it is a matter of
-  publishing that alongside. It remains the owner's call and is the single largest blocker to a
-  bundle, because a bundle without the guest is a bundle whose `doctor` passes and whose first
-  sandbox will not boot.
+  publishing that alongside. `release.yml` now does distribute it, with a `SOURCE.txt` pointer,
+  in the guest archives and in the Windows bundle; **that is CI implementing a reading of the
+  obligation, not the owner ruling on it**, and the last section of this document is where the
+  reading is stated and where reversing it would start.
 
 ### The CI gap, and how it was closed
 
@@ -333,10 +334,10 @@ locally is what lets brew ad-hoc sign it.
 |---|---|---|
 | guest kernel + EROFS rootfs, per guest arch | `guest-image.yml` | `boks-guest_<v>_x86_64.tar.gz`, `boks-guest_<v>_aarch64.tar.gz` |
 | Linux `libkrun.so` + `containerd-shim-nerdbox-v1`, per arch | `linux-runtime.yml` | `boks-runtime_<v>_linux_amd64.tar.gz`, `…_linux_arm64.tar.gz` |
-| `krun.dll` | `libkrun-windows.yml` | inside `boks-runtime_<v>_windows_amd64.zip` |
-| Windows nerdbox shim | `nerdbox-windows.yml` | the same zip, **renamed** to `containerd-shim-nerdbox-v1.exe` |
-| Windows `containerd.exe`, `ctr.exe`, `mkfs.erofs.exe`, `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | `containerd-windows.yml` | the same zip |
-| `boks` for linux/amd64, linux/arm64, darwin/arm64 and **windows/amd64**, plus `.deb` and `.rpm` | `release.yml` | as before, plus the new Windows target |
+| `krun.dll` | `libkrun-windows.yml` | inside `boks-runtime_<v>_windows_amd64.zip`, and inside `boks_<v>_windows_amd64.zip` |
+| Windows nerdbox shim | `nerdbox-windows.yml` | the same two zips, **renamed** to `containerd-shim-nerdbox-v1.exe` |
+| Windows `containerd.exe`, `ctr.exe`, `mkfs.erofs.exe`, `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | `containerd-windows.yml` | the same two zips |
+| `boks` for linux/amd64, linux/arm64, darwin/arm64 and **windows/amd64**, plus `.deb` and `.rpm` | `release.yml` | as before; the Windows CLI is published only inside `boks_<v>_windows_amd64.zip` |
 
 The Windows shim rename is not cosmetic. `nerdbox-windows.yml` builds both architectures and
 therefore suffixes them; containerd resolves a runtime *id* to a binary *name*, so
@@ -346,6 +347,99 @@ shipped under its build name is a shim containerd reports as missing.
 There is deliberately **no macOS runtime archive**, and no `windows/arm64` anything: there is
 no `krun.dll` or `mkfs.erofs.exe` for aarch64 Windows, and go-erofs's recipe cross-compiles for
 x86-64 alone.
+
+### What goes in the Windows archive, and the guest
+
+Two tracks landed on `main` disagreeing about this file, which is the reason the section
+exists. The release workflow shipped the Windows CLI as `boks_<v>_windows_amd64.tar.gz`
+(reasoning: Windows 10+ ships `tar`) with the runtime separately as
+`boks-runtime_<v>_windows_amd64.zip`; the winget manifests named
+`boks_<v>_windows_amd64.zip` with `boks_<v>_windows_amd64/boks.exe` inside it. That asset did
+not exist, so a tag would have published a manifest whose `InstallerUrl` 404s.
+
+**The resolution: `boks_<v>_windows_amd64.zip` is the CLI, the runtime and the guest in one
+flat directory**, and it is both the winget target and the recommended Windows download.
+
+Three things force the shape rather than merely favouring it:
+
+- **A zip, not a tarball.** winget's `InstallerType` supports `zip` and has no `tar.gz`. The
+  "Windows ships `tar`" argument is true and buys nothing here, because the winget asset has
+  to be a zip regardless, and a second archive of the same binary in another format is a
+  choice offered to a user who has no basis for making it.
+- **Flat, with `boks.exe` at the root of one top-level directory**, because that is the path
+  `NestedInstallerFiles.RelativeFilePath` already declares. `assemble` asserts the path
+  exists rather than letting winget-pkgs' bot discover it is wrong.
+- **The runtime is in it**, because the principle this whole document argues from is that a
+  user should not assemble a stack from parts. A `winget install` delivering a CLI with no
+  runtime would contradict it in the one place a new user meets the project first.
+
+**The Windows CLI-only tarball is gone.** It is a strict subset of the zip — the same
+`boks.exe`, the same `LICENSE` and `README.md` — so the only thing distinguishing it is that
+it cannot start a sandbox. It would also create a contract nothing enforces: two assets whose
+`boks.exe` must stay byte-identical. `scripts/build-release.sh windows amd64` still builds it,
+because that is how the binary reaches `assemble` and because `make dist` and
+`RELEASE_TARGETS` must keep naming the same platform set the workflow's matrix does — the
+assertion in `internal/release/`. It is built and consumed, not published.
+
+**`boks-runtime_<v>_windows_amd64.zip` stays.** Unlike the CLI tarball it is a complement
+rather than a subset-in-practice: it is what someone wants who built `boks.exe` from source on
+Windows (the route `docs/install.md` still recommends today), or who is driving `containerd`
+and `ctr` by hand the way `docs/windows-e2e.md` does. Handing that person the all-in-one
+archive would put a second `boks.exe` beside the one they built. It also keeps Windows
+symmetric with Linux, where the `.deb` carries the runtime *and* `boks-runtime_*_linux_*.tar.gz`
+is published for the tarball route.
+
+#### The guest kernel and rootfs go in it
+
+This was the open decision, and it is decided: **included**, x86_64 only.
+
+**It removes the last download.** Without the guest, `winget install boks` ends at `boks
+doctor` reporting `guest image fail` and telling the user to fetch an artifact from a GitHub
+Actions run — which needs a GitHub login, expires, and is the worst possible last step for a
+first install. That is the "assemble a stack from parts" failure in its purest form.
+
+**It works, which was checked against the code rather than assumed.**
+`internal/daemon/locate.go`'s `RuntimeDirs()` searches the directory the `boks` executable
+resolves to, following symlinks — and a winget portable install *is* a symlink into the
+package directory. `daemonPath()` then **prepends** those directories to the `PATH` it starts
+containerd with, and the shim locates `krun.dll`, the kernel and the rootfs by scanning that
+same `PATH` (`internal/doctor/checks.go` transcribes the scan). So a flat directory needs no
+`PATH` entry, no environment variable and no configuration.
+
+> **The proviso, and it is real.** All of that holds only when containerd is the one `boks
+> daemon start` runs. Start the bundled `containerd.exe` by hand and none of the search
+> applies, because the daemon's `PATH` is then whatever the shell handed it.
+
+**The licence question is not made worse, and it is not resolved either.** The reading is
+already recorded above and at the end of this document: `release.yml` publishes the guest on
+the basis that GPL-2.0's corresponding-source obligation is met by shipping a pointer — a
+`SOURCE.txt` naming the exact nerdbox revision and the two `docker buildx bake` commands that
+reproduce it. Putting the same bytes in a second archive on the same release does not change
+who is distributing or on what basis: winget hosts a **manifest**, not the bytes, and its
+`InstallerUrl` points at our own GitHub release, so we remain the sole distributor and the
+recipient is one click from the repository `SOURCE.txt` names. What it does change is the
+blast radius if the reading is wrong — the kernel would then be in two archives rather than
+one — and the fix remains what it was: one job in `release.yml`.
+
+So the mechanism rides along by construction. `assemble` writes `SOURCE.txt` into **every**
+archive that contains the kernel, guest archives and Windows bundle alike, from one function
+rather than two copies of a heredoc. An archive carrying a GPL-2.0 kernel and no pointer would
+be a genuinely new obligation rather than the same one, which is the only reason the file
+exists.
+
+**The size is not the deciding factor and should not be presented as one.** The guest adds the
+kernel and the rootfs — 8,343,552 bytes measured for the arm64 rootfs on 2026-08-13, and a
+kernel reported at ~34 MB for the CI x86_64 ELF `vmlinux`, which is the figure this archive
+carries and is *reported rather than committed*. Against a bundle that already holds a 43 MB
+containerd, a 22 MB `ctr` and an ~18 MB shim, the guest is not what makes this archive large.
+
+**What excluding it would have bought**, stated so the decision can be reversed on its merits:
+a materially smaller download, and one fewer place the corresponding-source reading is
+exercised. Both are real. Neither outweighs an install that ends in a sandbox that will not
+boot — which is exactly the failure mode this document names as the reason a bundle exists at
+all.
+
+There is no `aarch64` guest in it because there is no aarch64 Windows runtime to boot it with.
 
 ### How the runtime crosses a workflow boundary
 
@@ -434,6 +528,17 @@ workflows that parse, pass `actionlint` with no new findings, and whose shell wa
 against stand-in files — which is evidence about the scripts and none at all about how GitHub
 behaves.
 
+The `assemble` job's three shell steps have been run that way, extracted verbatim from
+`release.yml` rather than retyped, against stand-in artifacts named exactly as each producing
+workflow names them. They produced every archive, and the Windows zip contained
+`boks_<v>_windows_amd64/boks.exe` at the path the winget manifest declares. Four **negative
+controls** were run against the same steps, because a check that never fails proves nothing:
+a CLI archive with no `boks.exe`, an incoming artifact carrying neither a `SHA256SUMS` nor a
+`.sha256`, a corrupted CLI tarball, and a corrupted runtime file. All four failed the step that
+should catch them. That is evidence about the shell. It says nothing about whether
+`actions/download-artifact` can see a called workflow's artifacts, which is still the row to
+watch in the table above.
+
 ---
 
 ## Part 4 — package by package
@@ -477,21 +582,29 @@ reached as a dependency so is never implicitly trusted. sbx has the same require
 
 ### winget (Windows)
 
-**Now viable in principle, and not yet in fact.** The maintainer's note is right that native
-Windows works and needs no elevation — the junction patch removed that requirement — and winget
-installs on Windows rather than inside WSL, which is the delivery mechanism the platform needs.
+**The `virtio-net` gate is passed.** This section used to say winget was blocked on it: no
+Ethernet frame had crossed a `virtio-net` on Windows, and Boks refuses to start a sandbox whose
+network policy it cannot enforce, so a package would have installed a binary whose only
+possible output was a refusal. On 2026-08-15 `boks run` completed unelevated on Windows 11 with
+the policy engine judging real traffic — the `boks run` bar, not the weaker `ctr` one. The
+maintainer's note that native Windows needs no elevation is also right, and the junction patch
+is what removed the requirement.
 
-The bar is `boks run` completing on Windows, which is stricter than a microVM booting there. On
-2026-08-14 `ctr tasks start` ran a Linux container end to end on real Windows 11 hardware. What
-remains is `virtio-net`: no Ethernet frame has crossed one on Windows, and Boks refuses to start
-a sandbox whose network policy it cannot enforce. A winget package today would install a binary
-whose only possible output is a refusal.
+**The manifests exist**, in [`packaging/winget/`](../packaging/winget/): three templates, a
+`render.sh` that stamps the version, digest and release date, and a `validate.py` that checks
+the rendered files against winget's own published JSON schemas. That directory's README is the
+authority on what has and has not been checked, and the summary is that schema validation has
+been run on Linux with a negative control, and `winget` itself has not been run at all by
+anyone on this project.
 
-**What we do not have:** a winget manifest; a `mkfs.ext4` story. The two release-side items
-that used to be on this list are done: `release.yml` builds and publishes a `windows/amd64`
-`boks`, and `krun.dll` is now an artifact and ships inside
-`boks-runtime_<v>_windows_amd64.zip` along with the shim, containerd, `ctr` and
-`mkfs.erofs.exe`. Neither has been through a tagged run.
+The artifact they name now exists too: `boks_<v>_windows_amd64.zip`, laid out to match
+`RelativeFilePath` exactly — see [What goes in the Windows archive, and the
+guest](#what-goes-in-the-windows-archive-and-the-guest).
+
+**What we do not have:** a submission to `microsoft/winget-pkgs`, which is a pull request to
+somebody else's repository needing a signed CLA and a human moderator and cannot be done from
+here; a tagged release for its `InstallerUrl` to point at; and a `mkfs.ext4` story. None of it
+has been through a tagged run, and no `winget install` has been attempted.
 
 **Code signing and SmartScreen.** The maintainer has decided not to spend on this yet, and the
 plan should state the consequence rather than argue with it. An unsigned installer triggers
@@ -507,17 +620,20 @@ protecting.
 
 ### Linux — `.deb`, `.rpm`, and the apt repository
 
-The packages exist and are built by `release.yml`. They contain the CLI, its licence and three
-shell completions, and nothing else. They declare `Recommends: erofs-utils` and no `Depends:`,
-for a reason stated in their own description: no distribution ships a containerd new enough, and
-nerdbox is packaged nowhere. `Depends: containerd` would install 1.7.x on Ubuntu 24.04 and
-produce a machine that looks provisioned and cannot start a sandbox.
+The packages exist and are built by `release.yml`. They contain the CLI, its licence, three
+shell completions **and the runtime** — `containerd`, `containerd-shim-nerdbox-v1` and
+`libkrun.so` under `/usr/libexec/boks/`, which `scripts/package-linux.sh` refuses to build
+without. They declare `Recommends: erofs-utils` and no `Depends:`, for a reason stated in their
+own description: no distribution ships a containerd new enough, and nerdbox is packaged nowhere.
+`Depends: containerd` would install 1.7.x on Ubuntu 24.04 and produce a machine that looks
+provisioned and cannot start a sandbox.
 
 **What we do not have:**
 
-- the runtime pieces to put in the package: CI builds a Linux `libkrun.so` and a Linux
-  nerdbox shim (see the gap table above). This is the largest single omission in the whole plan
-  and it is not tracked anywhere else;
+- the guest kernel and rootfs *inside* the package. They are release assets
+  (`boks-guest_<v>_<arch>.tar.gz`) and `package-linux.sh` will place them if handed them, but
+  `release.yml` does not hand them over today — so a `.deb` install still reaches
+  `guest image fail`. The Windows zip does carry the guest; Linux is the asymmetry;
 - the apt repository. The signing key exists — `packaging/apt/boks-archive-keyring.asc`,
   fingerprint `D5DD07C0F9589C164F7361C20EB93D3C39471E1E`, expiring 2029-08-13, private half a
   CI secret and the only copy — and nothing else does. No index generation, no `InRelease`, no
@@ -694,10 +810,12 @@ crosses a workflow boundary" above:
    pin in one run, so the manifest is a file that job writes rather than a cross-run
    reconciliation.
 
-Also done here, though it belongs to no numbered item: **a `windows/amd64` CLI is built and
-published**. It was excluded on the grounds that libkrun had no Windows backend and a binary
-whose only output is a refusal is worse than none. That has not been true since 2026-08-15,
-when `boks run` completed unelevated on Windows 11 with the policy engine judging real traffic.
+Also done here, though it belongs to no numbered item: **a `windows/amd64` CLI is built, and
+published inside `boks_<v>_windows_amd64.zip` rather than on its own**. It was excluded
+entirely on the grounds that libkrun had no Windows backend and a binary whose only output is a
+refusal is worse than none. That has not been true since 2026-08-15, when `boks run` completed
+unelevated on Windows 11 with the policy engine judging real traffic — and the same reasoning
+is why it does not ship alone now either.
 
 ### Release 2 — the smallest honestly usable install
 
@@ -729,8 +847,15 @@ unverified path would be the same mistake as a winget package that can only refu
 
 The `virtio-net` gate is passed: on 2026-08-15 `boks run` completed unelevated on Windows 11
 with the policy engine judging real traffic, which is the `boks run` bar rather than the `ctr`
-one. A Windows release build now exists too. What is left is the manifest itself and the
-SmartScreen decision — which can stay "no" without blocking anything.
+one. The manifests are written and schema-checked, and `boks_<v>_windows_amd64.zip` — the
+asset they name, carrying the CLI, the runtime and the guest — is assembled by `release.yml`.
+
+What is left is not ours to do from here: **cut a tag**, so the `InstallerUrl` resolves and the
+digest can be computed from a real file, then **submit a pull request to
+`microsoft/winget-pkgs`** behind a signed CLA and a human moderator.
+`packaging/winget/README.md` has that sequence in order, including why the automation that
+updates a package cannot bootstrap the first one. The SmartScreen decision can stay "no"
+without blocking any of it.
 
 ### Can wait, indefinitely
 
@@ -750,10 +875,22 @@ SmartScreen decision — which can stay "no" without blocking anything.
 through it Releases 2 and 3. `release.yml` now publishes the guest, on the reading that the
 corresponding-source obligation is satisfied by publishing the recipe alongside: it is entirely
 public — `scripts/build-nerdbox-guest.sh` and nerdbox's bake targets produce both files in about
-four minutes on an ordinary Linux runner — and every guest archive carries a `SOURCE.txt` naming
-the exact revision and the commands.
+four minutes on an ordinary Linux runner — and every archive that contains the kernel carries a
+`SOURCE.txt` naming the exact revision and the commands.
+
+**That reading now applies in two places, not one.** The guest archives publish the kernel, and
+so does `boks_<v>_windows_amd64.zip`, because a winget install that ends in a sandbox which will
+not boot is the failure this whole document is written against. `SOURCE.txt` is written into
+both from the same code path in `assemble`, so the two cannot drift; the reasoning is under
+[What goes in the Windows archive, and the
+guest](#what-goes-in-the-windows-archive-and-the-guest). Nothing about winget widens the
+obligation on its own — winget hosts a manifest and the bytes come from our own release URL, so
+we remain the sole distributor.
 
 **That is an implementation of a reading, not a legal opinion, and it was made by CI rather
 than by the owner.** If the owner's reading is that the obligation needs more than a pointer —
 an offer valid for three years, or the sources hosted by us rather than by upstream — the fix is
-one job in `release.yml`, and it is much easier to make before the first tag than after.
+one job in `release.yml`, and it is much easier to make before the first tag than after. What
+has changed is only how much rides on it: two archives now, so reversing it means removing the
+guest from the Windows bundle as well, and accepting that a `winget install` then needs a second
+download.
