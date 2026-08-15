@@ -66,6 +66,12 @@ to an executable using the daemon's `PATH`, not your shell's. If you start it fr
 launchd job or a `brew services` plist, that `PATH` is probably minimal and will not include
 `$(brew --prefix)/bin`.
 
+> [!TIP]
+> `boks daemon start` handles this one: it starts containerd itself, with the directories
+> Boks searches prepended to containerd's `PATH`. It also writes the rootless configuration
+> described under point 1 — the `[ttrpc]` section with a `uid`/`gid` — so that half is no
+> longer something to get right by hand either.
+
 **3. Build the guest kernel and root filesystem.** This is the gap, and it is the one
 `boks doctor` will not warn you about.
 
@@ -204,6 +210,30 @@ anyone on this project.
 > contain: containerd, a VM shim, a hypervisor library and a filesystem tool. On a fresh
 > machine every one of those is missing, and `boks doctor` will tell you so.
 
+**One of them Boks will now run for you.** `boks daemon start` writes a containerd
+configuration for this host and starts containerd with it:
+
+```sh
+boks daemon start     # writes the config, runs containerd, waits until it answers
+boks daemon status    # is it running, and is it actually serving
+boks daemon config    # the configuration, with the reason for every setting
+boks daemon logs      # what containerd wrote
+```
+
+It does not install containerd — you still need one, version 2.2 or later — and it does not
+touch a containerd you already run. The daemon it starts has its own root, its own state and
+its own endpoint under your state directory, so a machine running containerd for Docker keeps
+doing so and the two never see each other. Nothing is installed as a service and nothing runs
+at boot. Once it is up, Boks talks to it by default; `--containerd-address` and
+`BOKS_CONTAINERD_ADDRESS` still override that.
+
+The point of it is the configuration rather than the convenience. containerd's defaults are
+wrong for Boks in ways that fail late and name something else: on Linux its diff-service order
+is `['walking']`, which cannot unpack the stacked EROFS layers a sandbox boots from, and its
+listeners are chowned to uid 0, which kills a rootless daemon before it serves anything. Both
+are settings, and `boks daemon config` prints them with the failure each one prevents. See
+[distribution.md](distribution.md) for the full list and the evidence.
+
 | Piece | Why | macOS/arm64 | Linux | Windows |
 |---|---|---|---|---|
 | `boks` | the CLI | Homebrew, or a tarball | tarball, `.deb`, `.rpm` | in progress — see above |
@@ -290,6 +320,7 @@ containerd           fail   unreachable at /run/containerd/containerd.sock
 snapshotter          warn   could not list snapshotters
 snapshotter tools    ok     /usr/bin/mkfs.erofs (erofs-utils 1.9)
 vm runtime           fail   containerd-shim-nerdbox-v1 not found on PATH
+runtime skew         skip   no shim to compare (see vm runtime)
 hypervisor library   warn   libkrun.so not found where the shim looks
 guest image          fail   nerdbox-kernel-arm64 and nerdbox-rootfs.erofs not found
 

@@ -446,11 +446,16 @@ func DefaultLogPath() string {
 	return filepath.Join(StateDir(), "policy-log.jsonl")
 }
 
+// StateDirEnv overrides StateDir. It is exported because Boks spawns background processes
+// that must resolve the same directory this one did — the containerd supervisor is handed it
+// explicitly rather than left to recompute it from a HOME that may have changed underneath.
+const StateDirEnv = "BOKS_STATE_DIR"
+
 // StateDir is where Boks keeps host-side state that is never shared into a guest. It is
 // here rather than in a state package so that the policy log and the secret store agree on
 // one location without either depending on the sandbox lifecycle.
 func StateDir() string {
-	if dir := os.Getenv("BOKS_STATE_DIR"); dir != "" {
+	if dir := os.Getenv(StateDirEnv); dir != "" {
 		return dir
 	}
 	switch runtime.GOOS {
