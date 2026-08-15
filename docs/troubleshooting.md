@@ -207,18 +207,20 @@ there produces the same loud failure for an entirely unrelated reason.
 
 ## WSL2
 
-Boks inside WSL2 is the route to Boks on a Windows machine that is expected to work today.
-A native Windows build exists and is no longer refused — `boks run` binds the sandbox's link
-socket and attempts it — but **no Ethernet frame has ever crossed libkrun's virtio-net device
-on Windows, and nobody has run `boks run` there at all.** If you try it, expect the network
-supervisor to exit about half a minute after the task starts with an error saying nothing
-connected to the link socket; the sandbox's `stack.log` holds it, and it names what to check.
-A guest that comes up with no stack attached is *not* contained — it falls back to libkrun's
-TSI, where its `127.0.0.1` is the host's — so do not trust such a sandbox because it appeared
-to work. **Nobody has run it.** Every ingredient below is traced to WSL's source, its
-issue tracker or its kernel config, and none of it has been executed — the full analysis is in
-[Windows](windows.md). `doctor` detects WSL through `/bin/wslinfo` and gives WSL-specific
-remedies for the KVM failures.
+Boks inside WSL2 is a verified route, and since 2026-08-15 it is *the* verified Linux route:
+the first end-to-end Linux run happened in WSL2 on Ubuntu 26.04, with 25 of 26 checks passing
+([Verification](verification.md)). A native Windows build also works now and needs no
+elevation, so WSL2 is a choice rather than a fallback — see [Install](install.md#windows--winget).
+
+Two things that bit that run and will bite yours. **containerd will not start unprivileged
+with a default config**: it chowns its ttrpc socket to uid 0, and setting `[ttrpc] uid/gid` to
+the invoking user makes the chown a no-op. **The Linux diff-service default is `['walking']`**,
+and the walking differ cannot resolve a stacked erofs snapshot; `default = ['erofs',
+'walking']` unpacks all layers. Expect to run as root for sandbox creation either way: as an
+ordinary user it fails with `mount source: "overlay", err: operation not permitted`.
+
+`doctor` detects WSL through `/bin/wslinfo` and gives WSL-specific remedies for the KVM
+failures. The full analysis is in [Windows](windows.md).
 
 **WSL 2.5.1 is a hard floor**, because it introduced the modules image that makes any
 loadable module loadable at all, and clean cgroups v2.
