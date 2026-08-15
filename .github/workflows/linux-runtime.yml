@@ -497,6 +497,19 @@ jobs:
       # would buy nothing; build.sh asserts the ELF machine of what it produced, which is
       # what would catch it being wrong.
       - name: Build the containerd the packages vendor
+        env:
+          # actions/setup-go pins GOTOOLCHAIN=local so a build cannot silently pull a
+          # different compiler. That is right for Boks' own code and wrong here: this step
+          # builds somebody else's, and containerd v2.3.3's go.mod requires go >= 1.26.3
+          # while Boks' go.mod asks for less. With `local` the build fails with exactly that
+          # sentence, which is how this was found — the step failed on both architectures the
+          # first time it ran.
+          #
+          # `auto` is not an unpinned download. The version is named by the go.mod of the
+          # containerd release CONTAINERD_VERSION pins, and Go verifies a fetched toolchain
+          # against the checksum database. Hardcoding a version here instead would drift
+          # silently the next time that pin moves.
+          GOTOOLCHAIN: auto
         run: boks/packaging/containerd-linux/build.sh "${{ matrix.arch }}" "$PWD/staging"
 
       - name: Assemble the bundle
