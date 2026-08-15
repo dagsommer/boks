@@ -45,7 +45,22 @@ func acquire(path string) (func(), error) {
 		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, overlapped)
 	if err != nil {
 		f.Close()
-		return nil, fmt.Errorf("the lock %s is held: %w", path, err)
+		// Only a lock or sharing violation means somebody else holds it, and only
+		// that case may claim so — the same rule the Unix implementation follows.
+		// Without this the wrapper never carried ErrHeld on Windows, so every caller
+		// that asks "is it held?" got false and reported the raw Win32 sentence
+		// instead of its own. `boks daemon start` against a running daemon answered
+		// "The process cannot access the file because another process has locked a
+		// portion of the file" rather than naming the daemon and pointing at `boks
+		// daemon status`.
+		//
+		// That is the second time this exact divergence has been shipped: ErrHeld
+		// exists because `boks net serve` had it before, in the other direction. The
+		// abstraction was added to fix it and this half never joined in.
+		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) || errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+			return nil, fmt.Errorf("%w: %s (%v)", ErrHeld, path, err)
+		}
+		return nil, fmt.Errorf("locking %s: %w", path, err)
 	}
 	return func() {
 		_ = windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, overlapped)
