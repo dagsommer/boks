@@ -155,6 +155,16 @@ func executable(path string) bool {
 	return info.Mode()&0o111 != 0
 }
 
+// ContainerdPath returns the PATH containerd is started with: the bundle directories first,
+// then whatever this process inherited.
+//
+// Exported because it is not only what `boks daemon start` uses, it is the answer to "where
+// will the shim look?" — the shim inherits containerd's environment and scans PATH for
+// libkrun and for the guest images. Anything reasoning about what the shim can find has to
+// reason about this list rather than about the PATH of whichever shell asked, and
+// internal/doctor does.
+func ContainerdPath(inherited string) string { return daemonPath(inherited) }
+
 // daemonPath returns the PATH containerd is started with: the bundle directories first, then
 // whatever this process inherited.
 //
