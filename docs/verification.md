@@ -1168,6 +1168,40 @@ live clock through the same `BusDevice` entry point the vCPU's port-I/O exit cal
 Scope: `--net nat`, one sandbox, one machine. `boks rm` could not run because containerd
 was already down, so teardown is unverified in this run.
 
+### The Windows guest's clock is right, and TLS completes, 2026-08-15
+
+The CMOS fix, measured against the host on both sides of the run:
+
+```
+HOST UTC BEFORE = 2026-08-15 06:40:56.490 UTC   epoch=1786776056
+  guest: Sat Aug 15 06:41:02 UTC 2026   epoch=1786776062   uptime 1.58
+HOST UTC AFTER  = 2026-08-15 06:41:12.588 UTC   epoch=1786776072
+```
+
+The guest's epoch falls inside the host window, six seconds after the earlier reading,
+with the guest itself only 1.58 s old — the remainder is create and boot latency. Correct
+to the second, against `1999-11-30 00:02:19` the day before.
+
+**And it mattered.** The same probe that failed round 12 with `curl (60) SSL certificate
+problem: certificate is not yet valid` now returns **HTTP 200 from github.com**, fetched by
+a Linux container in a microVM on Windows through Boks' own gvisor stack. The denied host
+still fails at `CONNECT tunnel failed, response 403` — the policy refusing it, not a
+certificate. Three fresh policy-log records, host timestamps now consistent with the
+guest's own clock.
+
+The guest says almost nothing about the clock: no `rtc`, `cmos`, `hctosys` or `Time:`
+line. That is expected rather than disappointing — this kernel reads CMOS through
+`x86_platform.get_wallclock` during `timekeeping_init` instead of binding an `rtc-cmos`
+driver, so a successful read is silent. The correct `date -u` is the only positive signal
+available.
+
+**Teardown, verified for the first time on Windows.** `boks rm` on a running sandbox
+refuses and names the remedy; `boks stop` then `boks rm` leave nothing: the active
+snapshot released with only the seven committed image layers remaining, the state
+directory gone, the network directory including its socket, lock and log gone, and no shim
+processes. One leftover, recorded without a verdict: `notices/<sandbox>.json` survives
+`rm`, which may well be deliberate since it marks a warning as already seen.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
