@@ -1,0 +1,611 @@
+From de8dd32c38c7c7c3c60272a4f4cce6ae50ee38ed Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@gmail.com>
+Date: Sat, 15 Aug 2026 09:33:44 +0200
+Subject: [PATCH] runtime/v2: link a bundle's work directory with a junction on
+ Windows
+
+`NewBundle` ends by linking the task's working directory into the bundle:
+
+    // symlink workdir
+    if err := os.Symlink(work, filepath.Join(b.Path, "work")); err != nil {
+        return nil, err
+    }
+
+Creating a symlink on Windows requires SeCreateSymbolicLinkPrivilege, which
+Administrators hold by default and nobody else holds at all. Go already asks for
+the one concession the platform offers -- `os.Symlink` passes
+SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE and retries without it
+(os/file_windows.go) -- but Windows honours that flag only when Developer Mode
+is on, which is a machine-wide setting granting unprivileged symlink creation to
+every process run by every user, and is commonly disabled by policy on managed
+machines. So on a stock Windows 11 desktop this line fails with
+ERROR_PRIVILEGE_NOT_HELD for every task bundle, before any shim is launched, and
+an unelevated containerd cannot run a container at all. Measured there:
+
+    New-Item -ItemType SymbolicLink   ->  "Administrator privilege required"
+    mklink /J  (a junction)           ->  succeeds
+
+A junction -- a directory mount point -- is the same thing for this purpose and
+needs no privilege. Windows has no CreateJunction: a junction is an empty
+directory carrying an IO_REPARSE_TAG_MOUNT_POINT reparse point, made with
+CreateFile + DeviceIoControl(FSCTL_SET_REPARSE_POINT), which is what
+createWorkDirJunction does, with the handle flags the standard library's own
+os.TestDirectoryJunction uses.
+
+The junction is tried first and `os.Symlink` is kept as the fallback, rather
+than replaced. A junction is a strictly less capable link: its target has to be
+a fully qualified path on a local volume, so a `--root` on a UNC share, or any
+target ntPath declines to express, cannot be a junction and can be a symlink.
+Ordering it this way means every configuration that works today still works, the
+unelevated one now works too, and neither failing is reported as one error
+naming both causes -- which is the only moment at which "which of the two
+constraints did this machine violate" is answerable.
+
+What this must never do is succeed without a link, and that is why a junction
+whose reparse point could not be set has its directory removed before the error
+is returned. `Bundle.Delete` finds the working directory to remove by reading
+that link back, and tolerates a failed read by skipping the removal:
+
+    work, werr := os.Readlink(filepath.Join(b.Path, "work"))
+    ...
+    if werr == nil { return atomicDelete(work) }
+
+so an ordinary empty directory named `work` would not fail anything; it would
+quietly stop working directories from being removed. (`cleanupWorkDirs` reaps
+them at the next daemon start, so the loss is bounded by a restart rather than
+permanent -- which makes it quieter still, not better.)
+
+`os.Readlink` reads junctions: os/file_windows.go's readReparseLinkHandle
+handles IO_REPARSE_TAG_MOUNT_POINT alongside IO_REPARSE_TAG_SYMLINK and passes
+the substitute name through normaliseLinkPath, and os.TestReadlink covers
+`mklink /J` explicitly. `os.RemoveAll` does not descend into one either: a mount
+point is a name-surrogate reparse point, so fileStat.mode() withholds ModeDir
+from it exactly as it does from a symlink. The bundle's layout and its teardown
+are therefore unchanged; only the reparse tag differs.
+
+Nothing outside Windows changes. The symlink is correct wherever creating one is
+unprivileged, and the runc shim resolves <bundle>/work by walking that path
+rather than reading it, so !windows keeps calling os.Symlink verbatim.
+
+The buffer encoder lives in worklink.go, deliberately without a build
+constraint, so that the one thing here that can be got wrong quietly -- the
+REPARSE_DATA_BUFFER layout, where a mis-stated ReparseDataLength earns nothing
+but ERROR_INVALID_PARAMETER and a swapped name offset earns a junction pointing
+somewhere else -- is checked by tests on builders that have no Windows.
+---
+ core/runtime/v2/bundle.go           |   5 +-
+ core/runtime/v2/worklink.go         | 150 ++++++++++++++++++++++
+ core/runtime/v2/worklink_other.go   |  31 +++++
+ core/runtime/v2/worklink_test.go    | 192 ++++++++++++++++++++++++++++
+ core/runtime/v2/worklink_windows.go | 109 ++++++++++++++++
+ 5 files changed, 485 insertions(+), 2 deletions(-)
+ create mode 100644 core/runtime/v2/worklink.go
+ create mode 100644 core/runtime/v2/worklink_other.go
+ create mode 100644 core/runtime/v2/worklink_test.go
+ create mode 100644 core/runtime/v2/worklink_windows.go
+
+diff --git a/core/runtime/v2/bundle.go b/core/runtime/v2/bundle.go
+index 3d301b2..c230155 100644
+--- a/core/runtime/v2/bundle.go
++++ b/core/runtime/v2/bundle.go
+@@ -99,8 +99,9 @@ func NewBundle(ctx context.Context, root, state, id string, spec typeurl.Any) (b
+ 		}
+ 	}
+ 	paths = append(paths, work)
+-	// symlink workdir
+-	if err := os.Symlink(work, filepath.Join(b.Path, "work")); err != nil {
++	// link the working directory into the bundle. On every platform but Windows this is
++	// a symlink; see linkWorkDir for why Windows needs a second option and what it costs.
++	if err := linkWorkDir(work, filepath.Join(b.Path, "work")); err != nil {
+ 		return nil, err
+ 	}
+ 	// Spec may be nil for some sandboxers that do not initialize the spec, for
+diff --git a/core/runtime/v2/worklink.go b/core/runtime/v2/worklink.go
+new file mode 100644
+index 0000000..8d9964a
+--- /dev/null
++++ b/core/runtime/v2/worklink.go
+@@ -0,0 +1,150 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package v2
++
++// This file has no build constraint on purpose. Everything in it is pure byte
++// manipulation with no system call in it, and it is only ever used by Windows --
++// so the one machine that cannot compile it is the one machine that needs it.
++// Keeping it constraint-free is what lets worklink_test.go check the buffer
++// layout on a Linux builder, where the rest of the Windows path cannot even be
++// compiled, let alone run.
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"unicode/utf16"
++)
++
++const (
++	// ioReparseTagMountPoint is IO_REPARSE_TAG_MOUNT_POINT, the reparse tag of a
++	// directory junction. Not IO_REPARSE_TAG_SYMLINK (0xA000000C): a junction is what
++	// an unprivileged Windows user is allowed to create.
++	ioReparseTagMountPoint = 0xA0000003
++
++	// mountPointHeaderSize is the size of everything in a mount point
++	// REPARSE_DATA_BUFFER before PathBuffer: ReparseTag (4) + ReparseDataLength (2) +
++	// Reserved (2) + SubstituteNameOffset (2) + SubstituteNameLength (2) +
++	// PrintNameOffset (2) + PrintNameLength (2). See [MS-FSCC] 2.1.2.2.
++	mountPointHeaderSize = 16
++
++	// mountPointFixedFieldsSize is how much of that header ReparseDataLength counts:
++	// the four uint16 name fields, and not the tag, length and reserved words that
++	// precede them. Getting this wrong is the classic way FSCTL_SET_REPARSE_POINT
++	// returns ERROR_INVALID_PARAMETER, which is why the test pins it.
++	mountPointFixedFieldsSize = 8
++
++	// maximumReparseDataBufferSize is MAXIMUM_REPARSE_DATA_BUFFER_SIZE. The whole
++	// buffer, header included, has to fit.
++	maximumReparseDataBufferSize = 16 * 1024
++)
++
++// errNotAWindowsLocalPath is returned by encodeMountPointReparseBuffer for a target
++// it cannot express as an NT path. A junction is a strictly less capable link than a
++// symlink -- it needs a fully qualified local target -- so callers are expected to
++// treat this as "cannot use a junction here" and fall back, not as a fatal error.
++var errNotAWindowsLocalPath = errors.New("not a fully qualified Windows local path")
++
++// encodeMountPointReparseBuffer builds the REPARSE_DATA_BUFFER that turns an empty
++// directory into a junction pointing at target, ready to hand to
++// DeviceIoControl(FSCTL_SET_REPARSE_POINT).
++//
++// The layout is [MS-FSCC] 2.1.2.2, and it is the same one go-winio's
++// EncodeReparsePoint writes; it is reproduced here rather than imported because
++// go-winio's copy is behind a windows build constraint and so cannot be tested
++// anywhere it would be worth testing.
++//
++// PathBuffer holds the substitute name (the NT path the filesystem actually follows)
++// and then the print name (the DOS path a user is shown), each NUL-terminated. The
++// NULs are stored but are not counted in either length field -- Windows accepts the
++// counted form without them, but junctions written by mklink /J carry them, and
++// matching what the platform writes is worth more than saving four bytes.
++func encodeMountPointReparseBuffer(target string) ([]byte, error) {
++	// Backslashes, always: NT paths have no notion of '/' as a separator, and a
++	// containerd --root is free to have been configured with one.
++	printName := strings.ReplaceAll(target, "/", `\`)
++	ntName, err := ntPath(printName)
++	if err != nil {
++		return nil, err
++	}
++
++	substitute := utf16.Encode([]rune(ntName + "\x00"))
++	display := utf16.Encode([]rune(printName + "\x00"))
++	total := mountPointHeaderSize + (len(substitute)+len(display))*2
++	if total > maximumReparseDataBufferSize {
++		return nil, fmt.Errorf("reparse point for %q exceeds MAXIMUM_REPARSE_DATA_BUFFER_SIZE", target)
++	}
++
++	buf := make([]byte, total)
++	putUint32LE(buf[0:4], ioReparseTagMountPoint)
++	putUint16LE(buf[4:6], uint16(total-(mountPointHeaderSize-mountPointFixedFieldsSize)))
++	// buf[6:8] is Reserved, and stays zero.
++	putUint16LE(buf[8:10], 0)                              // SubstituteNameOffset
++	putUint16LE(buf[10:12], uint16((len(substitute)-1)*2)) // SubstituteNameLength
++	putUint16LE(buf[12:14], uint16(len(substitute)*2))     // PrintNameOffset
++	putUint16LE(buf[14:16], uint16((len(display)-1)*2))    // PrintNameLength
++	at := mountPointHeaderSize
++	for _, names := range [][]uint16{substitute, display} {
++		for _, u := range names {
++			putUint16LE(buf[at:at+2], u)
++			at += 2
++		}
++	}
++	return buf, nil
++}
++
++// putUint16LE and putUint32LE stand in for encoding/binary, which this package cannot
++// import: core/runtime/v2 already has a type called binary (binary.go), and shadowing
++// it here would break that file rather than this one.
++func putUint16LE(b []byte, v uint16) {
++	b[0], b[1] = byte(v), byte(v>>8)
++}
++
++func putUint32LE(b []byte, v uint32) {
++	b[0], b[1], b[2], b[3] = byte(v), byte(v>>8), byte(v>>16), byte(v>>24)
++}
++
++// ntPath converts a Windows path to the NT form a reparse point's substitute name has
++// to be in. It deliberately refuses everything it is not sure about -- a relative
++// path, a drive-relative path like `C:work`, a device path -- because the caller's
++// answer to "no" is to fall back to a symlink, which is strictly more capable.
++//
++// filepath is not used here, and must not be: this file is compiled and tested on
++// Linux, where filepath.IsAbs("C:\\x") is false and filepath.VolumeName is "".
++func ntPath(path string) (string, error) {
++	if strings.ContainsRune(path, 0) {
++		return "", fmt.Errorf("%q: %w", path, errNotAWindowsLocalPath)
++	}
++	switch {
++	case strings.HasPrefix(path, `\\?\`):
++		// Already an extended-length path; \\?\ and \??\ mean the same thing to the
++		// object manager.
++		return `\??\` + path[4:], nil
++	case strings.HasPrefix(path, `\\`):
++		// A UNC path. Encoded correctly, and expected to be refused by Windows:
++		// junctions cannot leave the local machine. The caller falls back.
++		return `\??\UNC\` + path[2:], nil
++	case len(path) >= 3 && isDriveLetter(path[0]) && path[1] == ':' && path[2] == '\\':
++		return `\??\` + path, nil
++	default:
++		return "", fmt.Errorf("%q: %w", path, errNotAWindowsLocalPath)
++	}
++}
++
++func isDriveLetter(c byte) bool {
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++}
+diff --git a/core/runtime/v2/worklink_other.go b/core/runtime/v2/worklink_other.go
+new file mode 100644
+index 0000000..8814548
+--- /dev/null
++++ b/core/runtime/v2/worklink_other.go
+@@ -0,0 +1,31 @@
++//go:build !windows
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package v2
++
++import "os"
++
++// linkWorkDir links a bundle's working directory into the bundle as `work`.
++//
++// A symlink, unchanged, and deliberately so: it is the correct link everywhere
++// os.Symlink is not a privileged operation, the runc shim resolves
++// <bundle>/work by walking that path, and Bundle.Delete reads it back with
++// os.Readlink. Only Windows has a reason to do anything else.
++func linkWorkDir(work, link string) error {
++	return os.Symlink(work, link)
++}
+diff --git a/core/runtime/v2/worklink_test.go b/core/runtime/v2/worklink_test.go
+new file mode 100644
+index 0000000..d480547
+--- /dev/null
++++ b/core/runtime/v2/worklink_test.go
+@@ -0,0 +1,192 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package v2
++
++// No build constraint, matching worklink.go. These tests are about the bytes a
++// Windows daemon hands to FSCTL_SET_REPARSE_POINT, and they are most useful on the
++// machines that cannot run a Windows daemon.
++
++import (
++	binle "encoding/binary"
++	"encoding/hex"
++	"errors"
++	"strings"
++	"testing"
++	"unicode/utf16"
++)
++
++// The mount point REPARSE_DATA_BUFFER for a junction at some path pointing at
++// `C:\w`, written out by hand from [MS-FSCC] 2.1.2.2 rather than captured from the
++// encoder, so that agreeing with it means something:
++//
++//	03 00 00 a0   ReparseTag           IO_REPARSE_TAG_MOUNT_POINT, little-endian
++//	24 00         ReparseDataLength    36 = the whole buffer (44) less the 8 bytes
++//	                                   of tag/length/reserved that precede the count
++//	00 00         Reserved
++//	00 00         SubstituteNameOffset 0, the substitute name comes first
++//	10 00         SubstituteNameLength 16 = len(`\??\C:\w`) * 2, NUL not counted
++//	12 00         PrintNameOffset      18 = past the substitute name AND its NUL
++//	08 00         PrintNameLength      8  = len(`C:\w`) * 2, NUL not counted
++//	5c00 3f00 3f00 5c00 4300 3a00 5c00 7700 0000    `\??\C:\w` + NUL, UTF-16LE
++//	4300 3a00 5c00 7700 0000                        `C:\w`     + NUL, UTF-16LE
++const junctionToCWGolden = "030000a0" + "2400" + "0000" +
++	"0000" + "1000" + "1200" + "0800" +
++	"5c003f003f005c0043003a005c0077000000" +
++	"43003a005c0077000000"
++
++func TestWorkDirJunctionBufferMatchesTheDocumentedLayout(t *testing.T) {
++	got, err := encodeMountPointReparseBuffer(`C:\w`)
++	if err != nil {
++		t.Fatalf("encodeMountPointReparseBuffer: %v", err)
++	}
++	want, err := hex.DecodeString(junctionToCWGolden)
++	if err != nil {
++		t.Fatalf("bad golden: %v", err)
++	}
++	if hex.EncodeToString(got) != hex.EncodeToString(want) {
++		t.Fatalf("reparse buffer mismatch\n got %s\nwant %s", hex.EncodeToString(got), hex.EncodeToString(want))
++	}
++	// Stated separately because it is the field most likely to be wrong and least
++	// likely to be noticed: Windows rejects the whole ioctl with
++	// ERROR_INVALID_PARAMETER if ReparseDataLength does not describe what follows it.
++	if l := binle.LittleEndian.Uint16(got[4:6]); int(l) != len(got)-8 {
++		t.Fatalf("ReparseDataLength = %d, want %d (buffer is %d bytes)", l, len(got)-8, len(got))
++	}
++}
++
++func TestWorkDirJunctionBufferIsAMountPointNotASymlink(t *testing.T) {
++	// The entire point of the patch. A symlink reparse point (0xA000000C) is what
++	// unprivileged Windows refuses to create; a mount point (0xA0000003) is what it
++	// allows. Nothing else in the buffer distinguishes them at a glance, and the two
++	// tags differ in one nibble.
++	const ioReparseTagSymlink = 0xA000000C
++	for _, target := range []string{`C:\w`, `C:\cdtest\root\default\abc123`, `\\?\C:\w`} {
++		buf, err := encodeMountPointReparseBuffer(target)
++		if err != nil {
++			t.Fatalf("encodeMountPointReparseBuffer(%q): %v", target, err)
++		}
++		tag := binle.LittleEndian.Uint32(buf[0:4])
++		if tag == ioReparseTagSymlink {
++			t.Fatalf("encodeMountPointReparseBuffer(%q) wrote IO_REPARSE_TAG_SYMLINK", target)
++		}
++		if tag != ioReparseTagMountPoint {
++			t.Fatalf("encodeMountPointReparseBuffer(%q) tag = %#x, want %#x", target, tag, ioReparseTagMountPoint)
++		}
++		// A mount point buffer has no Flags word. A symlink buffer does, and putting
++		// one here would shift both names by four bytes.
++		if off := binle.LittleEndian.Uint16(buf[8:10]); off != 0 {
++			t.Fatalf("SubstituteNameOffset = %d, want 0 (a mount point has no Flags word)", off)
++		}
++	}
++}
++
++func TestWorkDirJunctionBufferIsWhatReadlinkReadsBack(t *testing.T) {
++	// Bundle.Delete finds the working directory to remove with os.Readlink, and
++	// os.Readlink on Windows reads IO_REPARSE_TAG_MOUNT_POINT by taking the
++	// substitute name and stripping the `\??\` device prefix
++	// (go/src/os/file_windows.go, readReparseLinkHandle and normaliseLinkPath).
++	// If that came back wrong -- or empty -- Delete would silently stop removing
++	// working directories, which leaks disk rather than failing. So decode the way
++	// it does, from the field offsets and not from the encoder's variables.
++	for _, tc := range []struct{ target, want string }{
++		{`C:\w`, `C:\w`},
++		{`C:\cdtest\root\default\abc123`, `C:\cdtest\root\default\abc123`},
++		{`c:\lower\case`, `c:\lower\case`},
++		// A --root configured with forward slashes still has to produce an NT path.
++		{`C:/cdtest/root/default/abc123`, `C:\cdtest\root\default\abc123`},
++		// Extended-length in, plain out: `\\?\` and `\??\` are the same prefix to
++		// the object manager, so Readlink strips it to the same thing.
++		{`\\?\C:\w`, `C:\w`},
++	} {
++		buf, err := encodeMountPointReparseBuffer(tc.target)
++		if err != nil {
++			t.Fatalf("encodeMountPointReparseBuffer(%q): %v", tc.target, err)
++		}
++		got := readlinkFromMountPointBuffer(t, buf)
++		if got != tc.want {
++			t.Errorf("Readlink of a junction to %q would give %q, want %q", tc.target, got, tc.want)
++		}
++	}
++}
++
++func TestWorkDirJunctionRefusesTargetsAJunctionCannotExpress(t *testing.T) {
++	// Refusing is the safe answer: linkWorkDir falls back to os.Symlink, which is
++	// what these paths needed anyway. Accepting them would write a buffer Windows
++	// rejects, or worse, one it accepts and cannot follow.
++	for _, target := range []string{
++		``,
++		`work`,
++		`.\work`,
++		`\work`,
++		`C:work`,     // drive-relative: resolves against the drive's current directory
++		`1:\work`,    // not a drive letter
++		"C:\\w\x00x", // embedded NUL would truncate the counted string
++	} {
++		if _, err := encodeMountPointReparseBuffer(target); !errors.Is(err, errNotAWindowsLocalPath) {
++			t.Errorf("encodeMountPointReparseBuffer(%q) error = %v, want errNotAWindowsLocalPath", target, err)
++		}
++	}
++	// A UNC target encodes -- correctly, as `\??\UNC\...` -- and is left for Windows
++	// to refuse, because a junction cannot leave the local machine. Encoding it
++	// wrongly here would turn a clean fallback into a corrupt reparse point.
++	buf, err := encodeMountPointReparseBuffer(`\\server\share\work`)
++	if err != nil {
++		t.Fatalf("encodeMountPointReparseBuffer of a UNC path: %v", err)
++	}
++	if got := substituteName(buf); got != `\??\UNC\server\share\work` {
++		t.Errorf("UNC substitute name = %q, want %q", got, `\??\UNC\server\share\work`)
++	}
++	// And a target too long for the reparse buffer is refused rather than truncated.
++	if _, err := encodeMountPointReparseBuffer(`C:\` + strings.Repeat("a", 8192)); err == nil {
++		t.Error("a target larger than MAXIMUM_REPARSE_DATA_BUFFER_SIZE was accepted")
++	}
++}
++
++// substituteName reads the substitute name out of a mount point REPARSE_DATA_BUFFER
++// using the offsets from [MS-FSCC] 2.1.2.2 directly, so that a mistake in the encoder
++// cannot be cancelled out by the same mistake here.
++func substituteName(buf []byte) string {
++	off := 16 + int(binle.LittleEndian.Uint16(buf[8:10]))
++	end := off + int(binle.LittleEndian.Uint16(buf[10:12]))
++	u := make([]uint16, 0, (end-off)/2)
++	for i := off; i < end; i += 2 {
++		u = append(u, binle.LittleEndian.Uint16(buf[i:i+2]))
++	}
++	return string(utf16.Decode(u))
++}
++
++// readlinkFromMountPointBuffer is what os.Readlink does with these bytes on Windows.
++func readlinkFromMountPointBuffer(t *testing.T, buf []byte) string {
++	t.Helper()
++	if tag := binle.LittleEndian.Uint32(buf[0:4]); tag != ioReparseTagMountPoint {
++		t.Fatalf("os.Readlink would return ENOENT: tag %#x is neither a symlink nor a mount point", tag)
++	}
++	s := substituteName(buf)
++	// os.normaliseLinkPath: `\??\X:\...` becomes `X:\...`, `\??\UNC\a\b` becomes
++	// `\\a\b`, and anything else is returned as it stands.
++	if !strings.HasPrefix(s, `\??\`) {
++		return s
++	}
++	s = s[4:]
++	switch {
++	case len(s) >= 2 && s[1] == ':':
++		return s
++	case strings.HasPrefix(s, `UNC\`):
++		return `\\` + s[4:]
++	}
++	return s
++}
+diff --git a/core/runtime/v2/worklink_windows.go b/core/runtime/v2/worklink_windows.go
+new file mode 100644
+index 0000000..50a84b0
+--- /dev/null
++++ b/core/runtime/v2/worklink_windows.go
+@@ -0,0 +1,109 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package v2
++
++import (
++	"fmt"
++	"os"
++
++	"golang.org/x/sys/windows"
++)
++
++// linkWorkDir links a bundle's working directory into the bundle as `work`.
++//
++// A junction first, and a symlink only if that fails.
++//
++// Creating a symlink on Windows requires SeCreateSymbolicLinkPrivilege, which
++// Administrators hold and ordinary users do not. Go already asks for the one
++// concession the platform offers -- os.Symlink passes
++// SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE and retries without it -- but Windows
++// honours that flag only when Developer Mode is on, which is a machine-wide setting
++// that grants unprivileged symlink creation to every process on the machine and is
++// commonly disabled by policy. So an unelevated containerd could not create a task
++// bundle at all: NewBundle failed with ERROR_PRIVILEGE_NOT_HELD before the shim was
++// ever launched.
++//
++// A junction (a directory mount point) is the same thing for this purpose and needs
++// no privilege at all -- `mklink /J` works for an ordinary user, which is the whole
++// reason it is tried first. It is a strictly less capable link: the target must be a
++// fully qualified path on a local volume, so it cannot express a UNC or relative
++// target that a symlink can. That is why this falls back rather than replacing the
++// symlink outright. Every configuration that works today still works; the unelevated
++// one now works too.
++//
++// Both failing is reported as one error naming both causes, because the useful
++// question at that point is which of the two constraints the machine violated. What
++// this never does is succeed without a link: `work` is how Bundle.Delete finds the
++// working directory to remove, and a bundle that quietly had no link would leak that
++// directory on every task, forever, with nothing failing.
++func linkWorkDir(work, link string) error {
++	jerr := createWorkDirJunction(work, link)
++	if jerr == nil {
++		return nil
++	}
++	serr := os.Symlink(work, link)
++	if serr == nil {
++		return nil
++	}
++	return fmt.Errorf("link work directory %s -> %s: as a junction: %w; as a symlink: %w", link, work, jerr, serr)
++}
++
++// createWorkDirJunction makes link a directory junction pointing at target.
++//
++// There is no CreateJunction in Win32 and none in Go: a junction is an empty
++// directory carrying a mount point reparse point, and it is made in two steps.
++// If the second step fails the first is undone, because the failure mode of
++// leaving an ordinary empty directory called `work` behind is the bad one --
++// os.Readlink would then fail on it, Bundle.Delete tolerates a failed Readlink by
++// skipping the working directory, and the leak would be silent.
++//
++// The handle flags are the ones the Go standard library's own directory-junction
++// test uses (os.TestDirectoryJunction): FILE_FLAG_BACKUP_SEMANTICS is required to
++// open a directory at all, and FILE_FLAG_OPEN_REPARSE_POINT is what makes the open
++// address the directory itself rather than follow anything already on it.
++func createWorkDirJunction(target, link string) (err error) {
++	buf, err := encodeMountPointReparseBuffer(target)
++	if err != nil {
++		return err
++	}
++	if err := os.Mkdir(link, 0700); err != nil {
++		return err
++	}
++	defer func() {
++		if err != nil {
++			if rerr := os.Remove(link); rerr != nil {
++				err = fmt.Errorf("%w (and removing the half-made junction failed: %v)", err, rerr)
++			}
++		}
++	}()
++	p, err := windows.UTF16PtrFromString(link)
++	if err != nil {
++		return err
++	}
++	h, err := windows.CreateFile(p, windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING,
++		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
++	if err != nil {
++		return fmt.Errorf("open %s to set a reparse point: %w", link, err)
++	}
++	defer func() { _ = windows.CloseHandle(h) }()
++	var returned uint32
++	if err := windows.DeviceIoControl(h, windows.FSCTL_SET_REPARSE_POINT,
++		&buf[0], uint32(len(buf)), nil, 0, &returned, nil); err != nil {
++		return fmt.Errorf("set a mount point reparse point on %s: %w", link, err)
++	}
++	return nil
++}
+-- 
+2.53.0
+

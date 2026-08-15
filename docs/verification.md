@@ -942,25 +942,42 @@ file with the pre-formatted one. The other order hands the guest a filesystem th
 that fails the check without touching it, and deletes one it created and could not format. The
 pre-formatted-image workflow is unaffected: `rwlayer-64m.img` carries a real superblock.
 
-**Windows genuinely requires elevation or Developer Mode, and this repository said otherwise.**
+**Windows genuinely required elevation or Developer Mode, and this repository said otherwise.**
 `core/runtime/v2/bundle.go:103` does `os.Symlink` unconditionally in `NewBundle`, for every task
 bundle. Unprivileged Windows will not create a symlink without `SeCreateSymbolicLinkPrivilege`;
 Go already passes `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, which Windows honours only
 under Developer Mode. Measured: `New-Item -ItemType SymbolicLink` → *"Administrator privilege
-required"*, while `mklink /J` succeeds. The junction workaround used for the root-ACL blocker
-does not transfer — the link must land inside `b.Path`, and `b.Path` must not pre-exist
-(`os.Mkdir` at `bundle.go:74`, error returned unconditionally), so there is no moment to place
-one.
+required"*, while `mklink /J` succeeds.
 
-So the honest position: **unpacking an image works as an ordinary user; creating a task does
-not.** The options are an elevated daemon, machine-wide Developer Mode, or neither — with the
-costs of each, including that Developer Mode grants unprivileged symlink creation to every
-process on the machine and may not be the user's decision on a managed one, set out in
-`packaging/containerd-windows/README.md`. If containerd is run elevated, its `--root` must be
-created by the elevated daemon itself: pointing it at a root an unprivileged user pre-created
-hands that user full control over a privileged daemon's content store, which is the escalation
-the protected DACL above exists to prevent, reached from the other side.
-`new-containerd-root.ps1` is therefore for the unelevated case only.
+The scope, stated exactly, because it was overstated at first in both directions: it was the
+**containerd daemon** that needed elevation, and only because the daemon is what creates task
+bundles. `boks create`, `boks ls`, `boks inspect` and `boks rm` never touched it. Unpacking an
+image did not either.
+
+**It is now patched, and the patch has not been run on Windows.**
+`packaging/containerd-windows/patches/0006` creates that link as a **junction** — the thing
+`mklink /J` makes, and the thing the measurement above says an ordinary user can create — with
+`os.Symlink` kept as a fallback for targets a junction cannot express, and with `!windows`
+untouched. What was verified, on Linux, on 2026-08-15: the reparse buffer matches the layout in
+[MS-FSCC] 2.1.2.2, against a golden written out by hand before the encoder was run; the
+junction path is linked into both Windows binaries and reachable from `main`, read out of the
+pclntab name table; the same assertion fails on a pristine v2.3.3 built from the same tree; and
+`os.Readlink` reads `IO_REPARSE_TAG_MOUNT_POINT`, which is what `Bundle.Delete` needs to keep
+removing working directories, read out of the Go 1.26.3 source and covered by Go's own
+`os.TestReadlink`. What was **not** verified: any of it on Windows. No unelevated daemon has
+created a task bundle.
+
+An earlier version of this entry said the junction workaround "does not transfer — the link
+must land inside `b.Path`, and `b.Path` must not pre-exist". That is true of *pre-creating* the
+junction from outside containerd, which is how the root-ACL blocker is worked around. It was
+never an argument against containerd creating the junction itself, and reading it as one is
+what left this open for a day.
+
+If containerd is run elevated anyway, its `--root` must be created by the elevated daemon
+itself: pointing it at a root an unprivileged user pre-created hands that user full control
+over a privileged daemon's content store, which is the escalation the protected DACL above
+exists to prevent, reached from the other side. `new-containerd-root.ps1` is therefore for the
+unelevated case only. None of that changes.
 
 **And the two "known unrelated" plugin failures were neither.** `io.containerd.internal.v1.opt`
 and `cri` failed unelevated and **disappear elevated** — they wanted directories under
@@ -1026,8 +1043,9 @@ anything, so it can only ever end at its own ceiling; the five teardowns reachab
 a process that never started now get a second instead
 (`packaging/nerdbox-windows/patches/0004`). Also unexecuted.
 
-Every failure mode ranked ahead of this one is now cleared on that machine. Elevation is
-still required, for the task-bundle symlink.
+Every failure mode ranked ahead of this one is now cleared on that machine. Elevation was
+still required at the time, for the task-bundle symlink; `containerd-windows/patches/0006`
+has since replaced that symlink with a junction, unverified on Windows.
 
 ### A container runs in a microVM on Windows, 2026-08-14
 
@@ -1059,8 +1077,10 @@ The console baseline held exactly: `activate event`, `Device is ready`, `Port re
 
 **What this does not mean.** This is `ctr`, not `boks run`. No Ethernet frame has crossed the
 virtio-net device on Windows, so nothing here says anything about the network enforcement,
-which is the thing Boks is for. Elevation is still required, for the task-bundle symlink at
-`bundle.go:103`. So: the stack underneath Boks works on Windows; Boks on Windows does not yet.
+which is the thing Boks is for. This run used an elevated containerd, for the task-bundle
+symlink at `bundle.go:103`; `containerd-windows/patches/0006` makes that a junction so an
+unelevated daemon should do, and no run has tested that. So: the stack underneath Boks works
+on Windows; Boks on Windows does not yet.
 
 > **Since this run, `boks run` no longer refuses on Windows.** The gate in
 > `internal/network/vmm_windows.go` that stopped it before anything was bound has been
@@ -1246,14 +1266,20 @@ which the guest logged as "not connected" and which would have failed at `reques
 only `IRQ_MAX` been raised — are all delivering. Non-zero `RES`, `CAL` and `TLB` counters
 mean real IPIs cross between vCPUs.
 
-**One hypothesis refuted.** sbx needs no elevation and Boks does, and the guess recorded
-here was that sbx drives the shim directly and never runs containerd's bundle code. Its
-MSI ships no `containerd.exe`, but a string scan of `sbx.exe` finds `core/runtime/v2`,
-`NewBundle`, `bundle.go` and `io.containerd.runtime.v2.task` — matching our own
-`containerd.exe` on all four, while `sailor.dll` matches none and both shims match only
-`bundle.go`. sbx embeds containerd's runtime-v2 machinery in-process. So the elevation
-requirement cannot be explained by our having chosen containerd, and why sbx avoids the
-symlink is open.
+**One hypothesis refuted, and the question it left has an answer now.** sbx needs no elevation
+and Boks did, and the guess recorded here was that sbx drives the shim directly and never runs
+containerd's bundle code. Its MSI ships no `containerd.exe`, but a string scan of `sbx.exe`
+finds `core/runtime/v2`, `NewBundle`, `bundle.go` and `io.containerd.runtime.v2.task` —
+matching our own `containerd.exe` on all four, while `sailor.dll` matches none and both shims
+match only `bundle.go`. sbx embeds containerd's runtime-v2 machinery in-process. So the
+elevation requirement could not be explained by our having chosen containerd, and *how* sbx
+avoids the symlink was left open.
+
+It is still open as a fact about sbx — nothing here has read its `NewBundle` — but it stopped
+being the interesting question, because the same code can be made not to need the privilege:
+`containerd-windows/patches/0006` links with a junction, which `mklink /J` shows an ordinary
+user can create. Whether sbx does that, patches the link out, or carries its own bundle
+layout, is unexamined and no longer blocking.
 
 ### What was proven on the machine with no hypervisor
 

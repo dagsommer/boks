@@ -22,20 +22,28 @@
 # names erofs first (read out of .data, because `strings` cannot tell that from three unrelated
 # words), that the mount manager's superblock probe table in the built PE really says ext4's
 # magic is 53 ef at offset 1080 (read out of .data for the same reason — a two-byte magic and a
-# small integer occur by coincidence all over a 37 MB binary), that mkfs.erofs.exe carries no
-# hardcoded "/tmp", and that the go-erofs recipe still produces a PE32+ binary whose help text
-# advertises tar mode. It also parses new-containerd-root.ps1 — the bundled script that must be
-# run before containerd, because an unelevated containerd creates its own --root with a DACL
-# that excludes the user.
+# small integer occur by coincidence all over a 37 MB binary), that the Windows work-directory
+# junction is linked into the PE and reachable from main (read out of the pclntab name table,
+# because `strings | grep` for "Reparse" or "WorkDir" passes on an unpatched binary), that
+# mkfs.erofs.exe carries no hardcoded "/tmp", and that the go-erofs recipe still produces a
+# PE32+ binary whose help text advertises tar mode. It also parses new-containerd-root.ps1 —
+# the bundled script that must be run before containerd, because an unelevated containerd
+# creates its own --root with a DACL that excludes the user.
 #
-# It runs the Go tests for the diff service, the transfer plugin and the mount manager, on
-# Linux, because that code is platform-neutral. Everything else is inspection.
+# It runs the Go tests for the diff service, the transfer plugin, the mount manager and the
+# task bundle, on Linux, because that code is platform-neutral. Everything else is inspection.
+#
+# And it ends by building a pristine v2.3.3 and requiring all three PE assertions to come out
+# the other way on it. Until that step existed, none of them was known to be capable of
+# failing.
 #
 # It proves NOTHING about whether the Windows binaries run. No Windows binary is executed here —
 # this is a Linux runner. Registering a plugin, linking it in, and naming it in a default list
 # are all necessary and none of them is sufficient; the first real Windows run needed four
-# separate fixes past "the plugins load". Download the bundle and run the commands in
-# packaging/containerd-windows/README.md to learn anything at all about whether it works.
+# separate fixes past "the plugins load". In particular, nobody has yet watched an unelevated
+# containerd create a task bundle with the junction patch 0006 adds. Download the bundle and
+# run the commands in packaging/containerd-windows/README.md to learn anything at all about
+# whether it works.
 name: containerd-windows
 
 on:
@@ -417,6 +425,29 @@ jobs:
               ext2:1080:53ef ext3:1080:53ef ext4:1080:53ef xfs:0:58465342
           done
 
+      # Patch 0006 is code, not configuration, so there is no value to read back: what can be
+      # checked is that the junction path is in the binary and reachable. That is the pclntab
+      # function-name table, which survives `-s -w` and which the linker's dead-code pass
+      # prunes, so a name being there means the function is reachable from main and not
+      # merely that the source was patched in.
+      #
+      # `strings | grep` was tried first and is worthless here, measured on an unpatched
+      # v2.3.3 built from this same tree: `grep -c Reparse` gives 22 and `grep -c WorkDir`
+      # gives 4 (cleanupWorkDirs and friends). Neither is zero. The script matches on
+      # NUL-delimited names for the same reason one layer down — a bare substring search for
+      # `…createWorkDirJunction` matches three times in the patched binary, because of its two
+      # closures. The step below this one proves the check can fail.
+      - name: Assert the Windows work-directory junction is linked in and reachable
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          pkg=github.com/containerd/containerd/v2/core/runtime/v2
+          for arch in amd64 arm64; do
+            python3 ../boks/packaging/containerd-windows/assert-func-linked.py \
+              "_out/$arch/containerd.exe" \
+              "$pkg.linkWorkDir" "$pkg.createWorkDirJunction" "$pkg.encodeMountPointReparseBuffer"
+          done
+
       # The only claims in this whole workflow that are checked by running something rather
       # than by looking at bytes. Dropping a skipped differ from the order is what keeps a
       # host with no mkfs.erofs.exe from losing its diff service — and with it bolt, and
@@ -434,11 +465,19 @@ jobs:
       # empty section marshals as `"windows":{"layerFolders":null}` — the exact text crun
       # refused on real hardware — which is what makes the other one's removal mean
       # something.
-      - name: Run the diff-service, transfer plugin, mount-manager and ctr spec tests
+      #
+      # The core/runtime/v2 tests are patch 0006's reparse buffer, and they are here for the
+      # same reason and by the same trick: the encoder lives in a file with no build
+      # constraint, so the bytes a Windows daemon would hand to FSCTL_SET_REPARSE_POINT can
+      # be checked against the layout in [MS-FSCC] 2.1.2.2 on a runner with no Windows. The
+      # rest of that package's tests come along, which is the point — they are the ones that
+      # say the platform which already worked still does.
+      - name: Run the diff-service, transfer plugin, mount-manager, bundle and ctr spec tests
         working-directory: containerd
         run: |
           set -euo pipefail
-          go test ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/manager/... -count=1
+          go test ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/manager/... \
+            ./core/runtime/v2/... -count=1
           # Named individually, and their PASS lines checked, because `go test -run` on a
           # pattern that matches nothing exits 0. A renamed or deleted test would otherwise
           # turn this assertion off without turning the workflow red.
@@ -449,20 +488,82 @@ jobs:
             grep -q -- "--- PASS: $t" ctr-spec.log \
               || { echo "$t did not run — patch 0004's windows-section fix is unasserted" >&2; exit 1; }
           done
+          go test ./core/runtime/v2/ -run WorkDirJunction -count=1 -v | tee worklink.log
+          for t in TestWorkDirJunctionBufferMatchesTheDocumentedLayout \
+                   TestWorkDirJunctionBufferIsAMountPointNotASymlink \
+                   TestWorkDirJunctionBufferIsWhatReadlinkReadsBack \
+                   TestWorkDirJunctionRefusesTargetsAJunctionCannotExpress; do
+            grep -q -- "--- PASS: $t" worklink.log \
+              || { echo "$t did not run — patch 0006's reparse buffer is unasserted" >&2; exit 1; }
+          done
           # The Windows-only assertions cannot run here, but they can at least be
           # type-checked, so a rename in the patched code fails in CI and not on a desktop.
           # cmd/ctr is in the list for patch 0004, most of whose diff is in a _windows.go
-          # file: `go build ./cmd/ctr` for Linux does not compile a line of it.
+          # file: `go build ./cmd/ctr` for Linux does not compile a line of it. core/runtime
+          # is in it for patch 0006, whose CreateFile and DeviceIoControl calls are likewise
+          # invisible to a Linux build.
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet \
-            ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/... ./cmd/ctr/...
+            ./plugins/services/diff/... ./plugins/transfer/... ./core/mount/... \
+            ./core/runtime/v2/... ./cmd/ctr/...
 
       # Two import lines cannot plausibly break Linux, which is exactly why it costs nothing
-      # to assert instead of assume.
+      # to assert instead of assume. Patch 0006 can: it puts a function call where an
+      # os.Symlink was, on every platform.
       - name: Build for Linux too, so the platform that works stays working
         working-directory: containerd
         run: |
           set -euo pipefail
           GOOS=linux GOARCH=amd64 go build -mod=readonly ./cmd/containerd ./cmd/ctr
+
+      # THE NEGATIVE CONTROL. Everything above this point is an assertion that the patched
+      # binary has some property. None of them is worth anything until something shows the
+      # same assertion failing on a binary that should not have it — a check that cannot fail
+      # is decoration, and this repository has shipped one of those before (a `grep -qa` for
+      # an exported symbol that was passing on a substring of an unrelated name).
+      #
+      # So: put the tree back to a pristine v2.3.3, build one more containerd.exe from it,
+      # and require every check above to come out the other way. This costs one extra Go
+      # build and retires the question for all three scripts at once, including the two that
+      # predate it and were only ever spot-checked by hand.
+      #
+      # It runs last because it destroys the patched tree. _out is already written and is
+      # what gets uploaded; git clean is told to leave it and the control alone.
+      - name: Negative control — the same assertions must fail on an unpatched v2.3.3
+        working-directory: containerd
+        run: |
+          set -euo pipefail
+          git checkout -- .
+          git clean -fdq -e _out -e _control
+          git diff --quiet && git diff --cached --quiet \
+            || { echo "the tree is not pristine after checkout+clean" >&2; exit 1; }
+
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -mod=readonly -ldflags "-s -w" \
+            -o _control/containerd.exe ./cmd/containerd
+
+          pkg=github.com/containerd/containerd/v2/core/runtime/v2
+          python3 ../boks/packaging/containerd-windows/assert-func-linked.py --absent \
+            _control/containerd.exe \
+            "$pkg.linkWorkDir" "$pkg.createWorkDirJunction" "$pkg.encodeMountPointReparseBuffer"
+
+          if python3 ../boks/packaging/containerd-windows/assert-diff-order.py \
+               _control/containerd.exe erofs windows windows-lcow; then
+            echo "assert-diff-order.py passed on an UNPATCHED binary — it proves nothing" >&2
+            exit 1
+          fi
+          if python3 ../boks/packaging/containerd-windows/assert-mkfs-magic.py \
+               _control/containerd.exe ext2:1080:53ef ext3:1080:53ef ext4:1080:53ef xfs:0:58465342; then
+            echo "assert-mkfs-magic.py passed on an UNPATCHED binary — it proves nothing" >&2
+            exit 1
+          fi
+
+          # And the reason assert-func-linked.py reads the name table instead of doing this:
+          # both of these substring greps pass on the binary that has none of the patches.
+          # Printed rather than asserted, because their exact counts are not ours to pin —
+          # what matters is that they are not zero.
+          echo "  substring greps on the unpatched control, for the record:"
+          echo "    strings | grep -c Reparse = $(strings -a _control/containerd.exe | grep -c Reparse || true)"
+          echo "    strings | grep -c WorkDir = $(strings -a _control/containerd.exe | grep -c WorkDir || true)"
+          rm -rf _control
 
       - uses: actions/upload-artifact@v4
         with:
@@ -613,14 +714,17 @@ jobs:
             echo "initialises, or the erofs differ returns \`ErrSkipPlugin\` and vanishes with no"
             echo "error that mentions it."
             echo
-            echo "**These steps run unelevated. Creating a *task* does not.** containerd's"
-            echo "\`NewBundle\` symlinks unconditionally (\`core/runtime/v2/bundle.go:103\`) and"
-            echo "unprivileged Windows will not create a symlink without Developer Mode, so"
-            echo "\`ctr run\` needs an elevated daemon or a machine-wide Developer Mode. Nothing"
-            echo "below reaches that — it unpacks an image and stops. If you do run elevated,"
-            echo "give the daemon a **fresh \`--root\` it creates itself**: an elevated daemon"
-            echo "pointed at a root an unprivileged user made hands that user its content"
-            echo "store. See \`README.md\` in the artifact."
+            echo "**Run all of this unelevated.** Elevation used to be required for one thing"
+            echo "and one thing only — creating a *task bundle*, because \`NewBundle\` symlinked"
+            echo "unconditionally (\`core/runtime/v2/bundle.go:103\`) and unprivileged Windows"
+            echo "will not create a symlink without machine-wide Developer Mode. Patch \`0006\`"
+            echo "makes that link a **junction**, which needs no privilege. Nothing below"
+            echo "reaches a task anyway — these steps unpack an image and stop — but \`ctr run\`"
+            echo "should no longer need an elevated daemon either. **That has not been run on"
+            echo "Windows by anyone.** If you do run elevated, give the daemon a **fresh"
+            echo "\`--root\` it creates itself**: an elevated daemon pointed at a root an"
+            echo "unprivileged user made hands that user its content store. See \`README.md\`"
+            echo "in the artifact."
             echo
             echo "**Run unelevated, pass \`--config\`, and create \`root\`/\`state\` first.** The"
             echo "defaults fail three ways over: a normal user cannot create"

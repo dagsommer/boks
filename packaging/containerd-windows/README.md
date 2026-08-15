@@ -21,11 +21,12 @@ snapshotter is the only one on Windows that hands nerdbox mounts the Linux guest
 
 ## The patches
 
-Five, in `patches/`. The first registers the plugins; `0002` and `0003` make them reachable,
+Six, in `patches/`. The first registers the plugins; `0002` and `0003` make them reachable,
 which turned out to be a separate problem; `0004` is about `ctr`, not the daemon, and only
 matters once you try to *run* a container rather than unpack one. `0005` is not about EROFS at
 all — it is a silent-corruption bug in containerd's mount manager that Windows makes certain to
-hit, found on the first end-to-end run.
+hit, found on the first end-to-end run. Neither is `0006`, which is the reason an unelevated
+containerd could not create a task bundle on Windows at all.
 
 ### `0001` — register the plugins
 
@@ -274,12 +275,41 @@ One behaviour change beyond the bug: an existing image for a filesystem the form
 create — anything but ext2/3/4 and xfs — is now refused with the same `unsupported filesystem`
 error the format path already gives, rather than accepted because a file happened to be there.
 
+### `0006` — link the bundle's work directory with a junction on Windows
+
+The last thing that made an elevated daemon compulsory, and the only one of these six that
+stops an unelevated containerd before it does anything at all. `NewBundle` ends by symlinking
+the task's working directory into the bundle, and unprivileged Windows will not create a
+symlink. Every task bundle, every time.
+
+`0006` creates a **junction** instead, falling back to the symlink, and the reasoning — why a
+junction, why the fallback, why this cannot silently leak working directories, and what
+remains unverified — is in "Elevation, and the choice you no longer have to make" below,
+because that is the section a reader arrives at with the question.
+
+Two things about its shape are worth stating here, next to the other patches:
+
+- **`!windows` is untouched.** `worklink_other.go` calls `os.Symlink(work, link)` and nothing
+  else. The symlink is the right link wherever making one is unprivileged, and the runc shim
+  resolves `<bundle>/work` by *walking* that path rather than reading it, so Linux must keep
+  a link the path parser follows.
+- **The reparse buffer is in a file with no build constraint** (`core/runtime/v2/worklink.go`),
+  for the same reason `0004`'s `guestspec.go` is: it is pure byte-shuffling, the one part
+  that can be wrong quietly, and the machine that cannot compile it is the machine that needs
+  it. `worklink_test.go` checks it against the layout in [MS-FSCC] 2.1.2.2 on Linux —
+  including that the tag is a mount point and not a symlink, that `ReparseDataLength` counts
+  the right bytes (getting it wrong buys nothing but `ERROR_INVALID_PARAMETER`), and that
+  decoding the result the way `os.Readlink` does returns the path that went in.
+
 The pin is `CONTAINERD_VERSION` — **v2.3.3**, matching the containerd that the nerdbox revision
 in `packaging/nerdbox/NERDBOX_REV` vendors.
 
-**All five belong upstream, not here.** Delete this directory once containerd takes them.
+**All six belong upstream, not here.** Delete this directory once containerd takes them.
 `0005` most of all: it is a data-corruption fix that has nothing to do with Boks, Windows is
-merely where it was impossible to miss.
+merely where it was impossible to miss. `0006` is close behind — it is not a Boks problem
+either, it is every unelevated Windows containerd's problem, and the earlier claim on this
+page that it was "upstream's design call, not something to fork here" was a way of not
+choosing.
 
 ## What actually works on Windows, and what does not
 
@@ -300,9 +330,9 @@ problem, not containerd's, and it has been attempted once. `docs/windows-e2e.md`
 procedure, and it turned up three more containerd-side obstacles: the OCI spec's platform (patch
 `0004` above); the writable layer, which the erofs snapshotter asks containerd to format with
 `mkfs.ext4`, a binary that does not exist on Windows; and the way containerd handled the failure
-of that format, which is patch `0005`. There is a fourth that is not containerd's to fix —
-`NewBundle` creates a symlink for every task, which unprivileged Windows will not do. See
-"Elevation, Developer Mode, and the choice you actually have" below.
+of that format, which is patch `0005`. There is a fourth — `NewBundle` creates a symlink for
+every task, which unprivileged Windows will not do — and it is patch `0006`. See "Elevation,
+and the choice you no longer have to make" below.
 
 ### The differ is invisible without `mkfs.erofs.exe`
 
@@ -319,20 +349,23 @@ entirely possible to have the snapshotter present and the differ missing, which 
 confusing half-state the test commands below are designed to detect.
 
 
-## Elevation, Developer Mode, and the choice you actually have
+## Elevation, and the choice you no longer have to make
 
-**This page used to tell you to run everything unelevated, full stop. That was wrong for
-anything that creates a task**, and the first end-to-end run on Windows 11 found out where.
+**Read this whole section if you have used an earlier bundle.** The advice has changed twice.
 
-The line is not between "containerd" and "Boks". It is between **unpacking an image** and
-**running a container**:
+- It first said *run everything unelevated*. That was wrong for anything that creates a task.
+- It then said *elevate, or turn on Developer Mode, or stop before `ctr run`* — correct for
+  the binaries it was written about.
+- Patch `0006` is the answer to it, and this section now says: **run unelevated**, and be
+  aware that **nobody has yet watched an unelevated daemon create a task bundle.** The patch
+  is verified as far as a Linux machine can verify it, which is not far enough to claim it
+  works.
 
-| What you are doing | Unelevated, no Developer Mode |
-| --- | --- |
-| everything in "Testing it on Windows" below — `plugins ls`, `images pull`, checking EROFS blobs | **works.** Measured, 2026-08-14. No task bundle is created, so nothing below is reached |
-| `ctr run`, `ctr tasks start`, or anything Boks does with a sandbox | **fails**, in containerd, before the shim is launched |
+Note what elevation was ever needed *for*. It was the **containerd daemon**, and only the
+daemon, because the daemon is what creates task bundles. `boks create`, `boks ls`,
+`boks inspect` and `boks rm` never touched this and always worked as an ordinary user.
 
-### Why
+### What it was
 
 `core/runtime/v2/bundle.go:103`, in `NewBundle`, for **every task bundle**, unconditionally:
 
@@ -344,67 +377,86 @@ if err := os.Symlink(work, filepath.Join(b.Path, "work")); err != nil {
 ```
 
 Creating a symlink on Windows requires `SeCreateSymbolicLinkPrivilege`, which an ordinary user
-does not hold. Go already does the one thing that can help — `os/file_windows.go:371` passes
+does not hold. Go already does the one thing that can help — `os/file_windows.go` passes
 `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, and retries without it if that fails — but
-**Windows honours that flag only when Developer Mode is on.** Measured on the test machine:
+**Windows honours that flag only when Developer Mode is on**, which is machine-wide, grants
+unprivileged symlink creation to every process run by every user, and is commonly disabled by
+policy (`AllowDevelopmentWithoutDevLicense`) on managed machines. So on a stock Windows 11
+desktop, an unelevated `ctr run` failed inside containerd before any shim was launched.
+Measured on the test machine:
 
 ```
 New-Item -ItemType SymbolicLink   ->  "Administrator privilege required"
 mklink /J  (a junction)           ->  succeeds
 ```
 
-### The junction workaround does not transfer, and it is worth saying why
+That second line is the entire patch.
 
-The root-ACL problem below is fixed by *pre-creating* a directory, because
-`MkdirAllWithACL` returns early on a path that already exists. Nothing equivalent is available
-here. The link has to appear at `b.Path\work`, and `b.Path` is created by containerd itself two
-dozen lines earlier:
+### What `0006` does
+
+A **junction** — a directory mount point — instead of a symlink, on Windows only. It is the
+same thing for this purpose and needs no privilege at all. Windows has no `CreateJunction`: a
+junction is an empty directory carrying an `IO_REPARSE_TAG_MOUNT_POINT` reparse point, made
+with `CreateFile` plus `DeviceIoControl(FSCTL_SET_REPARSE_POINT)`, with the handle flags the
+Go standard library's own `os.TestDirectoryJunction` uses.
+
+**The junction is tried first and `os.Symlink` is kept as the fallback**, rather than replaced.
+A junction is a strictly *less* capable link: its target must be a fully qualified path on a
+local volume, so a `--root` on a UNC share cannot be one and can be a symlink. Ordering it this
+way means every configuration that works today still works, the unelevated one now works too,
+and both failing produces one error naming both causes. There is no configuration in which the
+patch removes an option.
+
+**An earlier revision of this page said no such patch was possible**, on the grounds that the
+link has to appear inside `b.Path` and `b.Path` is created by `os.Mkdir` with no `IsExist`
+tolerance twenty lines earlier, so there is nowhere to stand. That reasoning was about
+*pre-creating* the junction from outside containerd — which is indeed impossible, and is the
+trick that fixes the `--root` ACL problem further down. It says nothing about containerd
+creating the junction itself, which is what `0006` does.
+
+### Why this cannot leak working directories
+
+The link has exactly one consumer, `Bundle.Delete` (`bundle.go:133`):
 
 ```go
-// bundle.go:74
-if err := os.Mkdir(b.Path, 0700); err != nil {
-    return nil, err
-}
+work, werr := os.Readlink(filepath.Join(b.Path, "work"))
+...
+if werr == nil { return atomicDelete(work) }
 ```
 
-`os.Mkdir`, not `MkdirAll`, and the error is returned with no `IsExist` tolerance — so `b.Path`
-**must not exist** when `NewBundle` runs. There is no moment at which you could put a junction
-inside it. That the target is a directory, and so junction-shaped, does not matter; there is
-nowhere to stand.
+A failed `Readlink` is *tolerated* — the working directory is simply not removed. So the
+dangerous failure here is not an error; it is a `work` that exists and is not a link, which
+would leave every task's working directory behind under `--root` and fail nothing. Three
+things stand against that:
 
-### The three options, and what each costs
+- **`os.Readlink` reads junctions.** `os/file_windows.go`'s `readReparseLinkHandle` handles
+  `IO_REPARSE_TAG_MOUNT_POINT` alongside `IO_REPARSE_TAG_SYMLINK` and passes the substitute
+  name through `normaliseLinkPath`; `os.TestReadlink` covers `mklink /J` explicitly, with an
+  absolute drive target, and runs on Go's Windows builders. Read out of the Go 1.26.3 source
+  tree containerd v2.3.3's `go.mod` selects.
+- **A half-made junction is removed, not left.** `createWorkDirJunction` makes the directory
+  and then sets the reparse point; if the second step fails it removes the directory before
+  returning the error, so `NewBundle` fails loudly rather than returning a bundle with a
+  plain directory called `work` in it.
+- **Nothing else on Windows touches it.** The only other consumer of `<bundle>/work` in
+  containerd is the runc shim (`cmd/containerd-shim-runc-v2/runc/container.go:127`), which is
+  `//go:build linux`. nerdbox's host shim does not read it either. So the junction never has
+  to be *evaluated*, only read — which matters, because `fsutil behavior` can disable
+  evaluation of some link classes without affecting `FSCTL_GET_REPARSE_POINT`.
 
-**1. Run `containerd.exe` elevated.** Administrators hold `SeCreateSymbolicLinkPrivilege` by
-default, so `NewBundle` succeeds. Cost: the daemon, every shim it spawns and every VM those
-shims start run with an administrator's token. For a machine you are testing on, that is a
-defensible trade; for anything else, weigh it. **Read the security note below before doing
-this** — it changes how `--root` must be created, and getting that wrong is an escalation.
-*(That elevation makes the symlink succeed is inferred from Windows' default privilege
-assignment plus the failure measured unelevated; nobody has watched containerd create a task
-bundle elevated.)*
+`os.RemoveAll` does not descend into a junction either: a mount point is a *name-surrogate*
+reparse point, so `fileStat.mode()` withholds `ModeDir` from it exactly as it does from a
+symlink, and teardown behaves identically. (Its `Lstat` mode is `ModeIrregular` rather than
+`ModeSymlink` — the one observable difference, and nothing in containerd on Windows looks.)
 
-**2. Turn on Developer Mode** (Settings → System → For developers). Cost, stated plainly
-because it is easy to wave through: Developer Mode is **machine-wide and grants unprivileged
-symlink creation to every process run by every user on that machine**, not to containerd and
-not to you. It is not scoped to an application, a directory or a session. It also switches on
-other developer features you did not ask for.
+Even in the worst case the loss would be bounded rather than permanent: `cleanupWorkDirs`
+(`core/runtime/v2/shim_load.go:242`) reaps working directories with no loaded shim at every
+daemon start. That makes a missing link quieter, not better.
 
-On a **corporate-managed machine this may not be your decision at all.** It is commonly
-disabled by policy (`AllowDevelopmentWithoutDevLicense`), and the toggle may be greyed out or
-silently revert. If your machine is managed, ask before flipping it rather than after — and
-note that this document is in no position to tell you it is fine, because whether it is
-depends on a policy we cannot see.
+### If you still want to run elevated
 
-**3. Neither.** Perfectly reasonable, and it is what the test procedure below assumes. You get
-the whole unpack path — which is the part of this bundle that has actually been proven to work
-on Windows — and you do not get a running container.
-
-There is no fourth option that Boks can supply. A patch making the symlink optional would be a
-change to containerd's bundle layout, affecting `work` resolution on every platform, and it is
-not obviously right: the symlink exists so that a bundle under `--state` can find its working
-directory under `--root`. If containerd upstream wants a Windows answer, a junction created
-with `CreateDirectory` + a reparse point, or simply recording the path in a file, would both
-work — but that is upstream's design call, not something to fork here.
+You can, and the security note below still applies in full — it is about `--root`, not about
+symlinks, and nothing in `0006` changes it. What is no longer true is that you *must*.
 
 ### If you do run elevated: `--root` must be created by the elevated daemon
 
@@ -628,10 +680,12 @@ ext4 image that only matters when you go on to *run* a container, and
 **Run all of this unelevated, pass the config, and create the directories first.** All three
 matter, and each one costs you a run if you skip it.
 
-Unelevated is correct **for this test**, and only because none of it creates a task: the
-symlink in `NewBundle` that unprivileged Windows refuses is never reached. If you go on to
-`ctr run`, read "Elevation, Developer Mode, and the choice you actually have" above first — and
-if you decide to run elevated, do **not** reuse the `--root` that step 0 creates here.
+Unelevated is correct for this test and, since patch `0006`, is meant to be correct past it
+too: `NewBundle`'s link is a junction now, which an ordinary user can create. Nothing in the
+steps below reaches a task bundle either way — they unpack an image and stop — so this test
+says nothing about whether that patch works. If you go on to `ctr run`, read "Elevation, and
+the choice you no longer have to make" above first; and if you decide to run elevated anyway,
+do **not** reuse the `--root` that step 0 creates here.
 
 - **Create `root` and `state` before starting containerd** — `.\new-containerd-root.ps1`. See
   "The root directory must exist first" above for the failure this avoids and why the fix is
@@ -808,14 +862,14 @@ is also where to look if you are testing an older bundle.
 ctr.exe -n test images rm docker.io/library/alpine:latest
 ```
 
-## Verified here, on Linux, 2026-08-14
+## Verified here, on Linux, 2026-08-14 and 2026-08-15
 
 Cross-compiled and inspected. **No Windows binary has been executed** — this is a Linux machine.
 Where a claim below was checked by running something, it says so.
 
 | Check | How | Result |
 | --- | --- | --- |
-| all five patches apply to pristine v2.3.3 | `git apply --check` | clean |
+| all six patches apply to pristine v2.3.3, in order | `git apply --check`, then `git apply`, on a fresh v2.3.3 clone | clean |
 | PE32+ x86-64 | `objdump -f` | `pei-x86-64` for `containerd.exe` and `ctr.exe` |
 | erofs plugins linked in | `strings` | `plugins/diff/erofs/plugin`, `plugins/snapshots/erofs/plugin` present, both arches |
 | existing plugins kept | `strings` | `plugins/snapshots/windows` still present |
@@ -828,6 +882,11 @@ Where a claim below was checked by running something, it says so.
 | `config.toml` decodes to what it claims | **executed** — containerd's own `srvconfig.LoadConfig` + `Decode` | order `[erofs windows windows-lcow]`, both `unpack_config` entries, `optional=true` on erofs |
 | the Windows-only assertions type-check | `GOOS=windows go vet`, both arches | clean |
 | **the empty `windows` section is what crun rejected, and `0004` removes it** | **executed** — `go test ./cmd/ctr/commands/run/... -run WindowsSection` | passes; one test asserts a Linux spec holding an empty `specs.Windows` marshals as `"windows":{"layerFolders":null}` — so `omitempty` on a pointer field is shown not to save it — and the others that the option removes it and leaves the rest of the spec alone |
+| **the junction's reparse buffer has the layout Windows documents** | **executed** — `go test ./core/runtime/v2/ -run WorkDirJunction` | passes; the golden buffer in the test was written out by hand from [MS-FSCC] 2.1.2.2 and matched the encoder on the first run, which is the only reason it is evidence rather than a copy |
+| **the junction path is in the shipped PE and reachable from `main`** | `assert-func-linked.py` reads the pclntab function-name table | `linkWorkDir`, `createWorkDirJunction`, `encodeMountPointReparseBuffer` present in `.rdata`, both arches; absent from an unpatched build of the same tree |
+| **that check can fail** | **executed** — built pristine v2.3.3 for `windows/amd64` and re-ran all three scripts | `assert-func-linked.py --absent` passes, `assert-diff-order.py` and `assert-mkfs-magic.py` both exit 1. The `strings` greps a lazier check would have used pass on that same unpatched binary: `grep -c Reparse` → 22, `grep -c WorkDir` → 4 |
+| **`os.Readlink` reads a junction, so `Bundle.Delete` still cleans up** | read out of the Go 1.26.3 source `containerd/go.mod` selects | `os/file_windows.go` `readReparseLinkHandle` handles `IO_REPARSE_TAG_MOUNT_POINT`; `os.TestReadlink` has a `junction_dir_drive_absolute` case that runs `mklink /J` and requires `Readlink` to return the absolute target. **Not executed here** — it runs on Go's Windows builders, not on this machine |
+| **the platform that works still works** | **executed** — `go test ./core/runtime/v2/... -count=1` on Linux | passes, including the existing bundle tests, with `worklink_other.go` calling `os.Symlink` verbatim |
 
 The xfs row is the one gap: `mkfs.xfs` is not on this machine, so `XFSB` at offset 0 is taken
 from `/usr/include/linux/magic.h` and XFS's documented big-endian metadata magics, and
@@ -851,3 +910,11 @@ are what exercise the logic, on Linux, against platform-neutral code.
 
 Likewise `plugins ls` reporting `ok` remains a weak signal by construction, which is why step 5
 and not step 4 is the one that answers the question.
+
+**And `0006` is the least covered of the six.** Everything above establishes that the binary
+carries a junction path, that the bytes it would write match the format Microsoft documents,
+and that the Go runtime reads such a link back. **Not one of those is Windows accepting the
+`FSCTL_SET_REPARSE_POINT`.** Nobody has run `ctr run` against an unelevated daemon built from
+these patches, on any machine. Until somebody does, "elevation is no longer required" is a
+claim about code, not about a computer. The commands that would settle it are in
+[`docs/windows-e2e.md`](../../docs/windows-e2e.md), step 4 onwards.

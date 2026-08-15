@@ -45,8 +45,10 @@ Windows host — which a shared-kernel container cannot do — and `/proc/uptime
 deliberately: it declines to start sandbox networking on Windows, because no Ethernet frame
 has yet crossed the virtio-net device there, and its enforcement is the network datapath.
 `boks doctor` fails its platform check on Windows for the same reason, correctly. Running a
-container also still needs an elevated shell or Developer Mode, for a symlink containerd
-creates in the task bundle.
+container also needed an elevated **containerd daemon**, or Developer Mode, for a symlink
+containerd creates in every task bundle; `packaging/containerd-windows/patches/0006` makes
+that link a junction instead, which an ordinary user can create, and nobody has run it on
+Windows yet. `boks create`, `ls`, `inspect` and `rm` never needed elevation either way.
 
 So the honest line has moved, but not to "yes": everything below Boks works on Windows, and
 the part Boks is has not been run there.

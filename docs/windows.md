@@ -101,16 +101,21 @@ That is Boks' architecture, on Windows, in a shipping product. So the question "
 userspace process terminate and judge a guest's every packet on Windows" is answered *yes*, by
 demonstration.
 
-> **"No administrator rights" is true of `sbx`, and is not yet true of the Boks stack.** That
-> bullet is about the reference product's installer and its enforcement design, both verified
-> from its shipped binaries, and neither is contradicted by anything below. But do not read it
-> as a claim about what Boks needs today. On the first end-to-end run on Windows 11,
-> **containerd could not create a task bundle unelevated**: `core/runtime/v2/bundle.go:103`
-> symlinks unconditionally in `NewBundle`, and unprivileged Windows will not create a symlink
-> without Developer Mode. Unpacking an image works fine as an ordinary user; running a
-> container needs an elevated daemon or a machine-wide Developer Mode. That is a real parity
-> gap against `sbx`, it is containerd's rather than Boks', and it is documented with its costs
-> in `packaging/containerd-windows/README.md` and `docs/windows-e2e.md`.
+> **"No administrator rights" is true of `sbx`. It is now believed true of the Boks stack, and
+> has not been demonstrated.** That bullet is about the reference product's installer and its
+> enforcement design, both verified from its shipped binaries. On the first end-to-end run on
+> Windows 11, **containerd could not create a task bundle unelevated**:
+> `core/runtime/v2/bundle.go:103` symlinks unconditionally in `NewBundle`, and unprivileged
+> Windows will not create a symlink without Developer Mode. That was a real parity gap against
+> `sbx`, and it was containerd's rather than Boks'.
+>
+> It is patched: `packaging/containerd-windows/patches/0006` makes that link a **junction**,
+> which an ordinary user can create, with the symlink kept as a fallback. **Nobody has run it
+> on Windows.** Be precise about the scope in the meantime — elevation was ever needed only by
+> the **containerd daemon**, because the daemon is what creates task bundles; `boks create`,
+> `boks ls`, `boks inspect` and `boks rm` always worked as an ordinary user, and unpacking an
+> image did too. Costs, mechanism and what remains unverified are in
+> `packaging/containerd-windows/README.md` and `docs/windows-e2e.md`.
 
 | Half | Status |
 |---|---|
