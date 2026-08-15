@@ -377,11 +377,15 @@ func guestImageResult(dirs []string) Result {
 			"The names it accepts are:\n"+
 			"  %s\n"+
 			"  %s\n"+
-			"Nothing packages these: nerdbox's GitHub releases carry no assets, and building\n"+
-			"them is a Linux kernel build driven by 'docker buildx bake'.\n"+
-			"Two routes. Download them from the newest successful run of the guest-image\n"+
-			"workflow, which builds both on a Linux runner and attaches them with their\n"+
-			"checksums — this needs no Docker and is the only practical route on Windows:\n"+
+			"Upstream packages neither: nerdbox's GitHub releases carry no assets, and\n"+
+			"building them is a Linux kernel build driven by 'docker buildx bake'.\n"+
+			"Three routes, easiest first. A Boks release publishes them as\n"+
+			"boks-guest_<version>_<arch>.tar.gz, and on Windows the whole install archive\n"+
+			"boks_<version>_windows_amd64.zip already contains them:\n"+
+			"  https://github.com/dagsommer/boks/releases\n"+
+			"Before the first release, download them from the newest successful run of the\n"+
+			"guest-image workflow, which builds both on a Linux runner and attaches them\n"+
+			"with their checksums — this needs no Docker:\n"+
 			"  https://github.com/dagsommer/boks/actions/workflows/guest-image.yml\n"+
 			"Or build them yourself with scripts/build-nerdbox-guest.sh, which needs Docker\n"+
 			"with buildx and takes a while. They are guest artefacts, so building them once\n"+
