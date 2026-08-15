@@ -1202,6 +1202,59 @@ directory gone, the network directory including its socket, lock and log gone, a
 processes. One leftover, recorded without a verdict: `notices/<sandbox>.json` survives
 `rm`, which may well be deliberate since it marks a warning as already seen.
 
+### Workspace, persistence and SMP on Windows, 2026-08-15
+
+**Workspace write-through, both directions.** `pwd` inside the guest is the derived guest
+path; a file written there appears at the exact host path, byte-identical, LF not CRLF —
+no line-ending translation through virtiofs — and a file written on the host is readable
+in the guest. The exact-path promise holds on Windows, not only on macOS.
+
+**Persistence.** A marker written to `/root` survives `boks stop` and a subsequent run,
+with the new guest reporting 1.05 s of uptime — a fresh VM over the same writable
+snapshot, as on macOS.
+
+**SMP works, and had already been working.** This is a correction to something recorded
+here as an untested risk. `boks create` with no `--cpus` takes the host's CPU count, and
+that machine has eight — so **every Windows round from the sixth onward has booted an
+eight-vCPU guest.** The AP startup path was never the untested code it was described as;
+it had been carrying every result. Explicit runs at 2, 4 and 8 all boot, `nproc` agrees,
+and no `VcpuInitSipiTrapLoop` ever fired:
+
+```
+smp: Bringing up secondary CPUs ...
+smpboot: x86: Booting SMP configuration:
+.... node  #0, CPUs:      #1 #2 #3 #4 #5 #6 #7
+smp: Brought up 1 node, 8 CPUs
+```
+
+Seven APs in 24 ms. The clock does not misbehave with more than one vCPU either — idle
+time scales 2.00×, 3.97× and 7.95× against a 1.01 s wall interval — and a two-thread busy
+loop moved both per-CPU counters in `/proc/stat`, so the vCPUs genuinely execute rather
+than merely existing.
+
+**`/proc/interrupts` validates the IOAPIC fix directly**, which no host-side check could:
+
+```
+  5:  0 15  0  0  0  0  0  0  IO-APIC   5-edge   virtio0
+ 16:  0  0  0 12  0  0  0  0  IO-APIC  16-edge   virtio11
+ 19:  0  0  0  0  0 27  0  0  IO-APIC  19-edge   virtio14
+ERR: 0     MIS: 0     SPU: 0
+```
+
+Fifteen devices on pins 5-19. Pins 16-19 — the ones the MPTable never described before,
+which the guest logged as "not connected" and which would have failed at `request_irq` had
+only `IRQ_MAX` been raised — are all delivering. Non-zero `RES`, `CAL` and `TLB` counters
+mean real IPIs cross between vCPUs.
+
+**One hypothesis refuted.** sbx needs no elevation and Boks does, and the guess recorded
+here was that sbx drives the shim directly and never runs containerd's bundle code. Its
+MSI ships no `containerd.exe`, but a string scan of `sbx.exe` finds `core/runtime/v2`,
+`NewBundle`, `bundle.go` and `io.containerd.runtime.v2.task` — matching our own
+`containerd.exe` on all four, while `sailor.dll` matches none and both shims match only
+`bundle.go`. sbx embeds containerd's runtime-v2 machinery in-process. So the elevation
+requirement cannot be explained by our having chosen containerd, and why sbx avoids the
+symlink is open.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been
