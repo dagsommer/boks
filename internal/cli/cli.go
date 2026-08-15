@@ -18,10 +18,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"github.com/dagsommer/boks/internal/update"
 )
 
 // Version is the build version, overridden at link time.
@@ -181,15 +184,54 @@ func newRootCommand(env Env) *cobra.Command {
 }
 
 func newVersionCommand(env Env) *cobra.Command {
-	return &cobra.Command{
+	var check bool
+	cmd := &cobra.Command{
 		Use:   "version",
 		Short: "Print the boks version",
-		Args:  noArgs,
+		Long: `Prints the version of boks that is running.
+
+With --check, also asks GitHub which release is newest and says whether this one is behind.
+That request is made every time --check is passed: it is an explicit instruction, so it
+neither reads the daily check's cached answer nor writes one, and the environment variables
+that turn the daily check off do not apply to it.
+
+'boks run' reports a new release by itself, once a day, from a cached answer. This command
+is for asking now.`,
+		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(env.Stdout, "boks %s\n", Version)
+			if !check {
+				return nil
+			}
+			latest, err := update.Check(cmd.Context())
+			switch {
+			case errors.Is(err, update.ErrNoReleases):
+				// Not a failure: it is the true answer until the first release
+				// is cut, and exiting non-zero for it would be wrong.
+				fmt.Fprintln(env.Stdout, "no release has been published yet")
+				return nil
+			case err != nil:
+				// The version was printed, which is what the command is for, so
+				// this is a failure of the extra rather than of the command.
+				return fmt.Errorf("could not reach the release list: %w", err)
+			}
+			switch {
+			case update.IsNewer(Version, latest):
+				exe, _ := os.Executable()
+				fmt.Fprintf(env.Stdout, "%s is available — %s\n",
+					latest, update.Detect(exe).Upgrade())
+			case Version == "dev":
+				// Saying "up to date" to a local build would be a claim about a
+				// version that was never released.
+				fmt.Fprintf(env.Stdout, "latest release is %s\n", latest)
+			default:
+				fmt.Fprintf(env.Stdout, "%s is the newest release\n", latest)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&check, "check", false, "ask whether a newer release exists")
+	return cmd
 }
 
 // noArgs rejects positional arguments with a message that says what the command does take,
