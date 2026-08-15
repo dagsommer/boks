@@ -369,7 +369,6 @@ func TestFetchLatestRejectsNonVersions(t *testing.T) {
 // any number depending on scheduling.
 func TestAttemptIsRecordedBeforeItCompletes(t *testing.T) {
 	blocked := make(chan struct{})
-	defer close(blocked)
 
 	var calls atomic.Int32
 	started := make(chan struct{}, 16)
@@ -378,16 +377,20 @@ func TestAttemptIsRecordedBeforeItCompletes(t *testing.T) {
 		calls.Add(1)
 		started <- struct{}{}
 		// Never returns while the test runs — exactly like a request outliving the
-		// process that made it.
+		// process that made it. It then fails, so that releasing it at the end of
+		// the test cannot race t.TempDir's cleanup by writing the cache back.
 		<-blocked
-		return "v9.9.9", nil
+		return "", errors.New("released at end of test")
 	}
 
 	_, done := Notify(cfg) // discloses, no request
 	<-done
 
 	// The caller walks away without waiting, as boks does.
-	Notify(cfg)
+	_, abandoned := Notify(cfg)
+	// Released only once every assertion below has been made, and waited for, so no
+	// goroutine outlives the test.
+	defer func() { close(blocked); <-abandoned }()
 
 	// Synchronous invariant: the attempt is on disk already.
 	if c := loadCache(cfg.StateDir); c.Checked.IsZero() {
