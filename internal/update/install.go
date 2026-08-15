@@ -48,7 +48,13 @@ const releasesPage = "https://github.com/dagsommer/boks/releases/latest"
 // so this is testable. An empty path reports MethodUnknown rather than guessing from the
 // platform, because "probably Homebrew, it is a Mac" is exactly the guess that produces a
 // command the user cannot run.
-func Detect(exePath string) Method {
+func Detect(exePath string) Method { return detect(runtime.GOOS, exePath) }
+
+// detect is Detect with the platform named, so that every platform's rules can be tested on
+// every platform. Without this the Homebrew cases silently became assertions about
+// MethodUnknown when the suite ran on Windows, which is how they were found: the Windows CI
+// leg failed on two cases that had passed everywhere else.
+func detect(goos, exePath string) Method {
 	if exePath == "" {
 		return MethodUnknown
 	}
@@ -58,9 +64,12 @@ func Detect(exePath string) Method {
 	if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
 		exePath = resolved
 	}
-	slashed := filepath.ToSlash(exePath)
+	// Both separators, not filepath.ToSlash: that converts using the *running* platform's
+	// separator, so a Windows path examined on Linux would keep its backslashes and match
+	// nothing.
+	slashed := strings.ReplaceAll(exePath, "\\", "/")
 
-	if runtime.GOOS == "windows" {
+	if goos == "windows" {
 		// winget unpacks portable packages under a Packages directory in the user's
 		// local app data, and shims them from Links. Matching on the path segment rather
 		// than on an absolute prefix keeps this working for a machine-scope install,
@@ -78,7 +87,7 @@ func Detect(exePath string) Method {
 	if strings.Contains(slashed, "/Cellar/boks/") || strings.Contains(slashed, "/homebrew/") {
 		return MethodHomebrew
 	}
-	if runtime.GOOS == "linux" {
+	if goos == "linux" {
 		return detectLinuxPackage(slashed)
 	}
 	return MethodUnknown
