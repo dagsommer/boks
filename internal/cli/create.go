@@ -51,6 +51,9 @@ Agents:
 		positional, agentArgs := splitAtDash(cmd, args)
 		ctx := cmd.Context()
 
+		// See internal/cli/update.go. Never blocks, never fails.
+		noticeUpdate(env.Stderr)
+
 		if err := dev.requireIsolation(env.Stderr); err != nil {
 			return err
 		}
