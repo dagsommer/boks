@@ -1,0 +1,34 @@
+# The containerd release the LINUX packages vendor, built by build.sh.
+#
+# A tag, not a SHA — unlike packaging/linux/LIBKRUN_REV and packaging/nerdbox/NERDBOX_REV,
+# which pin unreleased trees where only a SHA is meaningful. containerd cuts real releases,
+# tags in containerd are not moved, and the tag is the thing a user would recognise, compare
+# against their distribution's install, and file a bug against.
+#
+# WHY THIS EXACT VERSION, AND WHY IT IS NOT A FLOOR. It is the containerd that
+# packaging/nerdbox/NERDBOX_REV vendors, so the daemon this builds and the shim shipped
+# beside it are the same containerd. That is not neatness. Measured on WSL2, 2026-08-15
+# (docs/verification.md, "Boks runs and enforces policy on Linux"): the shim emits version-3
+# bootstrap parameters, Ubuntu's containerd 2.2.2 cannot decode them, falls back to treating
+# the whole protobuf reply as an address, and fails at task start with
+#
+#     unsupported protocol: Yunix
+#
+# which is three bytes of protobuf framing rendered as letters and names no version, no shim
+# and no protocol. `boks doctor` reported `containerd ok` and `vm runtime ok`, both truthfully.
+# Vendoring collapses that axis of skew: one package, one pair, no combination to get wrong.
+#
+# It also happens to be why this file exists at all rather than a `Depends: containerd`.
+# Ubuntu 24.04 LTS ships 1.7.1 and 26.04 ships 2.2.2; neither can run the shim.
+#
+# This is deliberately NOT packaging/containerd-windows/CONTAINERD_VERSION, even though the
+# two currently read the same. That one is pinned to the tree its six patches apply to and
+# moves when the patch series does; this one moves with the nerdbox pin. Keeping them
+# separate is what made it possible for the libkrun pins to diverge without anyone noticing
+# they had to — see packaging/linux/LIBKRUN_REV for how that went.
+#
+# Before moving this: read packaging/containerd-linux/README.md's "what is NOT patched here",
+# and re-check that the erofs snapshotter, the erofs differ and the erofs mount plugin are
+# still registered on Linux by cmd/containerd/builtins/builtins_linux.go. The whole reason
+# Linux needs no patches is that they are.
+v2.3.3
