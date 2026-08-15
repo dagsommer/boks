@@ -116,7 +116,14 @@ func TestCloneModeAllowsAReadOnlySecondWorkspace(t *testing.T) {
 // The mode lives in the OCI mounts, which are written when a container is created and never
 // revisited, so --clone on a re-attach cannot be applied. It must say so — loudly for the
 // case that matters, which is a sandbox that is about to write to the user's disk.
-func TestCloneOnAnExistingDirectSandboxIsARefusedNoOp(t *testing.T) {
+// --clone on an existing direct-mode sandbox is refused, not noted.
+//
+// It used to print a warning and proceed, which is the one shape this class of flag must not
+// have: the flag exists so guest writes never touch the user's disk, so ignoring it hands the
+// guest a read-write share of the repository the flag was reached for to protect. The refusal
+// comes from checkFixedAtCreation, with every other fixed-at-creation flag, so applyCloneMode
+// is left with nothing to say.
+func TestCloneOnAnExistingDirectSandboxIsRefused(t *testing.T) {
 	inv := invocation{
 		name:   "web",
 		exists: true,
@@ -127,17 +134,29 @@ func TestCloneOnAnExistingDirectSandboxIsARefusedNoOp(t *testing.T) {
 		},
 	}
 
-	cfg, out, err := applyClone(t, inv)
-	if err != nil {
-		t.Fatalf("applyCloneMode: %v", err)
+	var c fixedConflicts
+	c.sandbox = inv.name
+	checkCloneMode(&sandboxFlags{clone: true}, inv, &c)
+	err := c.err()
+	if err == nil {
+		t.Fatal("--clone on a direct-mode sandbox was accepted; guest writes would reach the host disk")
+	}
+	for _, want := range []string{"--clone", sandbox.FilesystemDirect, "boks rm web"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not mention %q", err, want)
+		}
+	}
+
+	// And applyCloneMode no longer says anything of its own about it.
+	cfg, out, applyErr := applyClone(t, inv)
+	if applyErr != nil {
+		t.Fatalf("applyCloneMode: %v", applyErr)
 	}
 	if cfg.Clone {
 		t.Error("Config.Clone = true for a sandbox that already exists")
 	}
-	for _, want := range []string{"--clone is ignored", "DIRECT", "/home/alice/src/foo", "boks rm web"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("warning %q does not mention %q", out, want)
-		}
+	if out != "" {
+		t.Errorf("applyCloneMode still writes %q; the refusal is checkFixedAtCreation's job", out)
 	}
 }
 
