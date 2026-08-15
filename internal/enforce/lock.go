@@ -1,22 +1,33 @@
 package enforce
 
-import "errors"
+import (
+	"os/exec"
+
+	"github.com/dagsommer/boks/internal/proclock"
+)
+
+// The supervisor's process primitives. They live in internal/proclock, because the containerd
+// supervisor in internal/daemon owns a background process the same way and the rules — a held
+// lock rather than a recorded PID, SIGTERM rather than SIGKILL, and the Windows caveat about
+// when a dead holder's lock is actually released — are not obvious enough to transcribe twice.
+//
+// They are wrapped here rather than called through the package name so that the rest of this
+// package, and its tests, read as they did when the implementations were in this directory.
 
 // errLockHeld means the supervisor lock is held by another live process — that is, the
 // sandbox really does have a network supervisor.
 //
-// It exists because "I could not take the lock" and "somebody else has it" are not the same
-// statement, and reporting them with one sentence produced an error that was simply false.
-// `boks net serve` used to answer every failure of acquire with `sandbox %q already has a
-// network supervisor`, so a Windows host — where acquire refuses outright, because there is
-// no host-terminated link for a supervisor to own — was told a fresh sandbox already had one
-// running. The true cause was wrapped inside as a detail, and the first line of the log sent
-// the reader hunting for a process that had never existed.
-//
-// Only the platform lock primitives may attribute a failure to this sentinel, and only for a
-// lock another holder is provably holding. Everything else — a directory that cannot be
-// written, a platform that has no supervisor to run, a failure that is yet to exist — keeps
-// its own error, and is reported as itself. That distinction gets more valuable, not less,
-// as Windows moves from refusing to attempting: a real attempt has real ways to fail, and
-// every one of them would otherwise be announced as a supervisor that is already running.
-var errLockHeld = errors.New("another process holds the supervisor lock")
+// The distinction it draws matters more here than anywhere else, and proclock.ErrHeld carries
+// the history: only a lock somebody is provably holding may be reported as one, and every
+// other failure keeps its own error. `boks net serve` used to answer every failure of acquire
+// with `sandbox %q already has a network supervisor`, which told a Windows host that a fresh
+// sandbox already had one running.
+var errLockHeld = proclock.ErrHeld
+
+func acquire(path string) (func(), error) { return proclock.Acquire(path) }
+
+func locked(path string) bool { return proclock.Locked(path) }
+
+func terminate(pid int) error { return proclock.Terminate(pid) }
+
+func detach(cmd *exec.Cmd) { proclock.Detach(cmd) }
