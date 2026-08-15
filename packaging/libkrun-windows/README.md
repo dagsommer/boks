@@ -113,6 +113,26 @@ the new revision, regenerate the series, and let the workflow tell you what chan
 patches to drop out over time — upstream is working on the same port, and a patch that no
 longer applies because upstream fixed it is the outcome this directory is aiming for.
 
+### This pin is Windows-only, and Linux has its own
+
+`UPSTREAM_REV` here is libkrun **2.0.0-dev**. [`packaging/linux/LIBKRUN_REV`](../linux/LIBKRUN_REV)
+is **v1.19.4**, and the divergence is deliberate rather than neglect.
+
+libkrun 2.0 removed four of the nineteen symbols nerdbox v0.2.3 binds — `krun_set_log_level`,
+`krun_set_console_output`, `krun_set_gvproxy_path` and `krun_set_net_mac` — and nerdbox
+resolves its whole binding table eagerly at `dlopen`, so a missing symbol fails the load
+rather than the call. This series does not notice because patch 0014 re-exports the 1.x names
+under `#[cfg(windows)]` and patch 0026 restores `krun_set_console_output` outside the
+`aws-nitro` feature. An *unpatched* build of this revision, which is what Linux ships, would
+not load at all — measured by building both revisions for `aarch64-unknown-linux-gnu` with
+`--features blk,net` and reading `.dynsym`.
+
+So do not "unify" the two pins without checking the exports first, and do not assume this
+series is safe to skip on Linux merely because these files sit in a directory named
+`libkrun-windows`: five of the 37 patches (0025, 0026, 0035, 0036, 0037) touch code that is
+compiled on Linux too. `packaging/linux/README.md` records what Linux gives up by omitting
+them.
+
 ## Upstreaming
 
 The tracking issue is [containers/libkrun#798](https://github.com/containers/libkrun/issues/798),
