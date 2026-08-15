@@ -95,6 +95,16 @@ disabled_plugins = [
 # A pipe name nothing else answers on. ctr must be told the same one:
 #
 #     ctr.exe --address \\.\pipe\boks-containerd ...
+#
+# boks does NOT default to this pipe — it defaults to containerd's own,
+# \\.\pipe\containerd-containerd. Point it here without editing anything:
+#
+#     $env:BOKS_CONTAINERD_ADDRESS = '\\.\pipe\boks-containerd'
+#
+# The distinct pipe is deliberate: it keeps this daemon from colliding with a
+# containerd that Docker Desktop or Docker Sandboxes may already be running. Two
+# testers have hand-edited this file instead, which is why the variable is named
+# here rather than only in the README.
 # ---------------------------------------------------------------------------------------
 [grpc]
   address = '\\.\pipe\boks-containerd'
