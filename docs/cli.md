@@ -1446,5 +1446,19 @@ there when it starts again; 'boks rm' is what deletes it.
 Print the boks version
 
 ```
-boks version
+boks version [flags]
 ```
+
+Prints the version of boks that is running.
+
+With --check, also asks GitHub which release is newest and says whether this one is behind.
+That request is made every time --check is passed: it is an explicit instruction, so it
+neither reads the daily check's cached answer nor writes one, and the environment variables
+that turn the daily check off do not apply to it.
+
+'boks run' reports a new release by itself, once a day, from a cached answer. This command
+is for asking now.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--check` |  | ask whether a newer release exists |

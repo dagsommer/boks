@@ -78,6 +78,10 @@ Agents:
 	cmd.RunE = func(cmd *cobra.Command, args []string) (err error) {
 		positional, agentArgs := splitAtDash(cmd, args)
 
+		// Early, so the background refresh has the whole of a VM start to finish in.
+		// It never blocks and never fails; see internal/cli/update.go.
+		noticeUpdate(env.Stderr)
+
 		if err := dev.requireIsolation(env.Stderr); err != nil {
 			return err
 		}
