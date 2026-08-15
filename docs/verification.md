@@ -1545,3 +1545,47 @@ real filenames it accepts `x86_64` and `arm64` and rejects `aarch64`.
 
 **Not proven.** No arm64 guest has been built. This says the naming can now agree, not that the
 build succeeds — the first `aarch64` build never ran, and the first `arm64` one has not either.
+
+### `boks daemon start` gave a Win32 error instead of an answer, 2026-08-15
+
+The Windows CI leg failed `TestServeRefusesASecondDaemon`. Starting a daemon while one was
+already running reported
+
+```
+the lock C:\...\containerd\daemon.lock is held: The process cannot access the file
+because another process has locked a portion of the file.
+```
+
+instead of `a boks-managed containerd is already running; 'boks daemon status' shows it`.
+
+`internal/proclock` exists to separate "I could not take the lock" from "somebody else has
+it", and `serve.go` asks that question with `errors.Is(err, proclock.ErrHeld)`. The Unix
+implementation wraps `ErrHeld` on the one branch that means contention. The Windows
+implementation wrapped the raw Win32 error and nothing else, so the question always answered
+false and every caller fell through to printing the operating system's sentence.
+
+**This is the second time the same divergence has shipped, in opposite directions.**
+`ErrHeld`'s own doc comment records the first: `boks net serve` used to answer *every* failure
+of `Acquire` with "sandbox already has a network supervisor", which was false on Windows where
+`Acquire` refused outright. The type was introduced to fix that, and the Windows half never
+joined in. A shared error value only helps if both implementations produce it.
+
+Windows now wraps `ErrHeld` for `ERROR_LOCK_VIOLATION` and `ERROR_SHARING_VIOLATION`, and for
+nothing else — the same rule the Unix side follows.
+
+**Not proven.** The fix compiles and vets for `windows/amd64`; it has not been run on Windows.
+The next CI run on that leg is the test.
+
+### A test fixture, not a limit, broke the Windows suite
+
+`TestUnexercisedWarningIsNotSaidWhenThereIsNoLinkToDial` failed on Windows with "the link
+socket path is 128 characters, over the 104-byte limit for UNIX sockets". Nothing was wrong
+with the limit: `sun_path` is 104 bytes on macOS and Boks enforces that floor everywhere, which
+is conservative on Windows and Linux, where it is 108.
+
+What was wrong was the fixture. `t.TempDir()` embeds the test function's name in the path, this
+one is 52 characters, and the runner's temp root is long as well — together 128 bytes, so a
+test about network *modes* failed on a path length and advised using a shorter sandbox name.
+The daemon package had already met this and answered it with a `shortStateDir` helper;
+`internal/cli` now has the same one. The path it produces measures 73 bytes against the same
+runner layout.
