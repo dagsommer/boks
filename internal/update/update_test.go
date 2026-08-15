@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -254,21 +255,46 @@ func TestUnwritableStateDirDoesNotPanic(t *testing.T) {
 	}
 }
 
+// Every platform's rules, exercised on whatever platform the suite runs on. An earlier
+// version called Detect() and so tested only the host's rules: on the Windows CI leg the two
+// Homebrew cases became assertions that a Cellar path is NOT Homebrew, and failed.
 func TestDetect(t *testing.T) {
 	cases := []struct {
-		path string
-		want Method
-		why  string
+		goos, path string
+		want       Method
+		why        string
 	}{
-		{"", MethodUnknown, "no path is not a reason to guess"},
-		{"/opt/homebrew/Cellar/boks/0.1.0/bin/boks", MethodHomebrew, "Apple silicon prefix"},
-		{"/usr/local/Cellar/boks/0.1.0/bin/boks", MethodHomebrew, "Intel prefix"},
-		{"/home/alice/.local/bin/boks", MethodUnknown, "a tarball install is not package managed"},
-		{"/tmp/boks", MethodUnknown, "an arbitrary location"},
+		{"darwin", "", MethodUnknown, "no path is not a reason to guess"},
+		{"darwin", "/opt/homebrew/Cellar/boks/0.1.0/bin/boks", MethodHomebrew, "Apple silicon prefix"},
+		{"darwin", "/usr/local/Cellar/boks/0.1.0/bin/boks", MethodHomebrew, "Intel prefix"},
+		{"darwin", "/Users/someone/bin/boks", MethodUnknown, "a hand-installed binary"},
+
+		{"linux", "/home/alice/.local/bin/boks", MethodUnknown, "a tarball install is not package managed"},
+		{"linux", "/tmp/boks", MethodUnknown, "an arbitrary location"},
+
+		{"windows", `C:\Users\a\AppData\Local\Microsoft\WinGet\Packages\dagsommer.boks\boks.exe`,
+			MethodWinget, "a winget portable package"},
+		{"windows", `C:\Users\a\AppData\Local\Microsoft\WinGet\Links\boks.exe`,
+			MethodWinget, "the winget shim directory"},
+		{"windows", `C:\Program Files\WinGet\Packages\dagsommer.boks\boks.exe`,
+			MethodWinget, "a machine-scope install is not under AppData"},
+		{"windows", `C:\tools\boks.exe`, MethodUnknown, "unpacked by hand"},
+		{"windows", "/opt/homebrew/Cellar/boks/0.1.0/bin/boks", MethodUnknown,
+			"a Cellar path on Windows is not a Homebrew install"},
 	}
 	for _, c := range cases {
-		if got := Detect(c.path); got != c.want {
-			t.Errorf("Detect(%q) = %v, want %v — %s", c.path, got, c.want, c.why)
+		if got := detect(c.goos, c.path); got != c.want {
+			t.Errorf("detect(%q, %q) = %v, want %v — %s", c.goos, c.path, got, c.want, c.why)
+		}
+	}
+}
+
+// The exported entry point has to agree with the parameterised one for the running platform,
+// or the tests above would be checking a function nothing calls.
+func TestDetectMatchesTheExportedEntryPoint(t *testing.T) {
+	for _, path := range []string{"", "/tmp/boks", "/opt/homebrew/Cellar/boks/0.1.0/bin/boks"} {
+		if got, want := Detect(path), detect(runtime.GOOS, path); got != want {
+			t.Errorf("Detect(%q) = %v but detect(%q, %q) = %v", path, got, runtime.GOOS, path, want)
 		}
 	}
 }
