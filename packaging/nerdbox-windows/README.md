@@ -21,9 +21,17 @@ in Boks links against a patched nerdbox — the patches are compiled, never ship
 
 Not every patch here is about Windows. Patch 0003 fixes a plain API drift against the libkrun
 revision Boks pins and patch 0004 an error-path stall in the shim's IO teardown; both fail
-identically on Linux. Patch 0005 is Windows-only, and is the one patch here found by running
-the thing rather than by reading it. They live here because this is the only place Boks builds
-nerdbox from source.
+identically on Linux — as does the `io.go` half of patch 0005, which is the only part of that
+patch outside a `//go:build windows` file. Patch 0005 is otherwise Windows-only, and is the
+one patch here found by running the thing rather than by reading it.
+
+They live here because this was the only place Boks built nerdbox from source. It no longer
+is: [`packaging/linux/`](../linux/) builds the same pinned revision **unpatched**, for
+amd64 and arm64, and publishes it. That directory deliberately does not apply this series, and
+patch 0003 is the reason it can get away with it — 0003 exists because libkrun `de84d01`
+removed the implicit vsock device, and that commit is in the 2.x revision this series targets
+but not in the 1.x revision Linux pins. If the Linux pin ever moves onto 2.x, 0003 stops being
+a Windows concern and becomes a prerequisite there too.
 
 The revision they apply to is `packaging/nerdbox/NERDBOX_REV`. There is no second pin file
 here on purpose: the guest kernel, the rootfs, and the shim that boots them all have to come

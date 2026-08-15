@@ -1,0 +1,542 @@
+# Build the two pieces of the Boks runtime that Linux users currently have to build by hand,
+# and publish them as one downloadable bundle per architecture.
+#
+# WHY THIS EXISTS. Boks orchestrates containerd, the nerdbox shim and libkrun. On Linux — the
+# platform Boks is designed for — neither of the last two is obtainable as a binary:
+#
+#   * nerdbox v0.2.3 ships ZERO release assets. Its release workflow has failed on every tag
+#     since v0.2.0, and it is packaged nowhere: not apt, not the AUR, not nixpkgs. Repology
+#     tracks it in none of roughly 400 repositories.
+#   * libkrun is not packaged for the distributions Boks targets either.
+#
+# So the first thing a Linux user must do is clone and build two projects, one of them Rust.
+# That is the single biggest barrier to Linux adoption, and it is a strange thing to ask when
+# Windows testers already get everything from CI. This workflow removes it.
+#
+# WHAT IT BUILDS, AND FROM WHERE.
+#
+#   containerd-shim-nerdbox-v1   containerd/nerdbox @ packaging/nerdbox/NERDBOX_REV, UNPATCHED
+#   libkrun.so                   containers/libkrun @ packaging/linux/LIBKRUN_REV, UNPATCHED,
+#                                --features blk,net
+#
+# NEITHER PATCH SERIES IS APPLIED, and both omissions were checked rather than assumed:
+#
+#   * packaging/nerdbox-windows/patches/ — three of the five (0003, 0004, and the io.go half
+#     of 0005) touch files with no build constraint and DO change Linux behaviour. They are
+#     still left out here, because they are a matched set with the Windows libkrun pin: 0003
+#     adds a binding for krun_add_vsock, which exists to work around libkrun 2.x removing the
+#     implicit vsock device. On the 1.x line this workflow builds against, the device is still
+#     implicit and the symbol is not bound, so applying 0003 would add a 20th eagerly-resolved
+#     symbol for no gain. See packaging/linux/README.md.
+#   * packaging/libkrun-windows/patches/ — five of the 37 are not Windows-only either (0025,
+#     0026, 0035, 0036, 0037). They are generated against the 2.0 tree and do not apply to the
+#     1.x pin at all, so the question is moot here; the README records what Linux gives up.
+#
+# THE PINS ARE DIFFERENT ON PURPOSE. Linux does not reuse the Windows libkrun pin, because
+# libkrun 2.0 dropped four of the 19 symbols nerdbox binds and nerdbox resolves them eagerly
+# at dlopen. packaging/linux/LIBKRUN_REV has the measurements. This is exactly the failure the
+# export assertion below exists to catch, and it is not hypothetical — it is what building
+# against the Windows pin actually produces.
+#
+# WHAT A GREEN RUN PROVES, AND WHAT IT DOES NOT. It proves the artifacts exist, are ELF
+# objects of the architecture they are named for, and that libkrun.so exports every symbol
+# nerdbox's loader will resolve at dlopen. That last one is a real load-time contract: get it
+# wrong and no VM starts anywhere, which is why it is asserted whole-name and out of .dynsym
+# rather than grepped for.
+#
+# It proves NOTHING about whether a sandbox runs. No VM is started here — GitHub's runners are
+# themselves virtualised and /dev/kvm is not available, so nerdbox's own kvm.CheckKVM() would
+# refuse before libkrun was reached. A symbol can be exported and return -ENOSYS. Boks has
+# never been verified end-to-end on Linux; that is the work this bundle exists to make
+# possible, not work this workflow does.
+#
+# Triggers: the pins, the packaging directory, or this file. Plus workflow_dispatch, because
+# "does upstream still build" is a question worth being able to ask on demand.
+name: linux-runtime
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/linux/**"
+      - "packaging/nerdbox/NERDBOX_REV"
+      - ".github/workflows/linux-runtime.yml"
+  pull_request:
+    paths:
+      - "packaging/linux/**"
+      - "packaging/nerdbox/NERDBOX_REV"
+      - ".github/workflows/linux-runtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------------------
+  # The shim. Pure Go on Linux, so one runner cross-compiles both architectures.
+  # ---------------------------------------------------------------------------------------
+  shim:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - name: Read the pinned nerdbox revision
+        id: pin
+        run: |
+          set -euo pipefail
+          # Comments and blank lines stripped; the SHA is the one remaining line.
+          rev="$(grep -v '^[[:space:]]*#' boks/packaging/nerdbox/NERDBOX_REV | tr -d '[:space:]')"
+          case "$rev" in
+            [0-9a-f]*) ;;
+            *) echo "NERDBOX_REV does not contain a commit SHA: '$rev'" >&2; exit 1 ;;
+          esac
+          if [ "${#rev}" -ne 40 ]; then
+            echo "NERDBOX_REV must be a full 40-character SHA, got ${#rev} characters" >&2
+            exit 1
+          fi
+          echo "rev=$rev" >>"$GITHUB_OUTPUT"
+
+      # `fetch-depth: 0` because a pinned SHA is not necessarily reachable from the default
+      # branch tip that a shallow clone would fetch.
+      - uses: actions/checkout@v5
+        with:
+          repository: containerd/nerdbox
+          ref: ${{ steps.pin.outputs.rev }}
+          path: nerdbox
+          fetch-depth: 0
+
+      # Assert the tree really is unpatched before building it. Without this, someone adding a
+      # patch step later — or a stray file from a cached checkout — would ship a binary whose
+      # provenance line in the summary was a lie. `git status` is cheap and unambiguous.
+      - name: Assert the nerdbox tree is pristine
+        working-directory: nerdbox
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "the nerdbox checkout is not pristine — this workflow ships UNPATCHED binaries" >&2
+            git status --porcelain >&2
+            exit 1
+          fi
+          echo "  nerdbox @ $(git rev-parse HEAD): clean"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: nerdbox/go.mod
+          cache: false
+
+      - name: Record the toolchain
+        run: go version
+
+      # `-mod=vendor` is explicit rather than inferred: nerdbox vendors its dependencies, and
+      # a silent switch to the module cache would build something subtly different from what
+      # the pinned tree describes.
+      #
+      # No `CGO_ENABLED=0`. nerdbox reaches libkrun through purego, which needs the dynamic
+      # loader, and the resulting binary links libdl/libpthread/libc. Forcing a static build
+      # is not a portability win here — it is how you get a shim that cannot dlopen anything.
+      - name: Build the shim for Linux
+        working-directory: nerdbox
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            echo "::group::GOOS=linux GOARCH=$arch"
+            GOOS=linux GOARCH="$arch" go build \
+              -o "_out/$arch/containerd-shim-nerdbox-v1" \
+              ./cmd/containerd-shim-nerdbox-v1
+            echo "::endgroup::"
+          done
+          ls -lR _out/
+
+      # `go build -o <name>` will happily write a PE or a Mach-O if GOOS leaks, and the
+      # filename would not tell you. Nor would a bare `\x7fELF` check: it passes on an aarch64
+      # binary published as the amd64 artifact, which is the mistake a user notices as
+      # "cannot execute binary file". assert-elf.py reads e_machine.
+      - name: Assert each shim is an ELF of the architecture it is named for
+        run: |
+          set -euo pipefail
+          python3 boks/packaging/linux/assert-elf.py \
+            nerdbox/_out/amd64/containerd-shim-nerdbox-v1 --machine x86-64
+          python3 boks/packaging/linux/assert-elf.py \
+            nerdbox/_out/arm64/containerd-shim-nerdbox-v1 --machine aarch64
+
+      # ---------------------------------------------------------------------------------
+      # NEGATIVE CONTROL for the assertion above.
+      #
+      # Every check in this repository is now expected to demonstrate that it can fail,
+      # because three that could not were found in a single session — a `grep -qa` export
+      # test that matched substrings, a doctor fix nothing pinned, and a magic-byte grep
+      # that matched an unpatched binary 22 times.
+      #
+      # So: build the same source for Windows, and feed the two artifacts to the checker
+      # with the WRONG expectations. A checker that cannot tell aarch64 from x86-64, or a
+      # PE from an ELF, passes all three of these — and if any does pass, this step fails
+      # the job.
+      #
+      # Each control demands exit status EXACTLY 1 — "the assertion ran and rejected this
+      # input" — rather than merely non-zero. assert-elf.py exits 2 for a usage error or an
+      # unreadable file, and a plain `! cmd` would count that as a rejection: one typo in a
+      # path would then make every control here pass while testing nothing whatsoever. That
+      # is the same always-green failure these controls exist to rule out, so it is not a
+      # hole worth leaving in the thing doing the ruling out.
+      # ---------------------------------------------------------------------------------
+      - name: Prove the ELF assertion can fail
+        working-directory: nerdbox
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -euo pipefail
+          GOOS=windows GOARCH=amd64 go build -o _out/control.exe ./cmd/containerd-shim-nerdbox-v1
+          A=../boks/packaging/linux/assert-elf.py
+          reject() {
+            label="$1"; shift
+            set +e
+            python3 "$A" "$@" >/dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 1 ]; then
+              echo "CONTROL FAILED: $label — expected exit 1 (ran and rejected), got $rc" >&2
+              exit 1
+            fi
+            echo "  rejected, as it must: $label"
+          }
+          reject "an amd64 ELF checked as aarch64" \
+            _out/amd64/containerd-shim-nerdbox-v1 --machine aarch64
+          reject "an arm64 ELF checked as x86-64" \
+            _out/arm64/containerd-shim-nerdbox-v1 --machine x86-64
+          reject "a Windows PE checked as an ELF" \
+            _out/control.exe --machine x86-64
+          rm -f _out/control.exe
+          echo "all three controls rejected as they should"
+
+      # The shim is not the only thing built from this tree, and a Linux-only build says
+      # nothing about the test files. `go vet` type-checks them without running them.
+      - name: Vet the shim packages, test files included
+        working-directory: nerdbox
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            echo "::group::GOOS=linux GOARCH=$arch go vet ./internal/..."
+            GOOS=linux GOARCH="$arch" go vet ./internal/...
+            echo "::endgroup::"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nerdbox-shim-linux
+          path: nerdbox/_out/**/containerd-shim-nerdbox-v1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------
+  # libkrun. Native runners per architecture rather than a cross-compile: several crates in
+  # the dependency graph run `cc` from a build script, and the repo already uses
+  # ubuntu-24.04-arm elsewhere (images.yml), so a native aarch64 runner costs nothing extra
+  # and removes a whole class of cross-toolchain failure that says nothing about the code.
+  # ---------------------------------------------------------------------------------------
+  libkrun:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            machine: x86-64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            machine: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - name: Read the pinned libkrun revision
+        id: pin
+        run: |
+          set -euo pipefail
+          rev="$(grep -v '^[[:space:]]*#' boks/packaging/linux/LIBKRUN_REV | tr -d '[:space:]')"
+          case "$rev" in
+            [0-9a-f]*) ;;
+            *) echo "LIBKRUN_REV does not contain a commit SHA: '$rev'" >&2; exit 1 ;;
+          esac
+          if [ "${#rev}" -ne 40 ]; then
+            echo "LIBKRUN_REV must be a full 40-character SHA, got ${#rev} characters" >&2
+            exit 1
+          fi
+          echo "rev=$rev" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: containers/libkrun
+          ref: ${{ steps.pin.outputs.rev }}
+          path: libkrun
+          fetch-depth: 0
+
+      - name: Assert the libkrun tree is pristine
+        working-directory: libkrun
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "the libkrun checkout is not pristine — Linux ships UNPATCHED upstream" >&2
+            git status --porcelain >&2
+            exit 1
+          fi
+          echo "  libkrun @ $(git rev-parse HEAD): clean"
+
+      - name: Record the toolchain
+        run: |
+          rustup show
+          cargo --version
+
+      # libkrunfw is NOT built, NOT installed, and NOT needed.
+      #
+      # This is worth stating because the obvious assumption is the opposite one: libkrun
+      # normally boots a kernel that libkrunfw bundles, and building libkrunfw would mean
+      # compiling a guest kernel in CI. It is not needed here, for two independent reasons,
+      # both read out of the pinned source rather than inferred:
+      #
+      #   1. It is not a build dependency at all. There is no build.rs linking it and no
+      #      `-lkrunfw`; src/libkrun/src/lib.rs loads it at RUNTIME with
+      #      `libloading::Library::new("libkrunfw.so.5")` inside a LazyLock, and keeps the
+      #      failure as a value rather than panicking. Nothing at compile time touches it.
+      #   2. The one place that value is consulted is guarded by
+      #      `external_kernel.is_none() && kernel_bundle.is_none() && firmware_config.is_none()`.
+      #      nerdbox always calls krun_set_kernel with the nerdbox-kernel-<arch> that
+      #      guest-image.yml builds, which sets external_kernel, so the branch is never taken
+      #      and the LazyLock is never even forced.
+      #
+      # So the bundled-kernel path is unreachable for Boks and its dlopen never has to succeed.
+      # If a future pin makes libkrunfw a link-time dependency, this build breaks loudly rather
+      # than quietly compiling a kernel — which is the intended failure mode.
+      - name: Build libkrun with the features Boks needs
+        working-directory: libkrun
+        run: |
+          set -euo pipefail
+          # blk for the erofs rootfs disk nerdbox attaches as /dev/vda, net for the virtio-net
+          # device that carries guest traffic to the policy engine. Named explicitly because a
+          # build without `net` yields a VM with no network at all rather than a slower one.
+          cargo build --release -p libkrun --features blk,net
+          ls -l target/release/libkrun.so
+
+      # The filename matters as much as the contents, and it is easy to get wrong.
+      #
+      # nerdbox stats for exactly two names on Linux (internal/vm/libkrun/instance.go):
+      # `libkrun-<arch>.so` and then `libkrun.so`, where <arch> is kernelArch() — "x86_64" on
+      # amd64, but plain GOARCH otherwise, so "arm64" and NOT "aarch64" on 64-bit ARM. It does
+      # not consult the dynamic linker's search path and it does not follow an soname.
+      #
+      # cargo emits target/release/libkrun.so, which is already one of the two names it looks
+      # for, on both architectures. The embedded DT_SONAME is libkrun.so.1 (build.rs stamps
+      # -soname from the major version) and is irrelevant here: nerdbox dlopens an absolute
+      # path, and dlopen of a path containing a slash loads that file directly without
+      # consulting SONAME. Shipping the plain `libkrun.so` name is therefore correct for amd64
+      # and arm64 alike, and avoids the aarch64/arm64 trap entirely.
+      - name: Record the soname and stage the artifact under the name nerdbox stats
+        working-directory: libkrun
+        run: |
+          set -euo pipefail
+          mkdir -p _out
+          cp target/release/libkrun.so _out/libkrun.so
+          echo "DT_SONAME: $(readelf -d _out/libkrun.so | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
+          echo "filename:  libkrun.so  (one of the two names nerdbox stats)"
+
+      # ALL NINETEEN symbols nerdbox binds, not a sample. Its loader reflects over the whole
+      # binding table and resolves every one eagerly at dlopen, so the library either satisfies
+      # all of them or fails to load outright — there is no partial success to sample for.
+      #
+      # NINETEEN, not the twenty the Windows workflow checks. That workflow builds a nerdbox
+      # PATCHED by packaging/nerdbox-windows/patches/, whose patch 0003 adds a krun_add_vsock
+      # binding. This one builds nerdbox unpatched, so that binding does not exist. Regenerate
+      # the list from the tree this workflow actually checks out, rather than editing by hand:
+      #
+      #   grep -oE 'C:"krun_[a-z0-9_]+"' internal/vm/libkrun/krun.go \
+      #     | sed 's/C:"//;s/"//' | sort | tr '\n' ' '
+      #
+      # This assertion is not defensive programming. Built against the WINDOWS libkrun pin,
+      # four of these nineteen are absent and the artifact would fail to load on every Linux
+      # machine — see packaging/linux/LIBKRUN_REV. That is the bug this step catches.
+      - name: Assert libkrun.so is the right architecture and exports what nerdbox binds
+        run: |
+          set -euo pipefail
+          A=boks/packaging/linux/assert-elf.py
+          python3 "$A" libkrun/_out/libkrun.so --machine ${{ matrix.machine }} --type dyn
+          python3 "$A" libkrun/_out/libkrun.so --require \
+            krun_set_log_level krun_init_log krun_create_ctx krun_free_ctx \
+            krun_set_vm_config krun_set_kernel krun_set_exec krun_set_console_output \
+            krun_start_enter krun_add_vsock_port2 krun_add_virtiofs3 \
+            krun_get_shutdown_eventfd krun_set_gpu_options krun_set_gvproxy_path \
+            krun_set_net_mac krun_add_disk krun_add_disk2 \
+            krun_add_net_unixstream krun_add_net_unixgram
+
+      # ---------------------------------------------------------------------------------
+      # NEGATIVE CONTROLS for the export assertion. Four distinct ways the check could be
+      # hollow, each demonstrated to be closed against the real artifact:
+      #
+      #   1. SUBSTRINGS. `krun_add_dis` is a strict prefix of the real export krun_add_disk.
+      #      A `strings | grep` test reports it present. This is not a hypothetical: the
+      #      exact bug shipped in this repo, where `grep -qa krun_add_vsock` was satisfied
+      #      by the bytes of krun_add_vsock_port2.
+      #   2. IMPORTS COUNTED AS EXPORTS. memcpy is in .dynsym as UND — `nm -D` and `strings`
+      #      both report it, and a check built on either would call it an export of libkrun.
+      #      Asserting it is NOT found proves the st_shndx filter is doing real work.
+      #   3. A NAME THAT SIMPLY DOES NOT EXIST, the base case.
+      #   4. THE FORBID ASSERTION ITSELF. --forbid is only evidence if forbidding a symbol
+      #      that IS exported fails, so that is checked too.
+      #
+      # If the checker is sound every one of these exits 1 — ran, and rejected. Exactly 1,
+      # not merely non-zero: assert-elf.py exits 2 for a usage error or an unreadable file,
+      # so accepting any non-zero status would let one bad path turn every control here
+      # green while testing nothing. The controls have to be harder to fool than the
+      # assertion they police.
+      #
+      # If any starts passing, the export assertion above has stopped meaning anything and
+      # this job goes red.
+      # ---------------------------------------------------------------------------------
+      - name: Prove the export assertion can fail
+        run: |
+          set -euo pipefail
+          A=boks/packaging/linux/assert-elf.py
+          K=libkrun/_out/libkrun.so
+          reject() {
+            label="$1"; shift
+            set +e
+            python3 "$A" "$K" "$@" >/dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 1 ]; then
+              echo "CONTROL FAILED: $label — expected exit 1 (ran and rejected), got $rc" >&2
+              exit 1
+            fi
+            echo "  rejected, as it must: $label"
+          }
+          reject "krun_add_dis, a strict prefix of the real export krun_add_disk" \
+            --require krun_add_dis
+          reject "memcpy, which is imported (UND) rather than exported" \
+            --require memcpy
+          reject "a symbol that does not exist at all" \
+            --require krun_no_such_symbol_at_all
+          reject "--forbid on krun_create_ctx, which IS exported" \
+            --forbid krun_create_ctx
+          # And the positive half of the --forbid control: it must pass for a symbol that is
+          # only imported. Without this, --forbid could be failing for the wrong reason.
+          echo "-- memcpy must pass --forbid, since it is imported and not exported"
+          python3 "$A" "$K" --forbid memcpy
+          echo "all four controls behaved as they should"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-linux-${{ matrix.arch }}
+          path: libkrun/_out/libkrun.so
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------
+  # One artifact per architecture, because the pieces are useless apart. The containerd
+  # Windows bundle exists for the same reason and its README explains what it cost not to
+  # have one: a tester collecting binaries from three artifacts into one directory spends the
+  # session debugging a missing file instead of testing the thing.
+  # ---------------------------------------------------------------------------------------
+  bundle:
+    runs-on: ubuntu-24.04
+    needs: [shim, libkrun]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            machine: x86-64
+          - arch: arm64
+            machine: aarch64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nerdbox-shim-linux
+          path: shim
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libkrun-linux-${{ matrix.arch }}
+          path: krun
+
+      - name: Assemble the bundle
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cp "shim/${{ matrix.arch }}/containerd-shim-nerdbox-v1" staging/
+          cp krun/libkrun.so staging/
+          cp boks/packaging/linux/README.md staging/README.md
+          chmod +x staging/containerd-shim-nerdbox-v1
+          ls -l staging/
+
+      # Re-assert after assembly, not only in the producing jobs. Copying between artifacts is
+      # exactly where an amd64 libkrun.so ends up in the arm64 bundle, and that mix-up is
+      # invisible until a user's shim fails to dlopen it. The cost is one second.
+      - name: Assert the assembled bundle is internally consistent
+        run: |
+          set -euo pipefail
+          A=boks/packaging/linux/assert-elf.py
+          python3 "$A" staging/containerd-shim-nerdbox-v1 --machine ${{ matrix.machine }}
+          python3 "$A" staging/libkrun.so --machine ${{ matrix.machine }} --type dyn
+          python3 "$A" staging/libkrun.so --require \
+            krun_set_log_level krun_init_log krun_create_ctx krun_free_ctx \
+            krun_set_vm_config krun_set_kernel krun_set_exec krun_set_console_output \
+            krun_start_enter krun_add_vsock_port2 krun_add_virtiofs3 \
+            krun_get_shutdown_eventfd krun_set_gpu_options krun_set_gvproxy_path \
+            krun_set_net_mac krun_add_disk krun_add_disk2 \
+            krun_add_net_unixstream krun_add_net_unixgram
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          (cd staging && sha256sum containerd-shim-nerdbox-v1 libkrun.so | tee SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boks-runtime-linux-${{ matrix.arch }}
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Say what this is and what is still missing
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## Boks runtime for linux/${{ matrix.arch }}"
+            echo
+            echo "Artifact \`boks-runtime-linux-${{ matrix.arch }}\` — the two pieces Linux users"
+            echo "have had to build from source."
+            echo
+            echo '```'
+            (cd staging && cat SHA256SUMS) 2>/dev/null || echo "(build failed)"
+            echo '```'
+            echo
+            echo "Both are UNPATCHED upstream: nerdbox at \`packaging/nerdbox/NERDBOX_REV\`,"
+            echo "libkrun at \`packaging/linux/LIBKRUN_REV\` (the 1.x line — 2.x drops four of"
+            echo "the nineteen symbols nerdbox resolves at load)."
+            echo
+            echo "**This is not a complete runtime.** You also need the guest kernel and rootfs"
+            echo "from the \`guest-image\` workflow — \`nerdbox-kernel-<arch>\` and"
+            echo "\`nerdbox-rootfs-<arch>.erofs\` — and a containerd. Put everything in one"
+            echo "directory on \`PATH\`; see \`README.md\` in the artifact."
+            echo
+            echo "**Nothing here has been run.** No VM is started by this workflow: GitHub's"
+            echo "runners are virtualised and \`/dev/kvm\` is absent, so nerdbox's own"
+            echo "\`kvm.CheckKVM()\` would refuse before libkrun was reached. What is proven is"
+            echo "that the files are ELF objects of the right architecture and that"
+            echo "\`libkrun.so\` exports every symbol the shim binds eagerly at \`dlopen\` — a"
+            echo "load-time contract, not a working sandbox. Boks has never been verified"
+            echo "end-to-end on Linux."
+          } >>"$GITHUB_STEP_SUMMARY"
