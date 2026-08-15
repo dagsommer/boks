@@ -44,8 +44,10 @@ would sell.
   1.9 s and printing the guest kernel's own `uname`. What remains for Boks is **`virtio-net`**,
   which is exactly the device its enforcement depends on: no Ethernet frame has crossed one on
   Windows, so `boks run` declines to start sandbox networking there rather than pretend
-  otherwise, and `boks doctor` fails its platform check. Elevation (or Developer Mode) is also
-  still needed, for a symlink containerd makes in the task bundle. In the meantime Boks
+  otherwise, and `boks doctor` fails its platform check. Elevation of the **containerd
+  daemon** (or Developer Mode) was also needed, for a symlink containerd makes in every task
+  bundle; [`patches/0006`](../packaging/containerd-windows/patches/) makes that a junction
+  instead and has not been run on Windows. In the meantime Boks
   should run **inside WSL2** with nested virtualisation: unchanged, with workspace paths
   preserved exactly. Untested, but every ingredient is there — see [Windows](windows.md).
 
