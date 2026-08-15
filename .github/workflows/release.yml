@@ -115,7 +115,12 @@ jobs:
   # arm64 .deb and .rpm are built here too, since both formats are just archives of files
   # that were produced somewhere else.
   build:
-    needs: [version, check]
+    # runtime-linux is needed because the .deb and .rpm now contain the runtime rather than
+    # naming it as a dependency: no distribution ships a containerd at the 2.3 floor, so a
+    # package that only declared one would install a machine that looks provisioned and
+    # cannot start a sandbox. The darwin and windows legs of the matrix do not use it and
+    # wait for it anyway, which costs wall-clock and keeps the graph readable.
+    needs: [version, check, runtime-linux]
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -144,8 +149,23 @@ jobs:
       - name: Build the tarball
         run: scripts/build-release.sh "${{ matrix.goos }}" "${{ matrix.goarch }}" "${{ needs.version.outputs.version }}"
 
+      # The bundle carries containerd, the nerdbox shim and libkrun.so for this
+      # architecture, already checked against its own SHA256SUMS by the job that made it.
+      # package-linux.sh takes the directory as-is and ignores what it does not want, so
+      # nothing is unpacked or renamed here.
+      - uses: actions/download-artifact@v4
+        if: matrix.goos == 'linux'
+        with:
+          name: boks-runtime-linux-${{ matrix.goarch }}
+          path: runtime-assets
+
       - name: Build the Linux packages
         if: matrix.goos == 'linux'
+        env:
+          # Required by package-linux.sh. Unset, it refuses to build rather than quietly
+          # producing the CLI-only package that this release is meant to stop shipping —
+          # which is why it is passed explicitly here rather than defaulted in the script.
+          BOKS_RUNTIME_ASSETS: ${{ github.workspace }}/runtime-assets
         run: |
           set -euo pipefail
           # rpm ships rpmbuild; dpkg-deb is already on the runner. Distribution tools, not

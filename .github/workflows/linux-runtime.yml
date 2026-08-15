@@ -481,6 +481,24 @@ jobs:
           name: libkrun-linux-${{ matrix.arch }}
           path: krun
 
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: boks/go.mod
+          check-latest: false
+
+      # The third piece of the runtime, and the one a distribution cannot supply: Ubuntu
+      # 24.04 ships containerd 1.7.x and the measured floor is 2.3, so the Linux packages
+      # vendor their own. It is built here rather than in packaging/, so that the bundle a
+      # release consumes is complete — see the interface note in scripts/package-linux.sh,
+      # which requires exactly these three names in one directory.
+      #
+      # Cross-compiled on an amd64 runner for both architectures. containerd builds with
+      # CGO_ENABLED=0, so this is an ordinary cross-compilation and a native arm64 runner
+      # would buy nothing; build.sh asserts the ELF machine of what it produced, which is
+      # what would catch it being wrong.
+      - name: Build the containerd the packages vendor
+        run: boks/packaging/containerd-linux/build.sh "${{ matrix.arch }}" "$PWD/staging"
+
       - name: Assemble the bundle
         run: |
           set -euo pipefail
@@ -499,6 +517,7 @@ jobs:
           set -euo pipefail
           A=boks/packaging/linux/assert-elf.py
           python3 "$A" staging/containerd-shim-nerdbox-v1 --machine ${{ matrix.machine }}
+          python3 "$A" staging/containerd --machine ${{ matrix.machine }}
           python3 "$A" staging/libkrun.so --machine ${{ matrix.machine }} --type dyn
           python3 "$A" staging/libkrun.so --require \
             krun_set_log_level krun_init_log krun_create_ctx krun_free_ctx \
@@ -511,7 +530,7 @@ jobs:
       - name: Checksums
         run: |
           set -euo pipefail
-          (cd staging && sha256sum containerd-shim-nerdbox-v1 libkrun.so | tee SHA256SUMS)
+          (cd staging && sha256sum containerd containerd-shim-nerdbox-v1 libkrun.so | tee SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:
