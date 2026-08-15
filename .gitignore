@@ -34,3 +34,6 @@ secrets/
 
 # Agent worktrees and local Claude state
 .claude/
+
+# Python bytecode from running the packaging/ assertion scripts locally
+__pycache__/
