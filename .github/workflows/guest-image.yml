@@ -9,8 +9,18 @@
 # That is a poor thing to ask of someone testing the Windows port, whose machine has neither.
 # This job does it once, on a Linux runner, and leaves the artifacts attached to the run.
 #
-# Both outputs are architecture-specific and byte-reproducible enough to check: the job prints
-# SHA256 for each, so a file that arrives somewhere else can be shown to be the same file.
+# Both outputs are architecture-specific and byte-reproducible enough to check: the job writes
+# a SHA256SUMS into the artifact, so a file that arrives somewhere else can be shown to be the
+# same file. release.yml checks exactly that file before it puts either into a release archive.
+#
+# `workflow_call` exists so release.yml can build the guest at the tag. It takes the same
+# `arch` input as `workflow_dispatch` — one architecture per run, because the bake recipe
+# builds one at a time — so release.yml calls it twice, once per architecture.
+#
+# THE LICENCE. The kernel here is Linux, GPL-2.0, patched by nerdbox. Publishing the compiled
+# result carries a corresponding-source obligation; the recipe is entirely public, and
+# release.yml writes a SOURCE.txt naming the exact revision and the two bake commands into
+# every guest archive it publishes.
 name: guest-image
 
 on:
@@ -22,6 +32,13 @@ on:
         default: x86_64
         type: choice
         options: [x86_64, aarch64]
+  workflow_call:
+    inputs:
+      arch:
+        description: "Guest architecture"
+        required: false
+        default: x86_64
+        type: string
   push:
     branches: [main]
     paths:
@@ -31,8 +48,12 @@ on:
 permissions:
   contents: read
 
+# The architecture is in the group as well as the ref: release.yml calls this twice on one
+# ref, and without it the second call would cancel the first. `github.workflow` is the
+# caller's workflow name under workflow_call, which keeps a release build and a push-triggered
+# run on `main` apart.
 concurrency:
-  group: guest-image-${{ github.ref }}
+  group: ${{ github.workflow }}-guest-image-${{ github.ref }}-${{ inputs.arch || 'x86_64' }}
   cancel-in-progress: true
 
 jobs:
@@ -77,22 +98,34 @@ jobs:
           docker buildx bake rootfs
           ls -l _output/
 
+      # The names in SHA256SUMS are bare, not `_output/`-prefixed, because the artifact is
+      # flattened: whoever downloads it gets the files at the top level and needs
+      # `sha256sum -c SHA256SUMS` to work there without editing the file first. Written with a
+      # redirect rather than `| tee` into the same directory the glob covers — in a pipeline
+      # the shell may create the output file before the glob is expanded, and SHA256SUMS would
+      # then list itself as empty.
       - name: Checksums
-        working-directory: nerdbox
+        working-directory: nerdbox/_output
         run: |
           set -euo pipefail
-          sha256sum _output/* | tee _output/SHA256SUMS
+          files=(*)
+          sha256sum -- "${files[@]}" >SHA256SUMS
+          cat SHA256SUMS
           {
             echo "## Guest image"
             echo
             echo "nerdbox \`${{ steps.pin.outputs.rev }}\`, arch \`${{ inputs.arch || 'x86_64' }}\`."
             echo
             echo '```'
-            cat _output/SHA256SUMS | sed 's|_output/||'
+            cat SHA256SUMS
             echo '```'
             echo
             echo "Put both files on PATH, or in a directory named by \`LIBKRUN_PATH\`, next to"
-            echo "\`krun.dll\` and the nerdbox shim. Neither file has ever booted on Windows."
+            echo "\`krun.dll\`/\`libkrun.so\` and the nerdbox shim."
+            echo
+            echo "The kernel is Linux and therefore GPL-2.0. \`release.yml\` writes a"
+            echo "\`SOURCE.txt\` naming the exact nerdbox revision and the bake commands that"
+            echo "reproduce it into every guest archive it publishes."
           } >>"$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4

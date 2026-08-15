@@ -309,7 +309,7 @@ Two entries deserve their own note:
   bundle, because a bundle without the guest is a bundle whose `doctor` passes and whose first
   sandbox will not boot.
 
-### The CI gap nobody has written down
+### The CI gap, and how it was closed
 
 `.github/workflows/` builds every Windows piece, the guest images, and — since
 2026-08-15 — the Linux runtime too: `linux-runtime.yml` publishes `libkrun.so` and a Linux
@@ -318,25 +318,104 @@ added because the first attempt to verify Boks on Linux found that neither piece
 binary anywhere: nerdbox ships zero release assets and neither project is packaged in apt, the
 AUR or nixpkgs.
 
-What remains true is the **retention** problem. `libkrun-windows.yml` builds `krun.dll`, prints
-its size and checks its exported symbols — and uploads no artifact at all. Everything else is
-an artifact with an expiry rather than a release asset.
+The gap that remained was **retention**. Every one of those pieces was an artifact with an
+expiry rather than a release asset, and `krun.dll` was not even that — `libkrun-windows.yml`
+built it, size-checked it, asserted all twenty exported symbols, and threw it away. A bundle
+cannot be assembled from artifacts that expire, so making these release assets was a
+prerequisite to every packaging item below.
 
-So the honest state of the pipeline is:
+**`release.yml` now attaches all of it.** The maintainer's decision is that the first release
+bundles the runtime for Linux and Windows, and that macOS stays a Homebrew source build,
+because the shim there needs the `com.apple.security.hypervisor` entitlement and building
+locally is what lets brew ad-hoc sign it.
 
-| Artifact | Built in CI | Retention | Attached to a release |
-|---|---|---|---|
-| guest kernel + rootfs | yes, per arch | 30 days | **no** |
-| Windows containerd + `ctr` + `mkfs.erofs.exe` + bundle | yes | 30–90 days | **no** |
-| Windows nerdbox shim | yes | 90 days | **no** |
-| `krun.dll` | built, then **discarded** | — | **no** |
-| Linux `libkrun.so` | yes, per arch (`linux-runtime.yml`) | 90 days | **no** |
-| Linux nerdbox shim | yes, both arches | 90 days | **no** |
-| `boks` tarballs, `.deb`, `.rpm` | yes | 7 days | yes, on a tag |
+| Piece | Built by | Published as |
+|---|---|---|
+| guest kernel + EROFS rootfs, per guest arch | `guest-image.yml` | `boks-guest_<v>_x86_64.tar.gz`, `boks-guest_<v>_aarch64.tar.gz` |
+| Linux `libkrun.so` + `containerd-shim-nerdbox-v1`, per arch | `linux-runtime.yml` | `boks-runtime_<v>_linux_amd64.tar.gz`, `…_linux_arm64.tar.gz` |
+| `krun.dll` | `libkrun-windows.yml` | inside `boks-runtime_<v>_windows_amd64.zip` |
+| Windows nerdbox shim | `nerdbox-windows.yml` | the same zip, **renamed** to `containerd-shim-nerdbox-v1.exe` |
+| Windows `containerd.exe`, `ctr.exe`, `mkfs.erofs.exe`, `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | `containerd-windows.yml` | the same zip |
+| `boks` for linux/amd64, linux/arm64, darwin/arm64 and **windows/amd64**, plus `.deb` and `.rpm` | `release.yml` | as before, plus the new Windows target |
 
-Everything except `boks` itself expires. A bundle cannot be assembled from artifacts that
-expire, so **making these release assets is a prerequisite to every packaging item below**.
-The building is done; the publishing is not.
+The Windows shim rename is not cosmetic. `nerdbox-windows.yml` builds both architectures and
+therefore suffixes them; containerd resolves a runtime *id* to a binary *name*, so
+`io.containerd.nerdbox.v1` looks for `containerd-shim-nerdbox-v1.exe` exactly, and a shim
+shipped under its build name is a shim containerd reports as missing.
+
+There is deliberately **no macOS runtime archive**, and no `windows/arm64` anything: there is
+no `krun.dll` or `mkfs.erofs.exe` for aarch64 Windows, and go-erofs's recipe cross-compiles for
+x86-64 alone.
+
+### How the runtime crosses a workflow boundary
+
+`actions/download-artifact` cannot reach another workflow's run without a run id and a token,
+so getting five workflows' outputs onto one release needed a decision. Two candidates:
+
+**(a) Make the runtime workflows reusable and call them from `release.yml`.** A called workflow
+runs at the caller's ref and uploads into the caller's run, so the assets are built *at the
+tag* and a plain `download-artifact` can see them.
+
+**(b) `gh run download` from the latest green run on `main`.** Cheap — a tag build stays
+minutes rather than the better part of an hour — and it needs no change to the runtime
+workflows.
+
+**(a) was chosen, and it is what is implemented.** The argument is one property: under (b) the
+published bytes correspond to *some* commit on `main`, chosen by whichever run happened to be
+green, and nothing on the release records which. That is exactly the class of failure this
+project keeps finding — pieces that are each individually fine and wrong as a set, which is
+[5a](#5a-the-version-that-matters-is-the-set). Under (a) every asset on a tag was built from
+that tag's tree, which the build-provenance attestation then records and anyone can check with
+`gh attestation verify`.
+
+The cost is real and is accepted: a tag build now compiles libkrun for
+`x86_64-pc-windows-msvc` on a Windows runner, which is slow. A tag is rare; a release whose
+runtime came from an unknown commit is a permanent problem.
+
+**The `paths:` filters were not an obstacle**, contrary to the initial worry. A path filter
+constrains only the event it is written under; `workflow_call` is a separate event with no
+filter, so `libkrun-windows.yml` is fully callable even though its push trigger fires only when
+its own patch directory changes.
+
+Two things did have to change to make (a) safe, and both are in the runtime workflows:
+
+- **Concurrency groups now include `github.workflow`**, which under `workflow_call` is the
+  *caller's* name. These workflows all set `cancel-in-progress: true`; without the change, a
+  dispatched release on `main` and a push-triggered run of the same workflow on `main` would
+  share a group and cancel each other, and the one that died could be the release. If that
+  assumption about `github.workflow` is ever wrong, the group collapses to what it was before —
+  today's behaviour rather than a new failure.
+- **Every producing workflow now writes a `SHA256SUMS` into its own artifact.** `release.yml`
+  checks all of them on the far side of the artifact transport, before a byte is copied into a
+  release archive, then writes its own `.sha256` per asset which the publishing job checks
+  again. That extends the chain the CLI tarballs already had by one hop rather than trusting
+  the new hop. Each published archive also carries a `SHA256SUMS` over its own contents,
+  regenerated after assembly — the incoming ones are wrong by construction once the Windows
+  directory has gained a `krun.dll` and a renamed shim.
+
+### What a release is signed with, and what it is not
+
+**Binaries are not signed.** No Authenticode certificate, no Developer ID. That is the
+maintainer's decision and its cost is stated in the winget section below: SmartScreen's
+"Windows protected your PC", every time, with no reputation accruing.
+
+**`SHA256SUMS` is GPG-signed**, with the key that already exists in `packaging/apt/`
+(fingerprint `D5DD07C0F9589C164F7361C20EB93D3C39471E1E`, private half the Actions secret
+`APT_GPG_PRIVATE_KEY`). Reusing it rather than minting a second key means one key to publish,
+one to rotate and one set of instructions, and a detached signature over the checksum file
+covers every asset transitively. A tag that cannot reach the key **fails** rather than
+publishing an unsigned checksum file; a dispatched dry run, which produces a draft nobody can
+install, warns and continues.
+
+**Provenance covers every asset, the runtime included.** The publishing job holds
+`contents: write` and runs no compiler and no third-party code: it downloads, re-verifies,
+signs the checksum file, attests and creates the release. The runtime archives need that split
+more than the CLI does, not less — they are the binaries that boot a VM on someone's machine.
+
+**None of this has been executed.** No tagged run has happened. Everything above is a set of
+workflows that parse, pass `actionlint` with no new findings, and whose shell was run locally
+against stand-in files — which is evidence about the scripts and none at all about how GitHub
+behaves.
 
 ---
 
@@ -366,12 +445,13 @@ bottle.
   syntax and read against Homebrew's source, nothing more;
 - no bottles, which means every install is a source build including a Go toolchain;
 - the guest kernel and rootfs, which the formula cannot build (no Docker, no Linux
-  cross-toolchain in a Homebrew build) and which are published nowhere. This is the gap that
-  makes a successful `brew install boks` still produce `guest image  fail`.
+  cross-toolchain in a Homebrew build). This is the gap that makes a successful
+  `brew install boks` still produce `guest image  fail`.
 
-The guest gap has a known fix that is not technical: attach `nerdbox-guest-arm64-*.tar.gz` to a
-release and add a `resource` block, spelled out in `packaging/homebrew/README.md`. It waits on
-the GPL decision.
+**The guest half of that gap is closed on the release side.** `release.yml` publishes
+`boks-guest_<v>_aarch64.tar.gz`, which is the file a Mac needs; what remains is the `resource`
+block in the formula, spelled out in `packaging/homebrew/README.md`, and that is a formula
+change rather than a CI one.
 
 **Cost of the install, as designed:** four commands, not one — `brew tap`, `brew trust
 dagsommer/boks`, `brew trust --formula libkrun/krun/libkrun`, `brew install boks`. Homebrew
@@ -390,8 +470,11 @@ remains is `virtio-net`: no Ethernet frame has crossed one on Windows, and Boks 
 a sandbox whose network policy it cannot enforce. A winget package today would install a binary
 whose only possible output is a refusal.
 
-**What we do not have:** a manifest; a release carrying a Windows binary (none is built for
-release); `krun.dll` as an artifact at all; a `mkfs.ext4` story.
+**What we do not have:** a winget manifest; a `mkfs.ext4` story. The two release-side items
+that used to be on this list are done: `release.yml` builds and publishes a `windows/amd64`
+`boks`, and `krun.dll` is now an artifact and ships inside
+`boks-runtime_<v>_windows_amd64.zip` along with the shim, containerd, `ctr` and
+`mkfs.erofs.exe`. Neither has been through a tagged run.
 
 **Code signing and SmartScreen.** The maintainer has decided not to spend on this yet, and the
 plan should state the consequence rather than argue with it. An unsigned installer triggers
@@ -575,16 +658,29 @@ containerd themselves; they no longer have to configure it.
 
 ### Release 1 — make the artifacts durable
 
-Purely CI work, no decisions:
+Purely CI work, no decisions. **Done, and unverified by execution** — see "How the runtime
+crosses a workflow boundary" above:
 
-1. **Attach the guest images to releases** instead of letting them expire at 30 days. Blocked
-   on the GPL decision, which is therefore the first thing to resolve.
-2. **Upload `krun.dll`** from `libkrun-windows.yml`, which already builds and validates it and
-   then throws it away.
-3. **Write the two missing Linux workflows** — `libkrun.so` and the Linux nerdbox shim. These do
-   not exist at all and nothing else can proceed without them.
+1. ~~**Attach the guest images to releases**~~ — `release.yml` calls `guest-image.yml` once per
+   architecture and publishes `boks-guest_<v>_<arch>.tar.gz`. The GPL question is answered by
+   shipping the corresponding-source pointer rather than by not shipping: every guest archive
+   carries a `SOURCE.txt` naming the exact nerdbox revision and the two `docker buildx bake`
+   commands that reproduce it, and the whole recipe is public. That satisfies the obligation for
+   a public recipe; it does not make the decision for anyone who thinks the obligation is
+   larger, and it is the one item here worth a second look before the first tag.
+2. ~~**Upload `krun.dll`**~~ — `libkrun-windows.yml` now stages it with a checksum and uploads
+   it, and `release.yml` puts it in the Windows archive.
+3. ~~**Write the two missing Linux workflows**~~ — `linux-runtime.yml` builds both, and
+   `release.yml` publishes them per architecture.
 4. **Publish a manifest** naming the exact revisions built together, so 5a's fourth row becomes
-   checkable.
+   checkable. **Still outstanding.** It is much cheaper now than it was: a tag build has every
+   pin in one run, so the manifest is a file that job writes rather than a cross-run
+   reconciliation.
+
+Also done here, though it belongs to no numbered item: **a `windows/amd64` CLI is built and
+published**. It was excluded on the grounds that libkrun had no Windows backend and a binary
+whose only output is a refusal is worse than none. That has not been true since 2026-08-15,
+when `boks run` completed unelevated on Windows 11 with the policy engine judging real traffic.
 
 ### Release 2 — the smallest honestly usable install
 
@@ -605,15 +701,19 @@ libkrun.so, nerdbox-kernel-*, nerdbox-rootfs.erofs}`, with `mkfs.erofs` still a 
 because distributions do package it (and `boks daemon` already degrades correctly when it is too
 old or absent).
 
-Prerequisite: Release 1's Linux workflows, and a first Linux end-to-end run — **no sandbox has
-yet booted on Linux**, and shipping a 130 MB package for an unverified path would be the same
-mistake as a winget package that can only refuse.
+Both prerequisites are now met on the release side. Release 1's Linux workflows exist and their
+output is a release asset, and a sandbox **has** booted on Linux: 2026-08-15, in WSL2 on Ubuntu
+26.04, 25 of 26 checks. Two caveats keep this from being a formality — that run was inside
+WSL2, with no bare-metal Linux result recorded, and `linux/arm64` has never been run at all, so
+half of what a package would ship is still unexercised. Shipping a 130 MB package for an
+unverified path would be the same mistake as a winget package that can only refuse.
 
 ### Release 4 — winget
 
-Gated on `virtio-net` on Windows, which is a `boks run` bar rather than a `ctr` bar. Then the
-manifest, a Windows release build, and the SmartScreen decision — which can stay "no" without
-blocking anything.
+The `virtio-net` gate is passed: on 2026-08-15 `boks run` completed unelevated on Windows 11
+with the policy engine judging real traffic, which is the `boks run` bar rather than the `ctr`
+one. A Windows release build now exists too. What is left is the manifest itself and the
+SmartScreen decision — which can stay "no" without blocking anything.
 
 ### Can wait, indefinitely
 
@@ -629,8 +729,14 @@ blocking anything.
 
 ### The one decision blocking the most
 
-**Whether to distribute a compiled GPL-2.0 guest kernel.** It blocks Release 1, which blocks
-Releases 2 and 3. It is not a technical problem — `scripts/build-nerdbox-guest.sh` produces both
-files in about four minutes on an ordinary Linux runner, and the recipe is entirely public, so
-satisfying the corresponding-source obligation is a matter of publishing it alongside. It is the
-owner's call, and every packaging route waits on it.
+**Whether to distribute a compiled GPL-2.0 guest kernel.** It used to block Release 1, and
+through it Releases 2 and 3. `release.yml` now publishes the guest, on the reading that the
+corresponding-source obligation is satisfied by publishing the recipe alongside: it is entirely
+public — `scripts/build-nerdbox-guest.sh` and nerdbox's bake targets produce both files in about
+four minutes on an ordinary Linux runner — and every guest archive carries a `SOURCE.txt` naming
+the exact revision and the commands.
+
+**That is an implementation of a reading, not a legal opinion, and it was made by CI rather
+than by the owner.** If the owner's reading is that the obligation needs more than a pointer —
+an offer valid for three years, or the sources hosted by us rather than by upstream — the fix is
+one job in `release.yml`, and it is much easier to make before the first tag than after.
