@@ -1,0 +1,47 @@
+#| Lines beginning "#|" are notes to us and are stripped by render.sh. Everything else is
+#| the manifest a winget-pkgs moderator reads, and it is kept short on purpose: rationale
+#| belongs in packaging/winget/README.md, not in a file submitted to someone else's repo.
+#|
+#| InstallerType: zip + NestedInstallerType: portable
+#|     Boks is a CLI, and the Windows artifact is a bundle rather than a lone binary: the
+#|     CLI ships beside containerd, the nerdbox shim, krun.dll and the guest images,
+#|     because Boks orchestrates a stack it does not contain. A zip is the only archive
+#|     type winget unpacks, and `portable` is the only nested type that suits a CLI.
+#|
+#| No ArchiveBinariesDependOnPath
+#|     Setting it true would put the whole extracted directory on the user's PATH —
+#|     containerd.exe and ctr.exe included, shadowing a containerd they installed on
+#|     purpose. Omitting it makes winget create one alias, `boks`, and leave the rest
+#|     invisible. Boks finds its own bundle without PATH's help: internal/daemon/locate.go
+#|     resolves the executable, follows the symlink, and searches the directory it lands in.
+#|
+#| MinimumOSVersion: 10.0.22000.0
+#|     Windows 11 RTM. The Windows Hypervisor Platform predates it, but Windows 11 is the
+#|     only thing this stack has ever been run on (docs/verification.md), so this is the
+#|     floor we can state rather than the floor that might work.
+#|
+#| x64 only
+#|     There is no Windows arm64 build. libkrun's WHP backend here is x86_64, and so is the
+#|     guest kernel that has booted under it.
+# Created by packaging/winget/render.sh in github.com/dagsommer/boks
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+
+PackageIdentifier: dagsommer.boks
+PackageVersion: {{VERSION}}
+InstallerType: zip
+NestedInstallerType: portable
+Platform:
+- Windows.Desktop
+MinimumOSVersion: 10.0.22000.0
+Commands:
+- boks
+ReleaseDate: {{RELEASE_DATE}}
+Installers:
+- Architecture: x64
+  NestedInstallerFiles:
+  - RelativeFilePath: boks_{{VERSION}}_windows_amd64/boks.exe
+    PortableCommandAlias: boks
+  InstallerUrl: https://github.com/dagsommer/boks/releases/download/v{{VERSION}}/boks_{{VERSION}}_windows_amd64.zip
+  InstallerSha256: {{INSTALLER_SHA256}}
+ManifestType: installer
+ManifestVersion: 1.12.0
