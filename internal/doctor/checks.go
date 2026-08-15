@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -144,7 +143,7 @@ func snapshotterToolsCheckWith(probe versionProbe) Check {
 			found := map[string]string{}
 			var paths []string
 			for _, binary := range required {
-				path, err := exec.LookPath(binary)
+				path, err := lookPath(binary)
 				if err != nil {
 					missing = append(missing, binary)
 					continue
@@ -201,7 +200,7 @@ func runtimeShimCheck() Check {
 				}
 			}
 
-			path, err := exec.LookPath(binary)
+			path, err := lookPath(binary)
 			if err != nil {
 				return Result{
 					Status: StatusFail,
@@ -232,7 +231,7 @@ func hypervisorLibraryCheck() Check {
 	return Check{
 		Name: "hypervisor library",
 		Run: func(ctx context.Context, env Env) Result {
-			return hypervisorLibraryResult(runtime.GOOS, runtime.GOARCH, os.Getenv, hostLibraryFS())
+			return hypervisorLibraryResult(runtime.GOOS, runtime.GOARCH, shimGetenv, hostLibraryFS())
 		},
 	}
 }
@@ -342,7 +341,7 @@ func guestImageCheck() Check {
 	return Check{
 		Name: "guest image",
 		Run: func(ctx context.Context, env Env) Result {
-			return guestImageResult(nerdboxSearchPaths(runtime.GOOS, os.Getenv))
+			return guestImageResult(nerdboxSearchPaths(runtime.GOOS, shimGetenv))
 		},
 	}
 }
