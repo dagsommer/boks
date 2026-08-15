@@ -391,6 +391,30 @@ A sandbox created before Boks had network annotations runs on the runtime's defa
 (libkrun's TSI), where the guest's `127.0.0.1` is the host's and no policy can be applied to
 it at all. Boks warns about this by name. Recreate it.
 
+### `boks run` refuses `--cpus`, `--memory`, `-t`, `--env` or `--annotation`
+
+Those describe the VM and the container: the vCPU count and the memory size are annotations
+the runtime reads when it builds the machine, the image is the snapshot the filesystem came
+from, and the environment is written into the container's OCI process spec. All of it is
+written once, when the sandbox is created, and never revisited — so on a re-attach the flag
+cannot be applied at all.
+
+It used to be dropped in silence. `boks run --cpus 2` against a sandbox created with
+`--cpus 8` ran with eight vCPUs and said nothing, which the guest confirms in `dmesg`
+(`smp: Brought up 1 node, 8 CPUs`) and in the per-CPU columns of `/proc/interrupts`. Now the
+run stops, names every such flag you passed and the value the sandbox actually has, and points
+at the way to change it:
+
+```bash
+boks rm <name>                      # then run again with the flags you want
+boks run --name <other> ...         # or build a second sandbox beside it
+boks inspect <name>                 # what this one was created with
+```
+
+Passing the values the sandbox already has is not a disagreement and re-attaches in silence,
+so a command line that created a sandbox keeps working unchanged. To give one command a
+variable without rebuilding anything, use `boks exec -e KEY=VALUE <name> ...`.
+
 ### Nothing answers on a published port
 
 The service inside the sandbox is bound to the *guest's* own `127.0.0.1`. It has to listen on
