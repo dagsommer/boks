@@ -14,12 +14,21 @@
 #
 # WHAT THIS JOB PROVES. It compiles every crate for Windows and links the cdylib, so a
 # regression in the patch series or a drifted pin stops a merge. It proves the artifact
-# builds and exports what nerdbox will look for — it does not prove a VM can start.
+# builds and exports what nerdbox will look for — it does not prove a VM can start. A VM has
+# since started, repeatedly, on real Windows 11 hardware: `boks run` completed unelevated on
+# 2026-08-15 with the policy engine judging real traffic (docs/verification.md). None of that
+# was established here, and nothing here would have caught the four defects those runs found.
+#
+# WHAT IT SHIPS. `krun.dll`, as an artifact and — through release.yml, which calls this
+# workflow — as a release asset. It used to be built, size-checked, symbol-checked and then
+# thrown away, which made this the one Windows piece a user could not obtain at all.
 #
 # Triggers: this is a Rust build of a large workspace and it is slow, so it does not run on
 # pushes that have nothing to do with it. Only a change to the patches, the pin, or this file
 # can start it — plus `workflow_dispatch` for when you want to know whether upstream still
-# applies.
+# applies, and `workflow_call` so release.yml can build the DLL at the tag rather than
+# fetching one built from some other commit. A `paths:` filter constrains only the event it
+# is written under, so `workflow_call` is unaffected by the two above it.
 name: libkrun-windows
 
 on:
@@ -33,12 +42,19 @@ on:
       - "packaging/libkrun-windows/**"
       - ".github/workflows/libkrun-windows.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` is the CALLER's workflow name when this runs as a reusable workflow, so a
+# release build and a direct run of this workflow on the same ref land in different groups. It
+# matters because `cancel-in-progress` is on: without it, a `workflow_dispatch` of release.yml
+# on `main` and a push-triggered run of this file on `main` would cancel each other, and the
+# one that dies would be the release. If that assumption about `github.workflow` is ever wrong
+# the group collapses to what it was before, which is today's behaviour rather than a new bug.
 concurrency:
-  group: libkrun-windows-${{ github.ref }}
+  group: ${{ github.workflow }}-libkrun-windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -156,10 +172,13 @@ jobs:
       # `complete_cpuid`. Asking whether a crate the Windows build never uses compiles is a
       # question with no consequence either way.
       #
-      # READ THE GREEN HONESTLY. Everything here is compile- and link-time evidence. No VM has
-      # ever been started on Windows by this project, the WHP backend has never executed an
-      # instruction, and not one Ethernet frame has crossed the virtio-net device. A green run
-      # means the artifact exists and exports what its consumer will look for. Nothing more.
+      # READ THE GREEN HONESTLY. Everything here is compile- and link-time evidence, and the
+      # history of this series says exactly how little that is worth on its own: every defect
+      # that has actually stopped a Windows boot — the misaligned WHP register struct, the
+      # frozen APIC timer, the IOAPIC pins the MPTable never described, a CMOS device with no
+      # clock in it — was found by running a guest, and every one of them was present in a
+      # binary this job had already passed. A green run means the artifact exists and exports
+      # what its consumer will look for. Nothing more.
       # ---------------------------------------------------------------------------------
       - name: Link krun.dll and check the exports a boot depends on
         working-directory: libkrun
@@ -214,6 +233,29 @@ jobs:
           fi
           echo "all 20 symbols nerdbox binds are exported"
 
+      # The DLL was built, measured and asserted against, and then discarded — so the one
+      # piece of the Windows runtime a user cannot build without an MSVC toolchain and a Rust
+      # workspace was the one piece CI refused to hand over. It is staged under a bare
+      # `krun.dll`, which is the name nerdbox's loader passes to LoadLibrary.
+      #
+      # SHA256SUMS travels with it because release.yml checks it on the far side of the
+      # artifact transport before laying the file into a release archive. A file that arrives
+      # truncated is otherwise perfectly plausible right up until a machine tries to load it.
+      - name: Stage krun.dll with its checksum
+        working-directory: libkrun
+        run: |
+          set -euo pipefail
+          mkdir -p _out
+          cp target/x86_64-pc-windows-msvc/release/krun.dll _out/krun.dll
+          (cd _out && sha256sum krun.dll >SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: krun-dll-windows-amd64
+          path: libkrun/_out/*
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Record how far the port got
         if: always()
         run: |
@@ -225,6 +267,15 @@ jobs:
             echo
             echo "Every crate compiles and \`krun.dll\` links with \`blk,net\`."
             echo
-            echo "This is compile- and link-time evidence only. No VM has been started on"
-            echo "Windows, and no frame has crossed the virtio-net device."
+            echo '```'
+            (cd libkrun/_out && cat SHA256SUMS) 2>/dev/null || echo "(build failed)"
+            echo '```'
+            echo
+            echo "This job's evidence is compile- and link-time only: the artifact exists and"
+            echo "exports all 20 symbols nerdbox resolves eagerly at load. It starts no VM —"
+            echo "GitHub's Windows runners are themselves virtualised and there is no WHP"
+            echo "partition to be had. A DLL built here HAS since run on real hardware:"
+            echo "\`boks run\` completed unelevated on Windows 11 on 2026-08-15, with the"
+            echo "policy engine judging real traffic. See docs/verification.md — and note that"
+            echo "every defect those runs found was already present in a binary this job passed."
           } >>"$GITHUB_STEP_SUMMARY"

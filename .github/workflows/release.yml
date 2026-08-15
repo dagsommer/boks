@@ -1,4 +1,5 @@
-# Build the boks binaries and packages for a release tag, and publish them.
+# Build the boks binaries, the packages, and the runtime a sandbox actually needs, and
+# publish all of it against one tag.
 #
 # This workflow deliberately mirrors the shape of images.yml — resolve the version once,
 # build without a credential, publish with one — for the reason given on that file's `push`
@@ -9,20 +10,47 @@
 #
 # What is built, and what is not:
 #
-#   darwin/arm64   the only verified platform. See docs/verification.md.
-#   linux/amd64    builds and passes its tests; no sandbox has ever been booted on Linux.
-#   linux/arm64    the same, plus .deb and .rpm for both Linux architectures.
+#   darwin/arm64   verified end to end: the VM boundary and the network policy were both
+#                  measured there. See docs/verification.md.
+#   linux/amd64    verified end to end on 2026-08-15, in WSL2 on Ubuntu 26.04 — 25 of 26
+#                  checks passed, and the one failure was the tester's own and was proved
+#                  so. No bare-metal Linux run is recorded.
+#   linux/arm64    builds and passes its tests; nothing has ever been run on it.
+#   windows/amd64  verified end to end on 2026-08-15, unelevated: `boks run` boots a Linux
+#                  guest through WHP, the policy engine judges real traffic, and teardown
+#                  leaves nothing. One machine, `--net nat`.
 #
 #   darwin/amd64   not shipped. `boks doctor` hard-fails on Intel Macs with "no supported
 #                  hypervisor on amd64" and always will: libkrun uses Hypervisor.framework
 #                  in a configuration that needs Apple silicon.
-#   windows/amd64  not shipped. `GOOS=windows go build ./...` succeeds, and that is the
-#                  whole of it — libkrun has no Windows virtio-net backend, so a sandbox
-#                  cannot get the NIC Boks enforces policy on, and there is no VMM behind
-#                  the shim to boot one anyway. See docs/windows.md. A binary whose only
-#                  possible output is a refusal is worse than no binary: it makes the
-#                  platform look supported and moves the disappointment later. The Windows
-#                  answer today is the linux/amd64 build inside WSL2.
+#   windows/arm64  not shipped. The CLI cross-builds, but there is no runtime under it:
+#                  krun.dll is built for x86_64-pc-windows-msvc only, and mkfs.erofs.exe
+#                  has no aarch64 recipe (go-erofs cross-compiles for x86-64 alone). A
+#                  binary whose only possible output is a refusal makes the platform look
+#                  supported and moves the disappointment later.
+#
+# ---------------------------------------------------------------------------------------
+# THE RUNTIME, AND HOW IT GETS HERE
+#
+# A `boks` binary on its own cannot start a sandbox. It needs a nerdbox shim, a libkrun,
+# and a guest kernel and rootfs; on Windows it also needs a patched containerd, `ctr` and
+# `mkfs.erofs.exe`. Every one of those is built by another workflow in this directory, and
+# until now every one of them expired as an artifact — see docs/distribution.md, "How the
+# runtime crosses a workflow boundary".
+#
+# Those workflows are now REUSABLE, and this one CALLS them. `actions/download-artifact`
+# cannot reach another workflow's run without a run id and a token, and the alternative —
+# `gh run download` from the latest green run on `main` — would publish bytes built from
+# some other commit than the tag. A called workflow runs at the caller's ref and uploads
+# into the caller's run, so the artifacts here are provably the tag's, and a plain
+# `download-artifact` can see them.
+#
+# The cost is that a tag build now compiles libkrun for Windows, which is slow. A tag is
+# rare; a release whose runtime came from an unknown commit is a permanent problem.
+#
+# The `paths:` filters on those workflows are not an obstacle: a path filter constrains the
+# event it is written under, and `workflow_call` is a different event with no filter.
+# ---------------------------------------------------------------------------------------
 name: release
 
 on:
@@ -57,7 +85,8 @@ jobs:
         run: echo "version=$(scripts/image-tag.sh)" >>"$GITHUB_OUTPUT"
 
   # A tag whose tree does not pass its own tests must not become a release. This is the
-  # cheapest possible gate and it runs before anything is built.
+  # cheapest possible gate and it runs before anything is built — including, now, before the
+  # runtime workflows, so a failing test costs seconds rather than a Windows Rust build.
   check:
     runs-on: ubuntu-24.04
     steps:
@@ -100,6 +129,8 @@ jobs:
             goarch: amd64
           - goos: linux
             goarch: arm64
+          - goos: windows
+            goarch: amd64
     steps:
       # The default shallow checkout is enough: build-release.sh takes SOURCE_DATE_EPOCH
       # from `git log -1`, which the tip commit satisfies.
@@ -136,12 +167,252 @@ jobs:
           retention-days: 7
           compression-level: 0 # tarballs, debs and rpms are already compressed
 
+  # ---------------------------------------------------------------------------------------
+  # The runtime. Five calls into the workflows that already build these pieces, so nothing
+  # here duplicates a build recipe — if one of those workflows is wrong, it is wrong in one
+  # place and both its own runs and this one are wrong together.
+  #
+  # Each is gated on `check` rather than on `version`: they build no Boks code and do not
+  # need the version string, but a tag whose tests fail should not spend forty minutes
+  # compiling libkrun. They keep `contents: read`, matching what each declares for itself.
+  # ---------------------------------------------------------------------------------------
+
+  # libkrun.so and containerd-shim-nerdbox-v1 for linux/amd64 and linux/arm64.
+  runtime-linux:
+    needs: check
+    permissions:
+      contents: read
+    uses: ./.github/workflows/linux-runtime.yml
+
+  # The guest kernel and EROFS rootfs. One call per guest architecture, because the recipe
+  # builds one at a time; the artifact names carry the architecture, so they do not collide.
+  runtime-guest:
+    needs: check
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    uses: ./.github/workflows/guest-image.yml
+    with:
+      arch: ${{ matrix.arch }}
+
+  # krun.dll. Slow — a full Rust workspace on a Windows runner.
+  runtime-krun-dll:
+    needs: check
+    permissions:
+      contents: read
+    uses: ./.github/workflows/libkrun-windows.yml
+
+  # containerd-shim-nerdbox-v1.exe.
+  runtime-windows-shim:
+    needs: check
+    permissions:
+      contents: read
+    uses: ./.github/workflows/nerdbox-windows.yml
+
+  # containerd.exe, ctr.exe, mkfs.erofs.exe, and the configuration and root-creation script
+  # that an unelevated containerd on Windows does not work without.
+  runtime-windows-containerd:
+    needs: check
+    permissions:
+      contents: read
+    uses: ./.github/workflows/containerd-windows.yml
+
+  # ---------------------------------------------------------------------------------------
+  # Lay the runtime pieces out the way a user needs them and name them after the tag.
+  #
+  # This job compiles nothing and holds no credential, exactly like `build`. It is separate
+  # from `publish` for the same reason `build` is: the job that writes bytes and the job that
+  # holds `contents: write` are not the same job.
+  #
+  # Every incoming artifact is checked against the checksums its producing workflow wrote
+  # before anything is copied out of it, and every asset this job writes gets a `.sha256`
+  # that `publish` checks again. That is the same chain the CLI tarballs already have, one
+  # hop longer.
+  # ---------------------------------------------------------------------------------------
+  assemble:
+    needs:
+      [
+        version,
+        runtime-linux,
+        runtime-guest,
+        runtime-krun-dll,
+        runtime-windows-shim,
+        runtime-windows-containerd,
+      ]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      # For packaging/nerdbox/NERDBOX_REV, which names the guest kernel's source revision.
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: boks-runtime-linux-amd64
+          path: in/linux-amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: boks-runtime-linux-arm64
+          path: in/linux-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: nerdbox-guest-x86_64
+          path: in/guest-x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: nerdbox-guest-aarch64
+          path: in/guest-aarch64
+      - uses: actions/download-artifact@v4
+        with:
+          name: krun-dll-windows-amd64
+          path: in/krun-dll
+      - uses: actions/download-artifact@v4
+        with:
+          name: containerd-shim-nerdbox-v1-windows
+          path: in/windows-shim
+      - uses: actions/download-artifact@v4
+        with:
+          name: containerd-windows-amd64-bundle
+          path: in/windows-containerd
+
+      # Not ceremony. Seven artifacts from five workflows and eight separate runners are being
+      # merged here for the first time, and a truncated download or a mixed-up architecture is
+      # invisible afterwards — an amd64 libkrun.so in the arm64 archive looks perfectly
+      # well-formed and fails at `dlopen` on a user's machine. Each producing workflow wrote a
+      # SHA256SUMS next to its own output; this checks all of them before a byte is copied.
+      - name: Verify every incoming artifact against the checksums its builder wrote
+        run: |
+          set -euo pipefail
+          for d in in/*/; do
+            if [ ! -f "$d/SHA256SUMS" ]; then
+              echo "$d has no SHA256SUMS — its producing workflow must write one" >&2
+              exit 1
+            fi
+            echo "::group::$d"
+            (cd "$d" && sha256sum -c SHA256SUMS)
+            echo "::endgroup::"
+          done
+
+      - name: Lay out the release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage
+
+          # The Linux bundles are already the right set of files; they are only renamed for
+          # the tag and given a top-level directory, the way the CLI tarballs are.
+          for arch in amd64 arm64; do
+            d="stage/boks-runtime_${VERSION}_linux_${arch}"
+            mkdir -p "$d"
+            cp -a "in/linux-$arch/." "$d/"
+          done
+
+          # The guest. The file names are NOT hardcoded: nerdbox's own bake recipe decides
+          # them, they have been spelled at least two ways in this repository's own notes
+          # (nerdbox-rootfs.erofs and nerdbox-rootfs-<arch>.erofs), and getting the guess
+          # wrong here would silently ship an archive missing the rootfs. Whatever the
+          # producing workflow put in the artifact is what goes in.
+          rev="$(grep -v '^[[:space:]]*#' boks/packaging/nerdbox/NERDBOX_REV | tr -d '[:space:]')"
+          for arch in x86_64 aarch64; do
+            d="stage/boks-guest_${VERSION}_${arch}"
+            mkdir -p "$d"
+            cp -a "in/guest-$arch/." "$d/"
+            # The guest kernel is Linux, so it is GPL-2.0, and nerdbox patches it. Shipping
+            # the compiled result carries a corresponding-source obligation; the recipe is
+            # entirely public, so the obligation is met by saying precisely which recipe.
+            cat >"$d/SOURCE.txt" <<SRC
+          The kernel in this archive is Linux, licensed GPL-2.0, built from the recipe in
+          containerd/nerdbox at revision:
+
+            $rev
+            https://github.com/containerd/nerdbox/tree/$rev
+
+          Reproduce it with, from a checkout of that revision:
+
+            KERNEL_ARCH=$arch DESTDIR=./_output docker buildx bake kernel
+            KERNEL_ARCH=$arch DESTDIR=./_output docker buildx bake rootfs
+
+          That recipe names the exact kernel tarball, configuration and patch series used.
+          The pin is recorded in packaging/nerdbox/NERDBOX_REV in dagsommer/boks, and this
+          archive was built by .github/workflows/guest-image.yml.
+          SRC
+            ls -l "$d"
+          done
+
+          # Windows: one directory, because every piece is useless without the others and a
+          # tester collecting them from three artifacts spends the session debugging a
+          # missing file. containerd's bundle already carries the config, the root-creation
+          # script and the pre-formatted writable layer.
+          d="stage/boks-runtime_${VERSION}_windows_amd64"
+          mkdir -p "$d"
+          cp -a in/windows-containerd/. "$d/"
+          cp in/krun-dll/krun.dll "$d/"
+          # RENAMED, and this matters. nerdbox-windows.yml builds both architectures and so
+          # suffixes them; containerd resolves a runtime id to a binary NAME, so
+          # io.containerd.nerdbox.v1 looks for containerd-shim-nerdbox-v1.exe exactly. A shim
+          # shipped under its build name is a shim containerd will report as missing.
+          cp in/windows-shim/containerd-shim-nerdbox-v1-amd64.exe \
+            "$d/containerd-shim-nerdbox-v1.exe"
+          ls -l "$d"
+
+          # Every archive carries a SHA256SUMS covering everything actually in it, replacing
+          # whichever partial one came in with an artifact. The incoming ones are wrong by
+          # construction after this job has finished with them — the Windows directory has
+          # gained a krun.dll and a renamed shim, the guest directories a SOURCE.txt — and a
+          # checksum file that silently omits half the archive is worse than none.
+          for d in stage/*/; do
+            (cd "$d" && rm -f SHA256SUMS && files=(*) && sha256sum -- "${files[@]}" >SHA256SUMS)
+            echo "::group::$d"
+            cat "$d/SHA256SUMS"
+            echo "::endgroup::"
+          done
+
+      - name: Archive them, and write a checksum for each
+        run: |
+          set -euo pipefail
+          cd stage
+          for d in boks-runtime_*_linux_* boks-guest_*; do
+            # Sorted, ownerless, epoch timestamps: the same inputs give the same archive.
+            # That is a property of the packing, not of the builds inside it — libkrun and
+            # the guest kernel are not claimed to be reproducible.
+            tar --sort=name --numeric-owner --owner=0 --group=0 --mtime=@0 \
+              -cf - "$d" | gzip -9n >"../dist/$d.tar.gz"
+          done
+          # zip for Windows, because that is what a Windows machine opens without being told
+          # how. -X drops the platform-specific extra fields; it does not make the archive
+          # reproducible — zip records real mtimes and directory order — and nothing here
+          # claims it is. The SHA256SUMS inside the archive is what a suspicious reader
+          # checks, and it is over the files rather than over the container.
+          for d in boks-runtime_*_windows_*; do
+            TZ=UTC zip -qrX "../dist/$d.zip" "$d"
+          done
+          cd ../dist
+          for f in *; do sha256sum "$f" >"$f.sha256"; done
+          ls -l
+          cat -- *.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-runtime
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0 # already compressed
+
   # The job that holds the credential. It compiles nothing and runs no third-party code: it
-  # downloads what `build` produced, re-verifies every checksum, and creates a release.
-  # Keeping it separate is the whole point — `contents: write` never coexists with a
-  # compiler and someone else's module graph in the same runner.
+  # downloads what `build` and `assemble` produced, re-verifies every checksum, signs the
+  # combined SHA256SUMS, and creates a release. Keeping it separate is the whole point —
+  # `contents: write` never coexists with a compiler and someone else's module graph in the
+  # same runner. That now covers the runtime too, which needs it more than the CLI does:
+  # these are the binaries that boot VMs on someone's machine.
   publish:
-    needs: [version, build]
+    needs: [version, build, assemble]
     if: github.ref_type == 'tag' || inputs.publish
     runs-on: ubuntu-24.04
     permissions:
@@ -159,18 +430,58 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          # The per-file sums were written next to each artifact by the build job. Checking
-          # them here proves the bytes that will be published are the bytes that were built,
-          # rather than trusting the artifact upload to have been lossless.
+          # The per-file sums were written next to each artifact by the build and assemble
+          # jobs. Checking them here proves the bytes that will be published are the bytes
+          # that were built, rather than trusting the artifact upload to have been lossless.
           for sum in *.sha256; do sha256sum -c "$sum"; done
           rm -f -- *.sha256
           sha256sum -- * | sort -k2 >SHA256SUMS
           cat SHA256SUMS
 
+      # Binaries are NOT signed — no Authenticode certificate, no Developer ID — and that is
+      # a decision, not an oversight: it costs money and buys a first-run dialog. What is
+      # signed is the checksum file, with the same key packaging/apt/ already uses for the
+      # repository index, so there is one key to publish and one to rotate rather than two.
+      # A detached armored signature over SHA256SUMS covers every asset transitively.
+      - name: Sign SHA256SUMS with the archive key
+        working-directory: dist
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          GPG_KEY_FPR: ${{ secrets.APT_GPG_KEY_FPR }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            # A real tag must not ship an unsigned checksum file. A dispatched dry run may,
+            # because it produces a draft nobody can install and the key is deliberately
+            # held in one place only — see packaging/apt/README.md.
+            if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+              echo "APT_GPG_PRIVATE_KEY is unset — see packaging/apt/README.md" >&2
+              exit 1
+            fi
+            echo "::warning::no signing key available; publishing without SHA256SUMS.asc"
+            exit 0
+          fi
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          signer=()
+          if [ -n "${GPG_KEY_FPR:-}" ]; then
+            signer=(--local-user "$GPG_KEY_FPR")
+          fi
+          gpg --batch --yes --armor --detach-sign "${signer[@]}" \
+            --output SHA256SUMS.asc SHA256SUMS
+          # Verify what was just written, against the key that was just imported. This
+          # catches an empty or truncated secret, which otherwise produces a file that looks
+          # like a signature and satisfies nobody's `gpg --verify`.
+          gpg --batch --verify SHA256SUMS.asc SHA256SUMS
+
       # Lets anyone run `gh attestation verify <file> --repo dagsommer/boks` and learn which
       # workflow, at which commit, produced the file they downloaded. Asking people to run
       # something that boots VMs on their machine and offering them no way to check where it
-      # came from would be a poor trade.
+      # came from would be a poor trade — and the runtime archives ARE the thing that boots
+      # the VM, so they are covered by the same glob rather than by a weaker promise.
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
@@ -193,30 +504,90 @@ jobs:
           ## Install
 
           See [docs/install.md](https://github.com/dagsommer/boks/blob/main/docs/install.md).
-          Read it before downloading: a `boks` binary on its own cannot start a sandbox, and
-          the document says exactly what else each platform needs.
+          Read it before downloading: a `boks` binary on its own cannot start a sandbox. This
+          release carries the rest — the shim, libkrun, the guest kernel and rootfs, and on
+          Windows a containerd — as separate archives, listed below.
 
           Run `boks doctor` first. It checks every prerequisite and prints what to do about
-          each gap.
+          each gap. `boks daemon start` writes containerd's configuration and supervises it.
 
-          ## Platforms
+          ## What is in this release
 
-          | Artifact | State |
+          | Asset | What it is |
           |---|---|
-          | `darwin_arm64` | The verified platform. The VM boundary and the network policy were both measured here — see [docs/verification.md](https://github.com/dagsommer/boks/blob/main/docs/verification.md). |
-          | `linux_amd64`, `linux_arm64` | Build and pass their tests. **No sandbox has ever been booted on Linux.** |
-          | `.deb`, `.rpm` | The CLI only. Neither can install containerd 2.2+ or nerdbox, because no distribution packages them at a usable version. |
+          | `boks_*.tar.gz` for `linux_amd64`, `linux_arm64`, `darwin_arm64` and `windows_amd64` | the CLI |
+          | `boks_*.deb`, `boks_*.rpm` | the CLI, packaged. `docs/install.md` says what a package puts on the machine. |
+          | `boks-runtime_*_linux_amd64.tar.gz`, `_linux_arm64.tar.gz` | `containerd-shim-nerdbox-v1` and `libkrun.so` |
+          | `boks-runtime_*_windows_amd64.zip` | `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer |
+          | `boks-guest_*_x86_64.tar.gz`, `_aarch64.tar.gz` | the guest kernel and EROFS rootfs a sandbox boots |
 
-          There is no Windows binary, and no Intel macOS binary. Neither can start a sandbox;
-          see the comment at the top of `.github/workflows/release.yml` for why shipping one
-          anyway would be worse than shipping none.
+          The Windows **CLI** comes as a `.tar.gz` like every other platform's, because
+          Windows 10 and later ship `tar`: `tar -xf boks_*_windows_amd64.tar.gz` works in an
+          ordinary shell. The Windows **runtime** is a `.zip`, because it is the archive a
+          Windows machine opens without being told how.
+
+          **macOS has no runtime archive, on purpose.** libkrun needs the
+          `com.apple.security.hypervisor` entitlement, and Homebrew's source build is what
+          re-signs the shim after relocating it — a pre-built binary would arrive without the
+          entitlement and die inside libkrun with `krun_start_enter failed: -22`, an error
+          naming neither code signing nor the entitlement. Use `brew install boks`. The
+          `aarch64` guest archive above is the same file a Mac needs.
+
+          ## Platforms — what has actually been run
+
+          The table is the point of this project's `docs/verification.md`, and it distinguishes
+          what was measured from what was assumed. It is reproduced honestly here.
+
+          | Platform | State |
+          |---|---|
+          | `darwin_arm64` | **Verified.** The VM boundary and the network policy were both measured here: a Linux guest on a Darwin host, its own `boot_id`, uptime and vCPU count, and a policy that refuses a raw TLS handshake to a denied address while an allowed one completes with the origin's own certificate. |
+          | `linux_amd64` | **Verified end to end on 2026-08-15**, in WSL2 on Ubuntu 26.04 — 25 of 26 checks passed, including the network boundary with its positive control. The single failure was the tester's own file ownership and was proved so. **No bare-metal Linux run is recorded.** |
+          | `linux_arm64` | Builds and passes its tests. **Nothing has ever been run on it.** |
+          | `windows_amd64` | **Verified end to end on 2026-08-15, unelevated.** `boks run` boots a Linux guest through the Windows Hypervisor Platform, the policy engine allows `github.com` and refuses `example.com` on real traffic, TLS completes, and `boks stop` / `boks rm` leave nothing behind. One machine, `--net nat`. |
+
+          ## What is *not* proven
+
+          - **No bare-metal Linux run.** The Linux verification was inside WSL2. Nothing says a
+            distribution kernel with `/dev/kvm` behaves the same.
+          - **`linux_arm64` has never been run** — neither the CLI nor the runtime archive.
+          - **On Linux, sandbox creation still needed more privilege than an ordinary user
+            had**: Boks host-mounts an overlay to read the image config, which failed with
+            `operation not permitted`. Expect to hit that.
+          - **The shim needs containerd 2.3 or newer, and no distribution ships one.** It emits
+            version-3 bootstrap parameters; a 2.2 daemon cannot decode them and fails with
+            `unsupported protocol: Yunix`, which names no version, no shim and no protocol.
+            This was measured against Ubuntu's 2.2.2. `boks doctor` now warns about the skew.
+          - **`windows_arm64` and Intel macOS are not shipped at all**, and cannot be: there is
+            no `krun.dll` or `mkfs.erofs.exe` for aarch64 Windows, and libkrun on macOS needs
+            Apple silicon.
+          - **Nothing in the runtime archives was executed by CI.** The workflows compile,
+            link, and read the built binaries back — architectures, exported symbols, linked
+            plugins — on runners with no hypervisor. That is load-time and link-time evidence.
+            The end-to-end results above were obtained on real hardware, by hand.
 
           ## Verifying what you downloaded
 
+          Nothing here is code-signed: no Authenticode certificate, no Developer ID. Windows
+          will show SmartScreen's "Windows protected your PC". What *is* signed is the checksum
+          file, with the archive key in
+          [`packaging/apt/`](https://github.com/dagsommer/boks/tree/main/packaging/apt)
+          (fingerprint `D5DD07C0F9589C164F7361C20EB93D3C39471E1E`).
+
           ```
+          curl -fsSL https://raw.githubusercontent.com/dagsommer/boks/main/packaging/apt/boks-archive-keyring.asc | gpg --import
+          gpg --verify SHA256SUMS.asc SHA256SUMS
           sha256sum -c SHA256SUMS --ignore-missing
           gh attestation verify <file> --repo dagsommer/boks
           ```
+
+          The attestation is the stronger of the two: it does not require trusting a key, and
+          it names the workflow and the commit that produced each file.
+
+          ## Source for the guest kernel
+
+          The guest archives contain a Linux kernel, which is GPL-2.0, patched by nerdbox. Each
+          carries a `SOURCE.txt` naming the exact upstream revision and the two `docker buildx
+          bake` commands that reproduce it.
           EOF
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
