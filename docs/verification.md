@@ -1324,6 +1324,68 @@ The create-time-fixed flags are hard errors now, each naming the requested value
 actual one — `--cpus 2` against an 8-vCPU sandbox, `--net none` against one wired for
 `nat`, `--memory 4g` against 2048 MiB.
 
+### Boks runs and enforces policy on Linux, 2026-08-15
+
+The platform Boks is designed for, verified end to end for the first time — in WSL2 on
+Ubuntu 26.04, which also settles the fallback route the documentation had recommended
+for a year without anyone running it. 25 of 26 checks pass.
+
+**It is a VM, and the evidence is the part that carries the argument on Linux.** Both
+host and guest are Linux, so a kernel version proves little:
+
+```
+host  boot_id  a7c70d34-…    guest boot_id  366323cf-…  (run a, --cpus 2)
+                             guest boot_id  03b3b119-…  (run b, --cpus 1)
+host  uptime   2344.89 s     guest uptime   1.31 s
+host  nproc    8             guest nproc    2 then 1, tracking --cpus
+```
+
+Three distinct boot ids, a guest older than nothing, and vCPU counts following the flag
+*downward* on an eight-core host. Neither `docker.sock` nor `containerd.sock` is visible
+inside.
+
+**The network boundary passes with its positive control.** With all eight proxy variables
+cleared, an explicitly allowed address completed TLS and returned **the origin's own
+Cloudflare certificate** — tunnelled, not intercepted — while `1.1.1.1:443` was refused in
+the same sandbox on the same cleared environment. UDP to an external resolver timed out,
+and the host's loopback listener was unreachable. Every decision is in `boks policy log`,
+with `example.com` appearing as `forward-bypass` on the name and `transparent` on the
+resolved address.
+
+**Three host-configuration blockers, none of them a Boks bug, and one contradicts a
+documented floor.**
+
+1. **containerd will not start unprivileged with a default config** — it chowns its ttrpc
+   socket to uid 0. `[ttrpc] uid/gid` set to the invoking user makes the chown a no-op.
+2. **The Linux diff-service default is `['walking']`**, and the walking differ untars into
+   a writable host mount, so a stacked erofs snapshot forces the template path and fails
+   with `lowerdir={{ mount 0 }}` unresolved. `default = ['erofs', 'walking']` unpacks all
+   seven layers. This is the exact twin of a bug already patched for Windows.
+3. **The shim needs containerd ≥ 2.3, not the documented 2.2.** It emits version-3
+   bootstrap parameters; a 2.2 daemon cannot decode them, falls back to treating the whole
+   protobuf reply as an address, and fails with `unsupported protocol: Yunix` — the three
+   leading control bytes rendering as letters. `go version -m` settles it: the shim links
+   containerd v2.3.3, Ubuntu ships 2.2.2. The floor in the docs was wrong and is corrected.
+
+**Still needing more privilege than Windows.** After the unpack succeeded as root,
+sandbox creation failed for the client as an ordinary user:
+
+```
+failed to mount /run/user/1000/containerd-mount…: mount source: "overlay", err: operation not permitted
+```
+
+That is **boks itself** host-mounting the image overlay to read the image config — the
+Linux twin of the Windows `invalid windows mount type: erofs`, which we answered there by
+substituting a metadata-only image-config path. Whether that substitution transfers to
+Linux is under investigation. Until it does, Linux needs privileges Windows no longer
+does, which is the wrong way round.
+
+**The single failure was the tester's own and was proved so.** `guest to host` write-through
+failed because the client ran as root, leaving the workspace `root:root 755` while the
+guest runs as uid 1000 and virtiofs passes uids through unmapped. Changing only the
+ownership — same binaries, same daemon — produced `WRITE OK` and the file on the host. Not
+a defect, and no source was changed to establish it.
+
 ### What was proven on the machine with no hypervisor
 
 So that the two are never confused, this is the whole of what the fix for check 6 has been

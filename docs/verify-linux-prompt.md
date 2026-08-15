@@ -47,7 +47,7 @@ Give this to the agent verbatim. It is written to be pasted.
 > **Setup.**
 >
 > 1. Clone the repository and `make build`. Boks needs Go 1.26 or later.
-> 2. Read `docs/get-started.md#prerequisites`. Boks needs a running containerd 2.2+, the
+> 2. Read `docs/get-started.md#prerequisites`. Boks needs a running containerd 2.3+, the
 >    `containerd-shim-nerdbox-v1` binary on *containerd's* `PATH` (the daemon's, not your
 >    shell's), libkrun 1.18+, and `mkfs.erofs` from erofs-utils **1.8 or later**. None of
 >    these are installed by the script and it will not install them for you.

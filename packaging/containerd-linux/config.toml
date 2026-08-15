@@ -1,0 +1,229 @@
+# containerd configuration for running Boks on Linux WITHOUT root.
+#
+# Pass it explicitly:
+#
+#     containerd --config ~/.config/boks/containerd.toml --log-level debug
+#
+# ########################################################################################
+# STATUS: DERIVED FROM SOURCE, NOT YET MEASURED ON HARDWARE.
+#
+# Every claim below is traced to containerd v2.3.3 and nerdbox source, named file and
+# symbol by symbol. None of it has been run end to end by anyone. The one measurement we
+# do have is the failure this file is meant to fix: on WSL2/Ubuntu 26.04, 2026-08-15, an
+# unprivileged containerd passed all eight `boks doctor` checks and then failed the image
+# pull with `operation not permitted` on a bind mount. Treat the fix as a prediction.
+# ########################################################################################
+
+version = 3
+
+# ---------------------------------------------------------------------------------------
+# A root, a state directory and a socket the invoking user owns.
+#
+# The defaults are /var/lib/containerd, /run/containerd and /run/containerd/containerd.sock,
+# none of which an ordinary user can create. Unlike Windows there is no DACL trap here —
+# containerd just needs somewhere it can write. Create these yourself, or let containerd
+# create them; either works as long as the parent is yours.
+#
+# `/var/run/containerd` is a SEPARATE problem and this file cannot fix it: containerd
+# derives the shim's socket path from a compile-time constant, so no setting moves it
+# (containerd#12444). You still need, once, as root:
+#
+#     sudo mkdir -p /var/run/containerd
+#     sudo chown "$(id -u):$(id -g)" /var/run/containerd
+#
+# See docs/install.md, "Then three things Homebrew cannot do for you".
+# ---------------------------------------------------------------------------------------
+root = '/home/YOU/.local/share/boks/containerd/root'
+state = '/home/YOU/.local/state/boks/containerd/state'
+
+# ---------------------------------------------------------------------------------------
+# Both sockets, both with a uid/gid.
+#
+# Setting only [grpc] leaves the ttrpc socket at its default path and containerd dies at
+# startup on `chown …containerd.sock.ttrpc: operation not permitted`. Point boks at the
+# grpc one:
+#
+#     export BOKS_CONTAINERD_ADDRESS=/home/YOU/.local/state/boks/containerd/containerd.sock
+# ---------------------------------------------------------------------------------------
+[grpc]
+  address = '/home/YOU/.local/state/boks/containerd/containerd.sock'
+  uid = 1000
+  gid = 1000
+
+[ttrpc]
+  address = '/home/YOU/.local/state/boks/containerd/containerd.sock.ttrpc'
+  uid = 1000
+  gid = 1000
+
+# ---------------------------------------------------------------------------------------
+# THE DIFF-SERVICE ORDER. This is the setting that makes the image pull work unprivileged.
+#
+# Upstream's Unix default is ['walking'] — one entry, and it is not the erofs differ
+# (plugins/services/diff/service_unix.go:21). Boks pulls with client.Pull +
+# WithPullUnpack (internal/sandbox/sandbox.go:344, :366-372), and client.Pull hands the
+# unpacker `Applier: c.DiffService()` (client/pull.go:123) — the daemon's diff service,
+# walked in THIS order. Boks never names a differ, so on a stock Linux daemon the erofs
+# differ is never asked, no matter how healthy `ctr plugins ls` looks.
+#
+# What the walking differ then does, given the erofs snapshotter's mounts:
+#
+#   first layer   -> snapshotter returns ONE mount {Type: "bind", Source: <snap>/fs}
+#                    (plugins/snapshots/erofs/erofs.go:377-386)
+#   walking differ-> core/diff/apply/apply_linux.go:34 matches neither the single-overlay
+#                    fast path nor the sync+bind case, so it falls through to
+#                    mount.WithTempMount at line 68 — a real bind(2) on the host.
+#   unprivileged  -> EPERM. That is the reported failure, and it is the WALKING differ's
+#                    bind mount, not the erofs differ's.
+#
+# What the erofs differ does instead: nothing. erofsDiff.Apply
+# (plugins/diff/erofs/differ.go:100) never mounts on any platform. It calls
+# erofsutils.MountsToLayer (internal/erofsutils/mount.go:141), which only reads the mount
+# DESCRIPTORS to work out a directory —
+#
+#     "mkfs/…" prefixed mount[0] -> filepath.Dir(mount[0].Source)   (block mode)
+#     last mount is bind/erofs   -> filepath.Dir(mount.Source)
+#     last mount is overlay      -> filepath.Dir(upperdir=…)        (non-block mode)
+#
+# — checks a `.erofslayer` marker in it, and then runs `mkfs.erofs --tar=f` writing
+# layer.erofs into that directory. A subprocess writing a file. No mount(2), no loop
+# device, no CAP_SYS_ADMIN, in EITHER mode. This was confirmed by running the same
+# mkfs.erofs invocation as an ordinary user (erofs-utils 1.9): it succeeds.
+#
+# Order matters and 'erofs' must come FIRST. It is the differ that declines politely:
+# shown a layer directory without `.erofslayer` it returns ErrNotImplemented
+# (internal/erofsutils/mount.go:180) and local.Apply's walk continues
+# (plugins/services/diff/local.go:120-124). Keeping 'walking' behind it costs nothing and
+# preserves pulls into any other snapshotter.
+#
+# No patch is needed for this on Linux: the erofs snapshotter, differ and mount handler
+# are already compiled into a stock daemon (cmd/containerd/builtins/builtins_linux.go:23,
+# :25, :27). It is configuration only.
+# ---------------------------------------------------------------------------------------
+[plugins.'io.containerd.service.v1.diff-service']
+  default = ['erofs', 'walking']
+
+# ---------------------------------------------------------------------------------------
+# BLOCK MODE. This setting does NOT fix the pull — see above, the pull is already fixed by
+# the differ order. It fixes the container RUN, which fails one step later.
+#
+# The mechanism is the same one that makes Windows work. The erofs snapshotter derives
+# `blockMode = config.defaultSize > 0` (plugins/snapshots/erofs/erofs.go:187) from a
+# platform default that is 64MiB off Linux (erofs_other.go:30) and ZERO on Linux
+# (erofs_linux.go:38). The two modes emit different mount descriptors:
+#
+#   default_size = 0 (Linux stock)   ... {Type: "format/mkdir/overlay",
+#                                         Options: [workdir=/<root>/snapshots/7/work,
+#                                                   upperdir=/<root>/snapshots/7/fs]}
+#   default_size = '64MiB'           ... {Type: "mkfs/ext4",  Source: <snap>/rwlayer.img},
+#                                        {Type: "format/mkdir/overlay",
+#                                         Options: [workdir={{ mount 0 }}/work,
+#                                                   upperdir={{ mount 0 }}/upper]}
+#
+# The `{{ mount 0 }}` templates are the whole difference. nerdbox's shim inspects them:
+# internal/shim/task/mount.go, the "overlay"/"format/overlay"/"format/mkdir/overlay" case,
+# returns ErrNotImplemented with `cannot use virtiofs for upper dir in overlay` when the
+# upperdir or workdir is a literal host path rather than a template. On Linux
+# (internal/shim/task/mount_linux.go:68-85) that error is caught and falls back to
+# mountutil.All — which mounts the erofs loop devices and the overlay ON THE HOST and
+# shares the result over virtiofs. Loop setup and overlay mount both need CAP_SYS_ADMIN.
+# mount_other.go has no such fallback, which is exactly why Windows never had this problem.
+#
+# With the templates present the transform succeeds and nothing is mounted on the host.
+# The guest gets, instead:
+#
+#   - the writable layer as a virtio-blk device (`ext4` case in transformMounts)
+#   - each erofs layer as a virtio-blk device, or one GPT-partitioned VMDK past 8 layers
+#   - the overlay descriptor passed through for vminitd to assemble inside the VM
+#
+# Nothing on the host path mounts. containerd's mount manager reaches the same conclusion
+# independently: nerdbox advertises `containerd.io/runtime-allow-mounts =
+# "mkdir/*,format/*,erofs"` (nerdbox pkg/shim/manager/manager.go:85), so in
+# core/mount/manager/manager.go:132 the erofs and format/mkdir mounts set no system-mount
+# boundary, the mkfs transform at index 0 sets firstSystemMount = 0, and `mounts[:0]` is
+# empty — the manager mounts nothing and passes every descriptor through to the shim. The
+# only host-side work left is the mkfs transform itself (core/mount/manager/mkfs.go:38):
+# truncate a file to size and run `mkfs.ext4 -q` on it. No loop device, no mount. Running
+# exactly that as an ordinary user was confirmed to succeed.
+#
+# In non-block mode the manager instead finds no boundary at all, returns
+# ErrNotImplemented, and every descriptor reaches the shim unchanged — straight into the
+# host-mount fallback above.
+#
+# Two side effects of block mode, both wanted:
+#
+#   * checkCompatibility is skipped (erofs.go:148-153). On Linux that check requires the
+#     erofs kernel module in /proc/filesystems and d_type on the backing filesystem
+#     (erofs_linux.go:49-63). In block mode the host never mounts erofs, so it needs
+#     neither — and `sudo modprobe erofs` stops being a prerequisite.
+#   * `mkfs.ext4` becomes a host requirement (e2fsprogs). Universally present on Linux;
+#     `boks doctor` checks only mkfs.erofs today.
+#
+# 64MiB matches the non-Linux default. It caps how much a container may write to its
+# writable layer, so raise it for workloads that write more than that.
+# ---------------------------------------------------------------------------------------
+[plugins.'io.containerd.snapshotter.v1.erofs']
+  default_size = '64MiB'
+
+# ---------------------------------------------------------------------------------------
+# Optional: mkfs.erofs options, as on Windows. --sort=none avoids a tar reordering pass on
+# erofs-utils >= 1.8.2; -T0 --mkfs-time makes layers reproducible. Left commented out
+# because they have not been measured here either.
+# ---------------------------------------------------------------------------------------
+# [plugins.'io.containerd.differ.v1.erofs']
+#   mkfs_options = ['-T0', '--mkfs-time', '--sort=none']
+
+# ---------------------------------------------------------------------------------------
+# What still needs privilege after all of the above, and what does not.
+#
+# Needs it, once, as root, and this file cannot help:
+#   * `sudo mkdir -p /var/run/containerd && sudo chown …` (compile-time shim socket path).
+#   * `/dev/kvm` readable and writable by you — usually `sudo usermod -aG kvm $USER`. On
+#     WSL2 also a udev-less chown; `boks doctor`'s virtualization check already says so.
+#
+# Does NOT need it, once this file is in force:
+#   * the content store and the pull — ordinary file writes.
+#   * the erofs differ's unpack — a `mkfs.erofs --tar=f` subprocess writing layer.erofs.
+#   * snapshot Commit — the erofs differ already produced layer.erofs, so the ext4 mount in
+#     commitBlock (erofs.go:611-618) is never reached. It IS reached if some other differ
+#     handled a layer, which is why the erofs differ must be first rather than merely
+#     present.
+#   * task creation — mkfs.ext4 on a file, then virtio-blk. The guest kernel does the
+#     erofs and overlay mounts, as root inside the VM.
+#
+# One cosmetic wart: snapshot Remove calls cleanupUpper -> mount.UnmountAll on a directory
+# that was never mounted (erofs_linux.go:90-95). umount2 checks CAP_SYS_ADMIN before it
+# checks whether the path is a mount point, so an unprivileged daemon gets EPERM rather
+# than the EINVAL that UnmountAll swallows (core/mount/mount_unix.go:114). Verified by
+# calling umount2 directly as an ordinary user on this machine. It is logged at Warn
+# inside a deferred func and the removal still succeeds — expect
+# `failed to cleanup upperdir` on every `boks rm`.
+# ---------------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------------------
+# Why NOT containerd's rootless mode, which `boks doctor` currently suggests.
+#
+# doctor's connect remedy (internal/doctor/checks.go:55-59) says "use a rootless
+# containerd, which is the recommended setup". That advice is right for the problem it
+# answers — reaching a root-owned SOCKET — and does not answer this one.
+#
+# containerd's rootless mode (its docs/rootless.md) launches the daemon inside a
+# RootlessKit user namespace, where it is uid 0 with a full capability set scoped to that
+# namespace. Capabilities in a non-initial user namespace do not let you mount a
+# filesystem type the kernel has not flagged FS_USERNS_MOUNT. erofs and ext4 are not
+# flagged; tmpfs and overlay are. Probed directly on a Linux box as an ordinary user:
+#
+#     unshare -Umr mount -t erofs   none /mnt   -> EPERM (before the source is looked at)
+#     unshare -Umr mount -t ext4    none /mnt   -> EPERM
+#     unshare -Umr mount -t overlay ...  /mnt   -> passes the permission gate
+#     unshare -Umr mount -t tmpfs   none /mnt   -> succeeds
+#
+# So rootless containerd would NOT rescue the non-block-mode path: it still cannot mount
+# the erofs layers or loop-mount the ext4 writable layer. It buys nothing this file does
+# not, and it costs RootlessKit, newuidmap/newgidmap and /etc/subuid entries, slirp4netns
+# for networking, cgroup v2 delegation, and an `nsenter` for every client that wants to
+# talk to the daemon. containerd's own rootless doc steers you to the `native` snapshotter
+# for exactly this reason.
+#
+# The right framing: Boks does not need privilege in a namespace, it needs to stop
+# mounting on the host at all. Block mode plus the erofs differ is how you stop.
+# ---------------------------------------------------------------------------------------
