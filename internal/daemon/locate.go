@@ -54,15 +54,40 @@ func RuntimeDirs() []string {
 		candidates = append(candidates, dir)
 	}
 	if exe, err := os.Executable(); err == nil {
-		// Symlinks are resolved because a Homebrew install is a symlink farm in
-		// bin/ pointing into the keg, and the bundle sits beside the real file.
-		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-			exe = resolved
-		}
-		dir := filepath.Dir(exe)
-		candidates = append(candidates, dir, filepath.Join(dir, "..", "libexec", "boks"))
+		candidates = append(candidates, runtimeDirsFrom(exe)...)
 	}
+	return existingDirs(candidates)
+}
 
+// runtimeDirsFrom returns the bundle directories implied by a boks binary at exe, in the order
+// they should be searched. Separate from RuntimeDirs so the ordering can be tested against a
+// layout on disk rather than only against wherever the test binary happens to live.
+func runtimeDirsFrom(exe string) []string {
+	// Symlinks are resolved because a Homebrew install is a symlink farm in bin/ pointing
+	// into the keg, and the bundle sits beside the real file.
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	dir := filepath.Dir(exe)
+
+	// The dedicated bundle directory BEFORE the directory boks itself sits in, and the
+	// order is the whole point. A tarball install puts boks and the runtime in one
+	// directory, so there the two are the same and this changes nothing. A package install
+	// puts boks in /usr/bin — which on any real machine also holds the distribution's own
+	// containerd — and the runtime in /usr/libexec/boks.
+	//
+	// Searching the executable's own directory first therefore preferred the system
+	// containerd over the vendored one, which is the exact failure vendoring exists to
+	// prevent. Measured on 2026-08-15 from an installed .deb: `boks daemon start` reported
+	// "containerd v2.2.6" out of /usr/bin — below the 2.3 floor, the version that fails at
+	// task start — while the 2.3.3 the package had just installed sat unused in
+	// /usr/libexec/boks.
+	return []string{filepath.Join(dir, "..", "libexec", "boks"), dir}
+}
+
+// existingDirs cleans, absolutises and de-duplicates candidates, keeping only directories that
+// exist and preserving order.
+func existingDirs(candidates []string) []string {
 	var dirs []string
 	seen := map[string]bool{}
 	for _, dir := range candidates {
