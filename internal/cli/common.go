@@ -82,10 +82,15 @@ type sandboxFlags struct {
 	clone       bool
 	env         []string
 	annotations []string
+	// fs is the set these flags were registered on, kept so that "the user asked for
+	// this" can be told apart from "this is the default". The difference decides whether
+	// a re-attach refuses — see checkFixedAtCreation — and a zero value cannot carry it:
+	// `--cpus 0` means every host CPU, which is a request like any other.
+	fs *pflag.FlagSet
 }
 
 func registerSandboxFlags(fs *pflag.FlagSet, dev *devFlags) *sandboxFlags {
-	f := &sandboxFlags{dev: dev}
+	f := &sandboxFlags{dev: dev, fs: fs}
 	fs.StringVarP(&f.image, "template", "t", "",
 		"OCI image for the guest root filesystem (default: the agent's image)")
 	fs.BoolVar(&f.clone, "clone", false, cloneFlagHelp)
@@ -99,6 +104,13 @@ func registerSandboxFlags(fs *pflag.FlagSet, dev *devFlags) *sandboxFlags {
 	fs.StringArrayVar(&f.annotations, "annotation", nil,
 		"extra OCI annotation KEY=VALUE passed to the runtime (repeatable)")
 	return f
+}
+
+// changed reports whether this invocation actually named a flag, rather than inheriting its
+// default. cobra merges a parent's persistent flags into this set before it parses, so the
+// hidden development flags answer here too.
+func (f *sandboxFlags) changed(name string) bool {
+	return f.fs != nil && f.fs.Changed(name)
 }
 
 // splitAtDash separates boks' own positional arguments from the ones meant for the agent.
