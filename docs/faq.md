@@ -5,9 +5,10 @@ is the other page.
 
 ## What is Boks?
 
-A local-first, open-source alternative to Docker Sandboxes (`docker sbx`). It runs coding
-agents and other untrusted developer tooling inside isolated microVMs, on your own machine.
-No account, no cloud service, no telemetry.
+A tool for running coding agents and other untrusted developer tooling inside isolated
+microVMs, on your own machine. Point it at a directory and that code gets a virtual machine
+of its own — its own kernel, its own network, and none of your filesystem but the directory
+you named. No account, no cloud service, no telemetry.
 
 ## Is it a hypervisor?
 
@@ -33,39 +34,44 @@ flags rather than the host's. A shared-kernel container cannot produce any of th
 
 ## Can I run it on Windows?
 
-Not yet, natively — though the stack underneath Boks now does. A Windows Hypervisor Platform
-backend for libkrun is being built in this repository's patch series, alongside a patched
-containerd, a patched nerdbox shim and a `mkfs.erofs` for Windows. On 2026-08-14, on real
-Windows 11 hardware, `ctr tasks start` ran a Linux container end to end through all of it:
-the container's stdout came back, `uname -a` reported the 6.12.44 guest kernel rather than the
-Windows host — which a shared-kernel container cannot do — and `/proc/uptime` advanced.
-`t_boot=1.90127s`, `t_create=121.648ms`.
+Yes, natively. `boks run` boots a sandbox through the **Windows Hypervisor Platform** — a
+user-mode hypervisor API, not WSL2 and not Hyper-V's management stack — driven by a
+`krun.dll` this project builds from a patch series against libkrun, alongside a patched
+containerd, a patched nerdbox shim and a `mkfs.erofs` for Windows.
 
-**A container running under `ctr` is not `boks run`.** Boks' own path stops earlier, and
-deliberately: it declines to start sandbox networking on Windows, because no Ethernet frame
-has yet crossed the virtio-net device there, and its enforcement is the network datapath.
-`boks doctor` fails its platform check on Windows for the same reason, correctly. Running a
-container also needed an elevated **containerd daemon**, or Developer Mode, for a symlink
-containerd creates in every task bundle; `packaging/containerd-windows/patches/0006` makes
-that link a junction instead, which an ordinary user can create, and nobody has run it on
-Windows yet. `boks create`, `ls`, `inspect` and `rm` never needed elevation either way.
+On 2026-08-15, on real Windows 11 hardware and from an **ordinary unelevated terminal**, a
+Linux container ran in a microVM under Boks' own stack: an allowed host returned HTTP 200
+through Boks' network stack while a denied one was refused, the guest's clock was correct to
+the second against the host, workspace writes went through in both directions, a marker
+survived `boks stop`, eight vCPUs came up, and `boks stop` then `boks rm` left nothing
+behind.
 
-So the honest line has moved, but not to "yes": everything below Boks works on Windows, and
-the part Boks is has not been run there.
+What that does not cover: every Windows result comes from **one machine**, and there is no
+Windows arm64 build at all — the WHP backend and the guest kernel are both x86_64. No release
+has been cut, so Windows means building from source today. See [Install](install.md#windows--winget)
+and [Windows](windows.md).
 
-Inside WSL2 it should work unchanged, with workspace paths preserved exactly, and nobody has
-run it. See [Windows](windows.md) and [Troubleshooting](troubleshooting.md#wsl2).
+Running the Linux build inside WSL2 also works, and since 2026-08-15 it is the *verified*
+route on Linux — see the next answer.
 
 ## Does it work on Linux?
 
-The KVM path is built and designed for. It has not been exercised end to end by anyone on
-this project, so you would be the first. See
+Yes, and it was verified end to end for the first time on 2026-08-15 — in WSL2 on Ubuntu
+26.04, where 25 of 26 checks passed: three distinct guest `boot_id`s, `nproc` following
+`--cpus` downward on an eight-core host, and, with every proxy variable cleared, an allowed
+address completing TLS against the origin's own certificate while `1.1.1.1:443` was refused
+in the same sandbox.
+
+Two caveats before you count it as done. That run was **inside WSL2, not on bare metal** —
+nothing on this project has run on a bare-metal Linux host. And **creating a sandbox still
+needs more privilege than an ordinary user has**: as a normal user it fails with `mount
+source: "overlay", err: operation not permitted`, so expect to run as root for now. See
 [Get started](get-started.md#which-platforms-work).
 
 ## Do I need Docker Desktop?
 
-No. Nor Docker Sandboxes, nor an account anywhere. Boks needs containerd, nerdbox and
-libkrun, and `boks doctor` checks for each.
+No, and no account anywhere either. Boks needs containerd, nerdbox and libkrun, and
+`boks doctor` checks for each.
 
 ## Does Boks send anything anywhere?
 
@@ -146,11 +152,10 @@ derive the same name are not merged — the second gets a digest suffix and is t
 
 ## Why does `-t` mean two different things?
 
-On `exec` it is `--tty`, because that is what it is in Docker and in Docker Sandboxes. On
-`run` it is `--template`, which is Docker Sandboxes' own spelling for the image an agent runs
-in. Boks is meant to feel like a drop-in alternative, and a user's muscle memory is part of
-that interface, so short forms exist only where the reference has one. Inventing others would
-make the muscle memory wrong.
+On `exec` it is `--tty`, because that is what `-t` means in Docker and everywhere else you
+would type it. On `run` it is `--template`, the image an agent runs in. Muscle memory is part
+of an interface, so short forms exist only where an established tool already has one;
+inventing extra ones would make that memory wrong.
 
 ## Can I define my own agent?
 
@@ -165,9 +170,9 @@ run, and there is nothing in between.
 ## How does this compare to Docker Sandboxes feature by feature?
 
 [Docker Sandbox parity](docker-sandbox-parity.md), which is the honest matrix including the
-rows where the answer is "no" or "planned". Docker Sandboxes is the behavioural reference:
-Boks reproduces observable behaviour from public documentation using open-source components,
-and is not derived from Docker's code.
+rows where the answer is "no" or "planned". Boks is an independent implementation built from
+open-source components, working from public documentation; it is not derived from Docker's
+code.
 
 ## How do I know any of this is true?
 

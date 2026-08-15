@@ -260,9 +260,9 @@ Two things to expect:
 
 - The service inside the sandbox has to listen on the VM's external interface — bind
   `0.0.0.0` or `::`, not only `127.0.0.1`. `boks ports` says so when nothing answers.
-- **TCP only.** The grammar accepts `udp`, `udp4` and `udp6` because Docker Sandboxes' does,
-  and refuses them with the reason: the sandbox's network stack drops UDP at the link, so a
-  datagram has no way back.
+- **TCP only.** The grammar accepts `udp`, `udp4` and `udp6`, because that is the port syntax
+  people already type, and refuses them with the reason: the sandbox's network stack drops
+  UDP at the link, so a datagram has no way back.
 
 Publishing has never been driven by a real guest. The datapath is exercised end to end
 against a simulated one, which proves the host side works; a real VM reaching it through
@@ -270,8 +270,8 @@ libkrun's virtio-net device has not been tried.
 
 ## Flags worth knowing
 
-Named after Docker Sandboxes' own, because muscle memory is part of the interface. The
-complete list is in the [CLI reference](cli.md).
+Spelled the way the equivalent flags are spelled elsewhere, because muscle memory is part of
+an interface. The complete list is in the [CLI reference](cli.md).
 
 | Flag | Meaning |
 |---|---|
