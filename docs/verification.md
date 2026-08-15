@@ -1502,3 +1502,46 @@ against any implementation.
 `libkrun.so` were a shell script and an empty file — the checks assert presence and name, which
 is all they claim to, but nothing here shows the shim can actually `dlopen` a vendored libkrun.
 That needs a machine with a hypervisor and a real package installed on it.
+
+### The arm64 guest kernel was named so the shim could never find it, 2026-08-15
+
+Found by reading, while wiring the guest images into the Linux packages. No hardware needed:
+four files disagree and the disagreement is decidable from their text.
+
+`guest-image.yml` built the 64-bit ARM guest with `KERNEL_ARCH=aarch64`. Every other component
+in the chain spells that architecture `arm64`:
+
+- nerdbox's `Dockerfile` names its output `nerdbox-kernel-${KERNEL_ARCH}`, so the file would
+  have been `nerdbox-kernel-aarch64`;
+- nerdbox's shim looks the kernel up at boot as `nerdbox-kernel-<kernelArch()>`, and
+  `kernelArch()` is Go's `GOARCH` with only `amd64` rewritten to `x86_64` — so on 64-bit ARM
+  it asks for `nerdbox-kernel-arm64`;
+- Boks' own `guestArch()` in `internal/doctor/checks.go` is a faithful transcription of that
+  and agrees;
+- `scripts/package-linux.sh` looks for `nerdbox-kernel-arm64`.
+
+So a guest built as `aarch64` is one the shim never finds. It would not have got that far in
+any case: nerdbox ships `kernel/config-6.12.44-arm64` and `kernel/config-6.12.44-x86_64`, and
+the Dockerfile does `COPY kernel/config-${KERNEL_VERSION}-${KERNEL_ARCH}`, so an `aarch64`
+build fails at that COPY naming a config that does not exist — an error several layers from the
+word that caused it. `KERNEL_ARCH` is also compared against the literal `arm64` twice in that
+Dockerfile and passed to Linux's kbuild, which spells it `arm64` too.
+
+**Why nothing caught it.** The matrix that builds both architectures lives in `release.yml`,
+which has never run: `runtime-guest` was added on 2026-08-15 and no tag has been cut. A
+standalone `guest-image.yml` run builds its default, `x86_64`, alone — and the most recent run,
+31882491001, shows exactly one job. The `aarch64` leg had never executed.
+
+`linux-runtime.yml` documents this same trap in a comment and avoids it deliberately: "plain
+GOARCH otherwise, so `arm64` and NOT `aarch64` on 64-bit ARM ... avoids the aarch64/arm64 trap
+entirely". The project knew, in one workflow, and fell into it in another.
+
+**The guard.** An architecture nerdbox ships no kernel config for now stops the build with a
+message naming the ones it does ship and the arm64/aarch64 distinction. The first version of
+that guard was wrong in a way worth recording: it parsed the kernel version out of
+`docker-bake.hcl` with `grep -oP`, which is line-based, so it never matched the multi-line HCL
+block and rejected *every* architecture for want of `config--x86_64`. Run against nerdbox's
+real filenames it accepts `x86_64` and `arm64` and rejects `aarch64`.
+
+**Not proven.** No arm64 guest has been built. This says the naming can now agree, not that the
+build succeeds — the first `aarch64` build never ran, and the first `arm64` one has not either.
