@@ -1461,3 +1461,44 @@ against code that did not work; these were checked against code that does not.
 reported has been exercised only against a local `httptest` server and a fake clock, never
 against GitHub returning a real tag. The install-method detection is checked against literal
 paths; no binary installed by Homebrew, winget, apt or dnf has been asked to identify itself.
+
+### `boks doctor` was reading the wrong PATH, 2026-08-15
+
+Found while packaging the Linux runtime, on a `.deb` that was correctly built and correctly
+installed. `boks doctor` reported `vm runtime fail`, `hypervisor library warn` and `guest image
+fail` — while, on the same run, `runtime skew ok` named the version of the very shim the first
+line said was missing.
+
+The cause is whose PATH each check consulted. A packaged install puts `containerd`, the shim
+and `libkrun.so` in `/usr/libexec/boks/`, deliberately not on anyone's PATH: a `containerd` in
+`/usr/bin` would collide with the distribution's own package. `boks daemon` bridges that by
+prepending those directories to the PATH it starts containerd with, so containerd finds the
+shim and the shim finds libkrun. `runtime skew` went through `daemon.FindShim`, which knows
+this. The other three called `exec.LookPath` and `os.Getenv("PATH")`, which is the invoking
+shell's — a question none of these checks is asking.
+
+The remedy text on the `vm runtime` check has read "Note that containerd's PATH is the
+daemon's, not your shell's" since long before this. The code said it and did not do it.
+
+**Measured, on the layout a package installs** — a `boks` in `bin/` with the runtime in
+`../libexec/boks/` and a PATH of `/usr/bin:/bin` that excludes it:
+
+| | `vm runtime` | `hypervisor library` |
+|---|---|---|
+| before | `fail   containerd-shim-nerdbox-v1 not found on PATH` | `warn   libkrun.so not found where the shim looks` |
+| after | `ok     …/libexec/boks/containerd-shim-nerdbox-v1` | `ok     …/libexec/boks/libkrun.so` |
+
+Both binaries were rebuilt between the two runs. The first attempt at this comparison reverted
+the source and did *not* rebuild, so it re-ran the fixed binary and reported "before" results
+identical to "after"; the numbers above are from the corrected run.
+
+**Negative control.** With the same binary and the runtime directory emptied, the checks return
+to `fail` and `warn`, so they are not reporting `ok` unconditionally. **Mutation.** Reverting
+`shimGetenv` to `os.Getenv` fails both new tests, one of which asserts up front that the shell
+PATH does *not* already contain the staged directory — without that, the test would pass
+against any implementation.
+
+**Not proven.** No sandbox was started; this host has no `/dev/kvm`. The staged shim and
+`libkrun.so` were a shell script and an empty file — the checks assert presence and name, which
+is all they claim to, but nothing here shows the shim can actually `dlopen` a vendored libkrun.
+That needs a machine with a hypervisor and a real package installed on it.
