@@ -1422,3 +1422,42 @@ own log rather than as a decision.
 
 This is the same shape of probe that returned `http=200` on the Mac — and it is *not*
 evidence about a VM, because nothing here crossed a hypervisor.
+
+### The update check, measured rather than reasoned about, 2026-08-15
+
+Boks promises no telemetry. `internal/update` argues in its package comment why an update
+check is not that promise broken — nothing about you or what you ran is sent, the comparison
+happens locally, and the request is disclosed before the first one is made. What follows is
+what was measured rather than what was intended.
+
+**The endpoint answers differently than assumed.** `HEAD https://github.com/dagsommer/boks/releases/latest`
+against the real repository returned `302` to `https://github.com/dagsommer/boks/releases` —
+the releases index, not a `404`. A repository with no releases does not error, it redirects to
+a page naming no version. Code that pattern-matched `/tag/` and reported a parse failure would
+have sent a user hunting a bug in Boks on every check until the first release exists, which is
+every check today. That case is now `ErrNoReleases` and prints "no release has been published
+yet", exit 0.
+
+**The once-a-day bound did not hold, and the test could not see it.** The refresh runs in a
+goroutine that is abandoned when the process exits. With the timestamp written on completion,
+a `boks run` against an absent containerd — which fails in about a tenth of a second — started
+a request, died before the answer arrived, wrote nothing, and started another on the next run.
+Measured directly: after two such runs the record still read
+`{"v":1,"disclosed":true,"checked":"0001-01-01T00:00:00Z"}`. There is no back-off in that.
+
+The test asserting the back-off passed throughout, because it waited on the completion channel
+and so gave the goroutine a chance production never gives it. The invariant is now written as
+"the attempt is on disk by the time `Notify` returns", which is synchronous and race-free, and
+the same two-run sequence now records
+`{"v":1,"disclosed":true,"checked":"2026-08-15T11:19:18Z"}`.
+
+**Negative controls.** Four mutations were applied and each was required to fail: making the
+request before disclosing (4 tests fail), recording the timestamp on completion instead of at
+the start (fails 5 runs out of 5), omitting the timestamp on a failed check, and returning a
+version from a redirect that names no tag. Two earlier assertions in this project passed
+against code that did not work; these were checked against code that does not.
+
+**What is not proven.** No release exists, so the path where a newer version is actually
+reported has been exercised only against a local `httptest` server and a fake clock, never
+against GitHub returning a real tag. The install-method detection is checked against literal
+paths; no binary installed by Homebrew, winget, apt or dnf has been asked to identify itself.
