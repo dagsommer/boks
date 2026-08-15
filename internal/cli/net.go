@@ -131,46 +131,30 @@ proxy attaches to requests and those must not be visible in the process table.`,
 	}
 }
 
-// networkFor decides which network a sandbox gets, honouring what an existing sandbox was
-// already wired for, and refusing to run when this invocation asked for a different one.
+// networkFor decides which network a sandbox gets: the mode this invocation asked for when
+// the sandbox is about to be created, and the one it was wired for when it already exists.
 //
 // The mode is fixed when a sandbox is created, because it lives in annotations the runtime
 // reads at boot. Silently applying `-net none` to a sandbox created with a network would be
 // the worst kind of wrong: the flag would appear to be obeyed while the container stayed
-// connected. That is what used to happen — the disagreement was printed as a `note:` and then
-// the sandbox ran with its original mode anyway, so a user who typed `-net none` got NAT and
-// a line of prose saying so, several lines above whatever they were actually reading.
+// connected. That disagreement no longer reaches this function — checkFixedAtCreation refuses
+// it, along with every other flag a sandbox fixes at creation, before anything is pulled or
+// started. `-net` was the first of those to be made a refusal and this is where the refusal
+// used to live; it moved so that a user who passes `-net none --cpus 2` to an existing sandbox
+// is told about both at once instead of discovering them one command at a time.
 //
-// So it is an error. A flag that cannot be honoured must not be silently discarded, and the
-// message already said the right thing; only the behaviour was wrong. The refusal is on any
-// disagreement, in either direction: `-net none` against a NAT sandbox is a containment
-// failure, and `-net nat` against a none sandbox is not, but it is still a request that will
-// not be met, and the user finds out either way before anything runs rather than from a
-// connection that mysteriously fails inside the guest.
-//
-// This is deliberately stricter than the policy flags on the same path, which are applied.
-// The difference is whether the request can be met at all: `--allow`/`--deny`/`--policy`
-// resolve into the stack this run is about to start, so they take effect now even though they
-// are not recorded on the sandbox, and they can only narrow what a later `boks start` will
-// serve. The network mode cannot be applied at all — the annotations are already on the
-// container — so there is nothing to do with the flag except refuse it.
-func networkFor(inv invocation, requested network.Mode, explicit bool, stderr io.Writer) (mode network.Mode, wired bool, err error) {
+// What is left here is the part that is not a refusal: honouring the wiring for a run that
+// asked for nothing, and saying so — loudly — for a sandbox Boks never wired at all.
+func networkFor(inv invocation, requested network.Mode, stderr io.Writer) (mode network.Mode, wired bool) {
 	if !inv.exists {
-		return requested, true, nil
+		return requested, true
 	}
 	existing, wired := network.ModeFromAnnotations(inv.info.Annotations)
 	if !wired {
 		fmt.Fprintf(stderr, "%s", unwiredSandboxWarning(inv.name))
-		return existing, false, nil
+		return existing, false
 	}
-	if explicit && existing != requested {
-		return existing, true, fmt.Errorf(
-			"sandbox %q is wired for -net %s, and the mode is fixed when a sandbox is created.\n"+
-				"This run asked for -net %s, which cannot be applied to a sandbox that already exists.\n"+
-				"Remove it and run again to change it: boks rm %s",
-			inv.name, existing, requested, inv.name)
-	}
-	return existing, true, nil
+	return existing, true
 }
 
 // unwiredSandboxWarning covers a sandbox created before Boks wired networking, or by
@@ -195,10 +179,7 @@ func unwiredSandboxWarning(name string) string {
 func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocation, cfg *sandbox.Config,
 	requested network.Mode, quiet bool, env Env) (bool, error) {
 
-	mode, wired, err := networkFor(inv, requested, flags.mode != "", env.Stderr)
-	if err != nil {
-		return false, err
-	}
+	mode, wired := networkFor(inv, requested, env.Stderr)
 	if !wired {
 		// A sandbox Boks did not wire has no link socket to hold and no stack that
 		// could reach it. networkFor has already said so, loudly.
