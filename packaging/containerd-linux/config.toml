@@ -5,13 +5,25 @@
 #     containerd --config ~/.config/boks/containerd.toml --log-level debug
 #
 # ########################################################################################
-# STATUS: DERIVED FROM SOURCE, NOT YET MEASURED ON HARDWARE.
+# STATUS: PART MEASURED, PART PREDICTED. The two are marked setting by setting below.
 #
-# Every claim below is traced to containerd v2.3.3 and nerdbox source, named file and
-# symbol by symbol. None of it has been run end to end by anyone. The one measurement we
-# do have is the failure this file is meant to fix: on WSL2/Ubuntu 26.04, 2026-08-15, an
-# unprivileged containerd passed all eight `boks doctor` checks and then failed the image
-# pull with `operation not permitted` on a bind mount. Treat the fix as a prediction.
+# Measured on WSL2/Ubuntu 26.04, 2026-08-15:
+#   * [ttrpc] uid/gid — without it an unprivileged containerd dies at startup on
+#     `chown …/containerd.sock.ttrpc: operation not permitted`. With it, it runs.
+#   * the diff-service order — with upstream's ['walking'], a stacked erofs snapshot
+#     fails the unpack; with ['erofs', 'walking'] all seven layers of a real image
+#     unpacked. That much is a measurement.
+#
+# Predicted, from containerd v2.3.3 and nerdbox source read symbol by symbol, and NOT run
+# by anyone:
+#   * default_size / block mode. Nobody has started a Linux daemon with it set.
+#   * that the diff-service order also removes the differ's need for CAP_SYS_ADMIN. The
+#     order was measured to fix the unpack; whether the unpack then survives an
+#     UNPRIVILEGED daemon has not been shown end to end.
+#
+# Known still-broken, measured 2026-08-15: even with a root daemon and the unpack done,
+# `boks create` fails in the CLI on a host overlay mount it performs itself. See the last
+# section — that one is Boks' own code and this file cannot reach it.
 # ########################################################################################
 
 version = 3
@@ -189,6 +201,22 @@ state = '/home/YOU/.local/state/boks/containerd/state'
 #     present.
 #   * task creation — mkfs.ext4 on a file, then virtio-blk. The guest kernel does the
 #     erofs and overlay mounts, as root inside the VM.
+#
+# And one thing this file cannot fix, because it is not containerd's: BOKS ITSELF still
+# host-mounts the image while generating the OCI spec. oci.WithImageConfig's Linux branch
+# ends in `WithAdditionalGIDs("root")` — unconditionally, even for an image that declares
+# no USER (pkg/oci/spec_opts.go, WithImageConfigArgs) — and that resolves supplementary
+# groups by mounting the snapshot on the host via withReadonlyFS -> WithReadonlyTempMount.
+# It runs in the CLI process, not the daemon, which is why it survives a root daemon:
+#
+#     boks: creating sandbox "…": failed to mount /run/user/1000/containerd-mount630234285:
+#           mount source: "overlay", …, err: operation not permitted
+#
+# internal/sandbox/imageconfig.go already substitutes a metadata-only path for this on
+# Windows and containerd already does the same on darwin; Linux is the only host still
+# taking the mounting branch. See the report accompanying this file — the fix is one line
+# in containerdReadsGuestRootfs(), and its cost is the image's /etc/passwd and /etc/group
+# lookup, which nothing on an unprivileged host can perform anyway.
 #
 # One cosmetic wart: snapshot Remove calls cleanupUpper -> mount.UnmountAll on a directory
 # that was never mounted (erofs_linux.go:90-95). umount2 checks CAP_SYS_ADMIN before it
