@@ -37,6 +37,7 @@ func hypervisorLibraryHint() string { return "" }
 // binary from upstream today, and a shipping product runs exactly that binary.
 func unsupportedRemedy() string {
 	return "Boks has no virtual machine backend on this platform.\n" +
-		"macOS on Apple silicon is the verified platform; Linux with KVM is supported\n" +
-		"but has not been exercised end to end."
+		"It runs on macOS with Apple silicon, on Linux with KVM, and on x86-64 Windows\n" +
+		"with the Windows Hypervisor Platform. All three have been verified end to end;\n" +
+		"the Linux run was inside WSL2 rather than on bare metal."
 }

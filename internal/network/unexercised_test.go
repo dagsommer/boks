@@ -10,29 +10,23 @@ import (
 	"time"
 )
 
-// TestStartAsksNoPlatformPermission is the Unix half of the change that let Windows try.
+// TestStartAsksNoPlatformPermission is what is left of the change that let Windows try.
 //
 // There used to be a vmmSupported() gate at the top of Start, and on Windows it refused before
 // anything was bound. Removing it must not have moved anything on the platforms where a guest
-// has actually been watched across this link, so this pins the two properties that would
-// change if it had: the platform reports nothing to warn about, and Start binds a working
-// socket in both modes.
+// had already been watched across this link, so this pins the two properties that would change
+// if it had: the platform reports nothing to warn about, and Start binds a working socket in
+// both modes.
 //
-// The Unexercised expectation is guarded on runtime.GOOS rather than skipped, because it is
-// the one assertion whose *answer* differs by platform while the behaviour does not: Start
-// binds everywhere, and only the warning attached to it is Windows-specific.
+// The Unexercised expectation is no longer guarded on runtime.GOOS. It was, while Windows was
+// the one platform whose answer differed; a guest has since been watched across this link
+// there too, with policy allowing one destination and refusing another (docs/verification.md,
+// 2026-08-14 and 2026-08-15), so every platform now answers the same way and the test says so
+// without a branch. A branch here would be the last place the retired claim could hide.
 func TestStartAsksNoPlatformPermission(t *testing.T) {
-	switch err := Unexercised(); runtime.GOOS {
-	case "windows":
-		if err == nil {
-			t.Error("Unexercised() on windows returned nil; no frame has crossed this " +
-				"device there, and something has to say so")
-		}
-	default:
-		if err != nil {
-			t.Errorf("Unexercised() on %s = %v; a platform where a guest has been watched "+
-				"crossing this link must report nothing to warn about", runtime.GOOS, err)
-		}
+	if err := Unexercised(); err != nil {
+		t.Errorf("Unexercised() on %s = %v; a guest has been watched crossing this link "+
+			"on every platform Boks runs on, so nothing should be reported here", runtime.GOOS, err)
 	}
 	for _, mode := range Modes() {
 		t.Run(string(mode), func(t *testing.T) {
@@ -51,27 +45,44 @@ func TestStartAsksNoPlatformPermission(t *testing.T) {
 	}
 }
 
-// TestTheWindowsNoteNamesWhatIsUnproven reads the text Unexercised returns on Windows.
+// TestAnUnexercisedNoteNamesALimitAndItsConsequence constrains the *shape* of whatever this
+// package says when a platform's link has not been shown to carry frames — not the sentence.
 //
-// The build it belongs to is compiled in CI and executed nowhere, so this is the only place
-// the claim is checked at all. What matters is that it says the frame path is unexercised
-// rather than impossible, and that it names the consequence of nothing connecting — a guest on
-// TSI, which is the failure that looks like success.
-func TestTheWindowsNoteNamesWhatIsUnproven(t *testing.T) {
-	err := unexercisedOnWindows()
+// This replaces a test that asserted the literal string "no Ethernet frame has ever", which is
+// how a retired claim survived being retired: the sentence was false from 2026-08-14, and both
+// ways of correcting the code — returning nil, or rewording — failed the build. A test that
+// pins prose makes the prose unfixable, so this pins the two properties that actually matter
+// and nothing else.
+//
+// It is vacuous today, deliberately. No platform returns non-nil, so the loop body does not
+// run. It exists for the moment one does again — a new host platform, or a regression — and it
+// is the assertion that would have survived the correction it used to block.
+func TestAnUnexercisedNoteNamesALimitAndItsConsequence(t *testing.T) {
+	err := Unexercised()
 	if err == nil {
-		t.Fatal("unexercisedOnWindows() returned nil")
+		return
 	}
-	for _, want := range []string{"no Ethernet frame has ever", "Windows", "TSI", "docs/windows.md"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the Windows note does not mention %q:\n%v", want, err)
-		}
+	text := err.Error()
+
+	// A limit: the note has to say what has not been shown, on this platform.
+	if !strings.Contains(strings.ToLower(text), runtime.GOOS) {
+		t.Errorf("the note does not say which platform it is about (%s):\n%s", runtime.GOOS, text)
 	}
-	// It must not read as a refusal: nothing consults it before binding any more, and a
-	// sentence that says "not available" would be describing the code it replaced.
+	// And its consequence, which is the half a reader can act on. The failure that looks
+	// like success is a guest left on the runtime's own transport, so the note is useless
+	// unless it names that outcome and points somewhere it is written up.
+	if !strings.Contains(text, "TSI") {
+		t.Errorf("the note names no consequence: a guest left on the runtime's own "+
+			"transport is the failure that looks like success, and it has to be said:\n%s", text)
+	}
+	if !strings.Contains(text, "docs/") {
+		t.Errorf("the note points at no document, so a reader cannot check it:\n%s", text)
+	}
+	// It must not read as a refusal: nothing consults it before binding, and a sentence
+	// that says "not available" would be describing code that was deleted in 2026-08.
 	for _, unwanted := range []string{"not available", "is not supported"} {
-		if strings.Contains(err.Error(), unwanted) {
-			t.Errorf("the Windows note still reads as a refusal (%q):\n%v", unwanted, err)
+		if strings.Contains(text, unwanted) {
+			t.Errorf("the note reads as a refusal (%q):\n%s", unwanted, text)
 		}
 	}
 }
