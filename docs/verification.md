@@ -2108,3 +2108,56 @@ Both lines should appear — on the console, since a pty carries them together �
 status should be 0. The v0.1.0 build fails before running anything, naming a `-stderr` FIFO.
 The negative control is the same command piped, `… | cat`: that takes the non-tty path and
 succeeds on both builds, which is the whole reason the defect survived to a release.
+
+### macOS, installed the way a user installs it, 2026-08-16
+
+The first Boks install performed by an ordinary route rather than by building the tree:
+`brew tap dagsommer/boks`, `brew trust`, `brew install boks`, on macOS arm64.
+
+**`boks doctor` was green on the first try**, every check, including the one nothing else can
+substitute for:
+
+```
+containerd            ok  2.3.3 at /var/run/containerd/containerd.sock
+snapshotter tools     ok  /opt/homebrew/bin/mkfs.erofs,
+                          /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4 (erofs-utils 1.9.3)
+vm runtime            ok  /opt/homebrew/bin/containerd-shim-nerdbox-v1
+runtime skew          ok  containerd 2.3.3, shim built against v2.3.3
+hypervisor library    ok  /opt/homebrew/lib/libkrun.dylib
+guest image           ok  /opt/homebrew/lib/nerdbox-kernel-arm64, nerdbox-rootfs.erofs
+runtime entitlement   ok  com.apple.security.hypervisor
+```
+
+`mkfs.ext4` resolving to `/opt/homebrew/opt/e2fsprogs/sbin` is the keg-only path working as
+designed: Homebrew links that directory onto no PATH, and Boks appends it to the one it starts
+containerd with. Installing the formula is enough, with no PATH edit — which is what the
+`depends_on "e2fsprogs"` added earlier the same day was for.
+
+**v0.1.0 then failed to run anything**, and v0.1.1 fixes it. On v0.1.1, from a real terminal:
+
+```
+$ boks run shell . -- sh -c 'echo out; echo err >&2'
+network: nat · policy standard · 11 allow, 0 deny · no TLS interception
+         unchanged since this sandbox last ran.
+out
+err
+```
+
+Both streams from a tty run, which is the configuration that broke: `cio` fills in all three
+FIFO paths but does not create the stderr one under a terminal, and Boks announced it anyway.
+Every previous Linux and Windows run had captured its output, so `cfg.TTY` was false and all
+three FIFOs existed. **This is the first genuinely interactive run in the project's history**,
+and it is why "verified on three platforms" did not catch a defect present on two of them.
+
+Note also the second line of that output: the policy summary is the short form, because this
+sandbox had been described before. That is `internal/cli/notice.go` behaving as intended
+against a real repeat run rather than against a test.
+
+**What this establishes.** All three platforms now run a sandbox from an artifact an ordinary
+user can obtain: Windows from the release archive, Linux from the `.deb`, macOS from Homebrew.
+Until today every result in this file came from a tree somebody had built.
+
+**Not established here.** This run did not exercise the network from inside the guest, so the
+macOS policy evidence remains the 2026-08-12 run rather than this one. `--rm` and `-d` were not
+used. And the machine is Apple silicon; Intel Macs are still not shipped and `boks doctor` still
+refuses them.
