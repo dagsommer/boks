@@ -1943,3 +1943,89 @@ network for that sandbox's whole life**, with stop/start the only remedy the war
   both `mkfs.erofs.exe` and `mkfs.ext4.exe`.
 - The `C:\ProgramData\containerd\state` warning is still printed and is still wrong on this
   machine: that path does not exist, and sandboxes started fine.
+
+### What actually ended the network stack, established on a host with no hypervisor, 2026-08-16
+
+The entry above reported a defect and an inference: the sandbox's network stack died while the
+sandbox kept running, and the stack's lifetime *appeared* to be tied to the first task. The
+inference was wrong in a way that matters, and the real rule was established by reading the two
+code paths that can end a stack and then running the one that can be run on a Linux host with
+no `/dev/kvm`.
+
+**The rule, as it was.** A stack ended when any one of three things happened:
+
+1. the sandbox's containerd **task** left `Running`/`Paused`/`Created`, which the supervisor
+   sees for itself (`sandbox.WatchTask`, polled every 2 s) — correct, and the design;
+2. `boks stop`, `boks rm` or `boks net stop` asked for it — correct;
+3. **the `boks run` invocation that started it returned any error at all.** That is the defect.
+   `boks run` reports the guest command's exit status by returning an `ExitError`, so *a
+   non-zero exit inside a perfectly healthy sandbox was indistinguishable, to the cleanup path,
+   from a run that never got a sandbox up.* An interrupted run — Ctrl-C — reached it the same
+   way.
+
+So the tester's "tied to the first task" was close but not the mechanism: a task exiting **0**
+kept its stack, and a task exiting **127** did not. It was tied to the *exit status of the
+first invocation*. On the Windows run, step 5's command exited 127 (`cmd: not found`, the Linux
+guest refusing a Windows command) and that is what killed pid 15264 while the guest it served
+stayed up. The orphan warning the next command printed was accurate, and it was describing
+damage boks had done to itself.
+
+This is exactly the failure `internal/enforce/supervisor.go` was written to prevent — its
+opening paragraph says a stack in the CLI invocation would mean "pressing Ctrl-C would silently
+disconnect a background build running inside the sandbox". The supervisor's own lifetime was
+right; the CLI took it away afterwards.
+
+**The fix.** The cleanup no longer asks whether the *command* failed. It asks containerd
+whether the *sandbox* is still running, and a sandbox that is running keeps its stack however
+the command ended. An ephemeral (`--rm`) run still takes its stack with it, because the sandbox
+goes too. When the answer cannot be obtained — containerd unreachable, for instance — the stack
+is kept and the reason is printed: keeping one costs an idle process that reaps itself within a
+poll interval, and taking one costs a live guest its network permanently, because a running VM
+does not re-attach to a new link socket (measured 2026-08-12).
+
+**Measured on Linux, with no hypervisor.** The supervisor is a host-side process, so its
+lifetime is observable without a VM. `internal/cli/stack_test.go` starts a **real** supervisor —
+a child process holding a real link socket, a real lock and a real gvisor stack, spawned the way
+`enforce.Ensure` spawns one — and then runs the cleanup path against it:
+
+| after a run that… | the sandbox is | the stack |
+|---|---|---|
+| exited non-zero | running | **stays up** (same pid, socket still there) |
+| was interrupted | running | **stays up** |
+| never started one | not running | is stopped, socket removed |
+| `--rm` | either | is stopped |
+
+Each assertion was confirmed to be capable of failing: with the old condition restored, the
+first two fail and the last two pass, which is the shape the defect had. The "cannot tell"
+branch was exercised against a containerd address that does not exist.
+
+**What this does not establish.** No sandbox was booted here — there is no `/dev/kvm` on this
+host — so the containerd query itself (`sandbox.Running`) has been run only against a
+containerd with no such sandbox and against an absent socket, never against a live VM. **A
+Windows or macOS machine is still needed** for the end-to-end statement: run a command that
+exits non-zero in a persistent sandbox, then confirm from the same sandbox that the network
+still works — `boks net ls` still naming the stack, and a request from inside the guest
+reaching the proxy and being judged.
+
+#### The `C:\ProgramData\containerd\state` warning, fixed
+
+It was testing a Unix mechanism on Windows. containerd puts each shim's socket under
+`defaults.DefaultStateDir`, a path compiled into `pkg/shim/util_unix.go` — **unix only**. On
+Windows a shim is reached over a named pipe: `pkg/shim/util_windows.go` (containerd v2.3.3) has
+no `socketRoot`, no `SocketAddress` and no `writeSocketDir`, and its `RemoveSocket` is a no-op.
+Nothing on that host needed the directory, which is why sandboxes started fine without it. The
+note is now Unix-only, and its remedy no longer offers "run the daemon elevated" on the one
+platform where Boks has been verified end to end with no elevation at all. The check still
+fires where it means something: on this Linux host, `/run/containerd` can be neither created
+nor written by the test user, and the note is produced with the `sudo mkdir` remedy.
+
+#### `rwlayer-64m.img`: it had a consumer, and it was not the release archive
+
+`docs/windows-e2e.md`'s by-hand procedure still copies it into place, and that procedure
+collects its files from the containerd bundle — `boks-runtime_<v>_windows_amd64.zip` — not from
+the archive a user installs. Nothing in `boks_<v>_windows_amd64.zip` reads it: `mkfs.ext4.exe`
+formats the layer there, which is what the run above measured. So it stops being copied into
+the all-in-one archive (64 MiB, ~8% of the download) and stays in the runtime zip, where it is
+still that document's fallback for a machine where the formatter does not run. `release.yml`
+asserts its absence from the all-in-one archive, because "we stopped shipping it" is a claim
+about a file that is not there, and that is the kind of claim that goes wrong silently.
