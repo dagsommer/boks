@@ -304,18 +304,23 @@ kernel driver. There is no `.sys` file anywhere in it.
 
 ### About that SmartScreen warning
 
-**Boks ships unsigned, and Windows will say so.** If you download the archive with a browser
-and run `boks.exe` from it, Microsoft Defender SmartScreen is likely to show *"Windows
-protected your PC"* and require **More info → Run anyway**. Nothing is wrong with your
-download when that happens. SmartScreen fires on a file carrying the Mark of the Web —
+**Boks ships unsigned, and Windows says so.** This is measured, not predicted: on
+2026-08-16, on a Windows machine testing the first release archive, Defender blocked an
+executable and reported it as being from an unknown publisher. Expect **More info → Run
+anyway**. Nothing is wrong with your download when that happens.
+
+Two details of that report are still missing and are worth having if you hit it: the exact
+dialog wording, and *which* executable was blocked — the archive carries `boks.exe`,
+`containerd.exe`, `ctr.exe` and `mkfs.erofs.exe`, and which one Windows objects to changes
+what to tell people. SmartScreen fires on a file carrying the Mark of the Web —
 metadata Windows attaches to anything it considers downloaded — and it judges the file on the
 reputation of the certificate that signed it. An unsigned binary has no certificate, so there
 is nothing for a reputation to accrue against, and it does not improve with time the way a
 signed one does.
 
-Whether `winget install` trips it too depends on how winget marks what it fetched, and we
-have not measured that on a real machine. Expect the dialog rather than being surprised by
-it.
+Whether `winget install` trips it too depends on how winget marks what it fetched, and that
+has not been measured — the observation above was a directly downloaded archive, not a winget
+delivery.
 
 This is a deliberate decision rather than an oversight. Code-signing certificates cost money
 per year and an OV certificate still earns its reputation slowly over download volume; an EV

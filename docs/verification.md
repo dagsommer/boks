@@ -1725,3 +1725,30 @@ what it claims to read; what is untested is only the branch taken when a revisio
 recognised. `ShimResolvesUsernames` on that same binary is `false` — correctly, since a local
 branch SHA is not an upstream revision anyone has verified a guest for, which is the
 allowlist behaving as intended rather than a limitation.
+
+### Windows Defender blocks the unsigned release binary, 2026-08-16
+
+Reported from a Windows machine testing the first release archive: Defender stopped an
+executable and named it as being from an **unknown publisher**.
+
+This is the first measurement of a question `docs/install.md` had been answering by
+prediction — it said SmartScreen was "likely to" fire. It does. The prediction was right and
+is now an observation, which is a different kind of claim.
+
+**The maintainer's decision to ship unsigned stands**; this is the documented cost of it, not
+a defect. What it changes is the wording: the install page no longer hedges.
+
+**What is still unknown, and matters.** The report did not say *which* executable was blocked.
+The archive carries `boks.exe`, `containerd.exe`, `ctr.exe` and `mkfs.erofs.exe`, and the
+answer changes the advice — a block on `boks.exe` is the one a user meets first and can
+dismiss, while a block on a binary Boks itself invokes later would surface as a failure inside
+a command rather than as a dialog. The exact dialog text is also unrecorded.
+
+The run did not continue: the machine took an automatic update partway through. So nothing
+downstream of this — `boks doctor`, `boks daemon start`, whether a sandbox boots from a release
+archive — was reached, and none of it should be read as tested. The rest of
+`docs/verify-windows-release-prompt.md` remains unrun.
+
+**Not measured:** whether a `winget install` trips the same warning. This was a directly
+downloaded archive, which carries the Mark of the Web; winget may mark what it fetches
+differently.
