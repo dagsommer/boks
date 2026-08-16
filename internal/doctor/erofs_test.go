@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -291,5 +292,63 @@ func TestSnapshotterToolsCheckSkipsSnapshottersWithoutTools(t *testing.T) {
 		Run(context.Background(), Env{Snapshotter: "overlayfs"})
 	if res.Status != StatusSkip {
 		t.Errorf("Status = %v, want skip for a snapshotter with no host tools", res.Status)
+	}
+}
+
+// mkfs.ext4 is required exactly where containerd formats a writable layer, which is not
+// everywhere. `blockMode = config.defaultSize > 0` (erofs.go:187) against a platform default of
+// 64 MiB off Linux and 0 on it, so macOS and Windows format one ext4 image per active snapshot
+// before any task starts, and Linux formats none ever.
+//
+// Both halves matter. Without the requirement, `boks doctor` is green on a Mac that cannot
+// start a sandbox — which is what it was, and is why every macOS run in docs/verification.md
+// happened to be on a host with e2fsprogs already installed. With the requirement applied
+// everywhere, every Linux host fails for a binary containerd will never invoke there.
+func TestSnapshotterToolsAreRequiredWhereTheWritableLayerIsFormatted(t *testing.T) {
+	for _, goos := range []string{"darwin", "windows"} {
+		var names []string
+		for _, tool := range snapshotterTools("erofs", goos) {
+			names = append(names, tool.Binary)
+		}
+		if !slices.Contains(names, "mkfs.ext4") {
+			t.Errorf("snapshotterTools(erofs, %s) = %v, missing mkfs.ext4; doctor would pass a "+
+				"host whose every 'boks run' dies at task start formatting rwlayer.img", goos, names)
+		}
+		if !slices.Contains(names, "mkfs.erofs") {
+			t.Errorf("snapshotterTools(erofs, %s) = %v, missing mkfs.erofs", goos, names)
+		}
+	}
+
+	for _, tool := range snapshotterTools("erofs", "linux") {
+		if tool.Binary == "mkfs.ext4" {
+			t.Error("snapshotterTools(erofs, linux) requires mkfs.ext4; Linux runs the erofs " +
+				"snapshotter in ovlfs mode and never formats a writable layer, so this would " +
+				"fail every Linux host over a binary containerd does not run")
+		}
+	}
+}
+
+// The two tools come from different packages, so one shared remedy cannot be right for both.
+// The failure this guards against is concrete: telling somebody whose mkfs.ext4 is missing to
+// install erofs-utils, which they already have, because that is what the erofs snapshotter's
+// remedy said.
+func TestSnapshotterToolRemediesNameTheRightPackage(t *testing.T) {
+	for _, goos := range []string{"darwin", "windows"} {
+		for _, tool := range snapshotterTools("erofs", goos) {
+			if tool.Binary != "mkfs.ext4" {
+				continue
+			}
+			if strings.Contains(tool.Install, "erofs-utils") {
+				t.Errorf("the mkfs.ext4 remedy on %s sends the reader to erofs-utils:\n%s",
+					goos, tool.Install)
+			}
+			if goos == "darwin" && !strings.Contains(tool.Install, "keg-only") {
+				t.Errorf("the macOS remedy does not mention that Homebrew keeps e2fsprogs "+
+					"keg-only, which is the step that is not obvious:\n%s", tool.Install)
+			}
+			if goos == "windows" && !strings.Contains(tool.Install, "mkfs.ext4.exe") {
+				t.Errorf("the Windows remedy does not name the shipped binary:\n%s", tool.Install)
+			}
+		}
 	}
 }
