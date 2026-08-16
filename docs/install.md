@@ -409,6 +409,7 @@ are settings, and `boks daemon config` prints them with the failure each one pre
 | nerdbox guest kernel + `nerdbox-rootfs.erofs` | what the microVM boots | **build with Docker**, or the `arm64` guest archive by hand | the guest archive, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip |
 | libkrun ≥ 1.18 | the VMM | `brew install libkrun/krun/libkrun` | in the `.deb`/`.rpm`, or [from CI](#prebuilt-shim-and-libkrun-for-linux) | in the zip, as `krun.dll` |
 | `mkfs.erofs` (erofs-utils ≥ 1.8) | unpacking images for the guest | `brew install erofs-utils` (1.9.3) | packaged, often too old | in the zip, patched |
+| `mkfs.ext4` (e2fsprogs) | formatting each sandbox's writable layer | `brew install e2fsprogs` — pulled in by the formula; keg-only, and Boks puts the keg on containerd's PATH | **not needed**: Linux runs the snapshotter in ovlfs mode and never formats one | in the zip, cross-compiled |
 
 The one cell still in bold is why this page is longer than one install command — and note what
 the rest of the table says now: **the Windows column is the only one with no gap in it**, which

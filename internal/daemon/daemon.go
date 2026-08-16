@@ -320,7 +320,7 @@ func spawn(ctx context.Context, stateDir string, progress io.Writer) (State, err
 	}
 	if progress != nil {
 		fmt.Fprintf(progress, "containerd %s listening on %s\n", st.Version, st.Address)
-		report(progress, Preflight(settingsFor(dir, HasEROFS())))
+		report(progress, Preflight(settingsFor(dir, HasEROFS(), HasExt4())))
 		// The skew check runs here rather than before the start, because the version
 		// that matters is the one the daemon reported over its own API — not what its
 		// binary claims on a --version line, and not what its file name suggests.
