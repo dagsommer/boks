@@ -1848,3 +1848,98 @@ no leftover `containerd`/`boks`/shim/`gvproxy` processes.
 
 **Still unrun on Windows:** `uname -a`, the boot id, and both network-policy results. No
 sandbox has started from a release archive.
+
+### Boks boots a sandbox on Windows from an installable artifact, 2026-08-16
+
+Every earlier Windows result was obtained by driving containerd by hand, from CI artifacts, in
+a tree somebody had built — and, as the previous entry records, with a manual `Copy-Item` that
+no user performs. This one was obtained from the release archive, unattended, on Windows 11
+Enterprise 10.0.26200 on an Intel Xeon Platinum 8370C.
+
+**The archive was confirmed to be the rebuilt one** before anything else: 58,407,809 bytes,
+`da4c3cb0a991a45d…`, against the previous 58,141,552 / `64ee4365…`, with the old extraction
+deleted first.
+
+**`mkfs.ext4.exe` ran, on its first execution anywhere.** It had been cross-compiled and
+inspected on a Linux/arm64 machine that cannot run a Windows PE, so this was the first time the
+binary had started on any host:
+
+```
+mke2fs 1.47.2 (1-Jan-2025)  Using EXT2FS Library version 1.47.2   exit=0
+mkfs.ext4.exe -q rw.img                                            exit=0
+superblock magic at offset 1080:  53 ef
+```
+
+**No PATH edit, and no manual copy.** `boks daemon start` printed no mkfs note and wrote
+`default = ['erofs', 'windows', 'windows-lcow']` unprompted. Both of the defects found earlier
+the same day are closed from the artifact.
+
+**The boundary, measured cold.** The tester caught and corrected a confound rather than
+reporting it: a first run took 2.8 s because erofs snapshots from the earlier PATH-edited run
+were still in `%LOCALAPPDATA%\boks\containerd\root`, which would have been a warm result
+reported as a cold one. `root` and `state` were wiped and it was re-run from empty:
+
+```
+boks run shell . -- uname -a
+Linux (none) 6.12.44 #1 SMP Sun Aug 16 15:12:27 UTC 2026 x86_64 GNU/Linux
+exit=0   elapsed=19.77s
+```
+
+A Linux guest, on a Windows host, in 19.77 s from an empty root: pull, erofs unpack and VM boot.
+Two sandboxes reported distinct boot ids (`29e8ed76-…`, `5e364b05-…`), while repeated `boks run`
+into one running sandbox returned the same id in 0.11–0.19 s — an exec into the live VM rather
+than a new boot, which is the correct distinction and worth having both halves of.
+
+The step's own command stated the boundary a second way: `boks run shell . -- cmd /c ver` gave
+`exec: cmd: not found`, exit 127 — the Linux guest refusing a Windows command.
+
+**Network policy, enforced outside the guest.**
+
+```
+https://github.com    -> 200
+https://example.com   -> curl: (56) CONNECT tunnel failed, response 403
+```
+
+and `boks policy log` recorded all three decisions, including
+`Blocked: example.com:443  denied by default` and
+`Allowed: 140.82.121.3:443  no deny rule matched the resolved address`.
+
+**No elevation anywhere.** `Elevated: False` at every step, no UAC prompt, ordinary PowerShell
+from start to finish including the cold pull and both boots.
+
+#### The first policy attempt was indeterminate, and is reported as such
+
+Both requests failed identically at first — `Failed to connect to 192.168.127.1 port 3128` — so
+the positive control failed and the "must fail" result proved nothing. That is the trap a
+negative control exists to catch, and it was caught rather than read as a pass. The cause is the
+defect below; the sandbox was recreated and the measurement above is from that run.
+
+#### New defect: the network stack dies while the sandbox keeps running
+
+After the step-5 task exited, the sandbox remained `running` while the process serving its
+network was gone. Boks detected this precisely and said so, and the warning is accurate:
+
+> sandbox … is running, but the process serving its network is gone. A running guest does NOT
+> re-attach to a new link socket — measured on 2026-08-12 — so this sandbox has no network
+> until it is restarted.
+
+**Observed:** a new supervisor (pid 17296) was alive and `stack.json` pointed at it, while the
+running guest was still bound to the dead first stack (pid 15264); nothing listens on host 3128,
+correctly, since the proxy is inside the stack behind `net.sock`.
+
+**Inferred, not established:** the stack's lifetime appears tied to the first *task* rather than
+to the sandbox. Step 5's task exited 127 and the VM outlived it; whether a task exiting 0 does
+the same was not determined.
+
+The consequence is worth stating plainly: **a user who runs one failing command silently loses
+network for that sandbox's whole life**, with stop/start the only remedy the warning offers.
+
+#### Smaller notes
+
+- `rwlayer-64m.img` (67,108,864 bytes) still ships although the template route is gone — dead
+  weight in the archive unless it still has a consumer.
+- `doctor` is honest now: `platform ok`, and `virtualization warn — Windows Hypervisor Platform
+  assumed available` with text saying it cannot probe without booting. `snapshotter tools` names
+  both `mkfs.erofs.exe` and `mkfs.ext4.exe`.
+- The `C:\ProgramData\containerd\state` warning is still printed and is still wrong on this
+  machine: that path does not exist, and sandboxes started fine.
