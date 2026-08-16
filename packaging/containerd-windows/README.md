@@ -269,8 +269,12 @@ right *size* — which never worked, it just failed silently instead of loudly.
 > supported host in its own `configure.ac` and `lib/ext2fs/windows_io.c` is upstream. With it on
 > containerd's PATH the branch below never runs and no image has to be placed by hand.
 >
-> `rwlayer-64m.img` stays because that binary has never been executed. It also stays as the
-> answer to a question this patch does not answer: **0005 checks the magic, not the length.** A
+> `mkfs.ext4.exe` has since been executed: on Windows 11 on 2026-08-16 it formatted a writable
+> layer from the release archive, unattended, and the superblock magic was read back at offset
+> 1080. So `rwlayer-64m.img` stopped shipping in `boks_<v>_windows_amd64.zip` and stays in this
+> bundle — the one `docs/windows-e2e.md` collects its files from — as that document's fallback,
+> and as the answer to a question this patch does not answer: **0005 checks the magic, not the
+> length.** A
 > 64 MiB template dropped in where `default_size` asked for 256 MiB is accepted in silence, and
 > the sandbox gets a quarter of the space its configuration promises. A formatter has no such
 > failure mode, which is the main reason it is preferred to seeding.
