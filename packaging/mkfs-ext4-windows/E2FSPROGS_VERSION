@@ -1,0 +1,19 @@
+# The e2fsprogs release mkfs.ext4.exe is built from.
+#
+# A version, not a SHA, and no patches directory beside it — unlike
+# packaging/mkfs-erofs-windows, which pins a go-erofs commit because the Windows port of
+# mkfs.erofs exists only in that tree. e2fsprogs needs no port. mingw is a first-class host in
+# its own configure.ac: `case "$host_os" in mingw*)` appears four times, `include/mingw/`
+# carries the POSIX headers the build wants, and `OS_IO_FILE=windows_io` selects a Win32 I/O
+# manager (lib/ext2fs/windows_io.c, 1028 lines) instead of unix_io.c. So the recipe is a
+# ./configure invocation and nothing else, and the thing worth pinning is the release.
+#
+# Upstream tarball and its checksum, both verified in CI:
+#   https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.2/e2fsprogs-1.47.2.tar.gz
+#   7a959221c1b1cc6e28b7d7a4e204a2ffd8ec6d8a2de4461c482b64c5f4463cca
+#
+# 1.47.2 rather than the newest release for the reason CONTAINERD_VERSION gives: this is the
+# one the recipe in README.md was actually run against. Moving it is a one-line change and the
+# workflow will say immediately if the build breaks — what it cannot say is whether the result
+# runs, so move it deliberately.
+1.47.2

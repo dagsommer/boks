@@ -257,3 +257,55 @@ func TestPackagedLayoutResolvesThroughTheProductionPath(t *testing.T) {
 		t.Errorf("ContainerdPath leads with %q, want %q", first, libexec)
 	}
 }
+
+// Homebrew's e2fsprogs is keg-only, so `brew install e2fsprogs` — the thing every document
+// tells a macOS user to do — puts mkfs.ext4 in the keg's sbin and links it nowhere. Off Linux
+// containerd formats a writable layer per sandbox with that binary, so a Mac that did the
+// documented thing still could not start one. The daemon's PATH is where that is fixed.
+//
+// The prefixes and the platform are arguments rather than constants because neither is
+// reachable from a Linux test runner: /opt/homebrew does not exist here, and a test that only
+// called kegDirs would pass just as happily against a function that returned nothing.
+func TestKegDirsFindsHomebrewsKegOnlyE2fsprogs(t *testing.T) {
+	prefix := t.TempDir()
+	sbin := filepath.Join(prefix, "e2fsprogs", "sbin")
+	fakeExecutable(t, sbin, "mkfs.ext4")
+
+	got := kegDirsFor("darwin", []string{prefix})
+	if len(got) != 1 || got[0] != sbin {
+		t.Errorf("kegDirsFor(darwin) = %v, want [%q]; containerd on macOS would never find "+
+			"mkfs.ext4 and no sandbox could start", got, sbin)
+	}
+}
+
+// Only macOS, and only where the keg is. Prepending a directory that does not exist, or one
+// that means nothing on the platform, would be noise in a PATH the shim also reads.
+func TestKegDirsIsMacOSOnlyAndOnlyWhatExists(t *testing.T) {
+	prefix := t.TempDir()
+	fakeExecutable(t, filepath.Join(prefix, "e2fsprogs", "sbin"), "mkfs.ext4")
+
+	for _, goos := range []string{"linux", "windows"} {
+		if got := kegDirsFor(goos, []string{prefix}); len(got) != 0 {
+			t.Errorf("kegDirsFor(%s) = %v, want none: Homebrew's keg-only rule is not what "+
+				"stops a binary being found there", goos, got)
+		}
+	}
+	if got := kegDirsFor("darwin", []string{filepath.Join(prefix, "absent")}); len(got) != 0 {
+		t.Errorf("kegDirsFor(darwin) = %v for a prefix that does not exist, want none", got)
+	}
+}
+
+// The keg goes at the END. A user who installed a mkfs.ext4 of their own and put it on PATH
+// deliberately must keep it, and Boks' own bundle must still win over both.
+func TestKegDirsComeAfterTheInheritedPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("kegDirs is macOS-only, and daemonPath cannot be asked for another platform")
+	}
+	inherited := t.TempDir()
+	path := filepath.SplitList(daemonPath(inherited))
+	for i, dir := range path {
+		if strings.Contains(dir, "e2fsprogs") && i < len(path)-1 && path[i+1] == inherited {
+			t.Errorf("keg directory %q precedes the inherited PATH entry %q", dir, inherited)
+		}
+	}
+}
