@@ -281,9 +281,13 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 	if running {
 		fmt.Fprint(stderr, orphanedStackWarning(spec.Sandbox))
 	}
-	// Said before the sandbox is created, on the platform where the link has never carried
-	// a frame, and said regardless of --quiet: asking for less output is not consent to a
+	// Said before the sandbox is created, on a platform where the link has never carried a
+	// frame, and said regardless of --quiet: asking for less output is not consent to a
 	// network that may be enforcing nothing.
+	//
+	// No platform is in that state today — Windows was, and stopped being on 2026-08-14
+	// (see network.Unexercised) — so this prints nothing on any host Boks currently runs
+	// on. It is the gate, not the claim, and the claim is made in one place.
 	if unexercised := network.Unexercised(); warnUnexercisedNetwork(unexercised, spec.Plan.Mode) {
 		fmt.Fprint(stderr, unexercisedNetworkWarning(unexercised))
 	}
@@ -316,7 +320,9 @@ func warnUnexercisedNetwork(unexercised error, mode network.Mode) bool {
 }
 
 // unexercisedNetworkWarning is printed before a sandbox is created on a platform where
-// nothing has ever been seen putting a guest's frames on the link socket — today, Windows.
+// nothing has ever been seen putting a guest's frames on the link socket. No platform is in
+// that state today; Windows was until 2026-08-14, when a guest attached to Boks' own link
+// socket there and the policy engine judged real traffic across it.
 //
 // It is a WARNING rather than a note, and it is not suppressed by --quiet, for the same reason
 // the interception notice is not: the thing being announced is a way in which the sandbox may
