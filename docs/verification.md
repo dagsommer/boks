@@ -2161,3 +2161,54 @@ Until today every result in this file came from a tree somebody had built.
 macOS policy evidence remains the 2026-08-12 run rather than this one. `--rm` and `-d` were not
 used. And the machine is Apple silicon; Intel Macs are still not shipped and `boks doctor` still
 refuses them.
+
+### winget delivery, tested locally before any submission, 2026-08-16
+
+`winget install --manifest` against the rendered v0.1.1 manifests, on Windows 11. The zip's
+SHA-256 matched the release digest, and winget reported `Successfully verified installer hash`.
+
+**Installed and ran, unelevated.** `winget validate` ok; install in 8.68 s; `boks --version` →
+`boks 0.1.1`; `boks doctor` green; `boks daemon start` serving `containerd 2.3.3+boks-erofs`;
+and `boks run shell . -- uname -a` → `Linux (none) 6.12.44 … x86_64`, exit 0, 22.84 s cold.
+Only one step raised UAC: `winget settings --enable LocalManifestFiles`, which is a one-time
+setting for local manifests and is not part of a normal install.
+
+**Every runtime path resolved inside the winget package directory** — `mkfs.erofs.exe`,
+`mkfs.ext4.exe`, `containerd-shim-nerdbox-v1.exe`, `krun.dll`, both guest files, and
+containerd itself. Nothing resolved to a containerd elsewhere on a machine that has other
+tooling installed.
+
+#### The question this was meant to answer was not answered, and that is the finding
+
+There is **no symlink**. `WinGet\Links` was empty and not on `PATH`; winget put the package's
+own directory on the User `PATH` instead. The cause was observed rather than guessed:
+Developer Mode is off and the user cannot create symlinks —
+`SYMLINK REFUSED: Administrator privilege required`. Three other winget packages on the same
+machine are on `PATH` the same way, so this is winget's unprivileged fallback in general.
+
+So `os.Executable()` + `EvalSymlinks` was never asked to traverse a link, and **the symlink
+indirection remains untested**. Reproducing it needs elevation to create the link. This round
+must not be read as clearing that risk.
+
+#### SmartScreen does not fire on a winget install
+
+Measured: no dialog, no prompt. winget verifies the installer hash itself and never
+`ShellExecute`s the binary, so nothing consults the reputation check. A browser download of the
+same archive **does** fire it, measured the same day. The manifest's note and `docs/install.md`
+said this was unmeasured; both now say which route raises it.
+
+#### Two defects, neither blocking
+
+- **`winget uninstall dagsommer.boks` fails**: `No installed package found matching input
+  criteria`. The package registers under an ARP id
+  (`ARP\User\X64\dagsommer.boks__DefaultSource`), and uninstalling by that id works and cleans
+  up completely — package directory gone, off `PATH`, `winget list boks` empty. Inferred, not
+  measured: an artefact of `--manifest` installs having no source to resolve the identifier
+  against. Worth one check after the package is in winget-pkgs rather than assuming.
+- **`%LOCALAPPDATA%\boks` survives uninstall: 59 files, 1,768.8 MB.** That is Boks' own state —
+  containerd root with unpacked images, `net`, `policy-log.jsonl`, `update.json`. winget does
+  not own it, so leaving it is arguably correct, but 1.7 GB is not a rounding error and there
+  is no `boks` command that removes it.
+
+Also observed: the two streams arrive `err` then `out`. They are independently buffered, so
+this is not an ordering guarantee and was not treated as one.

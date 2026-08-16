@@ -326,9 +326,10 @@ reputation of the certificate that signed it. An unsigned binary has no certific
 is nothing for a reputation to accrue against, and it does not improve with time the way a
 signed one does.
 
-Whether `winget install` trips it too depends on how winget marks what it fetched, and that
-has not been measured — the observation above was a directly downloaded archive, not a winget
-delivery.
+**A `winget install` does not raise it**, measured on 2026-08-16: the install ran to
+completion in 8.68 s with no dialog and no prompt. winget verifies the installer hash itself
+and never launches the binary through Explorer, so nothing consults SmartScreen's reputation
+check. The dialog above belongs to the browser-download route.
 
 This is a deliberate decision rather than an oversight. Code-signing certificates cost money
 per year and an OV certificate still earns its reputation slowly over download volume; an EV
