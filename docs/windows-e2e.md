@@ -621,11 +621,18 @@ nothing either way about the link.
 
 `internal/network/vmm_windows.go` used to refuse outright on Windows; it no longer does, and
 the reason it stopped is worth keeping straight. The refusal rested on "no frame has ever
-crossed that device", which is *still true* — what changed is that a refusal is a bad way to
-hold that position, since it guarantees the fact stays unknown. `boks run` now binds the socket
-and attempts the sandbox, and if nothing connects to the link socket within 30 s of the task
-starting, the supervisor exits with an error naming what did not happen. Attempting it is not
-evidence that it works, and this document's checks are still the ones that have been run.
+crossed that device", and a refusal is a bad way to hold that position, since it guarantees the
+fact stays unknown. So `boks run` bound the socket and attempted the sandbox — and on
+2026-08-14 the guest attached to the link socket and the policy engine judged real traffic
+across it, which retired the claim the refusal stood on. On 2026-08-15 the same probe returned
+HTTP 200 from github.com through Boks' own stack. `network.Unexercised()` is nil on Windows now
+and nothing warns.
+
+The bounded wait remains, and is inert: if nothing connects to the link socket within 30 s of
+the task starting, the supervisor exits with an error naming what did not happen. That is now a
+misconfiguration — the wrong shim build, or a `krun.dll` without `--features blk,net` — rather
+than the expected outcome. None of it changes what *this* document's checks cover, which is the
+`ctr` path with no NIC.
 
 ## 5. Runtime options and annotations
 

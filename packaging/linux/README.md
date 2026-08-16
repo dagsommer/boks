@@ -1,7 +1,7 @@
 # Prebuilt Linux runtime: the nerdbox shim and libkrun
 
-This directory produces the two pieces of the Boks stack that a Linux user has otherwise had
-to build from source. The workflow is
+This directory produces the three pieces of the Boks stack that a Linux user has otherwise had
+to build from source or hunt for. The workflow is
 [`.github/workflows/linux-runtime.yml`](../../.github/workflows/linux-runtime.yml); this file
 is also shipped inside the artifact it builds, which is why it reads as instructions rather
 than as notes.
@@ -9,44 +9,54 @@ than as notes.
 ## Why this exists
 
 Boks orchestrates containerd, the nerdbox shim and libkrun. On Linux — the platform Boks is
-designed for — two of those three cannot be downloaded from anyone:
+designed for — none of the three arrives usable:
 
 - **nerdbox ships no binaries at all.** Its release workflow has failed on every tag since
   v0.2.0, so all ten of its GitHub releases carry zero assets, and it is packaged nowhere:
   not apt, not the AUR, not nixpkgs. Repology tracks it in none of the ~400 repositories it
   knows about.
 - **libkrun is not packaged** for the distributions Boks targets.
+- **containerd is packaged everywhere and never new enough.** The shim needs 2.3; Ubuntu
+  24.04 LTS ships 1.7.x and 26.04 ships 2.2.2.
 
 So the first step of trying Boks on Linux was "clone and build two projects, one of them
-Rust". Windows testers, meanwhile, have had everything from CI for weeks. This closes that
-gap.
+Rust", and then find a containerd no distribution offers. This closes that gap.
 
 ## What you get
 
 | File | Built from | Patches |
 |---|---|---|
+| `containerd` | `containerd/containerd` @ the version [`../containerd-linux/build.sh`](../containerd-linux/build.sh) pins | **none** |
 | `containerd-shim-nerdbox-v1` | `containerd/nerdbox` @ [`../nerdbox/NERDBOX_REV`](../nerdbox/NERDBOX_REV) | **none** |
 | `libkrun.so` | `containers/libkrun` @ [`LIBKRUN_REV`](LIBKRUN_REV), `--features blk,net` | **none** |
 
-Both are stock upstream. The workflow asserts the checkouts are pristine before building, so
-a stray patch step added later fails the job rather than quietly changing what "unpatched"
+All three are stock upstream. The workflow asserts the checkouts are pristine before building,
+so a stray patch step added later fails the job rather than quietly changing what "unpatched"
 means in the run summary.
 
 ### This is not the whole stack
 
-The bundle is two files. A sandbox also needs:
+The bundle is three binaries — `containerd`, `containerd-shim-nerdbox-v1` and `libkrun.so` —
+plus this README and a `SHA256SUMS` over the three. A sandbox also needs:
 
-- **the guest kernel and rootfs** — `nerdbox-kernel-<arch>` and `nerdbox-rootfs-<arch>.erofs`,
-  from the [`guest-image`](../../.github/workflows/guest-image.yml) workflow;
-- **containerd ≥ 2.2**, which no distribution packages at a usable version;
+- **the guest kernel and rootfs** — `nerdbox-kernel-<arch>` and `nerdbox-rootfs.erofs`, from
+  the [`guest-image`](../../.github/workflows/guest-image.yml) workflow. Note the rootfs is
+  **not** architecture-suffixed as it comes out of that workflow; the shim accepts either
+  spelling, and the `.deb`/`.rpm` rename it to `nerdbox-rootfs-<arch>.erofs`;
 - **`mkfs.erofs`** from erofs-utils ≥ 1.8;
 - **`/dev/kvm`**, and membership of the `kvm` group.
+
+containerd itself is no longer on that list: the bundle carries one, because **containerd 2.3
+is the floor** and no distribution packages a version that high. Ubuntu 24.04 LTS ships 1.7.x
+and 26.04 ships 2.2.2; measured on WSL2 on 2026-08-15, a shim linking 2.3.3 against a 2.2.2
+daemon dies at task start with `unsupported protocol: Yunix`, which is protobuf framing
+rendered as letters and names no version (`internal/daemon/compat.go`).
 
 `boks doctor` names each piece as it finds it missing.
 
 ## Installing it
 
-The shim and the library are found in different ways, and only one of them is on `PATH`.
+The three files are found in three different ways, and only one of them is on `PATH`.
 
 ```sh
 # The shim: containerd execs it by name, so anywhere on containerd's PATH.
@@ -54,7 +64,14 @@ sudo install -m0755 containerd-shim-nerdbox-v1 /usr/local/bin/
 
 # The library: the shim stats for it directly, and /usr/local/lib is on its default list.
 sudo install -m0644 libkrun.so /usr/local/lib/
+
+# containerd: `boks daemon start` runs it, and finds it beside the boks binary or in
+# ../libexec/boks. Anywhere BOKS_RUNTIME_DIR names works too.
+sudo install -m0755 containerd /usr/local/libexec/boks/
 ```
+
+The `.deb` and `.rpm` do all three for you, into `/usr/libexec/boks`; this is the route for a
+tarball or a source build.
 
 ### The filename of `libkrun.so` is load-bearing
 
@@ -170,8 +187,18 @@ of a real symbol, an imported symbol — and fails the job if any is accepted.
 virtualised and `/dev/kvm` is absent, so nerdbox's own `kvm.CheckKVM()` would refuse before
 libkrun was reached. A symbol can be exported and still return `-ENOSYS`. What is proven is a
 load-time contract — that the shim can open the library and bind every function it needs —
-not that a sandbox works. **Boks has never been verified end to end on Linux.** Making that
-verification possible without a two-project build is the entire point of this directory.
+not that a sandbox works.
+
+**A sandbox does work on Linux, and that was measured elsewhere.** On 2026-08-15, in WSL2 on
+Ubuntu 26.04, `boks run` booted a guest with its own `boot_id`, `nproc` tracked `--cpus`, and
+an allowed address completed TLS while a denied one was refused in the same sandbox — 25 of 26
+checks (`../../docs/verification.md`). Two limits from that run are real and are not softened
+here: it was **inside WSL2, not on bare metal** — nothing has yet booted a sandbox on a Linux
+host with a directly attached `/dev/kvm` — and **sandbox creation still needs more privilege
+than an ordinary user has**, because `boks` host-mounts the image overlay to read the image
+config and that mount fails with `operation not permitted` for a non-root client. Windows no
+longer needs elevation and Linux does, which is the wrong way round. Making that run possible
+without a two-project build is the entire point of this directory.
 
 ## Building it yourself instead
 

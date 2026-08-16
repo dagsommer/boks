@@ -641,12 +641,20 @@ provisioned and cannot start a sandbox.
 - any RPM repository metadata, despite the key's comment naming both.
 
 **Where the runtime pieces should go.** `boks daemon` already searches, nearest first:
-`$BOKS_RUNTIME_DIR`, the directory beside the `boks` executable, then `<exe dir>/../libexec/boks`.
-For a `.deb` or `.rpm` that means `/usr/libexec/boks/`, which is the FHS location for a
-program's private executables and keeps a bundled containerd off the user's `PATH` — where it
-would otherwise shadow a containerd they installed on purpose. For a Homebrew keg it is
-`libexec/`, reached through the symlink resolution the search already does. For a tarball,
-everything sits side by side and the first search location finds it.
+`$BOKS_RUNTIME_DIR`, then `<exe dir>/../libexec/boks`, then the directory beside the `boks`
+executable. For a `.deb` or `.rpm` that means `/usr/libexec/boks/`, which is the FHS location
+for a program's private executables and keeps a bundled containerd off the user's `PATH` —
+where it would otherwise shadow a containerd they installed on purpose. For a Homebrew keg it
+is `libexec/`, reached through the symlink resolution the search already does. For a tarball,
+everything sits side by side, so the two derived locations collapse into one.
+
+**The bundle directory comes before the executable's own, and that order is the bug that
+shipped.** It was written the other way round, and on an installed `.deb` — where `boks` is in
+`/usr/bin`, which also holds the distribution's own `containerd` — the search found the system
+binary first. Measured on 2026-08-15: `boks daemon start` reported "containerd v2.2.6" out of
+`/usr/bin`, below the 2.3 floor and the version that fails at task start, while the 2.3.3 the
+package had just installed sat unused in `/usr/libexec/boks`. Preferring the system copy over
+the vendored one is the exact failure vendoring exists to prevent.
 
 ---
 

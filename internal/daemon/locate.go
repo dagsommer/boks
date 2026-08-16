@@ -24,12 +24,11 @@ import (
 // one of the four things that cost time on the first run. A daemon Boks starts itself is the
 // one place that can simply be fixed.
 //
-// The layout below is what a bundled install would produce and does not exist yet — nothing
-// is published, and there is no CI job that builds libkrun or the nerdbox shim for Linux at
-// all. RuntimeDir therefore finds nothing on a machine today and everything falls through to
-// PATH, which is exactly the behaviour a source build wants. It is written now so that the
-// packaging work has somewhere to put files, rather than being retrofitted around whatever
-// the first package happens to do.
+// The layout below was written before anything produced it. It is produced now:
+// .github/workflows/linux-runtime.yml builds the shim, libkrun.so and a containerd into
+// `boks-runtime-linux-<arch>`, the .deb and .rpm install those into /usr/libexec/boks, and the
+// Windows zip lays them out flat beside boks.exe. On a source build nothing is found here and
+// everything falls through to PATH, which is exactly the behaviour a source build wants.
 
 // runtimeDirEnv names a directory to search ahead of everything else. It is the escape hatch
 // for a tester who has built the pieces and put them somewhere of their own.
@@ -42,12 +41,14 @@ const binaryEnv = "BOKS_CONTAINERD_BINARY"
 // first, keeping only those that exist.
 //
 // The two derived locations are relative to the boks executable rather than absolute, so that
-// a tarball unpacked anywhere works and a Homebrew keg's opt prefix needs no configuration:
+// a tarball unpacked anywhere works and a Homebrew keg's opt prefix needs no configuration.
+// The bundle directory comes FIRST, and the order is load-bearing rather than incidental —
+// see runtimeDirsFrom for the measured failure that reversing it produced:
 //
-//	<exe dir>                     a tarball or a build tree, everything side by side
 //	<exe dir>/../libexec/boks     the FHS location for a program's private executables,
 //	                              which is where a .deb, an .rpm or a Homebrew formula
-//	                              would put a containerd nobody should reach by typing it
+//	                              puts a containerd nobody should reach by typing it
+//	<exe dir>                     a tarball or a build tree, everything side by side
 func RuntimeDirs() []string {
 	var candidates []string
 	if dir := os.Getenv(runtimeDirEnv); dir != "" {
