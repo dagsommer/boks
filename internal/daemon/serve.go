@@ -258,10 +258,17 @@ func describeMissingContainerd(err error) error {
 // go and install one.
 const minimumContainerd = "2.2"
 
-// HasEROFS reports whether mkfs.erofs is on PATH, which decides whether the erofs differ may
-// be named in the diff order at all. See diffOrder.
+// HasEROFS reports whether containerd will be able to run mkfs.erofs, which decides whether
+// the erofs differ may be named in the diff order at all. See diffOrder.
+//
+// The lookup is LookPath, not exec.LookPath, and that distinction is the whole of a bug found
+// on Windows on 2026-08-16: the archive puts mkfs.erofs.exe beside boks.exe and nothing puts
+// that directory on the user's PATH, so this returned false, the generated config omitted the
+// erofs differ, and every image pull died in the Windows differ with "number of mounts should
+// always be 1 for Windows layers". containerd would have found the binary — ContainerdPath
+// hands it that directory — but the config had already decided it could not.
 func HasEROFS() bool {
-	_, err := exec.LookPath(erofsTool)
+	_, err := LookPath(erofsTool)
 	return err == nil
 }
 

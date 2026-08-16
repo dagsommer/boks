@@ -124,7 +124,8 @@ loudly, because it would mean the policy is not a boundary.
 ## 7. Clean up, and report
 
 ```powershell
-.\boks.exe rm --all
+.\boks.exe ls                      # name each sandbox this run created
+.\boks.exe rm -f <name>            # once per name; there is no --all
 .\boks.exe daemon stop
 ```
 

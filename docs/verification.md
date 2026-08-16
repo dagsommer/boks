@@ -1726,29 +1726,40 @@ recognised. `ShimResolvesUsernames` on that same binary is `false` — correctly
 branch SHA is not an upstream revision anyone has verified a guest for, which is the
 allowlist behaving as intended rather than a limitation.
 
-### Windows Defender blocks the unsigned release binary, 2026-08-16
+### SmartScreen, measured precisely — and the first report of it was wrong, 2026-08-16
 
-Reported from a Windows machine testing the first release archive: Defender stopped an
-executable and named it as being from an **unknown publisher**.
+An earlier entry here recorded "Defender blocks the unsigned release binary" from a first-hand
+report. **That framing was wrong and is retracted.** The full run, with Defender's own records
+read back, says something more precise and more useful.
 
-This is the first measurement of a question `docs/install.md` had been answering by
-prediction — it said SmartScreen was "likely to" fire. It does. The prediction was right and
-is now an observation, which is a different kind of claim.
+**Defender's antivirus engine never blocked anything.** `Get-MpThreat` and
+`Get-MpThreatDetection` are both empty; there are zero 1116/1117 events in
+`Microsoft-Windows-Windows Defender/Operational` in 24 hours, only configuration-change and
+signature-update entries. All sixteen archive files were present and nothing was quarantined.
+The nine `CodeIntegrity` events are boot-time policy activation.
 
-**The maintainer's decision to ship unsigned stands**; this is the documented cost of it, not
-a defect. What it changes is the wording: the install page no longer hedges.
+What fired was **SmartScreen's application-reputation check** — a different component with a
+different trigger — and it fired only under a condition the tester constructed deliberately:
 
-**What is still unknown, and matters.** The report did not say *which* executable was blocked.
-The archive carries `boks.exe`, `containerd.exe`, `ctr.exe` and `mkfs.erofs.exe`, and the
-answer changes the advice — a block on `boks.exe` is the one a user meets first and can
-dismiss, while a block on a binary Boks itself invokes later would surface as a failure inside
-a command rather than as a dialog. The exact dialog text is also unrecorded.
+| Launch path | Mark of the Web | SmartScreen |
+|---|---|---|
+| `.\boks.exe version` from PowerShell | none | nothing |
+| ShellExecute, i.e. an Explorer double-click | `ZoneId=3`, written by hand | the dialog |
 
-The run did not continue: the machine took an automatic update partway through. So nothing
-downstream of this — `boks doctor`, `boks daemon start`, whether a sandbox boots from a release
-archive — was reached, and none of it should be read as tested. The rest of
-`docs/verify-windows-release-prompt.md` remains unrun.
+```
+Windows protected your PC
+Microsoft Defender SmartScreen prevented an unrecognized app from starting.
+App:        boks-motw.exe
+Publisher:  Unknown publisher
+```
 
-**Not measured:** whether a `winget install` trips the same warning. This was a directly
-downloaded archive, which carries the Mark of the Web; winget may mark what it fetches
-differently.
+"Run anyway" was offered and worked. Two independent reasons the ordinary path is silent, both
+verified: `gh release download` writes no `Zone.Identifier` stream, and console `CreateProcess`
+does not consult the reputation check at all.
+
+So the honest statement is narrower than the prediction the docs carried: a user who downloads
+the archive **in a browser** and **double-clicks** `boks.exe` will meet the dialog; a user who
+downloads with a tool and runs it from a shell will not. `boks.exe` was the binary; it was not
+`containerd.exe`, `ctr.exe` or `mkfs.erofs.exe`.
+
+**Not measured:** whether a `winget install` trips it. Nothing here tested a winget delivery.
