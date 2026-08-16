@@ -15,7 +15,10 @@ out that people can actually install.
    restarted stack — measured on 2026-08-12 — so today the sandbox loses its network until it
    is restarted. Boks says exactly that when it meets one and gives the `stop && start` that
    fixes it; it does not restart the sandbox itself, because that kills whatever is running
-   inside.
+   inside. The commonest way to *reach* that state was boks: `boks run` ended the stack
+   whenever the command returned an error, and a guest command that exits non-zero is one.
+   Measured on Windows on 2026-08-16, fixed the same day. What is left here is a genuinely
+   crashed supervisor.
 2. **Sandbox creation on Linux without root**, which today fails for an ordinary user on a
    host mount Boks makes to read the image config — see below.
 3. **Policy over names for raw flows**, so that `--allow example.com` can authorise a direct
