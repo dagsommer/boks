@@ -1710,3 +1710,18 @@ The check that would let Linux drop its `CAP_SYS_ADMIN` requirement — `ShimRes
 in `internal/daemon/compat.go` — has also never returned true, because no nerdbox revision
 resolves the field yet. It is asserted false rather than exercised true, so the *closed* path
 is tested and the *open* one is not.
+
+Its *input* half, though, is measured rather than assumed. A `containerd-shim-nerdbox-v1`
+built from a real nerdbox git checkout on 2026-08-16 carries
+
+```
+mod    github.com/containerd/nerdbox  v0.2.4-0.20260816080949-5f0e4a44d293
+build  vcs.revision=5f0e4a44d29341a9391d7112756ff374726c7629
+build  vcs.modified=false
+```
+
+and `ShimNerdbox` on that binary returns the revision string exactly. So the detection reads
+what it claims to read; what is untested is only the branch taken when a revision is
+recognised. `ShimResolvesUsernames` on that same binary is `false` — correctly, since a local
+branch SHA is not an upstream revision anyone has verified a guest for, which is the
+allowlist behaving as intended rather than a limitation.
