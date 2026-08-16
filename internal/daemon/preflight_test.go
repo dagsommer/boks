@@ -83,6 +83,54 @@ func TestWritableLayerRemedyIsPlatformSpecific(t *testing.T) {
 	}
 }
 
+// The shim-socket note is Unix-only, and Windows is where that was learned the hard way.
+//
+// `boks daemon start` on Windows 11 warned about C:\ProgramData\containerd\state on
+// 2026-08-16, on a machine where the path did not exist and where sandboxes then started, ran,
+// enforced policy and stopped. The note is about a Unix domain socket in a directory
+// containerd compiles in; on Windows a shim is reached over a named pipe, which is not a file
+// in any directory — containerd's pkg/shim/util_windows.go has no socketRoot and no
+// writeSocketDir, and its RemoveSocket does nothing.
+//
+// A warning that fires on a host it does not apply to is worse than no warning: it is the one
+// that teaches the reader to skip the next one.
+func TestShimSocketNoteIsSilentOnWindows(t *testing.T) {
+	if note := shimSocketRootNote("windows"); note != nil {
+		t.Errorf("Windows was warned about %q\nremedy:\n%s\nA shim on Windows is a named pipe; "+
+			"that directory is not in the path of anything.", note.Detail, note.Remedy)
+	}
+}
+
+// The other direction, on the platform running this test. It must still be able to fire, or the
+// fix above deleted a real check instead of narrowing it: a directory that cannot be created
+// and cannot be written is the failure this note exists to move forward in time.
+func TestShimSocketNoteStillFiresOnUnix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the note does not apply here, which is what the test above is about")
+	}
+	// The note creates the directory when it can, so afterwards the host is in one of two
+	// states and the answer has to match the one it is in. Whichever way this host falls,
+	// one of the two branches is exercised.
+	note := shimSocketRootNote(runtime.GOOS)
+	root := ShimSocketRoot()
+	if writableDir(root) {
+		if note != nil {
+			t.Errorf("a host that can write %s was told it could not:\n%s", root, note.Remedy)
+		}
+		return
+	}
+	if note == nil {
+		t.Fatalf("%s can be neither created nor written and nothing was said; the failure "+
+			"then arrives later as 'creating sandbox process: mkdir %s: permission denied'", root, root)
+	}
+	if !strings.Contains(note.Remedy, "sudo mkdir") {
+		t.Errorf("the remedy does not give the one command that fixes it:\n%s", note.Remedy)
+	}
+	if strings.Contains(note.Remedy, "elevated") {
+		t.Errorf("a Unix host was told to run the daemon elevated:\n%s", note.Remedy)
+	}
+}
+
 // HasExt4 has to ask containerd's PATH, not the shell's, for exactly the reason HasEROFS does:
 // the Windows archive puts mkfs.ext4.exe beside boks.exe and no installer puts that directory
 // on anyone's PATH. Asking exec.LookPath would report the binary missing on the one layout
