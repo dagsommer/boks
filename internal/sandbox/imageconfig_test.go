@@ -145,6 +145,105 @@ func TestApplyImageConfigDoesNotGuessAUser(t *testing.T) {
 	}
 }
 
+// A USER value that is already a number needs no /etc/passwd, so every host can honour it.
+// Before this it went the same way as a name — recorded in Username, uid left at 0 — and
+// since nothing reads Username, `USER 1000` produced a container running as root.
+func TestApplyImageConfigHonoursANumericUser(t *testing.T) {
+	for _, tc := range []struct {
+		user     string
+		wantUID  uint32
+		wantGID  uint32
+		wantGids []uint32
+	}{
+		// Both halves stated: exactly right, with nothing left to infer.
+		{user: "1000:1000", wantUID: 1000, wantGID: 1000, wantGids: []uint32{1000}},
+		// A bare uid. gid 0 is what containerd's WithUserID settles on when
+		// /etc/passwd holds no entry for the uid, and a guest that reads Username
+		// can still refine it to the passwd group.
+		{user: "1000", wantUID: 1000, wantGID: 0, wantGids: []uint32{0}},
+		{user: "0", wantUID: 0, wantGID: 0, wantGids: []uint32{0}},
+		{user: "65534:65534", wantUID: 65534, wantGID: 65534, wantGids: []uint32{65534}},
+		// Half a number is still half an answer worth keeping.
+		{user: "node:1000", wantUID: 0, wantGID: 1000, wantGids: []uint32{1000}},
+		{user: "1000:node", wantUID: 1000, wantGID: 0, wantGids: []uint32{0}},
+	} {
+		t.Run(tc.user, func(t *testing.T) {
+			s := &specs.Spec{}
+			if err := applyImageConfig(s, ocispec.ImageConfig{User: tc.user}); err != nil {
+				t.Fatalf("applyImageConfig: %v", err)
+			}
+			if s.Process.User.UID != tc.wantUID || s.Process.User.GID != tc.wantGID {
+				t.Errorf("USER %q = %d:%d, want %d:%d",
+					tc.user, s.Process.User.UID, s.Process.User.GID, tc.wantUID, tc.wantGID)
+			}
+			// The string travels regardless, so a guest that can do better still can.
+			if s.Process.User.Username != tc.user {
+				t.Errorf("Username = %q, want %q kept for the guest", s.Process.User.Username, tc.user)
+			}
+			if !slices.Equal(s.Process.User.AdditionalGids, tc.wantGids) {
+				t.Errorf("AdditionalGids = %v, want %v", s.Process.User.AdditionalGids, tc.wantGids)
+			}
+		})
+	}
+}
+
+func TestNumericIDs(t *testing.T) {
+	for _, tc := range []struct {
+		user    string
+		uid     uint32
+		haveUID bool
+		gid     uint32
+		haveGID bool
+	}{
+		{user: "1000", uid: 1000, haveUID: true},
+		{user: "1000:1000", uid: 1000, haveUID: true, gid: 1000, haveGID: true},
+		{user: "node"},
+		{user: "node:node"},
+		{user: "node:27", gid: 27, haveGID: true},
+		{user: "27:node", uid: 27, haveUID: true},
+		// Out of the range runc accepts, so not claimed rather than wrapped.
+		{user: "2147483648"},
+		{user: "-1"},
+		{user: "1000:2147483648", uid: 1000, haveUID: true},
+		// Not a shape the image spec defines.
+		{user: "a:b:c"},
+		{user: ""},
+		// Whitespace is not a number, and trimming it would be inventing intent.
+		{user: " 1000"},
+	} {
+		t.Run(tc.user, func(t *testing.T) {
+			uid, haveUID, gid, haveGID := numericIDs(tc.user)
+			if uid != tc.uid || haveUID != tc.haveUID || gid != tc.gid || haveGID != tc.haveGID {
+				t.Errorf("numericIDs(%q) = (%d,%v,%d,%v), want (%d,%v,%d,%v)",
+					tc.user, uid, haveUID, gid, haveGID, tc.uid, tc.haveUID, tc.gid, tc.haveGID)
+			}
+		})
+	}
+}
+
+// The ordering trap, asserted rather than described.
+//
+// Linux may only stop using containerd's oci.WithImageConfig once the guest resolves USER
+// names itself. No nerdbox revision does, so the switch must not have happened — if this
+// fails, a Linux host is generating specs whose `USER node` silently means root.
+func TestLinuxKeepsContainerdsImageConfigUntilTheGuestCanResolveNames(t *testing.T) {
+	if guestResolvesUsernames() {
+		t.Fatal("guestResolvesUsernames() is true, but no nerdbox revision resolves " +
+			"Process.User.Username and daemon.nerdboxRevisionsResolvingUsernames is empty")
+	}
+	if runtime.GOOS == "windows" {
+		// Windows has no choice: it cannot mount the image at all.
+		if !usesMetadataImageConfig() {
+			t.Error("Windows must use the metadata-only image config")
+		}
+		return
+	}
+	if usesMetadataImageConfig() {
+		t.Errorf("%s took the metadata-only image config while the guest cannot resolve "+
+			"USER names — an image saying `USER node` would run as root", runtime.GOOS)
+	}
+}
+
 func TestReplaceOrAppendEnv(t *testing.T) {
 	tests := []struct {
 		name               string
