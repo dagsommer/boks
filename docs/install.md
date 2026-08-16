@@ -259,8 +259,9 @@ hand until it is live, and it holds:
 | `containerd-shim-nerdbox-v1.exe` | turns a container into a microVM |
 | `krun.dll` | the VMM, built from the 37-patch libkrun series |
 | `mkfs.erofs.exe` | unpacking images for the guest |
+| `mkfs.ext4.exe` | formatting each sandbox's writable layer, at task start |
 | `nerdbox-kernel-x86_64`, `nerdbox-rootfs.erofs` | **the guest the microVM boots** |
-| `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | the configuration and the pre-created root an unelevated containerd does not work without, and the writable layer Windows cannot format for itself |
+| `config.toml`, `new-containerd-root.ps1` | the configuration and the pre-created root an unelevated containerd does not work without |
 | `SHA256SUMS`, `SOURCE.txt`, `LICENSE`, `README.md`, `README-windows-runtime.md` | checksums over everything above, the guest kernel's GPL-2.0 source pointer, and the two READMEs |
 
 Unzip it anywhere. Everything sits in one flat directory beside `boks.exe`, and **nothing needs
