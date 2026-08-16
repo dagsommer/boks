@@ -118,9 +118,11 @@ directory on containerd's `PATH` or on `LIBKRUN_PATH` works too — the shim sca
 > **`boks doctor` does check for these two files**, as `guest image`, scanning the same
 > `PATH` and `LIBKRUN_PATH` the shim does. It used to report ready on a machine that then
 > failed at boot with `nerdbox-kernel not found in PATH or LIBKRUN_PATH`; a `fail` on that
-> line now says so up front. One caveat remains: `doctor` scans *your* `PATH`, and what
-> matters is the containerd daemon's — which is one more reason to let `boks daemon start`
-> be the thing that starts containerd, since then Boks sets that `PATH` itself.
+> line now says so up front. It also used to scan *your* `PATH` rather than the daemon's,
+> which is not the one that decides — fixed on 2026-08-15: `doctor` now searches the `PATH`
+> `boks daemon start` gives containerd, which is Boks' bundle directories prepended to your
+> own (`internal/doctor/paths.go`). The one case it still cannot see is a containerd you
+> started yourself with a different environment.
 
 ### What "installed" gets you
 
@@ -240,7 +242,7 @@ hand until it is live, and it holds:
 | `containerd-shim-nerdbox-v1.exe` | turns a container into a microVM |
 | `krun.dll` | the VMM, built from the 37-patch libkrun series |
 | `mkfs.erofs.exe` | unpacking images for the guest |
-| `nerdbox-kernel-x86_64`, `nerdbox-rootfs-x86_64.erofs` | **the guest the microVM boots** |
+| `nerdbox-kernel-x86_64`, `nerdbox-rootfs.erofs` | **the guest the microVM boots** |
 | `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | the configuration and the pre-created root an unelevated containerd does not work without, and the writable layer Windows cannot format for itself |
 | `SHA256SUMS`, `SOURCE.txt`, `LICENSE`, `README.md`, `README-windows-runtime.md` | checksums over everything above, the guest kernel's GPL-2.0 source pointer, and the two READMEs |
 
@@ -402,24 +404,28 @@ is no prebuilt shim, kernel or rootfs to download *from upstream*, for any platf
 ### Prebuilt shim and libkrun for Linux
 
 Because upstream publishes nothing, this repository builds them. Two workflows between them
-cover everything on the list above except containerd and `mkfs.erofs`:
+cover everything on the list above except `mkfs.erofs`:
 
 | Workflow | Artifact | Contents |
 |---|---|---|
-| [`linux-runtime`](../.github/workflows/linux-runtime.yml) | `boks-runtime-linux-<arch>` | `containerd-shim-nerdbox-v1`, `libkrun.so` |
-| [`guest-image`](../.github/workflows/guest-image.yml) | `nerdbox-guest-<arch>` | `nerdbox-kernel-<arch>`, `nerdbox-rootfs-<arch>.erofs` |
+| [`linux-runtime`](../.github/workflows/linux-runtime.yml) | `boks-runtime-linux-<arch>` | `containerd`, `containerd-shim-nerdbox-v1`, `libkrun.so` |
+| [`guest-image`](../.github/workflows/guest-image.yml) | `nerdbox-guest-<arch>` | `nerdbox-kernel-<arch>`, `nerdbox-rootfs.erofs` — the rootfs is **not** architecture-suffixed |
 
 Download the artifacts from a run's summary page, then:
 
 ```sh
 sudo install -m0755 containerd-shim-nerdbox-v1 /usr/local/bin/
 sudo install -m0644 libkrun.so /usr/local/lib/
-sudo install -m0644 nerdbox-kernel-* nerdbox-rootfs-*.erofs /usr/local/lib/
+sudo install -m0644 nerdbox-kernel-* nerdbox-rootfs.erofs /usr/local/lib/
+# containerd is found beside the boks binary, or in ../libexec/boks, or wherever
+# BOKS_RUNTIME_DIR names — not on PATH.
+sudo install -m0755 containerd /usr/local/libexec/boks/
 ```
 
-Both binaries are **unpatched upstream**, built from the SHAs pinned in
-[`packaging/nerdbox/NERDBOX_REV`](../packaging/nerdbox/NERDBOX_REV) and
-[`packaging/linux/LIBKRUN_REV`](../packaging/linux/LIBKRUN_REV), for amd64 and arm64.
+All three binaries are **unpatched upstream**, built for amd64 and arm64 from the revisions
+pinned in [`packaging/nerdbox/NERDBOX_REV`](../packaging/nerdbox/NERDBOX_REV),
+[`packaging/linux/LIBKRUN_REV`](../packaging/linux/LIBKRUN_REV) and
+[`packaging/containerd-linux/CONTAINERD_VERSION`](../packaging/containerd-linux/CONTAINERD_VERSION).
 [`packaging/linux/README.md`](../packaging/linux/README.md) covers where each file has to go
 and why `libkrun.so`'s filename matters — the shim stats for two exact names and never asks
 the dynamic linker.
@@ -565,8 +571,8 @@ machine is still missing, and [What a sandbox needs](#what-a-sandbox-needs) is t
 **The guest kernel and rootfs used to be the row that mattered most here**, because they are
 the difference between an install that works and one that reaches a passing `doctor` and a
 sandbox that will not boot. `release.yml` now publishes them — as `boks-guest_*_x86_64.tar.gz`
-and `_aarch64.tar.gz`, and inside `boks_*_windows_amd64.zip` — so on Windows there is nothing
-left to fetch. macOS is the platform still waiting: the `aarch64` guest archive is the file a
+and `_arm64.tar.gz`, and inside `boks_*_windows_amd64.zip` — so on Windows there is nothing
+left to fetch. macOS is the platform still waiting: the `arm64` guest archive is the file a
 Mac needs, and what remains is a `resource` block and one `lib.install` in
 `packaging/homebrew/nerdbox.rb`, spelled out in
 [packaging/homebrew/README.md](../packaging/homebrew/README.md).
