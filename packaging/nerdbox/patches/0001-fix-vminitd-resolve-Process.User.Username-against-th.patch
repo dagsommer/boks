@@ -1,0 +1,854 @@
+From 5f0e4a44d29341a9391d7112756ff374726c7629 Mon Sep 17 00:00:00 2001
+From: Boks <noreply@anthropic.com>
+Date: Sun, 16 Aug 2026 10:09:49 +0200
+Subject: [PATCH] fix(vminitd): resolve Process.User.Username against the guest
+ rootfs
+
+An OCI image may name its user rather than number it -- `USER node` rather
+than `USER 1000`. Resolving that name means reading /etc/passwd out of the
+image's root filesystem, and the runtime spec has a field for handing the
+unresolved name to whoever can do that: Process.User.Username.
+
+Nothing reads it. crun consults `user->uid`, `user->gid`, `user->umask` and
+`user->additional_gids` and nothing else -- every read of that struct in
+src/libcrun/linux.c and src/libcrun/container.c is one of those four. And
+`username` *is* in the OCI config schema (runtime-spec
+schema/config-schema.json, the process.user object), so libocispec parses it
+without complaint and crun then ignores the result.
+
+That combination is the dangerous one. An unknown field would be rejected and
+the container would fail to start; a known-but-ignored field fails silently.
+`uid` keeps its zero value, so a container that asked to drop to `node` runs
+as root without anything saying so.
+
+nerdbox reaches this state on any host that cannot mount the image. containerd's
+oci.WithUser resolves the name host-side by mounting the image's snapshot, which
+needs CAP_SYS_ADMIN and is impossible on a macOS or Windows host holding a Linux
+guest filesystem. containerd already knows this and has an explicit escape hatch:
+
+    if (s.Windows != nil && s.Linux != nil) || runtime.GOOS == "darwin" {
+        s.Process.User.Username = userstr
+        return nil
+    }
+
+whose own comment says the name is "a temporary holding spot until the guest can
+use the string to perform these same operations to grab the uid:gid inside".
+Nothing in the guest ever did. This is that missing half.
+
+The guest has the rootfs mounted already, so the lookup is an ordinary file read
+needing no privilege the guest does not have. It runs in NewContainer, after the
+rootfs components are mounted and before crun is handed the spec -- the only
+point at which the image's /etc/passwd exists and the container does not.
+
+Every USER form the image spec allows is accepted -- `user`, `uid`, `user:group`,
+`uid:gid`, `uid:group`, `user:gid` -- following containerd's own reading of them
+so that a spec resolved here and one resolved by oci.WithUser on a Linux host
+agree. That includes two rules that are not obvious: a numeric uid absent from
+/etc/passwd resolves to that uid with gid 0 rather than failing (oci.WithUserID),
+and the primary gid is prepended to AdditionalGids only when it is not already
+there (ensureAdditionalGids). Supplementary groups come from /etc/group as in
+oci.WithAdditionalGIDs.
+
+It fails open. A rootfs with no /etc/passwd, a name absent from the one that is
+there, an unreadable config.json: each leaves the spec exactly as it arrived and
+lets crun proceed, because this code only ever runs on a spec a host already gave
+up on, so "leave it alone" is the behaviour that was already in place. What it
+will not do is guess -- an unresolvable name is logged at WARN rather than
+silently becoming uid 0, which is the failure the change exists to prevent.
+
+No new dependency: the passwd/group parsing is ~60 lines here rather than a
+vendored user library, so the patch stays reviewable and `go mod vendor` is
+untouched.
+
+Tests use testing/fstest and a temp-dir bundle, so they need no VM, no root and
+no image. They were mutation-checked: making the resolver a no-op (the pre-patch
+behaviour) fails TestResolveSpecUserRewritesTheBundle, removing the own-group
+skip fails TestSupplementalGroupsSkipsTheUsersOwnGroup, and letting an
+unresolvable name fall through to uid 0 fails both
+TestResolveUserStringRefusesToGuess and
+TestResolveSpecUserLeavesAnUnresolvableNameAlone.
+
+NOT EXECUTED IN A VM. The mechanism is read from crun's and containerd's sources
+and the tests run the resolver directly; no microVM has booted with this change.
+---
+ internal/vminit/runc/container.go |   7 +
+ internal/vminit/runc/user.go      | 426 ++++++++++++++++++++++++++++++
+ internal/vminit/runc/user_test.go | 318 ++++++++++++++++++++++
+ 3 files changed, 751 insertions(+)
+ create mode 100644 internal/vminit/runc/user.go
+ create mode 100644 internal/vminit/runc/user_test.go
+
+diff --git a/internal/vminit/runc/container.go b/internal/vminit/runc/container.go
+index 78fe7ef..fd24970 100644
+--- a/internal/vminit/runc/container.go
++++ b/internal/vminit/runc/container.go
+@@ -101,6 +101,13 @@ func NewContainer(ctx context.Context, platform stdio.Platform, r *task.CreateTa
+ 		}
+ 	}
+ 
++	// After the rootfs is in place and before crun is handed the spec: this is the only
++	// point at which the image's /etc/passwd exists and the container has not yet been
++	// created. See user.go for why the resolution cannot happen on the host.
++	if err := resolveSpecUser(ctx, r.Bundle); err != nil {
++		return nil, err
++	}
++
+ 	p, err := newInit(
+ 		ctx,
+ 		r.Bundle,
+diff --git a/internal/vminit/runc/user.go b/internal/vminit/runc/user.go
+new file mode 100644
+index 0000000..507b845
+--- /dev/null
++++ b/internal/vminit/runc/user.go
+@@ -0,0 +1,426 @@
++//go:build linux
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package runc
++
++// Resolving Process.User.Username against the container's own /etc/passwd.
++//
++// # The field nothing reads
++//
++// An OCI image may name its user rather than number it — `USER node` rather than
++// `USER 1000`. Turning that name into a uid means reading /etc/passwd out of the image's
++// root filesystem. The runtime spec has a field for handing an unresolved name to whoever
++// is able to do that: Process.User.Username.
++//
++// No Linux runtime reads it. crun consults `user->uid`, `user->gid`, `user->umask` and
++// `user->additional_gids` and nothing else — every read of that struct in
++// src/libcrun/linux.c and src/libcrun/container.c is one of those four. `username` *is* in
++// the OCI config schema (runtime-spec schema/config-schema.json, the process.user object),
++// so libocispec parses it without complaint and crun then ignores the result.
++//
++// That combination is the dangerous one. An unknown field would be rejected and the
++// container would fail to start; a known-but-ignored field fails silently. `uid` keeps its
++// zero value, and a container that asked to drop to `node` runs as **root** without
++// anything saying so.
++//
++// # Why the host cannot always do it
++//
++// containerd's oci.WithUser resolves the name host-side by mounting the image's snapshot
++// and reading /etc/passwd from it (pkg/oci/spec_opts.go). That needs CAP_SYS_ADMIN, and on
++// a macOS or Windows host holding a *Linux* guest filesystem it is not merely privileged
++// but impossible. containerd already knows this: WithUser has an explicit escape hatch
++//
++//	if (s.Windows != nil && s.Linux != nil) || runtime.GOOS == "darwin" {
++//		s.Process.User.Username = userstr
++//		return nil
++//	}
++//
++// which records the name and stops, on the assumption that "the guest can use the string
++// to perform these same operations to grab the uid:gid inside" (its own comment). Nothing
++// in the guest ever did.
++//
++// This is that missing half. The guest has the rootfs mounted already, so the lookup is an
++// ordinary file read, needs no privilege the guest does not have, and happens immediately
++// before crun is asked to create the container.
++//
++// # Failing open, deliberately
++//
++// Every failure here leaves the spec exactly as it arrived and lets crun proceed. A rootfs
++// with no /etc/passwd, a name that is not in it, an unreadable config.json: none of them
++// become a container that refuses to start. The reason is that this code only ever runs on
++// a spec that a host already gave up on, so "leave it alone" is precisely the behaviour
++// that was in place before — a name that cannot be resolved is no worse off than it is
++// today, whereas turning it into a hard error would break containers that run now.
++//
++// The one thing it will not do is guess. An unresolvable name is logged at WARN naming the
++// name and the rootfs, because a container silently running as root is the failure this
++// file exists to prevent and a silent *fallback* to it would reintroduce it one level down.
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++
++	"github.com/containerd/log"
++	specs "github.com/opencontainers/runtime-spec/specs-go"
++)
++
++const (
++	passwdPath = "etc/passwd"
++	groupPath  = "etc/group"
++)
++
++// resolveSpecUser rewrites bundle/config.json so that a Process.User.Username the host
++// could not interpret becomes the numeric uid/gid that crun actually reads.
++//
++// It returns an error only for a failure that a caller could act on. A spec with nothing
++// to resolve, a rootfs without an /etc/passwd, and a name absent from the one that is
++// there all return nil with the bundle untouched; see the file comment for why.
++func resolveSpecUser(ctx context.Context, bundle string) error {
++	spec, err := readSpec(bundle)
++	if err != nil {
++		// crun is about to read the same file and will report it far better than this
++		// can. Saying nothing here keeps one failure from being announced twice.
++		log.G(ctx).WithError(err).Debug("resolveSpecUser: no readable config.json")
++		return nil
++	}
++	if spec.Process == nil || spec.Process.User.Username == "" {
++		return nil
++	}
++	name := spec.Process.User.Username
++
++	// The rootfs is taken from the spec rather than from NewContainer's local, which is
++	// empty when the bundle arrived with its rootfs already in place. crun resolves
++	// Root.Path against the bundle exactly this way, so this reads the same directory
++	// crun is about to make the container's /.
++	if spec.Root == nil || spec.Root.Path == "" {
++		log.G(ctx).WithField("user", name).Warn("spec has no root path; cannot resolve the image's user")
++		return nil
++	}
++	rootfs := spec.Root.Path
++	if !filepath.IsAbs(rootfs) {
++		rootfs = filepath.Join(bundle, rootfs)
++	}
++
++	root, err := os.OpenRoot(rootfs)
++	if err != nil {
++		log.G(ctx).WithError(err).WithFields(log.Fields{
++			"user":   name,
++			"rootfs": rootfs,
++		}).Warn("cannot open the container rootfs to resolve its user; it will run as the uid in the spec")
++		return nil
++	}
++	defer root.Close()
++
++	user, err := resolveUserString(root.FS(), name)
++	if err != nil {
++		log.G(ctx).WithError(err).WithFields(log.Fields{
++			"user":   name,
++			"rootfs": rootfs,
++		}).Warn("cannot resolve the image's user against the container's /etc/passwd; it will run as the uid in the spec")
++		return nil
++	}
++
++	// Field by field rather than a whole-struct assignment: Umask is part of the same
++	// struct, is nothing to do with the name, and arrives from the host already decided.
++	// Overwriting it with a zero value would silently change the container's file modes.
++	spec.Process.User.UID = user.UID
++	spec.Process.User.GID = user.GID
++	spec.Process.User.AdditionalGids = user.AdditionalGids
++	// The name has been consumed. Leaving it set would make the spec self-contradictory
++	// for anything that reads it later — a resolved uid beside an unresolved name.
++	spec.Process.User.Username = ""
++
++	if err := writeSpec(bundle, spec); err != nil {
++		return fmt.Errorf("rewriting config.json with the resolved user: %w", err)
++	}
++	log.G(ctx).WithFields(log.Fields{
++		"user":           name,
++		"uid":            user.UID,
++		"gid":            user.GID,
++		"additionalGids": user.AdditionalGids,
++	}).Debug("resolved the image's user against the container's /etc/passwd")
++	return nil
++}
++
++// resolveUserString resolves an OCI image USER value against a root filesystem.
++//
++// It accepts every form the image spec allows — `user`, `uid`, `user:group`, `uid:gid`,
++// `uid:group`, `user:gid` — and follows containerd's own reading of them, so that a spec
++// resolved here and a spec resolved by oci.WithUser on a Linux host agree. Two of
++// containerd's rules are worth naming because they are not obvious:
++//
++//   - A *numeric* uid that is absent from /etc/passwd is not an error. It resolves to that
++//     uid with gid 0, which is what oci.WithUserID does. Images that declare `USER 1000`
++//     without a matching passwd entry are common and they work today.
++//   - A *name* that is absent from /etc/passwd is an error, as it is in oci.WithUsername.
++//     There is no defensible number to invent for it. The caller turns that error into
++//     leaving the spec alone rather than into a dead container.
++//
++// AdditionalGids is filled from /etc/group with the supplementary groups the user belongs
++// to, mirroring oci.WithAdditionalGIDs, and always begins with the primary gid, mirroring
++// containerd's ensureAdditionalGids.
++func resolveUserString(root fs.FS, userstr string) (specs.User, error) {
++	var (
++		user     specs.User
++		username string
++	)
++
++	parts := strings.Split(userstr, ":")
++	switch len(parts) {
++	case 1:
++		uid, err := strconv.Atoi(parts[0])
++		if err != nil {
++			// Not a number, so it is a name, and a name must be found.
++			entry, ok := lookupUserByName(root, parts[0])
++			if !ok {
++				return specs.User{}, fmt.Errorf("no user %q in %s", parts[0], passwdPath)
++			}
++			username = entry.name
++			user.UID, user.GID = uint32(entry.uid), uint32(entry.gid)
++			break
++		}
++		if err := checkID(uid, "uid", userstr); err != nil {
++			return specs.User{}, err
++		}
++		// A numeric uid stands on its own. /etc/passwd is consulted only to find the
++		// primary group and the name the supplementary lookup needs.
++		user.UID = uint32(uid)
++		if entry, ok := lookupUserByID(root, uid); ok {
++			username = entry.name
++			user.GID = uint32(entry.gid)
++		}
++	case 2:
++		uid, err := strconv.Atoi(parts[0])
++		if err != nil {
++			entry, ok := lookupUserByName(root, parts[0])
++			if !ok {
++				return specs.User{}, fmt.Errorf("no user %q in %s", parts[0], passwdPath)
++			}
++			username = entry.name
++			user.UID = uint32(entry.uid)
++		} else {
++			if err := checkID(uid, "uid", userstr); err != nil {
++				return specs.User{}, err
++			}
++			user.UID = uint32(uid)
++			if entry, ok := lookupUserByID(root, uid); ok {
++				username = entry.name
++			}
++		}
++
++		gid, err := strconv.Atoi(parts[1])
++		if err != nil {
++			g, ok := lookupGroupByName(root, parts[1])
++			if !ok {
++				return specs.User{}, fmt.Errorf("no group %q in %s", parts[1], groupPath)
++			}
++			user.GID = uint32(g.gid)
++			break
++		}
++		if err := checkID(gid, "gid", userstr); err != nil {
++			return specs.User{}, err
++		}
++		user.GID = uint32(gid)
++	default:
++		return specs.User{}, fmt.Errorf("invalid USER value %q", userstr)
++	}
++
++	if username != "" {
++		user.AdditionalGids = supplementalGroups(root, username)
++	}
++	user.AdditionalGids = ensureAdditionalGids(user.GID, user.AdditionalGids)
++	return user, nil
++}
++
++// checkID applies the range containerd applies. The kernel would take more, but runc does
++// not, and a spec that is valid here and rejected one layer down helps nobody.
++func checkID(v int, what, userstr string) error {
++	const maxID = 1<<31 - 1
++	if v < 0 || v > maxID {
++		return fmt.Errorf("invalid USER value %q: %s out of range", userstr, what)
++	}
++	return nil
++}
++
++// ensureAdditionalGids keeps the primary gid at the head of the supplementary set, which
++// is what containerd's ensureAdditionalGids does.
++func ensureAdditionalGids(gid uint32, gids []uint32) []uint32 {
++	for _, g := range gids {
++		if g == gid {
++			return gids
++		}
++	}
++	return append([]uint32{gid}, gids...)
++}
++
++type passwdEntry struct {
++	name string
++	uid  int
++	gid  int
++}
++
++type groupEntry struct {
++	name    string
++	gid     int
++	members []string
++}
++
++func lookupUserByName(root fs.FS, name string) (passwdEntry, bool) {
++	for _, e := range readPasswd(root) {
++		if e.name == name {
++			return e, true
++		}
++	}
++	return passwdEntry{}, false
++}
++
++func lookupUserByID(root fs.FS, uid int) (passwdEntry, bool) {
++	for _, e := range readPasswd(root) {
++		if e.uid == uid {
++			return e, true
++		}
++	}
++	return passwdEntry{}, false
++}
++
++func lookupGroupByName(root fs.FS, name string) (groupEntry, bool) {
++	for _, g := range readGroup(root) {
++		if g.name == name {
++			return g, true
++		}
++	}
++	return groupEntry{}, false
++}
++
++// supplementalGroups returns the gids of the groups that list username as a member.
++//
++// A group whose *name* equals the username is skipped even if it lists the user, which is
++// containerd's rule: that is the user's own group, and it reaches AdditionalGids as the
++// primary gid rather than as a supplementary one.
++func supplementalGroups(root fs.FS, username string) []uint32 {
++	var gids []uint32
++	for _, g := range readGroup(root) {
++		if g.name == username {
++			continue
++		}
++		for _, m := range g.members {
++			if m == username {
++				gids = append(gids, uint32(g.gid))
++				break
++			}
++		}
++	}
++	return gids
++}
++
++// readPasswd parses etc/passwd. A missing file is an empty list: callers distinguish
++// "no such user" from "no such file" only in that a numeric uid tolerates both.
++func readPasswd(root fs.FS) []passwdEntry {
++	var out []passwdEntry
++	forEachColonRecord(root, passwdPath, 4, func(f []string) {
++		uid, err := strconv.Atoi(f[2])
++		if err != nil {
++			return
++		}
++		gid, err := strconv.Atoi(f[3])
++		if err != nil {
++			return
++		}
++		out = append(out, passwdEntry{name: f[0], uid: uid, gid: gid})
++	})
++	return out
++}
++
++// readGroup parses etc/group.
++func readGroup(root fs.FS) []groupEntry {
++	var out []groupEntry
++	forEachColonRecord(root, groupPath, 3, func(f []string) {
++		gid, err := strconv.Atoi(f[2])
++		if err != nil {
++			return
++		}
++		g := groupEntry{name: f[0], gid: gid}
++		// The member list is the fourth field and may be absent entirely, which is
++		// not the same as being present and empty — "wheel:x:10:" has no members.
++		if len(f) > 3 && f[3] != "" {
++			g.members = strings.Split(f[3], ",")
++		}
++		out = append(out, g)
++	})
++	return out
++}
++
++// forEachColonRecord walks the colon-separated records of a passwd-style file, skipping
++// blank lines, comments, and any line with fewer than min fields.
++//
++// Malformed lines are skipped rather than reported. These files come from an image built
++// by someone else; one unparseable line in a distribution's /etc/group must not decide
++// whether a container starts.
++func forEachColonRecord(root fs.FS, name string, min int, fn func([]string)) {
++	data, err := fs.ReadFile(root, name)
++	if err != nil {
++		return
++	}
++	for line := range strings.Lines(string(data)) {
++		line = strings.TrimSpace(line)
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		fields := strings.Split(line, ":")
++		if len(fields) < min {
++			continue
++		}
++		fn(fields)
++	}
++}
++
++// writeSpec replaces the bundle's config.json.
++//
++// Written to a temporary file in the same directory and renamed, so that a crash between
++// the truncate and the write cannot leave crun a half-written spec. The bundle is on the
++// guest's own filesystem, so the rename is atomic.
++func writeSpec(bundle string, spec *specs.Spec) error {
++	data, err := json.Marshal(spec)
++	if err != nil {
++		return err
++	}
++	dir := filepath.Clean(bundle)
++	tmp, err := os.CreateTemp(dir, "config.json.*")
++	if err != nil {
++		return err
++	}
++	name := tmp.Name()
++	defer os.Remove(name)
++	if _, err := tmp.Write(data); err != nil {
++		tmp.Close()
++		return err
++	}
++	if err := tmp.Close(); err != nil {
++		return err
++	}
++	if err := os.Chmod(name, 0o644); err != nil {
++		return err
++	}
++	return os.Rename(name, filepath.Join(dir, "config.json"))
++}
+diff --git a/internal/vminit/runc/user_test.go b/internal/vminit/runc/user_test.go
+new file mode 100644
+index 0000000..f6f7266
+--- /dev/null
++++ b/internal/vminit/runc/user_test.go
+@@ -0,0 +1,318 @@
++//go:build linux
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package runc
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++	"testing/fstest"
++
++	specs "github.com/opencontainers/runtime-spec/specs-go"
++)
++
++// A rootfs shaped like a real image's: a `node` user with its own group, a member of two
++// supplementary groups, and one group that lists a user who does not exist.
++func imageFS() fstest.MapFS {
++	return fstest.MapFS{
++		"etc/passwd": &fstest.MapFile{Data: []byte(
++			"root:x:0:0:root:/root:/bin/bash\n" +
++				"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n" +
++				"node:x:1000:1000::/home/node:/bin/bash\n")},
++		"etc/group": &fstest.MapFile{Data: []byte(
++			"root:x:0:\n" +
++				"daemon:x:1:\n" +
++				"sudo:x:27:node\n" +
++				"node:x:1000:\n" +
++				"docker:x:999:node,someoneelse\n" +
++				"ghosts:x:998:nobodyhere\n")},
++	}
++}
++
++func TestResolveUserString(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		userstr string
++		want    specs.User
++	}{
++		{
++			// The case this whole change exists for: a bare name that
++			// crun would otherwise ignore, leaving uid 0.
++			name:    "a name resolves to its uid, gid and supplementary groups",
++			userstr: "node",
++			want:    specs.User{UID: 1000, GID: 1000, AdditionalGids: []uint32{1000, 27, 999}},
++		},
++		{
++			name:    "a numeric uid finds its primary group in passwd",
++			userstr: "1000",
++			want:    specs.User{UID: 1000, GID: 1000, AdditionalGids: []uint32{1000, 27, 999}},
++		},
++		{
++			// oci.WithUserID's rule: a uid with no passwd entry is not an
++			// error, it is that uid with gid 0.
++			name:    "a numeric uid absent from passwd keeps gid 0",
++			userstr: "4242",
++			want:    specs.User{UID: 4242, GID: 0, AdditionalGids: []uint32{0}},
++		},
++		{
++			// The primary gid is prepended only when it is not already in the
++			// supplementary set — containerd's ensureAdditionalGids rule. Here
++			// 999 is `docker`, which node is a member of, so the order is the
++			// group file's rather than gid-first.
++			name:    "user:group resolves both names",
++			userstr: "node:docker",
++			want:    specs.User{UID: 1000, GID: 999, AdditionalGids: []uint32{27, 999}},
++		},
++		{
++			name:    "uid:gid needs no lookup but still collects groups",
++			userstr: "1000:1000",
++			want:    specs.User{UID: 1000, GID: 1000, AdditionalGids: []uint32{1000, 27, 999}},
++		},
++		{
++			name:    "user:gid",
++			userstr: "node:27",
++			want:    specs.User{UID: 1000, GID: 27, AdditionalGids: []uint32{27, 999}},
++		},
++		{
++			name:    "uid:group",
++			userstr: "1000:sudo",
++			want:    specs.User{UID: 1000, GID: 27, AdditionalGids: []uint32{27, 999}},
++		},
++		{
++			name:    "root resolves to 0/0 rather than being assumed",
++			userstr: "root",
++			want:    specs.User{UID: 0, GID: 0, AdditionalGids: []uint32{0}},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := resolveUserString(imageFS(), tc.userstr)
++			if err != nil {
++				t.Fatalf("resolveUserString(%q) = error %v", tc.userstr, err)
++			}
++			if !reflect.DeepEqual(got, tc.want) {
++				t.Errorf("resolveUserString(%q):\n got %+v\nwant %+v", tc.userstr, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestResolveUserStringRefusesToGuess(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		userstr string
++		root    fstest.MapFS
++	}{
++		{
++			// The failure that must not become uid 0. There is no
++			// defensible number for a name that is not there.
++			name:    "a name absent from passwd",
++			userstr: "claude",
++			root:    imageFS(),
++		},
++		{
++			name:    "a name in a rootfs with no passwd at all",
++			userstr: "node",
++			root:    fstest.MapFS{},
++		},
++		{
++			name:    "a group name absent from group",
++			userstr: "node:nosuchgroup",
++			root:    imageFS(),
++		},
++		{
++			name:    "a value with too many colons",
++			userstr: "node:node:node",
++			root:    imageFS(),
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := resolveUserString(tc.root, tc.userstr)
++			if err == nil {
++				t.Fatalf("resolveUserString(%q) = %+v, want an error rather than a guess", tc.userstr, got)
++			}
++		})
++	}
++}
++
++// A group whose name matches the user is the user's primary group, not a supplementary
++// one. containerd skips it and so must this, or the gid would appear twice.
++func TestSupplementalGroupsSkipsTheUsersOwnGroup(t *testing.T) {
++	root := fstest.MapFS{
++		"etc/group": &fstest.MapFile{Data: []byte("node:x:1000:node\nsudo:x:27:node\n")},
++	}
++	got := supplementalGroups(root, "node")
++	want := []uint32{27}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("supplementalGroups = %v, want %v", got, want)
++	}
++}
++
++func TestReadGroupDistinguishesNoMembersFromEmpty(t *testing.T) {
++	root := fstest.MapFS{
++		"etc/group": &fstest.MapFile{Data: []byte(
++			"# a comment\n" +
++				"\n" +
++				"wheel:x:10:\n" +
++				"docker:x:999:node,root\n" +
++				"malformed-too-few-fields\n" +
++				"nonnumeric:x:notagid:node\n")},
++	}
++	got := readGroup(root)
++	want := []groupEntry{
++		{name: "wheel", gid: 10},
++		{name: "docker", gid: 999, members: []string{"node", "root"}},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("readGroup = %+v, want %+v", got, want)
++	}
++}
++
++// The end-to-end shape: a bundle whose config.json names a user, and a rootfs that can
++// answer. This is what the guest actually does, minus crun.
++func TestResolveSpecUserRewritesTheBundle(t *testing.T) {
++	bundle := t.TempDir()
++	rootfs := filepath.Join(bundle, "rootfs")
++	writeImageRootfs(t, rootfs)
++
++	writeBundleSpec(t, bundle, &specs.Spec{
++		Version: specs.Version,
++		Root:    &specs.Root{Path: "rootfs"},
++		Process: &specs.Process{
++			// What a host that could not read the rootfs leaves behind:
++			// the name recorded, the uid still 0.
++			User: specs.User{Username: "node", UID: 0, GID: 0, AdditionalGids: []uint32{0}, Umask: uint32Ptr(0o027)},
++			Args: []string{"/bin/sh"},
++		},
++	})
++
++	if err := resolveSpecUser(t.Context(), bundle); err != nil {
++		t.Fatalf("resolveSpecUser: %v", err)
++	}
++
++	got := readBundleSpec(t, bundle)
++	if got.Process.User.UID != 1000 || got.Process.User.GID != 1000 {
++		t.Errorf("uid/gid = %d/%d, want 1000/1000 — an image saying USER node ran as uid %d",
++			got.Process.User.UID, got.Process.User.GID, got.Process.User.UID)
++	}
++	if got.Process.User.Username != "" {
++		t.Errorf("Username = %q, want it consumed", got.Process.User.Username)
++	}
++	if want := []uint32{1000, 27}; !reflect.DeepEqual(got.Process.User.AdditionalGids, want) {
++		t.Errorf("AdditionalGids = %v, want %v", got.Process.User.AdditionalGids, want)
++	}
++	// Umask travels in the same struct and has nothing to do with the name.
++	if got.Process.User.Umask == nil || *got.Process.User.Umask != 0o027 {
++		t.Errorf("Umask = %v, want it preserved at 0027", got.Process.User.Umask)
++	}
++	// Everything else in the spec must survive the rewrite.
++	if !reflect.DeepEqual(got.Process.Args, []string{"/bin/sh"}) {
++		t.Errorf("Args = %v, want them untouched", got.Process.Args)
++	}
++	if got.Root.Path != "rootfs" {
++		t.Errorf("Root.Path = %q, want it untouched", got.Root.Path)
++	}
++}
++
++// Failing open: an unresolvable name leaves the bundle byte-identical rather than
++// killing the container or inventing a uid.
++func TestResolveSpecUserLeavesAnUnresolvableNameAlone(t *testing.T) {
++	bundle := t.TempDir()
++	writeImageRootfs(t, filepath.Join(bundle, "rootfs"))
++
++	spec := &specs.Spec{
++		Version: specs.Version,
++		Root:    &specs.Root{Path: "rootfs"},
++		Process: &specs.Process{User: specs.User{Username: "claude"}},
++	}
++	writeBundleSpec(t, bundle, spec)
++	before, err := os.ReadFile(filepath.Join(bundle, "config.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := resolveSpecUser(t.Context(), bundle); err != nil {
++		t.Fatalf("resolveSpecUser returned %v, want nil — an unresolvable name must not fail the container", err)
++	}
++
++	after, err := os.ReadFile(filepath.Join(bundle, "config.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(before) != string(after) {
++		t.Errorf("config.json was rewritten for a name that could not be resolved:\nbefore %s\nafter  %s", before, after)
++	}
++}
++
++// A spec with no Username is not this code's business, and must come out unchanged.
++func TestResolveSpecUserIgnoresASpecWithNoUsername(t *testing.T) {
++	bundle := t.TempDir()
++	writeImageRootfs(t, filepath.Join(bundle, "rootfs"))
++	writeBundleSpec(t, bundle, &specs.Spec{
++		Version: specs.Version,
++		Root:    &specs.Root{Path: "rootfs"},
++		Process: &specs.Process{User: specs.User{UID: 65534, GID: 65534}},
++	})
++
++	if err := resolveSpecUser(t.Context(), bundle); err != nil {
++		t.Fatalf("resolveSpecUser: %v", err)
++	}
++	got := readBundleSpec(t, bundle)
++	if got.Process.User.UID != 65534 || got.Process.User.GID != 65534 {
++		t.Errorf("uid/gid = %d/%d, want 65534/65534 untouched", got.Process.User.UID, got.Process.User.GID)
++	}
++}
++
++func uint32Ptr(v uint32) *uint32 { return &v }
++
++func writeImageRootfs(t *testing.T, dir string) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Join(dir, "etc"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	for name, data := range map[string]string{
++		"etc/passwd": "root:x:0:0:root:/root:/bin/bash\nnode:x:1000:1000::/home/node:/bin/bash\n",
++		"etc/group":  "root:x:0:\nsudo:x:27:node\nnode:x:1000:\n",
++	} {
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++}
++
++func writeBundleSpec(t *testing.T, bundle string, spec *specs.Spec) {
++	t.Helper()
++	data, err := json.Marshal(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(bundle, "config.json"), data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func readBundleSpec(t *testing.T, bundle string) *specs.Spec {
++	t.Helper()
++	spec, err := readSpec(bundle)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return spec
++}
