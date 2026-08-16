@@ -385,6 +385,14 @@ boks stop <name> && boks start <name>
 Boks does not do that for you, because it kills whatever is running inside. This is the top
 item on the [roadmap](roadmap.md).
 
+**One cause of this was boks itself, and it is fixed.** Until 2026-08-16, `boks run` tore the
+stack down whenever the command returned an error — and the exit code of the command you ran
+*inside* the sandbox is one of those. So a single failing command, or a Ctrl-C, took the
+network away from a sandbox that was still running, for the rest of that sandbox's life. It was
+measured on Windows: a task that exited 127 left a `running` sandbox with a dead stack. The
+stack now ends when the *sandbox* stops, and nothing else about a run decides it. The warning
+above stays for the cases boks does not cause — a supervisor that was killed, or that crashed.
+
 ### A sandbox ignores `--net none`, or has no policy at all
 
 Network mode is fixed when a sandbox is created, because it is expressed in annotations the
