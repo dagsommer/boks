@@ -304,15 +304,22 @@ kernel driver. There is no `.sys` file anywhere in it.
 
 ### About that SmartScreen warning
 
-**Boks ships unsigned, and Windows says so.** This is measured, not predicted: on
-2026-08-16, on a Windows machine testing the first release archive, Defender blocked an
-executable and reported it as being from an unknown publisher. Expect **More info → Run
-anyway**. Nothing is wrong with your download when that happens.
+**Boks ships unsigned, and Windows will say so — but only on one route.** Measured on
+2026-08-16 against the first release archive, and the result is narrower than we expected:
 
-Two details of that report are still missing and are worth having if you hit it: the exact
-dialog wording, and *which* executable was blocked — the archive carries `boks.exe`,
-`containerd.exe`, `ctr.exe` and `mkfs.erofs.exe`, and which one Windows objects to changes
-what to tell people. SmartScreen fires on a file carrying the Mark of the Web —
+- downloaded with a tool and run from a shell — `gh release download`, then `.\boks.exe` in
+  PowerShell — **nothing happens**. `gh` writes no Mark of the Web, and a console
+  `CreateProcess` does not consult SmartScreen's reputation check at all;
+- downloaded in a **browser** and started by **double-clicking** it in Explorer, SmartScreen
+  shows *"Windows protected your PC — Microsoft Defender SmartScreen prevented an
+  unrecognized app from starting"*, with `Publisher: Unknown publisher`. **More info → Run
+  anyway** works.
+
+Nothing is wrong with your download when that happens. Defender's antivirus engine is not
+involved and blocks nothing — this is the application-reputation check, which judges a file on
+the reputation of the certificate that signed it. An unsigned binary has no certificate, so
+there is nothing for a reputation to accrue against, and it does not improve with time the way
+a signed one does. SmartScreen fires on a file carrying the Mark of the Web —
 metadata Windows attaches to anything it considers downloaded — and it judges the file on the
 reputation of the certificate that signed it. An unsigned binary has no certificate, so there
 is nothing for a reputation to accrue against, and it does not improve with time the way a
