@@ -135,30 +135,33 @@ func snapshotterToolsCheckWith(probe versionProbe) Check {
 	return Check{
 		Name: "snapshotter tools",
 		Run: func(ctx context.Context, env Env) Result {
-			required, ok := snapshotterBinaries[env.Snapshotter]
-			if !ok {
+			required := snapshotterTools(env.Snapshotter, runtime.GOOS)
+			if len(required) == 0 {
 				return Result{Status: StatusSkip, Detail: "no host tools needed for " + env.Snapshotter}
 			}
-			var missing []string
+			var missing []snapshotterTool
+			var names []string
 			found := map[string]string{}
 			var paths []string
-			for _, binary := range required {
-				path, err := lookPath(binary)
+			for _, tool := range required {
+				path, err := lookPath(tool.Binary)
 				if err != nil {
-					missing = append(missing, binary)
+					missing = append(missing, tool)
+					names = append(names, tool.Binary)
 					continue
 				}
-				found[binary] = path
+				found[tool.Binary] = path
 				paths = append(paths, path)
 			}
 			if len(missing) > 0 {
+				var remedy []string
+				for _, tool := range missing {
+					remedy = append(remedy, fmt.Sprintf("%s: %s\n%s", tool.Binary, tool.Needed, tool.Install))
+				}
 				return Result{
 					Status: StatusFail,
-					Detail: strings.Join(missing, ", ") + " not found on PATH",
-					Remedy: fmt.Sprintf("The %q snapshotter builds image layers with %s, which is not installed.\n"+
-						"Without it, pulling an image fails partway through with an exec error.\n"+
-						"Install erofs-utils (apt: erofs-utils, brew: erofs-utils).",
-						env.Snapshotter, strings.Join(missing, " and ")),
+					Detail: strings.Join(names, ", ") + " not found on PATH",
+					Remedy: strings.Join(remedy, "\n\n"),
 				}
 			}
 
@@ -177,9 +180,58 @@ func snapshotterToolsCheckWith(probe versionProbe) Check {
 	}
 }
 
-// snapshotterBinaries maps a snapshotter to the host executables it requires.
-var snapshotterBinaries = map[string][]string{
-	"erofs": {"mkfs.erofs"},
+// snapshotterTool is one host executable a snapshotter shells out to, with the two sentences
+// worth saying when it is absent: what stops working, and how to get it. They are per binary
+// rather than per snapshotter because the two erofs needs come from different packages and fail
+// at different moments, and one remedy naming erofs-utils for a missing mkfs.ext4 would send
+// the reader to install something they already have.
+type snapshotterTool struct {
+	Binary  string
+	Needed  string
+	Install string
+}
+
+// snapshotterTools returns the host executables a snapshotter requires on a platform.
+//
+// The platform argument is the point. mkfs.erofs is needed everywhere — the differ runs it once
+// per image layer. mkfs.ext4 is needed only where the snapshotter runs in block mode, which
+// containerd decides from `blockMode = config.defaultSize > 0` (erofs.go:187) against a
+// platform default of 64 MiB off Linux and 0 on it. So Linux never formats a writable layer and
+// macOS and Windows format one per sandbox, before any task starts.
+//
+// Requiring mkfs.ext4 on Linux too would be the easy symmetric thing and would be wrong: it
+// would fail a green Linux host for a binary containerd will never invoke there.
+func snapshotterTools(snapshotter, goos string) []snapshotterTool {
+	if snapshotter != "erofs" {
+		return nil
+	}
+	tools := []snapshotterTool{{
+		Binary: "mkfs.erofs",
+		Needed: "the erofs snapshotter builds image layers with it.\n" +
+			"Without it, pulling an image fails partway through with an exec error.",
+		Install: "Install erofs-utils (apt: erofs-utils, brew: erofs-utils).",
+	}}
+	if goos == "linux" {
+		return tools
+	}
+	install := "Install e2fsprogs (apt: e2fsprogs, brew: e2fsprogs)."
+	switch goos {
+	case "darwin":
+		install = "Install e2fsprogs (brew: e2fsprogs). Homebrew keeps it keg-only, so it lands\n" +
+			"in $(brew --prefix e2fsprogs)/sbin and on no PATH; Boks adds that directory to\n" +
+			"the daemon's PATH itself, so installing it is enough."
+	case "windows":
+		install = "The Windows archive ships mkfs.ext4.exe beside boks.exe. If it is missing, take\n" +
+			"it from the boks-runtime zip for this release, or point BOKS_RUNTIME_DIR at the\n" +
+			"directory holding it."
+	}
+	return append(tools, snapshotterTool{
+		Binary: "mkfs.ext4",
+		Needed: "off Linux the erofs snapshotter gives every active snapshot its own ext4 image\n" +
+			"for the writable layer, and containerd's mount manager formats it with this.\n" +
+			"Without it no sandbox starts: 'boks run' fails with `failed format \"...rwlayer.img\"`.",
+		Install: install,
+	})
 }
 
 // runtimeShimCheck looks for the shim binary that implements the VM runtime. containerd
