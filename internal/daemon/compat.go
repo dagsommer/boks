@@ -52,6 +52,90 @@ import (
 // containerdModule is the module path a shim links when it links containerd.
 const containerdModule = "github.com/containerd/containerd/v2"
 
+// nerdboxModule is the module path of the shim's own source tree.
+const nerdboxModule = "github.com/containerd/nerdbox"
+
+// ShimNerdbox returns the nerdbox source revision the shim binary at path was built from,
+// or "" if that cannot be established.
+//
+// This is the same technique as ShimContainerd and a weaker one. ShimContainerd reads a
+// *dependency's* version out of the module graph, which is recorded for every Go build.
+// nerdbox is the shim's own main module, so there is no dependency entry to read; what
+// there is instead is the VCS stamp the toolchain writes when it builds a main package
+// from inside a checkout. `go build` in a git tree sets it, which is what
+// .github/workflows/linux-runtime.yml does. A build from an unpacked tarball, or one with
+// -buildvcs=false, does not, and answers "" here.
+func ShimNerdbox(path string) string {
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if info.Main.Path != nerdboxModule {
+		return ""
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.revision" {
+			return setting.Value
+		}
+	}
+	return ""
+}
+
+// nerdboxRevisionsResolvingUsernames lists the nerdbox revisions whose vminitd resolves
+// Process.User.Username against the guest's own /etc/passwd.
+//
+// It is empty. That is the state of the world and not a placeholder left unfilled: no
+// released nerdbox resolves that field, the patch that would is carried unapplied in
+// packaging/nerdbox/patches/, and neither guest-image.yml nor linux-runtime.yml applies it
+// — both build the pinned revision pristine and assert as much. So there is no revision
+// that belongs in this map yet, and ShimResolvesUsernames below is false for every input.
+//
+// A map of exact revisions rather than a "this version or newer" comparison, which is what
+// CheckSkew does for containerd. The difference is that containerd's bootstrap encoding is
+// monotonic — a newer reader understands every older encoding — and this is not a
+// compatibility relation at all but the presence or absence of a feature in a source tree.
+// nerdbox has no release carrying it, so there is no version boundary to name, and
+// inventing one would be a claim about revisions nobody has looked at.
+var nerdboxRevisionsResolvingUsernames = map[string]bool{}
+
+// ShimResolvesUsernames reports whether the guest booted by the shim at path resolves an
+// image's USER name into a uid, rather than leaving Process.User.Username for a runtime
+// that ignores it.
+//
+// # Why the caller needs this
+//
+// An OCI image may say `USER node`. Resolving the name means reading /etc/passwd inside the
+// image, which a host can only do by mounting the image — needing CAP_SYS_ADMIN on Linux
+// and being impossible on Windows and macOS, where the guest filesystem is not one the host
+// can mount. containerd's answer on those hosts is to record the name in
+// Process.User.Username and stop. Nothing downstream reads that field: crun consults only
+// uid, gid, umask and additional_gids, so the uid stays 0 and the container runs as root
+// without saying so. A caller that would skip the host-side resolution has to know whether
+// the guest will pick the work up, and the honest default is that it will not.
+//
+// # What this actually proves, and what it does not
+//
+// It answers about the **shim**, and the code that would do the resolving is in **vminitd**,
+// inside the guest rootfs — a different artifact, built from the same nerdbox revision by
+// convention rather than by anything checkable at runtime. packaging/nerdbox/NERDBOX_REV is
+// a single pin for exactly that reason, and guest-image.yml and linux-runtime.yml both read
+// it, so in every build this project produces the two do agree. A guest image swapped in by
+// hand can still disagree, and nothing here would notice: the rootfs carries no version, no
+// manifest and no embedded revision, which compat.go's own list of uncovered skews already
+// records as the gap it is.
+//
+// That weakness is survivable only because of the direction it fails in. An unknown shim,
+// an unstamped build, a hand-built guest — all of them answer false, which keeps the
+// caller on the path that works everywhere. The check can withhold a capability that is
+// present; it cannot invent one that is absent, and only the second direction is unsafe.
+func ShimResolvesUsernames(path string) bool {
+	if path == "" {
+		return false
+	}
+	revision := ShimNerdbox(path)
+	return revision != "" && nerdboxRevisionsResolvingUsernames[revision]
+}
+
 // ShimContainerd returns the containerd version the binary at path was built against, or ""
 // if the file is not a Go binary or does not link containerd at all.
 //
