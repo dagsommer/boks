@@ -94,8 +94,20 @@ done
 
 # A template that still contains a placeholder is a manifest that will be rejected far away
 # from here, by a bot, in someone else's repository. Catch it now.
-if grep -l '{{[A-Z_]*}}' "$dest"/*.yaml; then
-	echo "render.sh: the files above still contain unsubstituted placeholders" >&2
+#
+# `[^{}]`, not `[A-Z_]`. The character class this check used until 2026-08-16 excluded
+# DIGITS, so it could not match `{{INSTALLER_SHA256}}` — one of the three placeholders it
+# exists to catch — nor a `{{GUEST_REV_X86_64}}` or `{{SHA256_ARM64}}` added later. Verified:
+# a template carrying a literal `{{GUEST_REV_X86_64}}` rendered and this script exited 0.
+# Matching anything between doubled braces has no false-positive cost here — `#|` note lines
+# are already stripped above, and a false positive is a loud failure rather than a silent
+# pass, which is the direction to err in.
+leftover="$(grep -oh '{{[^{}]*}}' "$dest"/*.yaml | sort -u || true)"
+if [ -n "$leftover" ]; then
+	echo "render.sh: unsubstituted placeholders remain in $dest:" >&2
+	printf '  %s\n' $leftover >&2
+	grep -l '{{[^{}]*}}' "$dest"/*.yaml >&2
+	echo "render.sh: add a sed rule above for each, or remove it from the template" >&2
 	exit 1
 fi
 
@@ -105,8 +117,17 @@ ls -1 "$dest"
 # Validate if the tooling is here. It is not a substitute for `winget validate` and the
 # README says so; it does catch every structural mistake a schema can express, which is
 # most of the ways these files go wrong.
+#
+# BOKS_WINGET_REQUIRE_VALIDATION turns the skip into a failure. A check that quietly does
+# nothing when a dependency is absent is the same shape as no check at all, and CI — which
+# installs the dependencies deliberately — must not be allowed to skip it because an install
+# step silently failed. Humans keep the graceful skip; the packaging workflow sets this.
 if python3 -c 'import jsonschema, yaml' 2>/dev/null; then
 	python3 "$here/validate.py" "$dest"
+elif [ -n "${BOKS_WINGET_REQUIRE_VALIDATION:-}" ]; then
+	echo "render.sh: BOKS_WINGET_REQUIRE_VALIDATION is set but python3 lacks jsonschema/pyyaml" >&2
+	echo "render.sh: refusing to report success on manifests nothing validated" >&2
+	exit 1
 else
 	echo "render.sh: python3 with jsonschema and pyyaml not available; skipped schema validation" >&2
 fi
