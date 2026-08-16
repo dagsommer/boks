@@ -60,7 +60,9 @@ InstallationNotes: |-
     boks daemon start    start the containerd this package ships, configured for Boks
     boks run shell .     run a sandbox over the current directory
 
-  This package is not code-signed. Windows SmartScreen may warn the first time you run
-  boks.exe; see docs/install.md for why, and for how to verify the download instead.
+  This package is not code-signed. A winget install did not raise SmartScreen when this
+  was measured, because winget verifies the installer hash itself rather than launching
+  the binary through Explorer; a browser download of the same archive does raise it. See
+  docs/install.md.
 ManifestType: defaultLocale
 ManifestVersion: 1.12.0
