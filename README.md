@@ -67,10 +67,10 @@ and says as much. On Linux that check reads `/dev/kvm` and is `ok` or `fail`.
 each one leaves you holding. The short version:
 
 - **macOS on Apple silicon** — a Homebrew tap installs the CLI, containerd, libkrun,
-  erofs-utils and a nerdbox shim signed with the entitlement libkrun needs. Two files it
-  cannot install, nerdbox's guest kernel and root filesystem, are built by
-  `scripts/build-nerdbox-guest.sh`. `boks doctor` reports those two as `guest image` and
-  fails when they are missing, so a green `doctor` is worth more than it used to be.
+  erofs-utils, a nerdbox shim signed with the entitlement libkrun needs, and nerdbox's guest
+  kernel and root filesystem from a Boks release. `boks doctor` reports those last two as
+  `guest image` and fails when they are missing, so a green `doctor` is worth more than it
+  used to be. The tap is not published yet, and no Mac has run the formulae.
 - **Linux** — a tarball, a `.deb` or an `.rpm`. The packages vendor the runtime alongside the
   CLI, because no distribution ships a containerd new enough and nerdbox is packaged nowhere.
   Expect to run as root for now: sandbox creation still needs more privilege than an ordinary
