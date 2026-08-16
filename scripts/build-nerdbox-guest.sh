@@ -21,7 +21,7 @@
 # cross-toolchain, so no formula can do this, and there is nothing published to download
 # instead: nerdbox's own release workflow has failed on every tag since v0.2.0 and all ten
 # of its GitHub releases carry zero assets. Boks pins nerdbox by tag and checksum here, and
-# `packaging/homebrew/nerdbox.rb` pins the same tag for the shim.
+# `packaging/homebrew/tap/Formula/nerdbox.rb.in` pins the same tag for the shim.
 #
 # ## What is pinned, and what is only pinned by nerdbox
 #

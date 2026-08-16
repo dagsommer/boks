@@ -265,7 +265,7 @@ debugging, and refusing would remove the machine they are debugging with.
 
 containerd resolves the runtime shim through **its own** `PATH`, and the shim then locates
 libkrun and the guest kernel by scanning that same `PATH`. `docs/install.md` lists "start
-containerd with the shim on its PATH" as one of three things Homebrew cannot do for the user;
+containerd with the shim on its PATH" as one of the things Homebrew cannot do for the user;
 `docs/verification.md` lists it as one of four things that cost time on the first macOS run.
 
 A daemon Boks starts is a daemon whose environment Boks sets. `boks daemon` prepends the bundle
@@ -558,27 +558,41 @@ a plain ad-hoc signature and carries no entitlements across. So the signature is
 `post_install`, which runs after `fix_dynamic_linkage`, and survives both a source build and a
 bottle.
 
+**The formulae are templates now**, in `packaging/homebrew/tap/`, rendered by
+`packaging/homebrew/render.sh` in the same shape as `packaging/winget/render.sh`: it stamps the
+version and two SHA-256s and refuses to emit a file with a placeholder left in it. The old
+hand-edited `sha256 "0000…0000"` is gone.
+
+**The guest gap is closed.** `release.yml` publishes `boks-guest_<v>_arm64.tar.gz`; `boks.rb`
+now fetches it as a `resource` and installs `nerdbox-kernel-arm64` and `nerdbox-rootfs.erofs`
+into `#{HOMEBREW_PREFIX}/lib`, which is the last directory the shim scans on Apple silicon. So
+a successful `brew install boks` should no longer leave `guest image  fail` — untested, like
+everything else here.
+
 **What we do not have:**
 
 - the tap repository `dagsommer/homebrew-boks` does not exist, and cannot be created from this
   repository;
-- `boks.rb` carries a placeholder `sha256 "0000…0000"` awaiting the first tag's tarball;
-- **no macOS machine on CI**, so neither formula has ever been run — they have been checked for
-  syntax and read against Homebrew's source, nothing more;
-- no bottles, which means every install is a source build including a Go toolchain;
-- the guest kernel and rootfs, which the formula cannot build (no Docker, no Linux
-  cross-toolchain in a Homebrew build). This is the gap that makes a successful
-  `brew install boks` still produce `guest image  fail`.
-
-**The guest half of that gap is closed on the release side.** `release.yml` publishes
-`boks-guest_<v>_arm64.tar.gz`, which is the file a Mac needs; what remains is the `resource`
-block in the formula, spelled out in `packaging/homebrew/README.md`, and that is a formula
-change rather than a CI one.
+- **a published release.** The `v0.1.0` release is a *draft*, and a draft carries no tag, so
+  `archive/refs/tags/v0.1.0.tar.gz` 404s and the two digests the formula needs cannot be taken
+  yet. This is now the first step of the publish procedure rather than a footnote;
+- **no macOS machine on CI**, so neither formula has ever been *installed*. They have been
+  linted, audited, dependency-resolved, trust-tested and bottle-fetched against a real
+  Homebrew 6.0.17 on Linux — see `packaging/homebrew/README.md` for the command-by-command
+  record — which is a document check and not an install;
+- no bottles of our own. On Tahoe and Sequoia that costs little: the macOS/arm64 closure is
+  **14 kegs and only `boks` and `nerdbox` compile**, both Go. On Sonoma it costs a lot, because
+  `libkrun`, `libkrunfw` and `virglrenderer` bottle `arm64_tahoe` and `arm64_sequoia` only —
+  31 kegs, with `rust`, `lld` and `llvm` pulled in to build them. That is the libkrun tap's
+  coverage, not ours, and the only lever here is to warn about it.
 
 **Cost of the install, as designed:** four commands, not one — `brew tap`, `brew trust
-dagsommer/boks`, `brew trust --formula libkrun/krun/libkrun`, `brew install boks`. Homebrew
-6.0.0 requires explicit trust for non-official taps, and `libkrun/krun/libkrun` is always
-reached as a dependency so is never implicitly trusted. sbx has the same requirement.
+dagsommer/boks`, `brew trust libkrun/krun`, `brew install boks`. Homebrew 6.0.0 requires
+explicit trust for non-official taps, and the check runs at formula load, so it fails in under
+a second rather than after a build. Note the third line: `brew trust --formula
+libkrun/krun/libkrun` was documented here and **is not enough** — libkrun depends on
+`libkrunfw` and `virglrenderer` from the same tap and trust is not transitive. sbx has the same
+requirement.
 
 ### winget (Windows)
 
@@ -820,8 +834,9 @@ is why it does not ship alone now either.
 ### Release 2 — the smallest honestly usable install
 
 **macOS/arm64 Homebrew, with the guest.** It is the only platform where Boks has been shown to
-work end to end, and with the guest resource added, `brew install boks` produces a machine where
-`boks doctor` passes and a sandbox boots. That is the first install that is *true*.
+work end to end, and the guest resource is now in `boks.rb`, so `brew install boks` should
+produce a machine where `boks doctor` passes and a sandbox boots. That would be the first
+install that is *true* — and "should" is doing real work in that sentence.
 
 It still requires the one `sudo` line for `/var/run/containerd` and the `brew trust` lines.
 Neither is avoidable and both are documented.
@@ -863,8 +878,10 @@ without blocking any of it.
   someone is upgrading. Publishing a `.deb` per release is the right size for now, and an apt
   repository is a standing commitment: indices that must stay consistent and a URL that must
   keep working.
-- **Homebrew bottles.** They save a Go toolchain and a build, which is minutes, and cost a
-  `brew bottle` run per macOS version plus hosting.
+- **Homebrew bottles.** They save two Go builds, which is minutes, and cost a `brew bottle`
+  run per macOS version plus hosting. On Tahoe and Sequoia those two builds are the only
+  compiles in the whole install, so the saving is small; on Sonoma the time goes into
+  libkrun's source build, which a Boks bottle would not touch.
 - **Code signing on Windows.** Costs money and buys a first-run dialog.
 - **Embedding containerd.** Revisit when the Windows patch series stops moving. The measurement
   is done and the answer will keep: 0.4 MB.

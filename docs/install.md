@@ -29,16 +29,17 @@ boundary and the network policy were both established here; see
 ```sh
 brew tap dagsommer/boks
 brew trust dagsommer/boks
-brew trust --formula libkrun/krun/libkrun
+brew trust libkrun/krun
 brew install boks
 ```
 
 > [!NOTE]
 > **Not published yet.** The tap does not exist. The formulae are written and reviewed — they
-> are in [`packaging/homebrew/`](../packaging/homebrew/) with instructions for creating the
-> tap — but none of this has been run: there is no macOS machine on this project's CI, and
-> the formulae have been checked for syntax and read against Homebrew's source, nothing more.
-> Until the tap is live, [build from source](#building-from-source).
+> are in [`packaging/homebrew/`](../packaging/homebrew/) with the procedure for creating the
+> tap — but no macOS machine has ever run them: there is no macOS CI on this project. They
+> have been linted, audited, dependency-resolved and trust-tested against a real Homebrew
+> 6.0.17 on Linux, which is a document check and not an install. Until the tap is live,
+> [build from source](#building-from-source).
 
 That installs the whole stack — containerd, erofs-utils, libkrun and a nerdbox shim signed
 with the entitlement libkrun needs — rather than the CLI alone, because a CLI alone would
@@ -51,13 +52,22 @@ yet) to run containers on this build of containerd."* That plugin is exactly wha
 `dagsommer/boks/nerdbox` supplies, and it is why the tap has two formulae rather than one.
 
 **Why the two `brew trust` lines.** Since Homebrew 6.0.0 a non-official tap must be trusted
-before Homebrew will load Ruby from it. Naming a formula in full on the command line trusts
-that formula implicitly, so `brew install dagsommer/boks/nerdbox dagsommer/boks/boks` also
-works — but only for the names you actually type. `libkrun/krun/libkrun` is always reached
-as a dependency and so always needs saying out loud. Any tap-based install has the same
-requirement; it is a Homebrew rule, not something specific to this project.
+before Homebrew will load Ruby from it. Any tap-based install has the same requirement; it is
+a Homebrew rule, not something specific to this project. The check runs when a formula is
+*loaded*, so a missing trust fails in under a second rather than after a build.
 
-### Then three things Homebrew cannot do for you
+Two shortcuts look like they should work and do not, both verified against Homebrew 6.0.17 on
+2026-08-16:
+
+- Naming formulae in full trusts only the names you type, so
+  `brew install dagsommer/boks/nerdbox dagsommer/boks/boks` still fails — on
+  `libkrun/krun/libkrun`, which is a dependency and was never typed.
+- `brew trust --formula libkrun/krun/libkrun` is not enough either. `libkrun` depends on
+  `libkrunfw` and `virglrenderer` from the same tap and trust is not transitive, so the
+  install stops at *"Refusing to load formula libkrun/krun/libkrunfw"*. Trust the tap, or
+  name all three formulae.
+
+### Then two things Homebrew cannot do for you
 
 **1. Give yourself `/var/run/containerd`.** containerd derives the shim's socket path from a
 compile-time constant, so no configuration setting moves it
@@ -85,8 +95,15 @@ launchd job or a `brew services` plist, that `PATH` is probably minimal and will
 > described under point 1 — the `[ttrpc]` section with a `uid`/`gid` — so that half is no
 > longer something to get right by hand either.
 
-**3. Build the guest kernel and root filesystem.** This is the gap, and the one thing on
-this page that no package on any platform installs for you.
+### The guest kernel and root filesystem, which the formula now fetches
+
+This used to be a third thing to do by hand, and on this platform it no longer is: `boks.rb`
+carries a `resource "guest"` pointing at the `boks-guest_<version>_arm64.tar.gz` asset a Boks
+release publishes, and installs both files into `$(brew --prefix)/lib`. `nerdbox.rb` still
+cannot build them — a Homebrew build has no Docker and no Linux cross-toolchain — so
+`brew install nerdbox` on its own leaves the gap and says so in its caveat.
+
+Build them yourself if you want to, or if you are not installing from the tap:
 
 ```sh
 git clone https://github.com/dagsommer/boks && cd boks
@@ -554,7 +571,7 @@ machine is still missing, and [What a sandbox needs](#what-a-sandbox-needs) is t
 
 | | Status | What it needs |
 |---|---|---|
-| Homebrew tap | formulae written, tap not created | a `dagsommer/homebrew-boks` repository, and the release tarball's checksum |
+| Homebrew tap | formulae written, linted and audited against a real Homebrew; tap not created | a published release — the draft `v0.1.0` has no tag, so the formula's `url` 404s — and a `dagsommer/homebrew-boks` repository. [`packaging/homebrew/README.md`](../packaging/homebrew/README.md) is the numbered procedure |
 | Homebrew bottles | none | a `brew bottle` run per macOS version on Apple silicon, and somewhere to host them |
 | apt repository | signing key created; not hosted | hosting for the static repository, and an index-and-sign job in CI |
 | winget | manifests written and schema-checked; nothing submitted | a tag, so the `InstallerUrl` resolves, then a pull request to `microsoft/winget-pkgs` behind a signed CLA and a human moderator's approval — [`packaging/winget/README.md`](../packaging/winget/) has the whole list |
@@ -564,12 +581,12 @@ machine is still missing, and [What a sandbox needs](#what-a-sandbox-needs) is t
 
 **The guest kernel and rootfs used to be the row that mattered most here**, because they are
 the difference between an install that works and one that reaches a passing `doctor` and a
-sandbox that will not boot. `release.yml` now publishes them — as `boks-guest_*_x86_64.tar.gz`
-and `_aarch64.tar.gz`, and inside `boks_*_windows_amd64.zip` — so on Windows there is nothing
-left to fetch. macOS is the platform still waiting: the `aarch64` guest archive is the file a
-Mac needs, and what remains is a `resource` block and one `lib.install` in
-`packaging/homebrew/nerdbox.rb`, spelled out in
-[packaging/homebrew/README.md](../packaging/homebrew/README.md).
+sandbox that will not boot. `release.yml` now publishes them — as `boks-guest_<version>_x86_64.tar.gz`
+and `boks-guest_<version>_arm64.tar.gz`, and inside `boks_*_windows_amd64.zip` — so on Windows
+there is nothing left to fetch. `boks.rb` fetches the `arm64` archive as a `resource` and
+installs both files into `$(brew --prefix)/lib`, so the tap closes it on macOS too. The `.deb`
+and `.rpm` are the remaining gap: `scripts/package-linux.sh` will place the guest if handed
+it, and `release.yml` does not hand it over.
 
 The kernel is GPL-2.0 and nerdbox patches it before building, so distributing the compiled
 result carries a corresponding-source obligation. Every archive that contains it ships a
