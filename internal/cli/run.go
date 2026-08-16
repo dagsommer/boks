@@ -75,7 +75,7 @@ Agents:
 	netFlags.register(cmd.Flags())
 	netFlags.registerPublish(cmd.Flags())
 
-	cmd.RunE = func(cmd *cobra.Command, args []string) (err error) {
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
 
 		// Early, so the background refresh has the whole of a VM start to finish in.
@@ -158,13 +158,16 @@ Agents:
 		if started {
 			defer func() {
 				// An ephemeral sandbox leaves nothing behind, its network
-				// included. A run that failed must not leave a stack holding a
-				// socket for a VM that will never connect. A persistent sandbox
-				// that started successfully keeps its stack — that it outlives
-				// this process is the whole point.
-				if ephemeral || err != nil {
-					stopNetworkQuietly(inv.name, env.Stderr)
-				}
+				// included, and a stack whose sandbox never came up must not be
+				// left holding a socket for a VM that will never connect. A
+				// sandbox that is running keeps its stack, however this command
+				// ended — that the stack outlives this process is the whole
+				// point of it being a process. See releaseStack for the run that
+				// proved this had to be decided by the sandbox's state rather
+				// than by this command's error.
+				releaseStack(inv.name, ephemeral, func() bool {
+					return sandboxIsRunning(ctx, cfg.Address, inv.name, env.Stderr)
+				}, env.Stderr)
 			}()
 		}
 		if ephemeral {
@@ -184,12 +187,9 @@ Agents:
 		cfg.TTY = !detached && isTerminal(env.Stdin) && isTerminal(env.Stdout)
 
 		if detached {
-			// Assign rather than declare: the deferred network cleanup above reads
-			// this function's error, and a shadowed one would make a failed run look
-			// successful to it and leave a stack behind.
-			info, upErr := sandbox.Up(ctx, cfg)
-			if upErr != nil {
-				return upErr
+			info, err := sandbox.Up(ctx, cfg)
+			if err != nil {
+				return err
 			}
 			fmt.Fprintln(env.Stdout, info.Name)
 			return nil
