@@ -298,10 +298,13 @@ guest kernel. Compressed, materially less — the rootfs and kernel are the inco
 
 Two entries deserve their own note:
 
-- **`mkfs.ext4` has no Windows build at all.** containerd wants it for a container's writable
-  layer, and `docs/windows-e2e.md` supplies a pre-made `rwlayer-64m.img` by hand. That is fine
-  for a documented procedure and is not a thing a package can ship — a fixed-size image is not
-  a filesystem tool. This is an open item, not a solved one.
+- **`mkfs.ext4` had no Windows build at all**, and containerd wants it for a container's
+  writable layer. The stopgap was a pre-made `rwlayer-64m.img` copied into place by hand from
+  `docs/windows-e2e.md` — fine for a documented procedure, and not a thing a package can ship,
+  because a fixed-size image is not a filesystem tool. It is solved now:
+  `packaging/mkfs-ext4-windows` cross-compiles a real `mkfs.ext4.exe`, which formatted a
+  writable layer on Windows on 2026-08-16 with no human in the loop. The image ships only in
+  the runtime zip, as that document's fallback.
 - **The guest kernel is GPL-2.0 and nerdbox patches it.** Distributing the compiled result
   carries a corresponding-source obligation. The recipe is entirely public — a pinned
   `cdn.kernel.org` tarball, a config and a patch set — so satisfying it is a matter of
@@ -336,7 +339,8 @@ locally is what lets brew ad-hoc sign it.
 | Linux `libkrun.so` + `containerd-shim-nerdbox-v1`, per arch | `linux-runtime.yml` | `boks-runtime_<v>_linux_amd64.tar.gz`, `…_linux_arm64.tar.gz` |
 | `krun.dll` | `libkrun-windows.yml` | inside `boks-runtime_<v>_windows_amd64.zip`, and inside `boks_<v>_windows_amd64.zip` |
 | Windows nerdbox shim | `nerdbox-windows.yml` | the same two zips, **renamed** to `containerd-shim-nerdbox-v1.exe` |
-| Windows `containerd.exe`, `ctr.exe`, `mkfs.erofs.exe`, `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | `containerd-windows.yml` | the same two zips |
+| Windows `containerd.exe`, `ctr.exe`, `mkfs.erofs.exe`, `mkfs.ext4.exe`, `config.toml`, `new-containerd-root.ps1` | `containerd-windows.yml` | the same two zips |
+| `rwlayer-64m.img` | `containerd-windows.yml` | `boks-runtime_<v>_windows_amd64.zip` **only** — nothing in the all-in-one archive reads it since `mkfs.ext4.exe` formats the layer |
 | `boks` for linux/amd64, linux/arm64, darwin/arm64 and **windows/amd64**, plus `.deb` and `.rpm` | `release.yml` | as before; the Windows CLI is published only inside `boks_<v>_windows_amd64.zip` |
 
 The Windows shim rename is not cosmetic. `nerdbox-windows.yml` builds both architectures and
