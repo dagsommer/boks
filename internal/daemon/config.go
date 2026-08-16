@@ -50,7 +50,29 @@ type Settings struct {
 	// EROFS reports whether mkfs.erofs was found. When it was not, the erofs differ must
 	// not be named in the diff order.
 	EROFS bool
+	// Ext4 reports whether mkfs.ext4 was found. Unlike EROFS this changes nothing in the
+	// rendered file, because there is nothing to write: containerd asks for the writable
+	// layer unconditionally and there is no setting that says "don't". It is a Settings
+	// field anyway so that Preflight can be tested against a host that does not have the
+	// binary from one that does — the same reason EROFS is one.
+	Ext4 bool
 }
+
+// blockWritableLayer reports whether the erofs snapshotter gives every active snapshot a
+// separate ext4 image for its writable layer on this platform, rather than a plain directory.
+//
+// containerd decides this from one number. `blockMode = config.defaultSize > 0`
+// (plugins/snapshots/erofs/erofs.go:187), and defaultSize comes from the platform's
+// defaultWritableSize: 64 MiB in erofs_other.go:30 — which is the !linux file — and 0 in
+// erofs_linux.go. So block mode is on for macOS and Windows and off for Linux, and Boks does
+// not currently write a `default_size` of its own to override either.
+//
+// In block mode an active snapshot's mount list begins with a mount of type `mkfs/ext4`
+// (erofs.go:395-411) whose source is `<erofs root>/snapshots/<id>/rwlayer.img`
+// (erofs.go:206-208). containerd's mount manager formats that image by running `mkfs.ext4`,
+// at task start. Off Linux that binary is not something a host reliably has, which is the
+// whole of writableLayerNote below.
+func blockWritableLayer(goos string) bool { return goos != "linux" }
 
 // diffOrder is the diff-service order for a platform, and it is the setting the whole file
 // exists for.
@@ -263,20 +285,21 @@ func quoteList(values []string) string {
 // It is exported for `boks daemon config`, which exists because the most useful thing to hand
 // somebody debugging a daemon is the file it is running with and the reasons for each line.
 func Config(stateDir string) (string, error) {
-	return render(settingsFor(Dir(stateDir), HasEROFS()))
+	return render(settingsFor(Dir(stateDir), HasEROFS(), HasExt4()))
 }
 
 // settingsFor builds the Settings for a host whose state lives under dir.
 //
 // uid and gid are read from the running process on Unix and left unset on Windows, which has
 // neither and whose named pipe is not chowned at all.
-func settingsFor(dir string, erofs bool) Settings {
+func settingsFor(dir string, erofs, ext4 bool) Settings {
 	s := Settings{
 		GOOS:   runtime.GOOS,
 		GOARCH: runtime.GOARCH,
 		Root:   filepath.Join(dir, "root"),
 		State:  filepath.Join(dir, "state"),
 		EROFS:  erofs,
+		Ext4:   ext4,
 	}
 	s.Address = addressIn(dir)
 	if runtime.GOOS != "windows" {

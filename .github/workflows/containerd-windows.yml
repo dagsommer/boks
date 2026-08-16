@@ -58,11 +58,13 @@ on:
     paths:
       - "packaging/containerd-windows/**"
       - "packaging/mkfs-erofs-windows/**"
+      - "packaging/mkfs-ext4-windows/**"
       - ".github/workflows/containerd-windows.yml"
   pull_request:
     paths:
       - "packaging/containerd-windows/**"
       - "packaging/mkfs-erofs-windows/**"
+      - "packaging/mkfs-ext4-windows/**"
       - ".github/workflows/containerd-windows.yml"
   workflow_dispatch:
   workflow_call:
@@ -295,6 +297,202 @@ jobs:
             echo
             echo "x86-64 only — go-erofs's recipe cross-compiles for no other Windows target."
             echo "This binary has never been executed, on Windows or anywhere."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # -----------------------------------------------------------------------------------------
+  # mkfs.ext4.exe — e2fsprogs cross-compiled with mingw-w64, from a pristine upstream release.
+  #
+  # This is the binary that formats every sandbox's writable layer. Off Linux the erofs
+  # snapshotter runs in block mode, so before any task starts containerd's mount manager
+  # creates <erofs root>\snapshots\<id>\rwlayer.img, truncates it to the requested size and
+  # runs `mkfs.ext4` on it. Without this file that is where every `boks run` on Windows stops,
+  # after a complete and successful image pull — measured on Windows 11 on 2026-08-16.
+  #
+  # Unlike mkfs.erofs, there is nothing to port: mingw is a supported host in e2fsprogs' own
+  # configure.ac and lib/ext2fs/windows_io.c is upstream. No patches directory, no vendored
+  # compatibility headers, no third-party recipe. Read packaging/mkfs-ext4-windows/README.md
+  # for the four configure.ac lines that make it so, and for why the pre-formatted
+  # rwlayer-64m.img below is a fallback rather than the answer.
+  #
+  # `ubuntu-latest`, not the pinned 24.04 the mkfs-erofs job needs. That pin exists because
+  # erofs-utils fails on newer mingw-w64 headers (`implicit declaration of asprintf`); nothing
+  # here depends on the mingw version, and the assertions below would say so if it did.
+  # -----------------------------------------------------------------------------------------
+  mkfs-ext4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: boks
+
+      - name: Read the pinned e2fsprogs version
+        id: pin
+        run: |
+          set -euo pipefail
+          v="$(grep -v '^[[:space:]]*#' boks/packaging/mkfs-ext4-windows/E2FSPROGS_VERSION | tr -d '[:space:]')"
+          case "$v" in
+            [0-9]*.[0-9]*) ;;
+            *) echo "E2FSPROGS_VERSION does not contain a version: '$v'" >&2; exit 1 ;;
+          esac
+          echo "version=$v" >>"$GITHUB_OUTPUT"
+          # The checksum lives in the same file, as a comment, so the pin and the bytes it
+          # names cannot drift apart in separate commits.
+          sum="$(grep -oE '^#[[:space:]]+[0-9a-f]{64}$' boks/packaging/mkfs-ext4-windows/E2FSPROGS_VERSION | tr -d '# ')"
+          [ -n "$sum" ] || { echo "no sha256 comment in E2FSPROGS_VERSION" >&2; exit 1; }
+          echo "sha256=$sum" >>"$GITHUB_OUTPUT"
+
+      - name: Install mingw-w64
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+          x86_64-w64-mingw32-gcc --version | head -1
+
+      - name: Fetch and verify e2fsprogs
+        run: |
+          set -euo pipefail
+          v='${{ steps.pin.outputs.version }}'
+          url="https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${v}/e2fsprogs-${v}.tar.gz"
+          curl -fsSL -o e2fsprogs.tar.gz "$url"
+          echo '${{ steps.pin.outputs.sha256 }}  e2fsprogs.tar.gz' | sha256sum -c -
+          tar xzf e2fsprogs.tar.gz
+          # No patches are applied, and that is an assertion rather than an omission: the day
+          # this directory grows a patches/ is the day this comment is wrong.
+          [ ! -d boks/packaging/mkfs-ext4-windows/patches ] \
+            || { echo "packaging/mkfs-ext4-windows/patches/ exists but nothing applies it" >&2; exit 1; }
+
+      # LDFLAGS="-static" is load-bearing. Without it the binary imports libwinpthread-1.dll,
+      # which a stock Windows machine does not have, and an exe that cannot start produces
+      # exactly the same "failed format" error as no exe at all — with a far worse explanation.
+      # The import table is asserted below.
+      - name: Configure for the mingw host
+        working-directory: e2fsprogs-${{ steps.pin.outputs.version }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-static" ./configure --host=x86_64-w64-mingw32 \
+            --disable-nls --disable-uuidd --disable-tls --disable-fuse2fs \
+            --disable-e2initrd-helper --disable-testio-debug --disable-defrag \
+            --disable-backtrace --without-libarchive >configure.log 2>&1 \
+            || { tail -40 configure.log >&2; exit 1; }
+          grep -q 'OS_IO_FILE.*windows_io' Makefile lib/ext2fs/Makefile 2>/dev/null \
+            || echo "  (OS_IO_FILE not visible in the Makefiles; the object check below is the real test)"
+
+      # The order is not cosmetic. lib/e2p includes lib/ext2fs/ext2_err.h, which lib/ext2fs
+      # generates, so building e2p first fails with "No rule to make target".
+      #
+      # lib/ss is skipped, and `make libs` is not used. lib/ss is debugfs' interactive
+      # subsystem library, it does not compile against mingw (sigset_t and SIGCONT undeclared
+      # in listen.c), and mke2fs does not link it — but `make libs` walks into it and stops,
+      # which makes a perfectly good port look like a failed one.
+      - name: Build the libraries mke2fs links
+        working-directory: e2fsprogs-${{ steps.pin.outputs.version }}
+        run: |
+          set -euo pipefail
+          for d in lib/et lib/ext2fs lib/e2p lib/uuid lib/blkid lib/support; do
+            make -C "$d" -j"$(nproc)" >"build-$(echo "$d" | tr / _).log" 2>&1 \
+              || { echo "::error::$d failed to cross-compile"; tail -40 "build-$(echo "$d" | tr / _).log" >&2; exit 1; }
+            echo "  $d ok"
+          done
+
+      # The one platform-specific decision in the whole build, asserted where it is visible.
+      # configure sets OS_IO_FILE=windows_io (configure.ac:1973), which is what selects
+      # lib/ext2fs/windows_io.c over unix_io.c. A binary carrying unix_io would compile, link,
+      # ship, and then fail to open any path on Windows.
+      - name: Assert the Win32 I/O manager was selected, not the POSIX one
+        working-directory: e2fsprogs-${{ steps.pin.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -f lib/ext2fs/windows_io.o ] \
+            || { echo "windows_io.o was not built — configure did not treat this as a mingw host" >&2; exit 1; }
+          if [ -f lib/ext2fs/unix_io.o ]; then
+            echo "unix_io.o was built; this binary would use POSIX open() on Windows" >&2
+            exit 1
+          fi
+          x86_64-w64-mingw32-nm lib/ext2fs/libext2fs.a | grep -q 'windows_io_manager' \
+            || { echo "windows_io_manager is not in libext2fs.a" >&2; exit 1; }
+          echo "  windows_io.o built, unix_io.o absent, windows_io_manager in libext2fs.a"
+
+      # The target is `mke2fs`, not `mke2fs.exe`; the Makefile's PROGS carry no suffix.
+      #
+      # And the copy is named mkfs.ext4.exe because THE NAME IS THE CONFIGURATION. containerd
+      # runs exec.Command("mkfs.ext4", "-q", <path>) with no filesystem argument, and mke2fs
+      # takes the type from argv[0]: parse_fs_type strips a leading "mkfs." and uses the rest
+      # (misc/mke2fs.c:1408-1421, :2158). A copy named anything else falls back to the profile
+      # default, which is ext2 — and since ext2 and ext4 share EXT2_SUPER_MAGIC, patch 0005's
+      # superblock check would accept the result without a word.
+      - name: Build and name mkfs.ext4.exe
+        working-directory: e2fsprogs-${{ steps.pin.outputs.version }}
+        run: |
+          set -euo pipefail
+          make -C misc mke2fs >build-mke2fs.log 2>&1 \
+            || { tail -40 build-mke2fs.log >&2; exit 1; }
+          x86_64-w64-mingw32-strip misc/mke2fs.exe
+          mkdir -p "${GITHUB_WORKSPACE}/out"
+          cp misc/mke2fs.exe "${GITHUB_WORKSPACE}/out/mkfs.ext4.exe"
+
+      # x86_64-w64-mingw32-objdump rather than the host objdump: the host binutils on a
+      # non-x86 runner does not have the pei-x86-64 target and reports "file format not
+      # recognized", which reads as a broken binary rather than a broken check.
+      - name: Assert mkfs.ext4.exe is a self-contained PE32+ that needs no mke2fs.conf
+        run: |
+          set -euo pipefail
+          f=out/mkfs.ext4.exe
+          [ "$(basename "$f")" = "mkfs.ext4.exe" ] \
+            || { echo "the artifact is not named mkfs.ext4.exe; it would format ext2" >&2; exit 1; }
+          magic="$(head -c 2 "$f")"
+          [ "$magic" = "MZ" ] || { echo "$f is not a PE image (magic '$magic')" >&2; exit 1; }
+          x86_64-w64-mingw32-objdump -f "$f" | grep -q 'pei-x86-64' \
+            || { echo "$f is not PE32+ x86-64" >&2; x86_64-w64-mingw32-objdump -f "$f" >&2; exit 1; }
+
+          # Nothing but the two DLLs every Windows machine has. libwinpthread-1.dll here means
+          # the binary will not start on a stock host.
+          dlls="$(x86_64-w64-mingw32-objdump -p "$f" | sed -n 's/.*DLL Name: //p' | sort -u | tr 'A-Z' 'a-z')"
+          unexpected="$(echo "$dlls" | grep -v -x -e 'kernel32.dll' -e 'msvcrt.dll' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "$f imports DLLs a stock Windows machine may not have:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+
+          # The same "it is the Win32 I/O manager" fact, asserted against the shipped artifact
+          # rather than against an intermediate object nobody downloads.
+          for sym in CreateFileA SetFilePointerEx GetFileSizeEx ReadFile WriteFile; do
+            x86_64-w64-mingw32-objdump -p "$f" | grep -qi "$sym" \
+              || { echo "$f does not import $sym — windows_io.c is not what is linked" >&2; exit 1; }
+          done
+
+          # mke2fs reads ROOT_SYSCONFDIR/mke2fs.conf, which mingw resolves to C:\etc\mke2fs.conf
+          # — a path no Windows machine has. On ENOENT it falls back to a profile compiled into
+          # the binary (misc/mke2fs.c:1704-1710). These strings are that profile. Without them
+          # the bundle would have to ship a config file as well, and would fail confusingly if
+          # anyone dropped it.
+          for s in metadata_csum_seed inode_ratio fs_types; do
+            strings "$f" | grep -q -- "$s" \
+              || { echo "$f has no compiled-in mke2fs profile ($s missing); it would need an mke2fs.conf" >&2; exit 1; }
+          done
+
+          echo "  PE32+ x86-64, $(wc -c <"$f") bytes, imports only: $(echo "$dlls" | tr '\n' ' ')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mkfs-ext4-windows-amd64
+          path: out/mkfs.ext4.exe
+          if-no-files-found: error
+
+      - name: Record what was built
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## mkfs.ext4.exe"
+            echo
+            echo "e2fsprogs \`${{ steps.pin.outputs.version }}\`, pristine — no patches."
+            echo
+            echo '```'
+            sha256sum out/mkfs.ext4.exe 2>/dev/null | sed 's|out/||' || echo "(build failed)"
+            echo '```'
+            echo
+            echo "x86-64 only. This binary has never been executed, on Windows or anywhere."
           } >>"$GITHUB_STEP_SUMMARY"
 
   # -----------------------------------------------------------------------------------------
@@ -608,7 +806,7 @@ jobs:
   # -----------------------------------------------------------------------------------------
   bundle:
     runs-on: ubuntu-latest
-    needs: [mkfs-erofs, containerd]
+    needs: [mkfs-erofs, mkfs-ext4, containerd]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -636,6 +834,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: mkfs-erofs-windows-amd64
+          path: staging
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mkfs-ext4-windows-amd64
           path: staging
 
       - uses: actions/download-artifact@v4
