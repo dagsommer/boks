@@ -45,6 +45,52 @@ version="$(grep -v '^[[:space:]]*#' "$here/CONTAINERD_VERSION" | grep -v '^[[:sp
 buildtags="$(grep -v '^[[:space:]]*#' "$here/BUILDTAGS" | grep -v '^[[:space:]]*$' | tr '\n' ' ')"
 buildtags="${buildtags% }"
 
+# --- what each build tag must actually REMOVE from the binary -----------------------------
+#
+# `go build -tags` is silent about a tag that matches no build constraint anywhere: it is not
+# a warning, it is not an error, the build succeeds and the plugin stays in. Measured against
+# containerd v2.3.3 on linux/arm64 on 2026-08-16: changing `no_cri` to `no_cri_` — one
+# character — produced a 35,586,210-byte daemon with CRI and CNI compiled in, 5.8 MB heavier
+# than the 29,753,506 bytes BUILDTAGS' own table records, and exit 0 either way. Nothing here
+# noticed, because the only post-build assertion was the ELF machine, which is identical.
+#
+# So each tag names the Go package path it is supposed to make disappear, and the built
+# binary is checked for it. Package paths survive -trimpath and -ldflags "-s -w" (they are in
+# the function name table, not the symbol table), which is what makes this readable from the
+# artifact rather than inferred from the flags that produced it.
+#
+# A tag with no entry here is a hard error. That is the half that catches the typo: an
+# unrecognised tag is either misspelled or new, and both need a human.
+markers_for_tag() {
+	case "$1" in
+	urfave_cli_no_docs) printf '%s\n' 'github.com/cpuguy83/go-md2man' ;;
+	no_cri) printf '%s\n' \
+		'github.com/containerd/containerd/v2/plugins/cri' \
+		'github.com/containerd/go-cni' ;;
+	no_devmapper) printf '%s\n' 'github.com/containerd/containerd/v2/plugins/snapshots/devmapper' ;;
+	no_zfs) printf '%s\n' 'github.com/containerd/zfs/v2' ;;
+	no_tracing) printf '%s\n' 'github.com/containerd/containerd/v2/pkg/tracing/plugin' ;;
+	*) return 1 ;;
+	esac
+}
+
+# The POSITIVE CONTROL for every "must be absent" assertion above. If a future toolchain or
+# ldflags change stripped package paths from the binary, every removal check would pass while
+# testing nothing — the classic hollow check. erofs is the snapshotter Boks pins
+# (internal/runtimecfg) and the one thing this daemon must not be built without, so its
+# presence is both the control and an assertion worth having on its own.
+REQUIRED_MARKER='github.com/containerd/containerd/v2/plugins/snapshots/erofs'
+
+for tag in $buildtags; do
+	markers_for_tag "$tag" >/dev/null || {
+		echo "$here/BUILDTAGS names '$tag', which build.sh has no marker for." >&2
+		echo "go build IGNORES a tag matching no build constraint, silently and with exit 0," >&2
+		echo "so an unrecognised tag here is either a typo or a new tag that needs an entry in" >&2
+		echo "markers_for_tag() saying which package it removes. Refusing to build." >&2
+		exit 1
+	}
+done
+
 [ -n "$version" ] || {
 	echo "no version in $here/CONTAINERD_VERSION" >&2
 	exit 1
@@ -110,5 +156,34 @@ echo "building containerd $version for linux/$goarch with tags: $buildtags" >&2
 # binary for the wrong GOARCH and the filename will not tell you, and the mistake surfaces on
 # a user's machine as "cannot execute binary file". assert-elf.py reads e_machine.
 python3 "$here/../linux/assert-elf.py" "$out" --machine "$machine"
+
+# The control first, so that "absent" below means absent rather than unreadable.
+if ! grep -qaF -- "$REQUIRED_MARKER" "$out"; then
+	echo "the erofs snapshotter's package path is not in $out." >&2
+	echo "Either the daemon was built without the one snapshotter Boks uses, or package" >&2
+	echo "paths are no longer readable from the binary — in which case every tag assertion" >&2
+	echo "below would pass while testing nothing, and this script must not be trusted until" >&2
+	echo "markers_for_tag() is rewritten against whatever the binary does carry." >&2
+	exit 1
+fi
+echo "control: $REQUIRED_MARKER is present, so package paths are readable" >&2
+
+untaken=0
+for tag in $buildtags; do
+	while IFS= read -r marker; do
+		if grep -qaF -- "$marker" "$out"; then
+			echo "TAG DID NOT TAKE: -tags $tag left $marker in the binary" >&2
+			untaken=$((untaken + 1))
+		else
+			echo "  $tag removed $marker" >&2
+		fi
+	done < <(markers_for_tag "$tag")
+done
+if [ "$untaken" -ne 0 ]; then
+	echo "$untaken build tag(s) had no effect on the binary; see above" >&2
+	echo "go build accepts a tag that matches no constraint without complaint, so a tag" >&2
+	echo "spelled right for a plugin that has moved fails exactly this way." >&2
+	exit 1
+fi
 
 echo "built $out ($(stat -c%s "$out") bytes, containerd $version, linux/$goarch)"

@@ -133,6 +133,59 @@ jobs:
           docker buildx bake rootfs
           ls -l _output/
 
+      # ---------------------------------------------------------------------------------
+      # Assert what was BUILT, not what was asked for. Until 2026-08-16 nothing in this
+      # workflow opened either output: the only check was `sha256sum` of the two files
+      # against themselves, which is true of any two files, and the architecture guard above
+      # globs the checked-out REPOSITORY's kernel configs rather than the artifact. Hardcode
+      # `KERNEL_ARCH: x86_64` and an `arm64` run stays entirely green while producing an
+      # x86_64 kernel that release.yml then lays into `boks-guest_<v>_arm64.tar.gz` beside a
+      # SOURCE.txt saying arm64. Reproduced against a staged `_output/` before this was
+      # written.
+      #
+      # assert-guest-image.py checks the filenames the shim looks these up by, refuses a
+      # kernel named for any other architecture, reads the architecture out of the kernel
+      # image itself, and requires the rootfs to carry the EROFS superblock magic. It uses
+      # assert-elf.py's reader for the x86_64 vmlinux; the arm64 build is an arm64 Image and
+      # not an ELF at all, so the format is identified rather than assumed — see the script.
+      # ---------------------------------------------------------------------------------
+      - name: Assert the built guest image is the architecture it will be labelled
+        run: |
+          set -euo pipefail
+          python3 boks/packaging/linux/assert-guest-image.py nerdbox/_output \
+            --arch '${{ inputs.arch || 'x86_64' }}'
+
+      # The control. The assertion above is only evidence if it can fail, and the way it
+      # would fail in production is precisely a kernel built for the other architecture — so
+      # that is what is staged, out of this build's own kernel, and it must be rejected.
+      # Exit status EXACTLY 1: the script exits 2 for a bad path or bad arguments, so
+      # accepting any non-zero status would let a typo pass the control while testing
+      # nothing.
+      - name: Prove the guest-image assertion can fail
+        run: |
+          set -euo pipefail
+          arch='${{ inputs.arch || 'x86_64' }}'
+          # `if`, not `[ ... ] && other=...`: under `set -e` that compound returns the test's
+          # status and would abort the step on the x86_64 build, which is the branch this
+          # control is most likely to run on.
+          if [ "$arch" = arm64 ]; then other=x86_64; else other=arm64; fi
+          rm -rf /tmp/guest-control
+          mkdir -p /tmp/guest-control
+          cp "nerdbox/_output/nerdbox-kernel-$arch" "/tmp/guest-control/nerdbox-kernel-$other"
+          cp nerdbox/_output/nerdbox-rootfs.erofs /tmp/guest-control/
+          set +e
+          python3 boks/packaging/linux/assert-guest-image.py /tmp/guest-control --arch "$other" \
+            >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 1 ]; then
+            echo "CONTROL FAILED: a $arch kernel named nerdbox-kernel-$other was not rejected" >&2
+            echo "expected exit 1 (ran and rejected), got $rc" >&2
+            exit 1
+          fi
+          echo "  rejected, as it must: a $arch kernel offered as $other"
+          rm -rf /tmp/guest-control
+
       # The names in SHA256SUMS are bare, not `_output/`-prefixed, because the artifact is
       # flattened: whoever downloads it gets the files at the top level and needs
       # `sha256sum -c SHA256SUMS` to work there without editing the file first. Written with a

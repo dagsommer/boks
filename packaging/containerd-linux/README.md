@@ -80,6 +80,28 @@ Part 3). The tags are worth roughly six megabytes and `BUILDTAGS` explains, tag 
 each removal is safe — and why `no_tracing` is left on the table despite being the largest
 remaining saving.
 
+### The tags are asserted, not trusted
+
+`go build -tags` is **silent** about a tag that matches no build constraint anywhere: no
+warning, no error, exit 0, and the plugin stays in. Until 2026-08-16 nothing here noticed —
+the only post-build assertion was the ELF machine, which is identical either way. Measured on
+2026-08-16, containerd v2.3.3, linux/arm64: changing `no_cri` to `no_cri_`, one character,
+produced a **35,586,210-byte** daemon with CRI and CNI compiled in — 5.8 MB above the table
+above — and `build.sh` reported success.
+
+`build.sh` now does two things instead. Before building, it refuses a tag it has no entry for,
+which catches the typo. After building, it checks the binary for the Go package path each tag
+is supposed to remove — `plugins/cri` and `go-cni` for `no_cri`, `plugins/snapshots/devmapper`
+for `no_devmapper`, `zfs/v2` for `no_zfs`, `go-md2man` for `urfave_cli_no_docs` — which
+catches the other half: a tag spelled correctly for a constraint upstream has since renamed.
+Package paths survive `-trimpath` and `-ldflags "-s -w"`, so this is read from the artifact
+rather than inferred from the flags that produced it.
+
+The removal checks carry a **positive control**: the erofs snapshotter's package path must be
+*present*. Without it, a future toolchain change that stripped package paths would make every
+"is absent" assertion pass while testing nothing — and erofs is the one snapshotter Boks pins,
+so its presence is worth asserting in its own right.
+
 ## What is NOT patched here, and how that was decided
 
 `packaging/containerd-windows/patches/` carries six patches. None is applied here, and that
