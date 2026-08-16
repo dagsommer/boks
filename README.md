@@ -57,9 +57,9 @@ the way it will be measured rather than the way it would sell, is in
 Docker Desktop is not required.
 
 Run `boks doctor` — it checks all of the above and tells you what to do about each gap.
-Nothing should be `fail`. On macOS one check warns on a perfectly good host and always will:
-`virtualization` cannot be probed without booting a VM, so it reports architecture support
-and says as much. On Linux that check reads `/dev/kvm` and is `ok` or `fail`.
+Nothing should be `fail`. On macOS and Windows one check warns on a perfectly good host and
+always will: `virtualization` cannot be probed without booting a VM, so it reports platform
+support and says as much. On Linux that check reads `/dev/kvm` and is `ok` or `fail`.
 
 ## Installing
 
