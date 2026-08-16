@@ -335,6 +335,55 @@ func WatchTask(ctx context.Context, address, name string, appear, interval time.
 	}
 }
 
+// Running reports whether a sandbox has a live VM right now, and returns an error rather than
+// a guess when it cannot tell.
+//
+// Info.Status cannot answer this for a caller that acts on the answer. describe folds a
+// container whose task cannot be read into "stopped", because a listing has to render some
+// word in a column and the cost of the wrong one is a wrong word. The caller here is the
+// cleanup path that decides whether to take a sandbox's network away, where the cost of the
+// wrong answer is a running guest with no network for the rest of its life — the VM connects
+// to the link socket once, while it boots, and never re-attaches (measured 2026-08-12). So
+// "I could not read it" is reported as itself.
+//
+// It deliberately does not share taskRunning with WatchTask. That function is polled in a loop
+// by the supervisor while a VM is booting, where a momentary unreadable status must not end
+// the stack; this one is asked once, by a caller for which the same tolerance would be the
+// bug. Same question, opposite handling of not knowing, so two readers rather than one with a
+// flag.
+func Running(ctx context.Context, address, name string) (bool, error) {
+	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
+	c, err := connect(ctx, address)
+	if err != nil {
+		return false, err
+	}
+	defer c.Close()
+
+	container, err := c.LoadContainer(ctx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("looking up sandbox %q: %w", name, err)
+	}
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, nil // a container with no task is stopped, which is not a failure
+		}
+		return false, fmt.Errorf("reading sandbox %q: %w", name, err)
+	}
+	status, err := task.Status(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reading the status of sandbox %q: %w", name, err)
+	}
+	switch status.Status {
+	case client.Running, client.Paused, client.Created:
+		return true, nil
+	}
+	return false, nil
+}
+
 // taskRunning reports whether the sandbox currently has a live task. A missing container or
 // a missing task both mean "not running" rather than an error: the caller is watching for
 // exactly that transition, and a sandbox removed out from under it is one way it happens.

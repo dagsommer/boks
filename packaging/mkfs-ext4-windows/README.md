@@ -65,9 +65,13 @@ same `failed format` error it stops with today, and `patches/0005` deletes the z
 so the next attempt retries rather than mounting 64 MiB of zeroes. The downside of trying a
 real formatter is bounded by the behaviour we already have.
 
-`rwlayer-64m.img` still ships, and `docs/windows-e2e.md` still documents the manual copy, as
-the fallback for a machine where this binary does not run. It should stop shipping once one
-has.
+`rwlayer-64m.img` no longer ships in `boks_<v>_windows_amd64.zip`, the archive a user installs.
+`mkfs.ext4.exe` ran there for the first time on 2026-08-16, unattended, and produced a real
+superblock (`53 ef` at offset 1080), so nothing in that archive reads the pre-formatted image
+and it was 64 MiB of the download for everyone. It still ships in
+`boks-runtime_<v>_windows_amd64.zip`, which is where `docs/windows-e2e.md` collects the files
+for its by-hand procedure, and it remains that document's fallback for a machine where the
+formatter does not run.
 
 ## Why the port is free
 
