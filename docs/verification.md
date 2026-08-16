@@ -2029,3 +2029,82 @@ the all-in-one archive (64 MiB, ~8% of the download) and stays in the runtime zi
 still that document's fallback for a machine where the formatter does not run. `release.yml`
 asserts its absence from the all-in-one archive, because "we stopped shipping it" is a claim
 about a file that is not there, and that is the kind of claim that goes wrong silently.
+
+### The first Homebrew install could not run a command, and the cause was a stream Boks named but never made, 2026-08-16
+
+`boks v0.1.0`, installed from the tap on macOS/arm64. `boks doctor` entirely green, the network
+stack up, and then `boks run .` failed:
+
+```
+boks: running "/usr/bin/tini" in sandbox "shell-bokstest": containerd-shim: opening file
+"/var/run/containerd/fifo/2028300063/boks-exec-af1c2eee9d36ee8a-stderr" failed:
+open /var/run/containerd/fifo/2028300063/boks-exec-af1c2eee9d36ee8a-stderr: no such file or directory
+```
+
+**It is not a path, a permission or a symlink problem, and the error's own shape rules those
+out.** The shim opens the streams it is handed in a fixed order — stdout, then stderr
+(nerdbox `internal/shim/task/io_copystreams_unix.go`, the loop at `copyStreams`). It got past
+stdout and failed on stderr. So `/var/run/containerd/fifo/2028300063/` existed, was reachable by
+the shim under whatever `/private/var` resolves to, and contained an openable stdout FIFO.
+Exactly one file was missing. That eliminates the `/var/run` symlink, the directory-ownership
+caveat, and the containerd#12444 family of compile-time paths in one stroke: the path was fine,
+the file was never created.
+
+**Who was supposed to create it.** On unix, `cio.NewFIFOSetInDir` fills in all three paths
+unconditionally (`containerd/v2/pkg/cio/io_unix.go`), and `copyIO` then creates the FIFOs — but
+skips stderr whenever a terminal is in play:
+
+```go
+if !fifos.Terminal && fifos.Stderr != "" {   // io_unix.go, openFifos
+```
+
+`cio.NewCreator` blanks the stderr *path* only when the caller passed no stderr writer
+(`if streams.Stderr == nil { fifos.Stderr = "" }`). Boks passed one, alongside
+`cio.WithTerminal`. So `task.Exec` sent `ExecProcessRequest.Stderr` naming a FIFO that cio had
+deliberately declined to make. `ctr` avoids this by passing `cio.WithStreams(con, con, nil)`
+with `cio.WithTerminal` — the nil is load-bearing, not tidiness.
+
+**Why it hit macOS and not the other two.**
+
+| | what happens | why |
+|---|---|---|
+| Windows | **cannot happen** | `cio`'s Windows `NewFIFOSetInDir` sets `Stderr: ""` itself when `terminal` is set, so no uncreated stream is ever named |
+| Linux | **same defect, not yet hit** | nerdbox's `copyStreams` is `//go:build !windows` — it has no terminal case and opens whatever it is given, on Linux exactly as on macOS. Every Linux and Windows run recorded on this page captured its output, so `cfg.TTY` was false (`run.go` requires *both* stdin and stdout to be terminals) and all three FIFOs were created. The Mac was the first interactive run. |
+| macOS | fails | first run with a real terminal on either end |
+
+So "Windows and Linux work" was true and misleading: one is safe by construction, the other had
+been exercised only in the configuration that avoids the bug.
+
+**The fix** is `ioOpts` in `internal/sandbox/sandbox.go`: with a TTY, stderr is not passed to
+cio. Nothing is lost — a pty *is* one stream, which `boks run` already told the user ("with a
+pty the guest's output would come back … no distinct stderr"). It covers `boks run` and
+`boks exec` together, because both go through the same helper.
+
+#### What was verified by running, on Linux, and what was not
+
+`internal/sandbox/io_test.go` asserts the invariant the shim actually depends on: **every path
+Boks names in the request exists on disk by the time the request is sent.** It drives the real
+`cio` machinery into a temp FIFO directory and stats what comes back. With the fix reverted it
+fails, on this Linux host, with the macOS failure's exact shape — a `-stderr` path in a random
+numeric subdirectory, missing, while stdin and stdout are there:
+
+```
+stderr is announced to the shim as ".../2690299100/boks-exec-test-stderr" but does not exist
+```
+
+That is the client half of the mechanism reproduced on hardware, not argued. **The other half —
+that the shim then opens it and the whole thing now succeeds — has not been run.** There is no
+`/dev/kvm` on this host and no Mac. The shim's behaviour is established by reading nerdbox at
+the pinned `cd2c23f` and containerd v2.2.6, not by execution.
+
+**The command a Mac user should run to settle it**, from a real terminal (both ends must be a
+tty or the bug is not exercised):
+
+```
+boks run shell . -- sh -c 'echo out; echo err >&2'
+```
+
+Both lines should appear — on the console, since a pty carries them together — and the exit
+status should be 0. The v0.1.0 build fails before running anything, naming a `-stderr` FIFO.
+The negative control is the same command piped, `… | cat`: that takes the non-tty path and
+succeeds on both builds, which is the whole reason the defect survived to a release.
