@@ -562,6 +562,65 @@ func steadyStateLine(pol policy.Policy, mode network.Mode, sandbox, agentName st
 		mode, pol.Name, allows, denies, tls, ls, sandbox)
 }
 
+// releaseStack ends the network stack this invocation started, unless the sandbox it serves is
+// still running.
+//
+// The rule it enforces is the one at the top of internal/enforce/supervisor.go: **the stack's
+// lifetime is the VM's lifetime, and no CLI invocation has that lifetime.** What used to stand
+// here did not enforce it. The condition was `ephemeral || err != nil`, and err is this
+// command's error — which for `boks run` is the *guest command's exit code*, carried out as an
+// ExitError so that boks exits with what ran inside the sandbox. So a command that exited
+// non-zero inside a perfectly healthy sandbox read as a failed run, and the stack was torn down
+// underneath a VM that was still up. Measured on Windows on 2026-08-16: `boks run shell . --
+// cmd /c ver` exited 127, the sandbox stayed `running`, and the process serving its network was
+// gone. Boks then detected the orphan correctly on the next command and told the user their
+// only remedy was stop/start — accurate, and describing damage boks had done itself.
+//
+// The same condition took the network away from a sandbox whose run was interrupted with
+// Ctrl-C, which is the exact scenario internal/enforce says the supervisor exists to prevent.
+//
+// So the question is not "did this command succeed" but "is anything still attached to this
+// stack". A sandbox that is running keeps its stack; nothing else does. --rm is decided
+// without asking, because an ephemeral sandbox is removed by the run that created it.
+//
+// running is a function rather than a bool so that the two answers can be constructed on a
+// host with no hypervisor, where the sandbox this reasons about cannot exist.
+func releaseStack(name string, ephemeral bool, running func() bool, stderr io.Writer) {
+	if !ephemeral && running() {
+		return
+	}
+	stopNetworkQuietly(name, stderr)
+}
+
+// sandboxIsRunning answers releaseStack's question by asking containerd, and answers "yes" when
+// it cannot tell.
+//
+// The two mistakes are not symmetric, and the supervisor's own design is what makes the bias
+// safe. Keeping a stack that nothing needs costs one idle process, and not for long: the
+// supervisor watches the sandbox's task itself and exits within a poll interval of it stopping,
+// or after TaskAppearTimeout if no task ever appears — and if containerd is what is unreachable,
+// its watch fails and it exits at once. Stopping a stack that is still needed costs a running
+// guest its network until somebody restarts it. So an unreadable answer keeps the stack.
+//
+// The context is detached from the command's, because the most likely reason a run ended with a
+// cancelled context is Ctrl-C — precisely the case where this question must still be answerable.
+func sandboxIsRunning(ctx context.Context, address, name string, stderr io.Writer) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sandboxStatusTimeout)
+	defer cancel()
+	running, err := sandbox.Running(ctx, address, name)
+	if err != nil {
+		fmt.Fprintf(stderr, "note: could not tell whether sandbox %q is still running (%v),\n"+
+			"      so its network stack is being left up rather than taken from a live guest.\n", name, err)
+		return true
+	}
+	return running
+}
+
+// sandboxStatusTimeout bounds that question. It is a local gRPC call on a socket this command
+// has already been talking to, so the only thing this covers is a containerd that has stopped
+// answering — and the answer to that is above.
+const sandboxStatusTimeout = 5 * time.Second
+
 // stopNetworkQuietly and forgetNetworkQuietly are the cleanup paths. Failures are reported
 // rather than returned: they run while a command is already failing or exiting, and the
 // original outcome is the more useful one to end up as the error.

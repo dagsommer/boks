@@ -44,6 +44,14 @@ package enforce
 //   - It receives the secrets it needs on a pipe and never the passphrase to the store, so
 //     it can attach the credentials configured for one sandbox and cannot obtain any other.
 //
+// One thing that owns a lifetime can still have it taken away by something else, and did.
+// `boks run` ends the stack it started when the run "failed", and until 2026-08-16 that
+// condition included the exit code of the command the user ran *inside* the sandbox — so one
+// failing command, or one Ctrl-C, disconnected a healthy running VM permanently. Everything
+// above is why that was possible to get wrong: the supervisor's lifetime is correct here and
+// was overridden there. The rule now is the one this file argues for, enforced in the CLI's
+// cleanup path as well: a sandbox that is running keeps its stack. See cli.releaseStack.
+//
 // What is unverified, and what would settle it: whether a VM whose link socket disappeared
 // re-attaches when a new stack binds the same path. If it does, a crashed supervisor is
 // recoverable by simply running another command; if it does not, the sandbox needs a
