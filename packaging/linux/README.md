@@ -166,6 +166,19 @@ were an export. Each assertion is accompanied in CI by a negative control that f
 checker something it must reject — a cross-architecture binary, a Windows PE, a strict prefix
 of a real symbol, an imported symbol — and fails the job if any is accepted.
 
+The guest half of the runtime is asserted by
+[`assert-guest-image.py`](assert-guest-image.py), which `guest-image.yml` runs over what
+`docker buildx bake` produced. It exists for the same reason: until 2026-08-16 that workflow
+asserted *nothing whatsoever* about its outputs — the only check was `sha256sum` of the two
+files against themselves, which is true of any two files, and the architecture guard beside it
+globs the checked-out repository's kernel configs rather than the artifact. Hardcoding
+`KERNEL_ARCH: x86_64` produced a fully green `arm64` run carrying an x86_64 kernel. It now
+requires the filenames the shim looks these up by, refuses a kernel named for another
+architecture, reads the architecture out of the kernel image itself, and requires the rootfs
+to carry the EROFS superblock magic. Note that the kernel is an ELF `vmlinux` on x86_64 and an
+arm64 *Image* on arm64 — the measured fact in `docs/install.md` — so the format is identified
+before an architecture is read out of it, rather than ELF being assumed.
+
 **Nothing here has been run.** No VM is started by the workflow: GitHub's runners are
 virtualised and `/dev/kvm` is absent, so nerdbox's own `kvm.CheckKVM()` would refuse before
 libkrun was reached. A symbol can be exported and still return `-ENOSYS`. What is proven is a

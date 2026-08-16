@@ -27,6 +27,13 @@ must not depend on anyone remembering three substitutions. `{{VERSION}}`,
 `{{INSTALLER_SHA256}}` and `{{RELEASE_DATE}}` are the only things a release changes, they
 appear nowhere else, and `render.sh` refuses to emit a file that still contains one.
 
+> That last clause became true on 2026-08-16. The guard matched `{{[A-Z_]*}}` — a character
+> class with no digits in it — so it could not match `{{INSTALLER_SHA256}}`, the very
+> placeholder it is named for, nor any later `{{GUEST_REV_X86_64}}` or `{{SHA256_ARM64}}`. A
+> manifest carrying a literal placeholder rendered and the script exited 0. It now matches
+> anything between doubled braces, and `.github/workflows/winget.yml` runs a control that
+> puts one back to prove the guard still fires.
+
 Template lines beginning `#|` are notes to ourselves and are **stripped at render**, so what
 lands in a pull request is a manifest and not our reasoning about it. The rendered files keep
 two comment lines: a provenance line and the `yaml-language-server` schema line, which is the
@@ -154,6 +161,27 @@ Both were exercised with a **negative control** — a copy of the rendered manif
 `InstallerType: tarball`, `NestedInstallerType: exe` and two nested files — and the validator
 reported all three faults and exited non-zero. A validator that passes everything proves
 nothing, which is why that run happened.
+
+**3. That all three manifests are there, and that they declare the schema version actually
+fetched.** Both added 2026-08-16, and both were holes rather than omissions:
+
+- a *missing* manifest was a silent pass. Only an entirely empty directory failed, so a
+  render that produced one file out of three reported `ok` — and every cross-file rule above
+  is vacuously satisfied over a set of one. Reproduced by deleting
+  `dagsommer.boks.installer.yaml` from a good render: exit 0.
+- `ManifestVersion` was compared only *across* the three documents. One `sed` pass stamps all
+  three from templates carrying the same literal, so that comparison cannot fail — while
+  `MANIFEST_VERSION` in `validate.py`, the constant the schema URL is built from, was never
+  compared to them at all. Reproduced by rewriting all three to `1.9.0`: the validator
+  fetched the 1.12.0 schemas, printed `ok against manifest.installer.1.12.0`, and exited 0.
+
+**Where these run.** `.github/workflows/winget.yml` renders and validates on every change
+under `packaging/winget/`, with a negative control for each defect above, and sets
+`BOKS_WINGET_REQUIRE_VALIDATION=1` so that render.sh's graceful "jsonschema not available,
+skipped schema validation" becomes a failure rather than a green run that checked nothing.
+`make winget` does the same render locally. Before that, nothing ran either script: they were
+documented here and in `docs/distribution.md` and invoked by no workflow, no Makefile target
+and no test, so the first thing to exercise them would have been a release.
 
 **What a pass does not mean.** It does not mean winget will install the package. It says
 nothing about whether the installer URL resolves, whether the SHA-256 matches the archive at

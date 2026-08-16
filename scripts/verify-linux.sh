@@ -15,9 +15,11 @@
 #
 # WHAT IT IS CAREFUL ABOUT
 #
-# 1. It never reports success for a machine it did not test. Every check is pass, fail,
-#    indeterminate or skip; the final verdict is VERIFIED only when every check ran and
-#    passed. "Cannot determine" is a first-class outcome and it is not a pass.
+# 1. It never reports success for a machine it did not test. Every result is pass, fail,
+#    warn, indeterminate or skip, and only pass counts towards a verdict: "cannot determine"
+#    and "with this caveat" are first-class outcomes and neither is a pass. VERIFIED also
+#    requires every check in CHECK_LIST to have recorded a result, checked by name — a run
+#    that recorded nothing at all used to satisfy "no failures" and print VERIFIED.
 # 2. It stops at the first failure that makes the rest meaningless. No /dev/kvm means no VM,
 #    so there is nothing to learn from twenty further checks that all fail for that one
 #    reason.
@@ -99,9 +101,10 @@ Options:
   -h, --help           this text
 
 Exit status:
-  0  VERIFIED    every check ran and passed
+  0  VERIFIED    every declared check recorded a result and every result was a pass
   1  FAILED      a check failed; at least one thing Boks claims is not true here
-  2  STOPPED or INCOMPLETE  a prerequisite is missing, or something could not be determined
+  2  STOPPED or INCOMPLETE  a prerequisite is missing, something could not be determined,
+                            or a declared check recorded nothing at all
 EOF
 }
 
@@ -147,11 +150,28 @@ if [[ "$CPUS_A" -eq 1 ]]; then CPUS_B=2; fi
 
 RESULTS=()
 N_FAIL=0
+N_WARN=0
 N_INDET=0
 N_SKIP=0
 
+# Which of the declared checks have recorded at least one result. A verdict is only
+# meaningful if every check in CHECK_LIST appears here, so this is what the verdict compares
+# against — see "coverage" below. A space-delimited string rather than an associative array,
+# because `declare -A` needs bash 4 and --list has to work wherever it is read.
+COVERED_IDS=" "
+CURRENT_CHECK="(none)"
+
 hdr() {
 	printf '\n=== %s\n' "$*"
+}
+
+# begin_check prints the section header AND names the check every result until the next one
+# belongs to. Attribution is what lets the verdict tell "check 8 passed" from "check 8 never
+# ran", which is the difference between a verdict and a guess.
+begin_check() {
+	CURRENT_CHECK="$1"
+	shift
+	hdr "$@"
 }
 
 say() {
@@ -171,11 +191,23 @@ evidence() {
 record() {
 	local status="$1" name="$2" note="${3:-}"
 	RESULTS+=("$status|$name|$note")
+	case "$COVERED_IDS" in
+	*" $CURRENT_CHECK "*) : ;;
+	*) COVERED_IDS="${COVERED_IDS}${CURRENT_CHECK} " ;;
+	esac
 	printf '  [ %-5s ] %s%s\n' "$status" "$name" "${note:+ — $note}"
 }
 
 pass() { record PASS "$1" "${2:-}"; }
-warn() { record WARN "$1" "${2:-}"; }
+
+# WARN is NOT a pass. It is the outcome for a check that ran, was not shown to be broken, and
+# was not shown to work either — a caveat on the evidence. It was invisible to the verdict
+# until 2026-08-16, which meant a --net none sandbox reporting an eth0 read as VERIFIED, so it
+# is counted here and rolled into INCOMPLETE below alongside indeterminate and skip.
+warn() {
+	record WARN "$1" "${2:-}"
+	N_WARN=$((N_WARN + 1))
+}
 
 fail() {
 	record FAIL "$1" "${2:-}"
@@ -222,23 +254,34 @@ summary() {
 }
 
 # --- the checks, as data, so --list and the run cannot drift apart -----------------------
+#
+# Each entry is "<id>|<description>". The id is stable, is what begin_check names, and is
+# what the verdict requires to have recorded a result. Before that requirement existed the
+# run counted its own RESULTS array against itself — `TOTAL_CHECKS="${#RESULTS[@]}"` — which
+# is a tautology: a harness that recorded nothing at all printed "checks recorded: 0" and
+# then VERDICT: VERIFIED. These ten are the checks a verdict is about; nothing else counts.
 
 CHECK_LIST=(
-	"0  host prerequisites          the tools this script itself needs                          GATE"
-	"1  platform and CPU            Linux, architecture, bare metal or WSL2, virt extensions    GATE"
-	"2  KVM                         /dev/kvm exists and this user can open it                   GATE"
-	"3  erofs                       the kernel filesystem and mkfs.erofs, whose version matters"
-	"4  boks doctor                 Boks' own prerequisite report, and it must be ready         GATE"
-	"5  a sandbox boots as a VM     boot_id, uptime, vCPU count and virtio topology are its own GATE"
-	"6  workspace                   shared at the exact host path; the parent is not"
-	"7  network boundary            a denied destination refused AND an allowed one connected"
-	"8  --net none                  no interface, nothing reachable"
-	"9  cleanup                     no container, task, shim, mount or stack left behind"
+	"host-prereqs|0  host prerequisites          the tools this script itself needs                          GATE"
+	"platform|1  platform and CPU            Linux, architecture, bare metal or WSL2, virt extensions    GATE"
+	"kvm|2  KVM                         /dev/kvm exists and this user can open it                   GATE"
+	"erofs|3  erofs                       the kernel filesystem and mkfs.erofs, whose version matters"
+	"doctor|4  boks doctor                 Boks' own prerequisite report, and it must be ready         GATE"
+	"boot|5  a sandbox boots as a VM     boot_id, uptime, vCPU count and virtio topology are its own GATE"
+	"workspace|6  workspace                   shared at the exact host path; the parent is not"
+	"network|7  network boundary            a denied destination refused AND an allowed one connected"
+	"net-none|8  --net none                  no interface, nothing reachable"
+	"cleanup|9  cleanup                     no container, task, shim, mount or stack left behind"
 )
+
+check_ids() {
+	local entry
+	for entry in "${CHECK_LIST[@]}"; do printf '%s\n' "${entry%%|*}"; done
+}
 
 if [[ "$MODE" == "list" ]]; then
 	printf 'Checks, in order. A GATE stops the run when it fails.\n\n'
-	printf '  %s\n' "${CHECK_LIST[@]}"
+	printf '  %s\n' "${CHECK_LIST[@]#*|}"
 	cat <<'EOF'
 
 Check 7 is the one that decides whether Boks is a boundary at all, and it is the one most
@@ -598,7 +641,7 @@ EOF
 
 # --- 0. host prerequisites (GATE) ---------------------------------------------------------
 
-hdr "0. Host prerequisites"
+begin_check host-prereqs "0. Host prerequisites"
 
 if [[ -z "$BOKS_BIN" ]]; then
 	if command -v boks >/dev/null 2>&1; then
@@ -636,7 +679,7 @@ pass "host tools" "python3 and coreutils present"
 
 # --- 1. platform and CPU (GATE) ------------------------------------------------------------
 
-hdr "1. Platform and CPU"
+begin_check platform "1. Platform and CPU"
 
 KERNEL_NAME="$(uname -s)"
 if [[ "$KERNEL_NAME" != "Linux" ]]; then
@@ -712,7 +755,7 @@ fi
 
 # --- 2. KVM (GATE) --------------------------------------------------------------------------
 
-hdr "2. KVM"
+begin_check kvm "2. KVM"
 
 KVM_MISSING_REMEDY_BARE="Boks needs hardware virtualisation through KVM.
 
@@ -875,7 +918,7 @@ pass "kvm" "/dev/kvm opened read-write by $(id -un); doctor issues the version i
 
 # --- 3. erofs -----------------------------------------------------------------------------
 
-hdr "3. erofs"
+begin_check erofs "3. erofs"
 
 # Two separate things, and doctor checks neither in this shape: the kernel filesystem the
 # snapshotter's images are mounted through, and the userspace tool's VERSION. containerd's
@@ -906,7 +949,7 @@ fi
 
 # --- 4. boks doctor (GATE) ------------------------------------------------------------------
 
-hdr "4. boks doctor"
+begin_check doctor "4. boks doctor"
 
 if [[ -z "$STATE_DIR" && $HOST_STATE -eq 0 ]]; then
 	TMPROOT="${WORKROOT:-$(mktemp -d "${TMPDIR:-/tmp}/boks-verify.XXXXXX")}"
@@ -955,12 +998,17 @@ printf '%s' "$GUEST_RAW_PROBE" >"$WORKSPACE/boks-raw-probe.py"
 chmod +x "$WORKSPACE/boks-proxy-probe.sh" "$WORKSPACE/boks-raw-probe.py"
 
 if [[ $IN_WSL -eq 1 && "$WORKSPACE" == /mnt/* ]]; then
+	# Attributed to check 6, whose evidence it qualifies — this runs between sections 4 and
+	# 5, so without naming the check it would be filed under `doctor` and read as a caveat on
+	# a report it has nothing to do with.
+	CURRENT_CHECK=workspace
 	warn "workspace location" "$WORKSPACE is under /mnt — WSL2 reaches it over 9p, and the guest then crosses 9p and virtiofs. Use --workdir under \$HOME"
+	CURRENT_CHECK=doctor
 fi
 
 # --- 5. a sandbox boots, and it is a VM (GATE) ----------------------------------------------
 
-hdr "5. A sandbox boots, and what boots is a VM"
+begin_check boot "5. A sandbox boots, and what boots is a VM"
 
 # The macOS run had it easy: the host was Darwin and the guest was Linux, so a shared kernel
 # was not a possible explanation for anything. On Linux both are Linux, so kernel VERSION is
@@ -1078,7 +1126,7 @@ fi
 
 # --- 6. workspace --------------------------------------------------------------------------
 
-hdr "6. Workspace"
+begin_check workspace "6. Workspace"
 
 WS_RC=0
 CREATED_SANDBOXES+=("boksverify-workspace")
@@ -1119,11 +1167,16 @@ fi
 
 # --- 7. the network boundary ------------------------------------------------------------------
 
-hdr "7. The network boundary (verification.md check 6)"
+begin_check network "7. The network boundary (verification.md check 6)"
 
 if [[ $SKIP_NETWORK -eq 1 ]]; then
 	skip "network boundary" "--skip-network was passed"
+	# Attributed to check 8 rather than check 7, so the coverage requirement below sees both
+	# checks answered. A SKIP recorded against the wrong id would leave check 8 looking as if
+	# it had never run, which is a different — and worse — thing to report.
+	CURRENT_CHECK=net-none
 	skip "--net none" "--skip-network was passed"
+	CURRENT_CHECK=network
 else
 	cat <<'EOF'
   This is the check that decides whether Boks is a boundary at all, and the one most easily
@@ -1144,7 +1197,9 @@ print(" ".join(addrs[:2]))
 
 	if [[ "$ALLOWED_IPS" == RESOLVE_FAILED* || -z "$ALLOWED_IPS" ]]; then
 		indeterminate "network boundary" "could not resolve $ALLOWED_HOST on the host: $ALLOWED_IPS"
+		CURRENT_CHECK=net-none
 		indeterminate "--net none" "not attempted without a reachable allowed host"
+		CURRENT_CHECK=network
 	else
 		say "allowed host $ALLOWED_HOST resolves to: $ALLOWED_IPS"
 
@@ -1231,9 +1286,12 @@ print(" ".join(addrs[:2]))
 			POSITIVE="$(fact_of positive_control "$RAW_OUT")"
 			NEGATIVE="$(fact_of negative_control "$RAW_OUT")"
 
+			# 0 = the allowed flow was not carried at all, 1 = carried but the origin
+			# was never confirmed, 2 = connected end to end with the origin's own
+			# certificate, which is the control this check's header promises.
 			POSITIVE_OK=0
 			if [[ "$POSITIVE" == connected* ]]; then
-				POSITIVE_OK=1
+				POSITIVE_OK=2
 				pass "positive control" "$FIRST_ALLOWED_IP:443 $POSITIVE"
 				if [[ "$POSITIVE" == *"O=Boks"* ]]; then
 					warn "positive control certificate" "the issuer is Boks' own CA, so this flow was intercepted rather than carried to the origin"
@@ -1241,9 +1299,12 @@ print(" ".join(addrs[:2]))
 			elif [[ "$POSITIVE" == tcp_connected* ]]; then
 				# The flow was carried, which is the fact the negative control needs to
 				# mean anything — but without a verified certificate this says nothing
-				# about WHOSE endpoint answered, so it is not the full control.
+				# about WHOSE endpoint answered, so it is not the control this check
+				# claims to have run. It was a WARN until 2026-08-16, which the verdict
+				# could not see, so an unverified positive control passed the negative
+				# control through as a full PASS and the run reported VERIFIED.
 				POSITIVE_OK=1
-				warn "positive control" "$FIRST_ALLOWED_IP:443 was carried but the certificate did not verify ($POSITIVE); the flow reached something, the origin is unconfirmed"
+				indeterminate "positive control" "$FIRST_ALLOWED_IP:443 was carried but the certificate did not verify ($POSITIVE); the flow reached something, the origin is unconfirmed"
 			else
 				fail "positive control" "$FIRST_ALLOWED_IP:443 was allowed by policy and did not connect: $POSITIVE"
 			fi
@@ -1251,8 +1312,10 @@ print(" ".join(addrs[:2]))
 			if [[ "$NEGATIVE" == connected* || "$NEGATIVE" == tcp_connected* ]]; then
 				fail "negative control" "$DENIED_IP:443 was reached from inside the sandbox: $NEGATIVE"
 			elif [[ "$NEGATIVE" == tcp_refused* ]]; then
-				if [[ $POSITIVE_OK -eq 1 ]]; then
-					pass "negative control" "$DENIED_IP:443 $NEGATIVE, while the allowed address connected"
+				if [[ $POSITIVE_OK -eq 2 ]]; then
+					pass "negative control" "$DENIED_IP:443 $NEGATIVE, while the allowed address connected to the origin"
+				elif [[ $POSITIVE_OK -eq 1 ]]; then
+					indeterminate "negative control" "$DENIED_IP:443 was refused and the allowed address was carried, but its certificate never verified — the control this check requires did not run"
 				else
 					indeterminate "negative control" "$DENIED_IP:443 was refused, but so was the allowed address — indistinguishable from a stack that drops everything"
 				fi
@@ -1293,7 +1356,7 @@ print(" ".join(addrs[:2]))
 
 		# --- 8. --net none -------------------------------------------------------
 
-		hdr "8. --net none"
+		begin_check net-none "8. --net none"
 		NONE_RC=0
 		CREATED_SANDBOXES+=("boksverify-net-none")
 		NONE_OUT="$("$BOKS_BIN" run shell "$WORKSPACE" --name boksverify-net-none --net none \
@@ -1313,7 +1376,12 @@ print(" ".join(addrs[:2]))
 			elif [[ "$CURL_NONE" == "200" ]]; then
 				fail "--net none" "a sandbox with no network reached $ALLOWED_HOST"
 			else
-				warn "--net none" "interfaces were '$IFACES' (expected 'lo,'), curl gave $CURL_NONE"
+				# A sandbox that asked for no network and reports a NIC anyway is the
+				# thing this check exists to find. curl not reaching the allowed host
+				# says nothing about whether that interface can carry traffic
+				# elsewhere, so this is "not determined", not "fine". It was a WARN
+				# until 2026-08-16, and WARN was invisible to the verdict.
+				indeterminate "--net none" "interfaces were '$IFACES' (expected 'lo,'), curl gave $CURL_NONE — an interface is present that should not be"
 			fi
 		fi
 	fi
@@ -1321,7 +1389,7 @@ fi
 
 # --- 9. cleanup ------------------------------------------------------------------------------
 
-hdr "9. Cleanup"
+begin_check cleanup "9. Cleanup"
 
 if [[ ${#CREATED_SANDBOXES[@]} -gt 0 ]]; then
 	"$BOKS_BIN" rm -f "${CREATED_SANDBOXES[@]}" 2>&1 | evidence || true
@@ -1377,12 +1445,38 @@ fi
 
 summary
 
-TOTAL_CHECKS="${#RESULTS[@]}"
+# COVERAGE. Counting results against themselves — the old `TOTAL_CHECKS="${#RESULTS[@]}"` —
+# answers "how many results are in the list of results", which is true of any list including
+# the empty one. The question a verdict needs answered is whether each of the ten checks
+# CHECK_LIST declares recorded anything at all, so that is what is asked here, and a check
+# that did not is named. No verdict is printed before this runs.
+UNANSWERED=()
+DECLARED=0
+while IFS= read -r check_id; do
+	DECLARED=$((DECLARED + 1))
+	case "$COVERED_IDS" in
+	*" $check_id "*) : ;;
+	*) UNANSWERED+=("$check_id") ;;
+	esac
+done < <(check_ids)
+ANSWERED=$((DECLARED - ${#UNANSWERED[@]}))
+if [[ $DECLARED -eq 0 ]]; then
+	# Reachable only if CHECK_LIST or check_ids has been broken. A coverage requirement that
+	# silently has nothing to require is the same tautology this replaced, so it says so and
+	# refuses rather than falling through to a verdict.
+	printf 'BROKEN: CHECK_LIST declared no checks, so nothing here can be a verdict.\n' >&2
+	exit 2
+fi
+
 printf 'host: %s %s, %s, %s\n' "$KERNEL_NAME" "$HOST_KERNEL" "$ARCH" \
 	"$([[ $IN_WSL -eq 1 ]] && echo 'inside WSL2' || echo 'not WSL')"
 printf 'boks: %s\n' "$BOKS_BIN"
-printf 'checks recorded: %s (%s failed, %s indeterminate, %s skipped)\n\n' \
-	"$TOTAL_CHECKS" "$N_FAIL" "$N_INDET" "$N_SKIP"
+printf 'checks answered: %s of %s declared; %s results recorded (%s failed, %s warned, %s indeterminate, %s skipped)\n' \
+	"$ANSWERED" "$DECLARED" "${#RESULTS[@]}" "$N_FAIL" "$N_WARN" "$N_INDET" "$N_SKIP"
+if [[ ${#UNANSWERED[@]} -gt 0 ]]; then
+	printf 'checks that recorded NOTHING: %s\n' "${UNANSWERED[*]}"
+fi
+printf '\n'
 
 if [[ $N_FAIL -gt 0 ]]; then
 	cat <<'EOF'
@@ -1395,13 +1489,14 @@ EOF
 	exit 1
 fi
 
-if [[ $N_INDET -gt 0 || $N_SKIP -gt 0 ]]; then
+if [[ ${#UNANSWERED[@]} -gt 0 || $N_WARN -gt 0 || $N_INDET -gt 0 || $N_SKIP -gt 0 ]]; then
 	cat <<'EOF'
 VERDICT: INCOMPLETE.
 
-Nothing failed, and that is not the same as everything passing. The checks marked ????? or
-SKIP were not answered, so this run does not establish that Boks works here. Resolve them
-and run it again rather than reporting a pass.
+Nothing failed, and that is not the same as everything passing. The checks marked ?????,
+WARN or SKIP were not answered — and any check listed above as having recorded NOTHING did
+not run at all, which is the same thing said more loudly. This run does not establish that
+Boks works here. Resolve them and run it again rather than reporting a pass.
 EOF
 	exit 2
 fi

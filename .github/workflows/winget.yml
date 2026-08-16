@@ -1,0 +1,186 @@
+# Render the winget manifests and check them, on every change to the templates or the two
+# scripts that stamp and validate them.
+#
+# WHY THIS EXISTS. `packaging/winget/render.sh` and `packaging/winget/validate.py` were
+# written, documented in packaging/winget/README.md and docs/distribution.md — and then
+# invoked by no workflow, no Makefile target and no test. The only thing that would ever run
+# them was a human cutting a release, which is the moment at which finding out they are
+# broken is least useful. They were broken:
+#
+#   * render.sh's leftover-placeholder guard matched `{{[A-Z_]*}}`, a character class with no
+#     digits in it, so it could not match `{{INSTALLER_SHA256}}` — the placeholder it exists
+#     to catch — nor any later `{{GUEST_REV_X86_64}}`. A manifest carrying a literal
+#     placeholder rendered with exit 0.
+#   * validate.py treated a MISSING manifest as a pass: only an entirely empty directory
+#     failed, and every cross-file rule is vacuous over a set of one.
+#   * its ManifestVersion check compared the three documents with each other. One `sed` pass
+#     stamps all three from templates carrying the same literal, so the comparison could not
+#     fail — while the constant the schemas are actually fetched by was never compared to
+#     them at all.
+#
+# WHAT A GREEN RUN MEANS. The manifests render with no placeholder left behind, and the three
+# rendered documents are schema-valid against microsoft/winget-cli's own JSON schemas for the
+# ManifestVersion they declare. It does NOT mean `winget validate` passed, that winget can
+# install the package, or that winget-pkgs' submission pipeline will accept it — nobody on
+# this project has a Windows machine and none of those has ever been run. See
+# packaging/winget/README.md.
+name: winget
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/winget/**"
+      - ".github/workflows/winget.yml"
+  pull_request:
+    paths:
+      - "packaging/winget/**"
+      - ".github/workflows/winget.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-winget-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # validate.py fetches winget's schemas over the network on first use. Pinning the two
+      # libraries rather than taking whatever is preinstalled, so a green run here means the
+      # same thing next month as it does today.
+      - name: Install the validator's dependencies
+        run: python3 -m pip install --no-input 'jsonschema==4.25.1' 'PyYAML==6.0.3'
+
+      # A version that is not a tag, so the "no tag, using today" path is the one exercised;
+      # SOURCE_DATE_EPOCH is fixed so the render is reproducible and the date field is a real
+      # date rather than whenever the runner happened to start.
+      #
+      # BOKS_WINGET_REQUIRE_VALIDATION turns render.sh's graceful "jsonschema not available,
+      # skipped schema validation" into a failure. Without it, a pip install that quietly
+      # failed above would leave this job green having validated nothing — which is the exact
+      # shape of defect this workflow was added to close.
+      - name: Render the manifests and validate them against winget's schemas
+        env:
+          SOURCE_DATE_EPOCH: "1767225600"
+          BOKS_WINGET_REQUIRE_VALIDATION: "1"
+        run: |
+          set -euo pipefail
+          packaging/winget/render.sh 9.9.9 \
+            A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90 \
+            "$PWD/dist/winget"
+          echo "--- rendered:"
+          cat dist/winget/manifests/d/dagsommer/boks/9.9.9/*.yaml
+
+      # ---------------------------------------------------------------------------------
+      # NEGATIVE CONTROLS, in the shape linux-runtime.yml uses for assert-elf.py. Each is a
+      # defect these two scripts actually shipped, reconstructed against the real templates
+      # and the real rendered output. If any of them starts passing, the check it polices has
+      # stopped meaning anything and this job goes red.
+      #
+      # Exit status EXACTLY 1, never merely non-zero: validate.py exits 2 for a usage error,
+      # so accepting any non-zero status would let a mistyped argument turn every control
+      # here green while testing nothing.
+      # ---------------------------------------------------------------------------------
+      - name: Prove the render and validate checks can fail
+        env:
+          SOURCE_DATE_EPOCH: "1767225600"
+        run: |
+          set -euo pipefail
+          rendered=dist/winget/manifests/d/dagsommer/boks/9.9.9
+          reject() {
+            label="$1"; shift
+            set +e
+            "$@" >/dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 1 ]; then
+              echo "CONTROL FAILED: $label — expected exit 1 (ran and rejected), got $rc" >&2
+              exit 1
+            fi
+            echo "  rejected, as it must: $label"
+          }
+
+          # 1. A PLACEHOLDER WITH A DIGIT IN IT. The whole of finding 7: the old character
+          #    class was [A-Z_], so this rendered and exited 0.
+          cp packaging/winget/manifests/dagsommer.boks.yaml.in /tmp/template-backup
+          printf 'GuestRev: {{GUEST_REV_X86_64}}\n' \
+            >>packaging/winget/manifests/dagsommer.boks.yaml.in
+          reject "a template still carrying {{GUEST_REV_X86_64}}" \
+            packaging/winget/render.sh 9.9.9 \
+            A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90 /tmp/winget-control
+          # 2. And the digit-bearing placeholder the guard is named after.
+          cp /tmp/template-backup packaging/winget/manifests/dagsommer.boks.yaml.in
+          printf 'Sha: {{INSTALLER_SHA256_ARM64}}\n' \
+            >>packaging/winget/manifests/dagsommer.boks.yaml.in
+          reject "a template still carrying {{INSTALLER_SHA256_ARM64}}" \
+            packaging/winget/render.sh 9.9.9 \
+            A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90 /tmp/winget-control
+          cp /tmp/template-backup packaging/winget/manifests/dagsommer.boks.yaml.in
+
+          # 3. A MISSING MANIFEST. Was a silent pass: only an empty directory failed.
+          rm -rf /tmp/wg-missing && cp -r "$rendered" /tmp/wg-missing
+          rm -f /tmp/wg-missing/dagsommer.boks.installer.yaml
+          reject "a set with no installer manifest" \
+            python3 packaging/winget/validate.py /tmp/wg-missing
+
+          # 4. ONE MANIFEST OUT OF THREE, where every cross-file rule is vacuous.
+          rm -rf /tmp/wg-one && cp -r "$rendered" /tmp/wg-one
+          rm -f /tmp/wg-one/dagsommer.boks.installer.yaml /tmp/wg-one/dagsommer.boks.locale.en-US.yaml
+          reject "a set of one manifest" python3 packaging/winget/validate.py /tmp/wg-one
+
+          # 5. MANIFESTVERSION MOVED IN ALL THREE AT ONCE. The old cross-file comparison was
+          #    satisfied by this — they still agreed with each other — while the schemas
+          #    being fetched were for a different version entirely.
+          rm -rf /tmp/wg-skew && cp -r "$rendered" /tmp/wg-skew
+          sed -i 's/^ManifestVersion: .*/ManifestVersion: 1.9.0/' /tmp/wg-skew/*.yaml
+          reject "all three declaring a ManifestVersion the schemas were not fetched for" \
+            python3 packaging/winget/validate.py /tmp/wg-skew
+
+          # 6. AN UNSUBSTITUTED PLACEHOLDER REACHING THE VALIDATOR. `{{X}}` is a YAML flow
+          #    mapping with an unhashable key, which used to be a PyYAML traceback rather
+          #    than a diagnosis — and a traceback is exit 1 too, so the control demands the
+          #    message as well.
+          rm -rf /tmp/wg-yaml && cp -r "$rendered" /tmp/wg-yaml
+          printf 'GuestRev: {{NOT_SUBSTITUTED}}\n' >>/tmp/wg-yaml/dagsommer.boks.yaml
+          reject "a manifest that is not valid YAML" \
+            python3 packaging/winget/validate.py /tmp/wg-yaml
+          # Captured, not piped: under `set -o pipefail` a pipeline takes the failing exit
+          # status of validate.py — which is 1 by design here — so `... | grep -q ... ||`
+          # would report the control failed however good the message was.
+          set +e
+          yaml_report="$(python3 packaging/winget/validate.py /tmp/wg-yaml 2>&1)"
+          set -e
+          case "$yaml_report" in
+            *"is not valid YAML"*) echo "  and it said so in words, rather than raising" ;;
+            *) echo "CONTROL FAILED: the YAML error was not reported as one:" >&2
+               printf '%s\n' "$yaml_report" >&2
+               exit 1 ;;
+          esac
+
+          # 7. THE GIT TREE MUST BE AS IT WAS. The controls above edit a template in place;
+          #    a control that leaves the repository modified would make the next one test
+          #    something else.
+          git diff --exit-code -- packaging/winget \
+            || { echo "CONTROL FAILED: the controls left packaging/winget modified" >&2; exit 1; }
+          echo "all seven controls behaved as they should"
+
+      - name: Say what this does and does not establish
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## winget manifests"
+            echo
+            echo "Rendered from \`packaging/winget/manifests/*.yaml.in\` and checked against"
+            echo "microsoft/winget-cli's JSON schemas for the ManifestVersion they declare."
+            echo
+            echo "**Not run:** \`winget validate\`, \`winget install\`, or winget-pkgs'"
+            echo "submission pipeline. All three need Windows, and nobody on this project has"
+            echo "run any of them. A green run here is a document check and nothing more."
+          } >>"$GITHUB_STEP_SUMMARY"

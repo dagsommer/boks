@@ -153,21 +153,53 @@ jobs:
           done
           ls -l _out/
 
-      # The two-byte "MZ" check is not ceremony. `go build -o foo.exe` will happily produce a
-      # Linux ELF if GOOS leaks or is overridden, and the filename would not tell you. This
-      # asserts the artifact is actually a PE image.
-      - name: Assert the artifacts are PE executables
+      # `go build -o foo.exe` will happily produce a Linux ELF if GOOS leaks or is overridden,
+      # and the filename would not tell you — hence a format check. But "MZ" alone, which is
+      # all this step read until 2026-08-16, is the same two bytes for both architectures: a
+      # build loop with a hardcoded GOARCH ships the amd64 shim under the arm64 name and this
+      # step passes it. Demonstrated by copying one binary to both names, whereupon both
+      # assertions reported PE and the job went green.
+      #
+      # So the COFF Machine field is read too, per architecture, the way
+      # containerd-windows.yml already reads it for mkfs.erofs.exe with
+      # `objdump -f | grep pei-x86-64` — except through assert-pe.py, which needs no binutils
+      # and covers windows/arm64, a target objdump on the runner cannot name.
+      - name: Assert the artifacts are PE executables of the architecture they claim
         working-directory: nerdbox
         run: |
           set -euo pipefail
-          for arch in amd64 arm64; do
+          A=../boks/packaging/windows/assert-pe.py
+          for pair in amd64:x86-64 arm64:arm64; do
+            arch="${pair%%:*}"
+            machine="${pair##*:}"
             f="_out/containerd-shim-nerdbox-v1-$arch.exe"
-            magic="$(head -c 2 "$f")"
-            if [ "$magic" != "MZ" ]; then
-              echo "$f is not a PE executable (magic '$magic', expected 'MZ')" >&2
+            python3 "$A" "$f" --machine "$machine" --kind exe
+            echo "  $f: $(wc -c <"$f") bytes"
+          done
+
+      # The control for the step above. `--machine` is only evidence if it can reject: the
+      # amd64 artifact must be refused when asked to be arm64, and the arm64 one when asked
+      # to be x86-64 — which is precisely the mix-up a hardcoded GOARCH produces. Exit
+      # status EXACTLY 1: assert-pe.py exits 2 for an unreadable file or a usage error, so
+      # accepting any non-zero status would let a mistyped path pass both controls.
+      - name: Prove the architecture assertion can fail
+        working-directory: nerdbox
+        run: |
+          set -euo pipefail
+          A=../boks/packaging/windows/assert-pe.py
+          for pair in amd64:arm64 arm64:x86-64; do
+            arch="${pair%%:*}"
+            wrong="${pair##*:}"
+            f="_out/containerd-shim-nerdbox-v1-$arch.exe"
+            set +e
+            python3 "$A" "$f" --machine "$wrong" >/dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 1 ]; then
+              echo "CONTROL FAILED: $f as $wrong — expected exit 1 (ran and rejected), got $rc" >&2
               exit 1
             fi
-            echo "  $f: PE, $(wc -c <"$f") bytes"
+            echo "  rejected, as it must: the $arch shim is not $wrong"
           done
 
       # `go build` never compiles a _test.go file, and patch 0005 adds one that only exists on
