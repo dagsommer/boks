@@ -75,9 +75,10 @@ prefix.
 `doctor` checks every prerequisite above and, for each gap, prints what to do about it rather
 than what is wrong. Nothing should be `fail`.
 
-One `warn` is expected forever on a perfectly healthy Mac: `virtualization` cannot be probed
-without booting a VM, so on Apple silicon it reports architecture support and says so. On
-Linux the same check opens `/dev/kvm` and is either `ok` or `fail`.
+One `warn` is expected forever on a perfectly healthy Mac, and on Windows: `virtualization`
+cannot be probed without booting a VM, so on Apple silicon and on the Windows Hypervisor
+Platform it reports platform support and says so. On Linux the same check opens `/dev/kvm`
+and is either `ok` or `fail`.
 
 If something fails, [Troubleshooting](troubleshooting.md) walks through each check.
 

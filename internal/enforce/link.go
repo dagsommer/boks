@@ -2,7 +2,7 @@ package enforce
 
 // The supervisor's bounded wait for a VM to turn up on the link socket.
 //
-// # Why a wait exists at all, and only on one platform
+// # Why a wait exists at all, and why nothing arms it today
 //
 // The supervisor binds the link socket, reports ready, and then does nothing about the link
 // for the rest of its life: the VM connects during boot, whenever boot happens to be, and the
@@ -10,10 +10,16 @@ package enforce
 // the VM does not connect there, it is because it did not boot, and containerd says so to the
 // command that started it.
 //
-// Windows is not in that position. Nothing has ever been observed putting an Ethernet frame on
-// libkrun's virtio-net device there (network.Unexercised), so "the socket is bound and nobody
-// came" is the *likely* outcome of the first attempt rather than an impossible one. Two things
-// make silence the wrong response to it:
+// Windows was not in that position while this was written. Nothing had been observed putting
+// an Ethernet frame on libkrun's virtio-net device there, so "the socket is bound and nobody
+// came" was the *likely* outcome of the first attempt rather than an unlikely one. A guest has
+// since been watched crossing that link, with policy allowing one destination and refusing
+// another (docs/verification.md, 2026-08-14 and 2026-08-15), so network.Unexercised is nil on
+// every platform and this watchdog is inert everywhere.
+//
+// It is kept, and kept tested against a constructed answer, because the reasoning below is
+// about a *state* rather than about Windows, and the state is reachable again the moment a new
+// host platform is attempted. Two things make silence the wrong response to it:
 //
 //   - **A shim that ignores the network annotations does not leave the guest disconnected.**
 //     It leaves it on libkrun's TSI, where the guest's AF_INET calls are performed on the host
@@ -53,17 +59,17 @@ import (
 // its virtio-net backend", which on the runs recorded in docs/verification.md is part of a boot
 // that completes in about two seconds in total. Thirty is generous by more than an order of
 // magnitude on purpose: the cost of being too slow is a diagnostic that arrives late, and the
-// cost of being too fast is a false accusation on the one platform where nobody can yet tell
-// the difference.
+// cost of being too fast is a false accusation on a platform where nobody can yet tell the
+// difference.
 const linkPeerGrace = 30 * time.Second
 
 // linkWatchdog watches for a peer on the link socket, and fails the supervisor if none
 // arrives after the sandbox's task is running.
 //
-// A watchdog that is not armed has nil channels, which is the whole of its Unix behaviour: a
-// receive on a nil channel blocks forever, so its arm of the supervisor's select can never be
-// chosen, and taskStarted does nothing. Nothing is started, nothing is timed, and no goroutine
-// exists.
+// A watchdog that is not armed has nil channels, which is the whole of its behaviour on every
+// platform today: a receive on a nil channel blocks forever, so its arm of the supervisor's
+// select can never be chosen, and taskStarted does nothing. Nothing is started, nothing is
+// timed, and no goroutine exists.
 type linkWatchdog struct {
 	started chan struct{}
 	failed  chan error
@@ -81,7 +87,7 @@ func (w *linkWatchdog) taskStarted() {
 }
 
 // failure returns the channel a bounded wait reports on. It is nil unless the watchdog is
-// armed, so a select on it is a no-op on every platform but Windows.
+// armed, which today is nowhere, so a select on it is a no-op.
 func (w *linkWatchdog) failure() <-chan error { return w.failed }
 
 // watchLink arms a watchdog where nothing has been seen carrying frames on this link, and
