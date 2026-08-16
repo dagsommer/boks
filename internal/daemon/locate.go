@@ -53,11 +53,22 @@ func RuntimeDirs() []string {
 	if dir := os.Getenv(runtimeDirEnv); dir != "" {
 		candidates = append(candidates, dir)
 	}
-	if exe, err := os.Executable(); err == nil {
+	if exe, err := osExecutable(); err == nil {
 		candidates = append(candidates, runtimeDirsFrom(exe)...)
 	}
 	return existingDirs(candidates)
 }
+
+// osExecutable is os.Executable, indirected so a test can put a boks binary somewhere it is
+// not.
+//
+// This exists because the first regression test for the packaged-install bug did not catch
+// it. That test called runtimeDirsFrom directly — the pure helper — and every other test in
+// this file reaches the search through BOKS_RUNTIME_DIR, so nothing exercised the one line
+// that connects the two. Deleting the whole executable-relative search left the daemon and
+// doctor suites green, which is the same defect the fix was for: the layout that breaks is
+// one only a package produces, and no test produced it.
+var osExecutable = os.Executable
 
 // runtimeDirsFrom returns the bundle directories implied by a boks binary at exe, in the order
 // they should be searched. Separate from RuntimeDirs so the ordering can be tested against a

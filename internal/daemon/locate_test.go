@@ -210,3 +210,50 @@ func TestBundleIsSearchedBeforeTheExecutablesOwnDirectory(t *testing.T) {
 			"runs the distribution's containerd instead of its own", dirs[0], libexec)
 	}
 }
+
+// The packaged layout, driven through the production entry points rather than the helper.
+//
+// The point is the wiring: TestBundleIsSearchedBeforeTheExecutablesOwnDirectory asserts the
+// order runtimeDirsFrom returns, but nothing asserted that RuntimeDirs consults it at all.
+// Deleting that call left every test in this package passing.
+func TestPackagedLayoutResolvesThroughTheProductionPath(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "usr", "bin")
+	libexec := filepath.Join(root, "usr", "libexec", "boks")
+	for _, d := range []string{bin, libexec} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A containerd in both places, as a package install produces: the distribution's in
+	// /usr/bin and the vendored one beside the rest of the runtime.
+	for _, d := range []string{bin, libexec} {
+		if err := os.WriteFile(filepath.Join(d, "containerd"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv(runtimeDirEnv, "")
+	t.Setenv(binaryEnv, "")
+	osExecutable = func() (string, error) { return filepath.Join(bin, "boks"), nil }
+	t.Cleanup(func() { osExecutable = os.Executable })
+
+	dirs := RuntimeDirs()
+	if len(dirs) == 0 || dirs[0] != libexec {
+		t.Errorf("RuntimeDirs() = %v; the bundle %q must come first", dirs, libexec)
+	}
+
+	got, err := FindContainerd()
+	if err != nil {
+		t.Fatalf("FindContainerd(): %v", err)
+	}
+	if want := filepath.Join(libexec, "containerd"); got != want {
+		t.Errorf("FindContainerd() = %q, want %q — a packaged install would run the "+
+			"distribution's containerd instead of the one it shipped", got, want)
+	}
+
+	// And the PATH handed to containerd must lead with the bundle, since that is what the
+	// shim inherits when it looks for libkrun and the guest.
+	if first := filepath.SplitList(ContainerdPath("/usr/bin"))[0]; first != libexec {
+		t.Errorf("ContainerdPath leads with %q, want %q", first, libexec)
+	}
+}
