@@ -1,8 +1,20 @@
 # Running the Linux verification
 
-Boks has one verified platform: macOS on Apple silicon. Linux with KVM — the platform it is
-designed for, built for, and shipped for — has never booted a sandbox. This page is for the
-person, or the agent, who is about to change that.
+> [!NOTE]
+> **This prompt has been run, and it is kept for the procedure rather than the premise.** It
+> was written when Linux had never booted a sandbox; that changed on 2026-08-15, when 25 of 26
+> checks passed under WSL2 on Ubuntu 26.04 — see *Boks runs and enforces policy on Linux* in
+> [verification.md](verification.md), including the one failure, which was a tester artefact.
+>
+> Two things it says are now false: that macOS is the only verified platform (Windows and
+> Linux followed on 2026-08-15), and that no sandbox has booted on Linux. What it says about
+> *how* to verify still holds, and the run it produced is the reason the rest of this document
+> is worth keeping.
+>
+> What it has **not** shown remains open and is the reason to run it again: this was WSL2, not
+> bare metal, and sandbox creation still needs more privilege than an ordinary user has.
+
+This page is for the person, or the agent, running the Linux verification.
 
 It has two parts: the [prompt](#the-prompt) to give an AI agent driving the machine, and the
 [things that will mislead it](#the-traps) if nobody warns it first. Both exist because the
