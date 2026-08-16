@@ -208,30 +208,113 @@ jobs:
           # feature — was enough on its own to stop nerdbox loading the DLL. A four-symbol
           # sample had reported everything fine.
           #
-          # Match WHOLE names, not substrings. A bare `grep -qa krun_add_vsock` is satisfied by
-          # the bytes of `krun_add_vsock_port2`, and `krun_add_disk` by `krun_add_disk2`, so a
-          # substring test would report those two present no matter what the DLL exports.
-          # Export names sit in the name table as NUL-terminated ASCII, so replacing every
-          # non-printable byte with a newline puts each name alone on a line and `grep -qx`
-          # can then be exact. `tr` rather than `strings` — coreutils is there on the runner,
-          # binutils is not guaranteed to be.
-          tr -c '[:print:]' '\n' <"$dll" | sort -u >/tmp/krun-dll-strings.txt
-          missing=0
-          for sym in krun_add_disk krun_add_disk2 krun_add_net_unixgram krun_add_net_unixstream krun_add_virtiofs3 krun_add_vsock krun_add_vsock_port2 krun_create_ctx krun_free_ctx krun_get_shutdown_eventfd krun_init_log krun_set_console_output krun_set_exec krun_set_gpu_options krun_set_gvproxy_path krun_set_kernel krun_set_log_level krun_set_net_mac krun_set_vm_config krun_start_enter; do
-            if grep -qxF "$sym" /tmp/krun-dll-strings.txt; then
-              echo "  export present: $sym"
-            else
-              echo "  EXPORT MISSING: $sym — nerdbox resolves eagerly, so this fails the load" >&2
-              missing=$((missing + 1))
-            fi
-          done
-          # Report every missing export, not just the first: nerdbox names only the one symbol
-          # its loader tripped over, so a one-at-a-time CI is a one-boot-at-a-time diagnosis.
-          if [ "$missing" -ne 0 ]; then
-            echo "$missing of 20 bound symbols are not exported" >&2
+          # READ FROM IMAGE_EXPORT_DIRECTORY, not from the file's bytes. Until 2026-08-16 this
+          # step ran `tr -c '[:print:]' '\n' <"$dll" | grep -qxF "$sym"` — every printable byte
+          # run anywhere in the file. That cannot tell an export from an import, from an
+          # .rdata literal or from a debug string, and it does not require the file to be a PE
+          # image at all: a 369-byte file containing only the twenty names as NUL-terminated
+          # ASCII passed all twenty assertions and exited 0. It also made krun.dll the one
+          # shipped binary with no format or architecture assertion, while mkfs.erofs.exe had
+          # `objdump -f | grep pei-x86-64` and libkrun.so had assert-elf.py.
+          #
+          # assert-pe.py walks e_lfanew, the PE signature, the COFF Machine field and data
+          # directory 0, and matches names WHOLE — so `krun_add_vsock` is not satisfied by the
+          # bytes of `krun_add_vsock_port2`, which is the exact bug this repository shipped.
+          # Python rather than binutils: the runner has a Python, and objdump on a
+          # non-Windows host frequently has no PE support at all. The interpreter is resolved
+          # rather than assumed — the Windows image spells it `python` about as often as
+          # `python3`, and `command -v python3 || python` failing open would skip the whole
+          # assertion silently, which is the class of defect this step is being fixed for.
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          command -v "$PY" >/dev/null 2>&1 || {
+            echo "neither python3 nor python is on PATH; the export assertion cannot run" >&2
             exit 1
-          fi
-          echo "all 20 symbols nerdbox binds are exported"
+          }
+          "$PY" ../boks/packaging/windows/assert-pe.py "$dll" \
+            --machine x86-64 --kind dll --require \
+            krun_add_disk krun_add_disk2 krun_add_net_unixgram krun_add_net_unixstream \
+            krun_add_virtiofs3 krun_add_vsock krun_add_vsock_port2 krun_create_ctx \
+            krun_free_ctx krun_get_shutdown_eventfd krun_init_log krun_set_console_output \
+            krun_set_exec krun_set_gpu_options krun_set_gvproxy_path krun_set_kernel \
+            krun_set_log_level krun_set_net_mac krun_set_vm_config krun_start_enter
+
+      # ---------------------------------------------------------------------------------
+      # NEGATIVE CONTROLS for the export assertion, in the shape linux-runtime.yml uses for
+      # libkrun.so. Seven ways the check above could be hollow, each demonstrated against
+      # this build's real artifact — plus the fabrication that defeated its predecessor.
+      #
+      # Exit status EXACTLY 1, never merely non-zero: assert-pe.py exits 2 for a usage error
+      # or an unreadable file, so accepting any non-zero status would let one mistyped path
+      # turn every control here green while testing nothing. The controls have to be harder
+      # to fool than the assertion they police.
+      # ---------------------------------------------------------------------------------
+      - name: Prove the export assertion can fail
+        working-directory: libkrun
+        run: |
+          set -euo pipefail
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          command -v "$PY" >/dev/null 2>&1 || {
+            echo "neither python3 nor python is on PATH; the controls cannot run" >&2
+            exit 1
+          }
+          A=../boks/packaging/windows/assert-pe.py
+          dll=target/x86_64-pc-windows-msvc/release/krun.dll
+          reject() {
+            label="$1"; shift
+            set +e
+            "$PY" "$A" "$@" >/dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 1 ]; then
+              echo "CONTROL FAILED: $label — expected exit 1 (ran and rejected), got $rc" >&2
+              exit 1
+            fi
+            echo "  rejected, as it must: $label"
+          }
+          # 1 and 2. SUBSTRINGS. krun_add_dis is a strict prefix of the real export
+          #    krun_add_disk, and krun_add_vsock_por of krun_add_vsock_port2 — that second
+          #    pair is not hypothetical, a `grep -qa krun_add_vsock` satisfied by the bytes
+          #    of krun_add_vsock_port2 is a false pass this repository shipped.
+          reject "krun_add_dis, a strict prefix of krun_add_disk" "$dll" --require krun_add_dis
+          reject "krun_add_vsock_por, a strict prefix of krun_add_vsock_port2" \
+            "$dll" --require krun_add_vsock_por
+          # 3. IMPORTS AND STRAY BYTES COUNTED AS EXPORTS. A cdylib exports only its
+          #    #[no_mangle] extern symbols, but memcpy appears in the file either way — in
+          #    the import table against VCRUNTIME, or as a name in a statically linked CRT.
+          #    The `tr | grep -qx` test this step replaced matched it in exactly that
+          #    situation, measured against a mingw DLL that exports no such symbol. Requiring
+          #    it to be REJECTED proves the export directory is really what is being read.
+          reject "memcpy, which is imported or linked in but never exported" \
+            "$dll" --require memcpy
+          # 4. A NAME THAT SIMPLY DOES NOT EXIST, the base case.
+          reject "a symbol that does not exist at all" "$dll" --require krun_no_such_symbol
+          # 5. THE FORBID ASSERTION ITSELF. --forbid is only evidence if forbidding a symbol
+          #    that IS exported fails.
+          reject "--forbid on krun_create_ctx, which IS exported" "$dll" --forbid krun_create_ctx
+          # 6. THE ARCHITECTURE ASSERTION, which krun.dll had none of at all until now. This
+          #    is an x86-64 build, so arm64 must be refused.
+          reject "--machine arm64 against an x86-64 DLL" "$dll" --machine arm64
+          # 7. THE FABRICATION THAT DEFEATED THE OLD CHECK, rebuilt here rather than
+          #    described: the twenty names as NUL-terminated ASCII and nothing else. The
+          #    predecessor of the step above reported all twenty exports present on this
+          #    file, in 369 bytes, and exited 0.
+          printf '%s\n' krun_add_disk krun_add_disk2 krun_add_net_unixgram \
+            krun_add_net_unixstream krun_add_virtiofs3 krun_add_vsock krun_add_vsock_port2 \
+            krun_create_ctx krun_free_ctx krun_get_shutdown_eventfd krun_init_log \
+            krun_set_console_output krun_set_exec krun_set_gpu_options krun_set_gvproxy_path \
+            krun_set_kernel krun_set_log_level krun_set_net_mac krun_set_vm_config \
+            krun_start_enter | tr '\n' '\0' >hollow.dll
+          echo "  hollow.dll: $(wc -c <hollow.dll) bytes of NUL-separated names, not a PE image"
+          reject "a file of bare names that is not a PE image at all" \
+            hollow.dll --require krun_create_ctx krun_add_disk krun_start_enter
+          # And the positive half of the --forbid control: it must PASS for a symbol that is
+          # not exported. Without this, --forbid could be failing for the wrong reason.
+          echo "-- memcpy must pass --forbid, since it is not an export"
+          "$PY" "$A" "$dll" --forbid memcpy
+          rm -f hollow.dll
+          echo "all seven controls behaved as they should"
 
       # The DLL was built, measured and asserted against, and then discarded — so the one
       # piece of the Windows runtime a user cannot build without an MSVC toolchain and a Rust
