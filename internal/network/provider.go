@@ -164,11 +164,11 @@ func (n *Network) DialGuest(ctx context.Context, port int) (net.Conn, error) {
 // Connected returns a channel that is closed the first time something attaches to the link
 // socket — that is, the first time anything claims to be this sandbox's VM.
 //
-// It answers one question, and it is a question only because of Windows: *did a VMM ever turn
-// up*. On a platform where a guest has been watched across this link, waiting on it is
-// pointless, because the alternative to the VM connecting is the VM failing to boot, which
-// containerd reports by itself. Where nothing has ever put a frame on this device
-// (Unexercised), the silent outcome is the likely one — a shim that does not carry the
+// It answers one question: *did a VMM ever turn up*. On a platform where a guest has been
+// watched across this link — which, since 2026-08-15, is every platform Boks runs on — waiting
+// on it is pointless, because the alternative to the VM connecting is the VM failing to boot,
+// and containerd reports that by itself. Where nothing has yet put a frame on this device
+// (Unexercised), the silent outcome is a live possibility — a shim that does not carry the
 // external network provider leaves the guest on libkrun's TSI and says nothing — and this is
 // the only evidence Boks has that it happened.
 //

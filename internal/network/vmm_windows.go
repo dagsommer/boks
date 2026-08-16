@@ -27,26 +27,41 @@ package network
 // way to hold that position, because it guarantees the thing stays unexercised. On 2026-08-14
 // a container ran end to end in a microVM on Windows 11 through `ctr`: containerd, the nerdbox
 // shim, krun.dll, WHP, a 6.12.44 guest kernel and an advancing clock (docs/verification.md).
-// Everything below Boks works there. So Boks now tries, and the honest failure has moved from
-// "we will not attempt this" to "we attempted it and here is exactly what did not happen".
+// Everything below Boks worked there. So Boks tried.
 //
-// # What is still not true
+// # The frame path, which this file said for a week had never carried a frame
 //
-// **No Ethernet frame has ever crossed libkrun's virtio-net device on Windows.** Not one. The
-// device compiles, links and exports its entry point; nothing has been observed writing a
-// frame into it or reading one out of it. Every boot on Windows so far has been either a
-// direct C probe against krun.dll or a `ctr` run with no network attached at all. So `boks
-// run` on Windows is an attempt, and Unexercised below says so to anything that wants to warn
-// a user or bound a wait.
+// It has. That claim is retired, and the two runs that retired it are worth naming precisely,
+// because a sentence this load-bearing should not be withdrawn on a vague impression:
 //
-// This matters more than "a feature might not work", and the reason is the fallback. A shim
-// that ignores the network annotations does not leave the guest with no network: it leaves it
-// on libkrun's TSI, where the guest's AF_INET calls are performed *on the host* and the
-// guest's 127.0.0.1 is the host's. That is the opposite of containment, and it looks from the
-// outside like a sandbox that is working. Nothing here can detect it directly — the only
-// signal Boks has is that nothing ever connected to the link socket — which is why the
-// supervisor treats "no peer" as a failure loud enough to stop trusting the sandbox, rather
-// than as a quiet wait (see internal/enforce, linkWatchdog).
+//   - **2026-08-14.** `boks run --net nat shell <workspace> -- uname -a` on Windows 11
+//     hardware, exit 0. The stack log recorded `network: the guest attached to the link
+//     socket …\boks\net\shell-boks\net.sock` — first contact on the frame path — and the
+//     policy engine judged real traffic rather than merely accepting an attach: an allowed
+//     destination completed a TCP connection to a resolved GitHub address, a denied one was
+//     refused at CONNECT, three `policy-log.jsonl` records with `stage:connect` and
+//     `stage:dial`.
+//   - **2026-08-15.** The same probe returned **HTTP 200 from github.com**, fetched by a
+//     Linux container in a microVM on Windows through Boks' own gvisor stack, while the
+//     denied host still failed at `CONNECT tunnel failed, response 403` — the policy refusing
+//     it rather than the guest's clock. Every step ran from an unelevated shell.
+//
+// So Unexercised below returns nil here, as it does everywhere else. Nothing warns and nothing
+// bounds a wait, because there is no longer a platform whose link has not been shown to carry
+// frames. The mechanism is kept rather than deleted — see the doc comment on Unexercised for
+// what it is still for.
+//
+// # The failure that looks like success, which is not retired
+//
+// A shim that ignores the network annotations does not leave the guest with no network: it
+// leaves it on libkrun's TSI, where the guest's AF_INET calls are performed *on the host* and
+// the guest's 127.0.0.1 is the host's. That is the opposite of containment, and from outside
+// it looks like a sandbox that is working. Nothing here can detect it directly; the only
+// signal Boks has is that nothing ever connected to the link socket. What has changed is that
+// this is now a misconfiguration — the wrong shim build, or a krun.dll built without
+// `--features blk,net` — rather than the expected outcome of the first attempt. `boks doctor`
+// reports where the shim will find krun.dll, and internal/enforce's noPeerError names the
+// three things to check.
 //
 // # What protects the link socket here, which is not what protects it on Unix
 //
@@ -70,11 +85,21 @@ package network
 // See docs/windows.md for the state of the port, and docs/verification.md for what has
 // actually been observed.
 
-// Unexercised reports that nothing has ever been seen putting a guest's frames on this link.
+// Unexercised reports whether anything on this platform has been observed putting a guest's
+// frames on the link this package binds.
 //
-// It is not a refusal and nothing consults it before binding: Start behaves identically on
-// every platform. It exists so that the two places which can do something useful with the fact
-// — the CLI, which warns before the sandbox is created, and the supervisor, which bounds its
-// wait for a peer instead of idling forever — can say the same true thing without duplicating
-// it.
-func Unexercised() error { return unexercisedOnWindows() }
+// It is nil here now, for the same reason it is nil on Unix: a real guest has been watched
+// across this link on Windows, with the policy engine allowing one destination and refusing
+// another, on 2026-08-14 and again on 2026-08-15 (docs/verification.md). Until 2026-08-14 this
+// returned a sentence saying no Ethernet frame had ever crossed libkrun's virtio-net device
+// here, and that sentence was printed as an unsuppressable WARNING before every `--net nat`
+// run on Windows. Leaving it in place after the runs above would have been the same kind of
+// error in the other direction.
+//
+// The function stays rather than being deleted, and so do its two consumers — the CLI, which
+// warns before the sandbox is created, and the supervisor, which bounds its wait for a peer
+// instead of idling forever (internal/enforce, linkWatchdog). Both take the answer as an
+// argument rather than reading it here, so both remain tested against a non-nil answer that a
+// test constructs. This is the one place that decides whether any platform is in that state,
+// and today none is.
+func Unexercised() error { return nil }

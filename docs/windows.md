@@ -35,23 +35,41 @@ to a primary source), **inferred** (reasoned from one), or **unknown**.
 > architecture; the install instructions live in one place and it is not here.
 
 Of the decisions this spike produced, one has been implemented — the workspace path mapping in
-section 4, which is pure path arithmetic and needs no Windows to be correct — and it has still
-never been exercised on Windows, because the request that would exercise it comes from
-`boks run`.
+section 4, which is pure path arithmetic and needs no Windows to be correct — and it **has**
+now been exercised on Windows, because `boks run` makes that request there. Measured on
+2026-08-15: `pwd` inside the guest is the derived guest path, a file written there appears at
+the exact host path byte-identical with LF endings and no line-ending translation through
+virtiofs, and a file written on the host is readable in the guest.
 
-> **Since this spike, on 2026-08-14: `boks run` no longer refuses on Windows.** The gate in
-> `internal/network/vmm_windows.go` that stopped a sandbox before anything was bound has been
-> removed, so the link socket is bound, the netstack is assembled and the sandbox is attempted.
-> That is not a report that it works — **no Ethernet frame has ever crossed libkrun's
-> virtio-net device on Windows**, and nobody has run `boks run` there. The change adds a
-> bounded wait instead: if nothing connects to the link socket within 30 s of the sandbox's
-> task starting, the supervisor exits with an error naming what did not happen and what to
-> check. Two things went with it — `internal/enforce/lock_windows.go` now implements the
-> supervisor's process primitives (`LockFileEx`, `TerminateProcess`, `DETACHED_PROCESS`)
-> instead of refusing, and the supervisor's control socket is deliberately *not* bound on
-> Windows, because neither its 0700 mode nor its peer-credential check can be enforced there
-> (`internal/enforce/control_windows.go`). See docs/verification.md for what has actually been
-> observed on Windows hardware, which is the stack underneath Boks and not Boks.
+> **Since this spike, on 2026-08-14: `boks run` no longer refuses on Windows, and it works.**
+> The gate in `internal/network/vmm_windows.go` that stopped a sandbox before anything was
+> bound has been removed, so the link socket is bound, the netstack is assembled and the
+> sandbox runs. This paragraph said for a day afterwards that no Ethernet frame had ever
+> crossed libkrun's virtio-net device on Windows and that nobody had run `boks run` there.
+> Both were false by then: the guest attached to Boks' own link socket, the policy engine
+> allowed one destination and refused another, and on 2026-08-15 the same probe fetched
+> **HTTP 200 from github.com** through Boks' own gvisor stack. `network.Unexercised()` returns
+> nil on Windows now and nothing warns.
+>
+> The bounded wait that came with the change remains, inert: if nothing ever connects to the
+> link socket within 30 s of the sandbox's task starting, the supervisor exits with an error
+> naming what did not happen and what to check — which is now a misconfiguration rather than
+> the expected outcome. Two other things went with it, and **one of them is still a live
+> limit**: `internal/enforce/lock_windows.go` implements the supervisor's process primitives
+> (`LockFileEx`, `TerminateProcess`, `DETACHED_PROCESS`) instead of refusing; and the
+> supervisor's control socket is deliberately *not* bound on Windows, because neither its 0700
+> mode nor its peer-credential check can be enforced there
+> (`internal/enforce/control_windows.go`). The consequence of that second one is real:
+> `boks ports --publish` cannot change the ports of a *running* sandbox on Windows. Ports the
+> sandbox was started with are bound by the supervisor itself and work.
+>
+> One more Windows-specific limit, recorded rather than warned about: the link socket's
+> protection here is the ACL inherited from `%LocalAppData%\boks`, not a kernel-enforced 0700
+> mode, and it moves with `BOKS_STATE_DIR`. Pointing that variable at a shared location leaves
+> the link socket reachable by any local user, who could claim it before the VM does and be
+> handed the sandbox's egress.
+>
+> See docs/verification.md for what has actually been observed on Windows hardware.
 
 **This document changed its mind once, and the reversal is left visible on purpose.** Sections
 1–6 conclude that Windows structurally cannot support Boks' network enforcement; section 7
@@ -781,10 +799,12 @@ Not implemented, deliberately:
 - **A host↔guest inverse for `boks cp`.** `cp` takes the guest path from the user directly
   (`SANDBOX:/abs/path`) and never derives one from a host path, so it has nothing to invert
   today. The mapping is reversible when it does.
-- **Anything that would run.** None of this has been executed on Windows and none of it is on a
-  path a user can reach. That was because there was no VMM; since 2026-08-14 there is one, and
-  the reason is now narrower: `boks run` refuses on Windows before it would ever ask for a path
-  to be mapped.
+- ~~**Anything that would run.**~~ This said the mapping had never been executed on Windows and
+  was not on a path a user could reach — first because there was no VMM, then because `boks run`
+  refused there. Neither holds: on 2026-08-15 `pwd` inside a Windows guest was the derived guest
+  path, a file written there appeared at the exact host path byte-identical with LF endings, and
+  a file written on the host was readable in the guest ([verification.md](verification.md)). The
+  mapping runs.
 
 ### The consequences, stated as costs
 

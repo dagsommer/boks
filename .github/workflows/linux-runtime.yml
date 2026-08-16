@@ -1,8 +1,11 @@
-# Build the two pieces of the Boks runtime that Linux users currently have to build by hand,
-# and publish them as one downloadable bundle per architecture.
+# Build the three pieces of the Boks runtime that Linux users currently have to build by hand
+# or hunt for, and publish them as one downloadable bundle per architecture.
 #
 # WHY THIS EXISTS. Boks orchestrates containerd, the nerdbox shim and libkrun. On Linux — the
-# platform Boks is designed for — neither of the last two is obtainable as a binary:
+# platform Boks is designed for — none of the three is obtainable as a usable binary. containerd
+# is packaged everywhere but never new enough: the shim needs 2.3, Ubuntu 24.04 LTS ships 1.7.x
+# and 26.04 ships 2.2.2, and a 2.2 daemon fails at task start. The other two are not packaged at
+# all:
 #
 #   * nerdbox v0.2.3 ships ZERO release assets. Its release workflow has failed on every tag
 #     since v0.2.0, and it is packaged nowhere: not apt, not the AUR, not nixpkgs. Repology
@@ -559,21 +562,23 @@ jobs:
           {
             echo "## Boks runtime for linux/${{ matrix.arch }}"
             echo
-            echo "Artifact \`boks-runtime-linux-${{ matrix.arch }}\` — the two pieces Linux users"
-            echo "have had to build from source."
+            echo "Artifact \`boks-runtime-linux-${{ matrix.arch }}\` — the three pieces Linux"
+            echo "users have had to build or hunt for: a containerd new enough, the shim and"
+            echo "libkrun."
             echo
             echo '```'
             (cd staging && cat SHA256SUMS) 2>/dev/null || echo "(build failed)"
             echo '```'
             echo
-            echo "Both are UNPATCHED upstream: nerdbox at \`packaging/nerdbox/NERDBOX_REV\`,"
+            echo "All three are UNPATCHED upstream: nerdbox at \`packaging/nerdbox/NERDBOX_REV\`,"
             echo "libkrun at \`packaging/linux/LIBKRUN_REV\` (the 1.x line — 2.x drops four of"
-            echo "the nineteen symbols nerdbox resolves at load)."
+            echo "the nineteen symbols nerdbox resolves at load), containerd at the release"
+            echo "\`packaging/containerd-linux/CONTAINERD_VERSION\` pins."
             echo
             echo "**This is not a complete runtime.** You also need the guest kernel and rootfs"
             echo "from the \`guest-image\` workflow — \`nerdbox-kernel-<arch>\` and"
-            echo "\`nerdbox-rootfs-<arch>.erofs\` — and a containerd. Put everything in one"
-            echo "directory on \`PATH\`; see \`README.md\` in the artifact."
+            echo "\`nerdbox-rootfs.erofs\`, which that workflow writes unsuffixed. Put"
+            echo "everything in one directory on \`PATH\`; see \`README.md\` in the artifact."
             echo
             echo "**Nothing here has been run.** No VM is started by this workflow: GitHub's"
             echo "runners are virtualised and \`/dev/kvm\` is absent, so nerdbox's own"
