@@ -34,9 +34,9 @@
 #
 # A `boks` binary on its own cannot start a sandbox. It needs a nerdbox shim, a libkrun,
 # and a guest kernel and rootfs; on Windows it also needs a patched containerd, `ctr` and
-# `mkfs.erofs.exe`. Every one of those is built by another workflow in this directory, and
-# until now every one of them expired as an artifact — see docs/distribution.md, "How the
-# runtime crosses a workflow boundary".
+# `mkfs.erofs.exe` and an `mkfs.ext4.exe`. Every one of those is built by another workflow
+# in this directory, and until now every one of them expired as an artifact — see
+# docs/distribution.md, "How the runtime crosses a workflow boundary".
 #
 # Those workflows are now REUSABLE, and this one CALLS them. `actions/download-artifact`
 # cannot reach another workflow's run without a run id and a token, and the alternative —
@@ -259,8 +259,8 @@ jobs:
       contents: read
     uses: ./.github/workflows/nerdbox-windows.yml
 
-  # containerd.exe, ctr.exe, mkfs.erofs.exe, and the configuration and root-creation script
-  # that an unelevated containerd on Windows does not work without.
+  # containerd.exe, ctr.exe, mkfs.erofs.exe, mkfs.ext4.exe, and the configuration and
+  # root-creation script that an unelevated containerd on Windows does not work without.
   runtime-windows-containerd:
     needs: check
     permissions:
@@ -487,6 +487,27 @@ jobs:
           # are all wrong for this directory and one has just overwritten another; the loop
           # below regenerates it over what is actually here.
           rm -f "$cli/SHA256SUMS"
+
+          # The two formatters containerd shells out to, asserted by name in the archive a
+          # user actually downloads. Neither is reachable through anything else: no installer
+          # puts this directory on PATH, and both are resolved by bare name off the PATH
+          # `boks daemon start` builds (internal/daemon/locate.go). Both have already shipped
+          # missing once — mkfs.erofs.exe was present but looked for on the wrong PATH, and
+          # mkfs.ext4.exe did not exist at all, which is why every Windows `boks run` died at
+          # task start after a perfectly good image pull.
+          #
+          # The failure without this check is silent here and loud three weeks later on
+          # somebody else's machine: a bundle job that quietly stopped producing one of them
+          # would still assemble, zip and publish.
+          for exe in mkfs.erofs.exe mkfs.ext4.exe containerd.exe \
+                     containerd-shim-nerdbox-v1.exe krun.dll; do
+            [ -f "$cli/$exe" ] || {
+              echo "$cli/$exe is missing from the Windows archive." >&2
+              echo "containerd resolves it by bare name off the PATH boks daemon start builds," >&2
+              echo "so an archive without it produces a daemon that cannot start a sandbox." >&2
+              exit 1
+            }
+          done
           ls -l "$cli"
 
           # Every archive carries a SHA256SUMS covering everything actually in it, replacing
@@ -652,7 +673,7 @@ jobs:
           | `boks_*.tar.gz` for `linux_amd64`, `linux_arm64` and `darwin_arm64` | the CLI |
           | `boks_*.deb`, `boks_*.rpm` | the CLI **and the Linux runtime**, packaged. `docs/install.md` says what a package puts on the machine. |
           | `boks-runtime_*_linux_amd64.tar.gz`, `_linux_arm64.tar.gz` | `containerd-shim-nerdbox-v1` and `libkrun.so` |
-          | `boks-runtime_*_windows_amd64.zip` | the Windows runtime **without** the CLI: `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer. For a `boks.exe` you built yourself, or for driving containerd by hand. |
+          | `boks-runtime_*_windows_amd64.zip` | the Windows runtime **without** the CLI: `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, `mkfs.ext4.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer. For a `boks.exe` you built yourself, or for driving containerd by hand. |
           | `boks-guest_*_x86_64.tar.gz`, `_arm64.tar.gz` | the guest kernel and EROFS rootfs a sandbox boots |
 
           **There is no Windows CLI-only archive, deliberately.** It would be a strict subset

@@ -13,9 +13,10 @@ import (
 //
 // Everything in config.go is a setting, and a setting can simply be written correctly. What is
 // left over is the residue: one directory whose location is compiled into containerd and
-// cannot be moved, and one host tool whose absence quietly changes what the configuration is
-// allowed to say. Both fail long after `boks daemon start` — at task start and at image unpack
-// respectively — so both are worth a sentence up front.
+// cannot be moved, and two host tools whose absence is invisible until much later — one of
+// which quietly changes what the configuration is allowed to say. The directory and one of the
+// tools fail at task start, the other at image unpack, and none of the three at `boks daemon
+// start`, which is when somebody is looking. So each is worth a sentence up front.
 
 // Note is something the user should know about the daemon that is starting. It is never fatal:
 // a daemon that comes up and can pull images is useful even if it cannot yet start a task, and
@@ -45,7 +46,61 @@ func Preflight(settings Settings) []Note {
 				"brew: erofs-utils) and run 'boks daemon start' again.",
 		})
 	}
+	if n := writableLayerNote(settings); n != nil {
+		notes = append(notes, *n)
+	}
 	return notes
+}
+
+// writableLayerNote reports whether containerd will be able to format a sandbox's writable
+// layer, on the platforms where it has to format one at all.
+//
+// This is the note that was missing for the whole of the Windows bring-up. Off Linux the erofs
+// snapshotter runs in block mode (see blockWritableLayer), so before any task starts, the mount
+// manager creates `<erofs root>/snapshots/<id>/rwlayer.img`, truncates it to the requested size
+// and runs `mkfs.ext4` on it. There is no configuration that turns this off and nothing checks
+// the binary is there. Measured on Windows 11 on 2026-08-16, from the v0.1.0 archive, after a
+// complete and successful image pull:
+//
+//	boks: starting the io.containerd.nerdbox.v1 runtime failed: failed format
+//	"...\io.containerd.snapshotter.v1.erofs\snapshots\11\rwlayer.img":
+//	mkfs.ext4 failed: : exec: "mkfs.ext4": executable file not found in %PATH%
+//
+// macOS has exactly the same gap and has never reported it. Every macOS run recorded in
+// docs/verification.md happened on a host with e2fsprogs 1.47.4 already installed
+// (docs/verification.md:39) — Homebrew's erofs-utils does not pull it in, no Boks install path
+// installs it, and `boks doctor` was green about a host that would have failed here.
+//
+// It is a Note and not a hard failure for the reason at the top of this file: a daemon that
+// comes up and can pull images is still worth having, and this one may be fixed without
+// restarting the daemon, since containerd resolves mkfs.ext4 per invocation.
+func writableLayerNote(settings Settings) *Note {
+	if !blockWritableLayer(settings.GOOS) || settings.Ext4 {
+		return nil
+	}
+	remedy := "On " + settings.GOOS + " the erofs snapshotter gives every active snapshot its own ext4\n" +
+		"image for the writable layer (containerd's defaultWritableSize is 64 MiB off Linux\n" +
+		"and 0 on it), and containerd's mount manager formats that image by running\n" +
+		"mkfs.ext4. Nothing turns this off. The daemon will start and can pull images;\n" +
+		"'boks run' will fail at task start with\n\n" +
+		"    failed format \"<snapshots dir>/<id>/rwlayer.img\": mkfs.ext4 failed\n\n"
+	switch settings.GOOS {
+	case "windows":
+		remedy += "The Windows archive ships mkfs.ext4.exe beside boks.exe. If it is missing, take it\n" +
+			"from the boks-runtime zip for this release, or set BOKS_RUNTIME_DIR to the\n" +
+			"directory holding it."
+	case "darwin":
+		remedy += "Install e2fsprogs (brew: e2fsprogs). Homebrew keeps it keg-only, so mkfs.ext4\n" +
+			"lands in $(brew --prefix e2fsprogs)/sbin and not on any PATH — Boks adds that\n" +
+			"directory to the daemon's PATH itself, so installing it is enough."
+	default:
+		remedy += "Install e2fsprogs and run 'boks daemon start' again."
+	}
+	return &Note{
+		Name:   ext4Tool,
+		Detail: "not on containerd's PATH, so no sandbox can start",
+		Remedy: remedy,
+	}
 }
 
 // shimSocketRootNote reports whether containerd will be able to create the shim's socket.

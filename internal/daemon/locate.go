@@ -203,19 +203,22 @@ func executable(path string) bool {
 func ContainerdPath(inherited string) string { return daemonPath(inherited) }
 
 // daemonPath returns the PATH containerd is started with: the bundle directories first, then
-// whatever this process inherited.
+// whatever this process inherited, then the keg directories below.
 //
 // Prepending rather than replacing is deliberate. containerd shells out to more than the shim
 // — mkfs.erofs, most importantly — and a PATH containing only Boks' bundle would break a host
 // that has erofs-utils installed normally, which is every host today.
 func daemonPath(inherited string) string {
 	dirs := RuntimeDirs()
-	if len(dirs) == 0 {
+	tail := kegDirs()
+	if len(dirs) == 0 && len(tail) == 0 {
 		return inherited
 	}
 	seen := map[string]bool{}
 	var out []string
-	for _, dir := range append(dirs, filepath.SplitList(inherited)...) {
+	all := append(dirs, filepath.SplitList(inherited)...)
+	all = append(all, tail...)
+	for _, dir := range all {
 		if dir == "" || seen[dir] {
 			continue
 		}
@@ -223,6 +226,44 @@ func daemonPath(inherited string) string {
 		out = append(out, dir)
 	}
 	return strings.Join(out, string(filepath.ListSeparator))
+}
+
+// kegPrefixes are the Homebrew opt prefixes holding a tool containerd runs but which Homebrew
+// deliberately keeps off every PATH, newest-layout first.
+//
+// There is exactly one such tool and it is mkfs.ext4. Off Linux the erofs snapshotter formats
+// each snapshot's writable layer with it (see blockWritableLayer), Homebrew's package is
+// e2fsprogs, and e2fsprogs is keg-only — `brew install e2fsprogs` links nothing into
+// /opt/homebrew/bin, because the formula would otherwise shadow macOS' own /sbin/mount and
+// friends. nerdbox's README tells macOS users to install it and then says Homebrew does not put
+// it on PATH, leaving the reader to work out what to do about that.
+//
+// So a Mac where the user did the documented thing still has a containerd that cannot start a
+// sandbox. These are appended AFTER the inherited PATH, not prepended: a user who has put a
+// mkfs.ext4 of their own choosing somewhere findable keeps it.
+//
+// Both prefixes are listed because Homebrew's default differs by architecture — /opt/homebrew
+// on Apple silicon, /usr/local on Intel — and a Mac may have both. existingDirs drops whichever
+// is not there, so listing both costs nothing.
+var kegPrefixes = []string{"/opt/homebrew/opt", "/usr/local/opt"}
+
+// kegDirs returns the keg-only sbin directories that exist on this host, or nothing at all off
+// macOS, where Homebrew's keg-only rule is not what stops the binary being found.
+func kegDirs() []string { return kegDirsFor(runtime.GOOS, kegPrefixes) }
+
+// kegDirsFor is kegDirs with the platform and the prefixes as arguments, so that a test can
+// build the layout Homebrew produces under a temporary directory and ask for it as darwin.
+// Neither is discoverable otherwise: the real prefixes do not exist on a Linux runner, and a
+// test that only called kegDirs there would pass against a function that did nothing.
+func kegDirsFor(goos string, prefixes []string) []string {
+	if goos != "darwin" {
+		return nil
+	}
+	var candidates []string
+	for _, prefix := range prefixes {
+		candidates = append(candidates, filepath.Join(prefix, "e2fsprogs", "sbin"))
+	}
+	return existingDirs(candidates)
 }
 
 // LookPath is exec.LookPath against the PATH containerd is started with, rather than the one

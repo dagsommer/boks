@@ -65,13 +65,14 @@ of it with a network device attached — which is the only part Boks itself need
 
 ## 1. What you need, and where each piece comes from
 
-Ten files from four places: three CI artifacts, and a `krun.dll` you build yourself. One of the
-ten is a file this document exists partly to explain.
+Eleven files from four places: three CI artifacts, and a `krun.dll` you build yourself. One of the
+eleven is a file this document exists partly to explain.
 
 | File | From | Notes |
 | --- | --- | --- |
 | `containerd.exe`, `ctr.exe` | `containerd-windows-amd64-bundle` | must report `v2.3.3+boks-erofs`; `ctr.exe` must carry `patches/0004` |
 | `mkfs.erofs.exe` | same bundle | needed at *daemon start*, or the erofs differ skips itself |
+| `mkfs.ext4.exe` | same bundle | needed at *task start*, to format the writable layer. New; see step 5 |
 | `config.toml`, `new-containerd-root.ps1`, `rwlayer-64m.img` | same bundle | see steps 0 and 5 |
 | `containerd-shim-nerdbox-v1.exe` | `containerd-shim-nerdbox-v1-windows` (`nerdbox-windows.yml`) | must be the **patched** shim — the unpatched one dies in 118 ms |
 | `nerdbox-kernel-x86_64`, `nerdbox-rootfs.erofs` | `nerdbox-guest-x86_64` (`guest-image.yml`) | exact filenames, no extension on the kernel |
@@ -159,6 +160,7 @@ C:\boks-test\
     containerd.exe
     ctr.exe
     mkfs.erofs.exe
+    mkfs.ext4.exe
     containerd-shim-nerdbox-v1.exe
     krun.dll
     nerdbox-kernel-x86_64
@@ -168,10 +170,10 @@ C:\boks-test\
     rwlayer-64m.img
 ```
 
-One directory is deliberate. Two separate processes resolve five names out of `PATH` — containerd
-for `mkfs.erofs.exe` and the shim binary, and the shim for the DLL, the kernel and the rootfs —
-and splitting them across directories is how you end up debugging a search order instead of a
-container.
+One directory is deliberate. Two separate processes resolve six names out of `PATH` — containerd
+for `mkfs.erofs.exe`, `mkfs.ext4.exe` and the shim binary, and the shim for the DLL, the kernel
+and the rootfs — and splitting them across directories is how you end up debugging a search
+order instead of a container.
 
 ## 3. The procedure
 
@@ -414,6 +416,21 @@ surfaces much later, inside crun, as something about a missing `linux` block.
 > deliberately-failing `run` rather than a `create`.
 
 ### Step 5 — put the writable layer where Windows cannot format it
+
+> **This step should no longer be necessary, and that has not been confirmed on Windows.**
+> The bundle now ships an `mkfs.ext4.exe`, cross-compiled from pristine upstream e2fsprogs with
+> mingw-w64 — see `packaging/mkfs-ext4-windows/README.md`. With it on `PATH`, containerd formats
+> `rwlayer.img` itself, at whatever size it asked for, and nothing below has to happen.
+>
+> That binary has **never been executed**, on Windows or anywhere; it was cross-compiled and
+> inspected on a Linux runner that cannot run a Windows PE. So this step stays, as the fallback
+> for a machine where it turns out not to work, and `rwlayer-64m.img` keeps shipping. **The
+> first Windows run that matters is the one where neither is used**: no `Copy-Item`, no
+> `rwlayer.img` anywhere under `…\snapshots\`, and step 6 succeeding anyway. Record the result
+> in `docs/verification.md` either way.
+>
+> The rest of this section describes the world without that binary, and remains exactly correct
+> for it.
 
 This is the step nobody expects, and it is unavoidable without shipping a `mkfs.ext4` for
 Windows.
