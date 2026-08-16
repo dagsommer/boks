@@ -49,6 +49,27 @@ class Boks < Formula
   depends_on "dagsommer/boks/nerdbox"
   depends_on "erofs-utils"
 
+  # e2fsprogs, for mkfs.ext4, and it is not optional on macOS.
+  #
+  # Off Linux the erofs snapshotter runs in block mode: containerd's defaultWritableSize is
+  # 64 MiB in erofs_other.go and 0 in erofs_linux.go, and `blockMode = defaultSize > 0`
+  # (erofs.go:187). So every active snapshot gets its own ext4 image at
+  # <erofs root>/snapshots/<id>/rwlayer.img, and containerd's mount manager formats it by
+  # running mkfs.ext4 at task start. No configuration turns that off.
+  #
+  # This dependency is late because the gap was invisible: every macOS run recorded in
+  # docs/verification.md happened on a machine that already had e2fsprogs 1.47.4 installed
+  # (docs/verification.md:39), so the requirement never announced itself. A Mac without it
+  # gets a green `boks doctor`, a clean `boks daemon start`, and a failure at the first
+  # `boks run` reading `failed format ".../rwlayer.img": mkfs.ext4 ...`.
+  #
+  # e2fsprogs is KEG-ONLY in homebrew-core — it would shadow macOS' own /sbin/mke2fs and
+  # friends — so this puts mkfs.ext4 in $(brew --prefix e2fsprogs)/sbin and links it onto no
+  # PATH at all. Installing it is nevertheless enough, because internal/daemon/locate.go
+  # appends that directory to the PATH it starts containerd with; see kegPrefixes there. Do
+  # not "fix" this with a `link_overwrite` or by putting sbin on the user's PATH.
+  depends_on "e2fsprogs"
+
   depends_on :macos
 
   # The guest kernel and EROFS root filesystem the microVM boots.

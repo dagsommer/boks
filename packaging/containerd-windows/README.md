@@ -230,10 +230,10 @@ mkfs.** So every way mkfs can fail leaves behind a file of exactly the size the 
 expects, containing nothing but zeroes. The next call `Stat`s it, finds it, skips the format,
 and returns the mount. **The guest is handed a zero-filled image presented as ext4.**
 
-Windows makes that certain rather than unlikely. There is no `mkfs.ext4` for Windows in any
+Windows made that certain rather than unlikely. There is no `mkfs.ext4` for Windows in any
 packaged form, and the erofs snapshotter asks for `mkfs/ext4` with
-`X-containerd.mkfs.size=67108864` on every active snapshot, so the format step fails by
-construction on the first `ctr run` and every attempt after it "succeeds". Measured on the
+`X-containerd.mkfs.size=67108864` on every active snapshot, so the format step failed by
+construction on the first `ctr run` and every attempt after it "succeeded". Measured on the
 Windows 11 machine, on the file the failing run left behind:
 
 ```
@@ -263,6 +263,17 @@ dangers here and they pull in opposite directions.
 ships `rwlayer-64m.img`.** That image is made by `mkfs.ext4` on the CI runner, so it carries a
 real superblock and is accepted. What no longer works is dropping in a file that is merely the
 right *size* — which never worked, it just failed silently instead of loudly.
+
+> **The bundle now also ships a real `mkfs.ext4.exe`, and that is meant to be the route.**
+> `packaging/mkfs-ext4-windows/` cross-compiles e2fsprogs for mingw — no patches; mingw is a
+> supported host in its own `configure.ac` and `lib/ext2fs/windows_io.c` is upstream. With it on
+> containerd's PATH the branch below never runs and no image has to be placed by hand.
+>
+> `rwlayer-64m.img` stays because that binary has never been executed. It also stays as the
+> answer to a question this patch does not answer: **0005 checks the magic, not the length.** A
+> 64 MiB template dropped in where `default_size` asked for 256 MiB is accepted in silence, and
+> the sandbox gets a quarter of the space its configuration promises. A formatter has no such
+> failure mode, which is the main reason it is preferred to seeding.
 
 The offsets and magics, and where each was checked:
 
