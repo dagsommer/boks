@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/containerd/containerd/v2/defaults"
 )
@@ -30,7 +29,7 @@ type Note struct {
 // Preflight returns what is wrong with the host that the configuration cannot express.
 func Preflight(settings Settings) []Note {
 	var notes []Note
-	if n := shimSocketRootNote(); n != nil {
+	if n := shimSocketRootNote(settings.GOOS); n != nil {
 		notes = append(notes, *n)
 	}
 	if !settings.EROFS {
@@ -106,10 +105,10 @@ func writableLayerNote(settings Settings) *Note {
 // shimSocketRootNote reports whether containerd will be able to create the shim's socket.
 //
 // containerd derives that path from a compile-time constant — pkg/shim/util_unix.go's
-// `const socketRoot = defaults.DefaultStateDir` — so no configuration setting moves it
-// (containerd#12444), and this is the one part of the daemon's layout Boks cannot choose. On
-// Linux it is /run/containerd and on macOS /var/run/containerd, both of which a normal user
-// cannot create.
+// `socketRoot`, which is `filepath.Join(defaults.DefaultStateDir, "s")` — so no configuration
+// setting moves it (containerd#12444), and this is the one part of the daemon's layout Boks
+// cannot choose. On Linux it is /run/containerd and on macOS /var/run/containerd, both of which
+// a normal user cannot create.
 //
 // The failure without this note arrives much later and reads as a Boks failure:
 //
@@ -118,7 +117,32 @@ func writableLayerNote(settings Settings) *Note {
 // docs/install.md calls the fix "the only step that needs root", and it still is — Boks does
 // not elevate to do it. What Boks can do is try the harmless half first: if the directory can
 // simply be created, it is created and there is nothing to report.
-func shimSocketRootNote() *Note {
+//
+// # Why it says nothing on Windows
+//
+// It used to, and it was wrong. `boks daemon start` on Windows 11 warned about
+// `C:\ProgramData\containerd\state` on 2026-08-16, on a machine where that path did not exist
+// and where sandboxes then started, ran, enforced policy and stopped without it. The check was
+// asking a question with no meaning on that host: a shim on Windows is reached over a **named
+// pipe**, which lives in the kernel's object namespace and not on any filesystem. containerd's
+// own pkg/shim/util_windows.go has no socketRoot, no SocketAddress and no writeSocketDir, and
+// its RemoveSocket is a no-op — the whole mechanism this note is about is Unix-only. The only
+// Windows use of DefaultStateDir is a *default* for `--state`, which Boks overrides anyway
+// (see config.go).
+//
+// It was also the wrong remedy in the wrong direction: it told an unelevated user to give
+// themselves write access to a machine directory or "run the daemon elevated", on the one
+// platform where Boks has been verified end to end with no elevation at all. A warning that
+// fires on a working host teaches its reader to ignore the ones that mean something, which is
+// the argument internal/cli/notice.go already makes about volume.
+//
+// The platform is a parameter rather than a read of runtime.GOOS so that the Windows case can
+// be constructed by a test on a machine that is not Windows — which is the only kind of machine
+// this repository's tests have ever run on.
+func shimSocketRootNote(goos string) *Note {
+	if goos == "windows" {
+		return nil
+	}
 	root := defaults.DefaultStateDir
 	if writableDir(root) {
 		return nil
@@ -134,19 +158,15 @@ func shimSocketRootNote() *Note {
 }
 
 func shimSocketRemedy(root string) string {
-	base := fmt.Sprintf(
-		"containerd puts each shim's socket in %s, and that path is a compile-time\n"+
+	return fmt.Sprintf(
+		"containerd puts each shim's socket under %s, and that path is a compile-time\n"+
 			"constant (containerd#12444) — no configuration moves it, so Boks cannot put it\n"+
 			"under your state directory with everything else. The daemon will start and can\n"+
 			"pull images; starting a sandbox will fail with\n\n"+
-			"    creating sandbox process: mkdir %s: permission denied\n\n", root, root)
-	if runtime.GOOS == "windows" {
-		return base + "Give your account write access to that directory, or run the daemon elevated."
-	}
-	return base + fmt.Sprintf(
-		"This is the one step that needs root, and it is needed once:\n\n"+
+			"    creating sandbox process: mkdir %s: permission denied\n\n"+
+			"This is the one step that needs root, and it is needed once:\n\n"+
 			"    sudo mkdir -p %s\n"+
-			"    sudo chown \"$(id -u):$(id -g)\" %s", root, root)
+			"    sudo chown \"$(id -u):$(id -g)\" %s", root, root, root, root)
 }
 
 // writableDir reports whether path is a directory this process can create a file in.

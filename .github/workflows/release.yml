@@ -442,10 +442,11 @@ jobs:
           # ---------------------------------------------------------------------------------
           # boks_<v>_windows_amd64.zip — the Windows install, in one file.
           #
-          # This is the winget target and the recommended Windows download, and it is a
-          # SUPERSET of the runtime directory above: the CLI, everything a sandbox needs to
-          # run, and the guest kernel and rootfs it boots. There is deliberately no CLI-only
-          # Windows tarball to pick instead; see the `build` job's upload step.
+          # This is the winget target and the recommended Windows download: the CLI,
+          # everything a sandbox needs to run, and the guest kernel and rootfs it boots. There
+          # is deliberately no CLI-only Windows tarball to pick instead; see the `build` job's
+          # upload step. It carries the runtime directory above save for one file nothing in
+          # it reads — see the copy loop below.
           #
           # FLAT, everything beside boks.exe, and that is load-bearing twice over:
           #
@@ -474,12 +475,30 @@ jobs:
           # packaging/containerd-windows/README.md under that same name. A plain copy would
           # replace the document a user opens first with one about driving containerd by
           # hand. The runtime's keeps its content under a name that says what it is.
+          #
+          # One file is deliberately left behind: rwlayer-64m.img, 64 MiB of pre-formatted
+          # ext4. It was the answer to a Windows host that could not format a writable layer,
+          # copied into place by hand from docs/windows-e2e.md. Nothing in this archive reads
+          # it: containerd formats the layer itself now, with the mkfs.ext4.exe asserted
+          # below, which ran for the first time on Windows on 2026-08-16 and produced a real
+          # superblock. It stays in boks-runtime_*_windows_amd64.zip, which is what
+          # docs/windows-e2e.md's by-hand procedure collects its files from — that document
+          # still names it, and it is the fallback for a machine where the formatter turns
+          # out not to work. It is 8% of the download for everyone else.
           for f in "$d"/*; do
             case "$(basename "$f")" in
             README.md) cp -a "$f" "$cli/README-windows-runtime.md" ;;
+            rwlayer-64m.img) ;;
             *) cp -a "$f" "$cli/" ;;
             esac
           done
+          # Asserted, because "we stopped shipping it" is a claim about a file that is not
+          # there, and the way that claim goes wrong is silently.
+          if [ -e "$cli/rwlayer-64m.img" ]; then
+            echo "rwlayer-64m.img is back in the all-in-one archive." >&2
+            echo "Nothing in it reads that file; mkfs.ext4.exe formats the layer." >&2
+            exit 1
+          fi
           # The guest, x86_64 only: there is no arm64 Windows runtime to boot it with.
           cp -a in/guest-x86_64/. "$cli/"
           write_source_txt "$cli" x86_64
@@ -539,9 +558,9 @@ jobs:
           # claims it is. The SHA256SUMS inside the archive is what a suspicious reader
           # checks, and it is over the files rather than over the container.
           # Both Windows archives: the all-in-one boks_*_windows_amd64.zip that winget
-          # installs, and the runtime-only boks-runtime_*_windows_amd64.zip it is a superset
-          # of. `boks_` cannot match `boks-runtime_` — the separator differs — so the two
-          # globs do not overlap.
+          # installs, and the runtime-only boks-runtime_*_windows_amd64.zip it is built from.
+          # `boks_` cannot match `boks-runtime_` — the separator differs — so the two globs do
+          # not overlap.
           for d in boks_*_windows_* boks-runtime_*_windows_*; do
             TZ=UTC zip -qrX "../dist/$d.zip" "$d"
           done
@@ -673,7 +692,7 @@ jobs:
           | `boks_*.tar.gz` for `linux_amd64`, `linux_arm64` and `darwin_arm64` | the CLI |
           | `boks_*.deb`, `boks_*.rpm` | the CLI **and the Linux runtime**, packaged. `docs/install.md` says what a package puts on the machine. |
           | `boks-runtime_*_linux_amd64.tar.gz`, `_linux_arm64.tar.gz` | `containerd-shim-nerdbox-v1` and `libkrun.so` |
-          | `boks-runtime_*_windows_amd64.zip` | the Windows runtime **without** the CLI: `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, `mkfs.ext4.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer. For a `boks.exe` you built yourself, or for driving containerd by hand. |
+          | `boks-runtime_*_windows_amd64.zip` | the Windows runtime **without** the CLI: `krun.dll`, `containerd-shim-nerdbox-v1.exe`, a patched `containerd.exe` and `ctr.exe`, `mkfs.erofs.exe`, `mkfs.ext4.exe`, a `config.toml`, `new-containerd-root.ps1` and a pre-formatted writable layer for the by-hand procedure in `docs/windows-e2e.md`. For a `boks.exe` you built yourself, or for driving containerd by hand. |
           | `boks-guest_*_x86_64.tar.gz`, `_arm64.tar.gz` | the guest kernel and EROFS rootfs a sandbox boots |
 
           **There is no Windows CLI-only archive, deliberately.** It would be a strict subset
