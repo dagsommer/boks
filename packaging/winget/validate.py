@@ -9,12 +9,21 @@ is portable: winget's manifest schemas are ordinary draft-07 JSON Schema, publis
 microsoft/winget-cli, so the same documents winget checks against can be checked against
 here.
 
-Be precise about what a pass means and does not mean. It means the three files parse as
-YAML, carry the fields the schema requires, and violate none of its patterns, enums or
-length limits. It does not mean winget will install the package, that the installer URL
-resolves, that the SHA-256 matches the archive at that URL, that the nested path exists
-inside the archive, or that winget-pkgs' own pipeline will accept the submission. Those are
-runtime facts and this is a document check.
+Be precise about what a pass means and does not mean. It means ALL THREE files are present,
+parse as YAML, carry the fields the schema requires, violate none of its patterns, enums or
+length limits, agree with each other about which package version they describe, and declare
+the ManifestVersion whose schemas were actually fetched. It does not mean winget will install
+the package, that the installer URL resolves, that the SHA-256 matches the archive at that
+URL, that the nested path exists inside the archive, or that winget-pkgs' own pipeline will
+accept the submission. Those are runtime facts and this is a document check.
+
+Two of those clauses are recent, and both were holes rather than omissions. Until 2026-08-16
+a *missing* manifest was a silent pass — only an entirely empty directory failed — so a
+render that produced one file out of three reported ok, and every cross-file rule was
+vacuously satisfied over a set of one. And ManifestVersion was compared only across the three
+documents, which one `sed` pass stamps from templates carrying the same literal: a
+tautology that held no matter what the value was, while MANIFEST_VERSION here — the constant
+the schema URL is built from — was never compared to them at all.
 
 The schemas are fetched from the network on first use and cached under the directory named
 by BOKS_WINGET_SCHEMA_CACHE, defaulting to a temporary directory. Nothing is committed:
@@ -137,12 +146,39 @@ def cross_file_problems(documents: dict) -> list[str]:
                     f"NestedInstallerType portable"
                 )
 
+    # ALL THREE documents, not "however many happened to be there". A winget-pkgs submission
+    # is a set of three and is rejected as incomplete without them; more to the point, every
+    # cross-file check below is vacuous over a set of one, so a missing manifest used to be a
+    # silent pass here. The only failure was an EMPTY directory.
+    missing_kinds = sorted(set(KINDS.values()) - set(documents))
+    if missing_kinds:
+        problems.append(
+            "the manifest set is incomplete: no "
+            + ", ".join(f"{kind} manifest" for kind in missing_kinds)
+        )
+
     # The three files describe one package version. winget-pkgs rejects a set that
     # disagrees with itself, and a rendering bug is exactly how they come to disagree.
     for field in ("PackageIdentifier", "PackageVersion", "ManifestVersion"):
         values = {kind: document.get(field) for kind, document in documents.items()}
         if len(set(values.values())) > 1:
             problems.append(f"{field} differs across the manifest set: {values}")
+
+    # And ManifestVersion against the constant this file validates AGAINST, which is the
+    # comparison that can actually fail. The three documents come out of one `sed` pass over
+    # templates that all carry the same literal, so "they agree with each other" is a
+    # tautology — it was true of a set whose ManifestVersion disagreed with the schemas being
+    # fetched, which is the mistake worth catching: the schema URL is built from
+    # MANIFEST_VERSION, so a template bumped without this constant would be checked against
+    # the wrong schema and pass.
+    for kind, document in sorted(documents.items()):
+        declared = document.get("ManifestVersion")
+        if declared != MANIFEST_VERSION:
+            problems.append(
+                f"{kind} manifest declares ManifestVersion {declared!r} but this validator "
+                f"fetched the {MANIFEST_VERSION} schemas; the templates and validate.py's "
+                f"MANIFEST_VERSION must be changed together"
+            )
 
     return problems
 
@@ -167,7 +203,23 @@ def main(argv: list[str]) -> int:
             failed = True
             continue
 
-        document = as_winget_types(yaml.safe_load(manifest.read_text(encoding="utf-8")))
+        try:
+            parsed = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            # A traceback is not a diagnosis. An unsubstituted `{{PLACEHOLDER}}` parses as a
+            # YAML flow mapping with an unhashable key and used to crash this script with a
+            # stack trace from PyYAML's constructor.
+            failed = True
+            print(f"{manifest.name}: is not valid YAML: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(parsed, dict):
+            failed = True
+            print(
+                f"{manifest.name}: is not a YAML mapping (got {type(parsed).__name__})",
+                file=sys.stderr,
+            )
+            continue
+        document = as_winget_types(parsed)
         documents[kind] = document
         errors = sorted(
             jsonschema.Draft7Validator(schema_for(kind)).iter_errors(document),

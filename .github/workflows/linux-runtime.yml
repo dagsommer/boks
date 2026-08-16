@@ -543,10 +543,23 @@ jobs:
             krun_set_net_mac krun_add_disk krun_add_disk2 \
             krun_add_net_unixstream krun_add_net_unixgram
 
+      # Every file in the directory, not a hand-written list of three. `staging/*` uploads
+      # four — README.md is the fourth — and `sha256sum -c` says nothing at all about a file
+      # absent from the list it is given, so release.yml's "Verify every incoming artifact
+      # against the checksums its builder wrote" reported OK on a README that had been
+      # replaced wholesale. `files=(*)` is what every other producer in this repository
+      # already does, guest-image.yml included.
+      #
+      # Written with a redirect rather than `| tee` into the directory the glob covers: in a
+      # pipeline the shell may create SHA256SUMS before the glob is expanded, and the file
+      # would then list itself as empty.
       - name: Checksums
+        working-directory: staging
         run: |
           set -euo pipefail
-          (cd staging && sha256sum containerd containerd-shim-nerdbox-v1 libkrun.so | tee SHA256SUMS)
+          files=(*)
+          sha256sum -- "${files[@]}" >SHA256SUMS
+          cat SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:

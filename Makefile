@@ -23,7 +23,7 @@ VERSION_ARG_docker-agent := version
 # windows/arm64 are absent.
 RELEASE_TARGETS := darwin/arm64 linux/amd64 linux/arm64 windows/amd64
 
-.PHONY: build test check integration vet fmt clean dist docs docs-check release-notes images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
+.PHONY: build test check integration vet fmt clean dist docs docs-check release-notes winget images images-test image-base $(addprefix image-,$(AGENT_IMAGES)) $(addprefix image-test-,$(AGENT_IMAGES))
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/boks
@@ -83,6 +83,29 @@ docs-check:
 release-notes:
 	@test -n "$(TAG)" || { echo "usage: make release-notes TAG=vX.Y.Z [INSERT=--insert]" >&2; exit 2; }
 	./scripts/release-notes.sh $(INSERT) $(TAG)
+
+# --- winget manifests ---------------------------------------------------------------
+#
+# Renders packaging/winget/manifests/*.yaml.in and checks the result against winget's own
+# JSON schemas, which validate.py fetches. It needs python3 with jsonschema and pyyaml, and
+# network access for the first fetch; .github/workflows/winget.yml runs the same two scripts
+# with the same controls on every change under packaging/winget/.
+#
+# The version and digest are placeholders unless passed, because this target exists to check
+# the manifests are well formed, not to stamp a release — for that, pass the real archive and
+# `render.sh` computes the digest from it:
+#
+#   make winget WINGET_VERSION=0.1.0 WINGET_DIGEST=dist/boks_0.1.0_windows_amd64.zip
+#
+# Not named VERSION/DIGEST: VERSION is this Makefile's own `git describe` and overriding it
+# on the command line would quietly change what every other target stamps into the binary.
+#
+# Nothing here is a substitute for `winget validate`, which runs only on Windows and has
+# never been run against these files. See packaging/winget/README.md.
+WINGET_VERSION ?= 0.0.0
+WINGET_DIGEST  ?= A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90
+winget:
+	packaging/winget/render.sh $(WINGET_VERSION) $(WINGET_DIGEST) dist/winget
 
 # --- agent images -----------------------------------------------------------------
 #
