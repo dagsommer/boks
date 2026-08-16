@@ -14,11 +14,13 @@ import (
 // unexercised stands in for network.Unexercised()'s Windows answer.
 //
 // The whole point of watchLink taking that error as a parameter is that the armed behaviour
-// can be built here, on Linux, rather than only existing on a platform the tests never run on.
+// can be built here rather than only existing on a platform the tests never run on. Since
+// 2026-08-15 no platform answers non-nil at all (docs/verification.md), so this is the only
+// way the armed path is exercised anywhere.
 var unexercised = errors.New("no Ethernet frame has ever crossed this device on this platform")
 
-// TestTheLinkWatchdogIsInertWhereTheLinkIsExercised is the proof that this change does nothing
-// on Unix.
+// TestTheLinkWatchdogIsInertWhereTheLinkIsExercised is the proof that this does nothing on a
+// platform where a guest has been watched on this link — which today is all of them.
 //
 // Everything the watchdog can do is reached through two channels, and where the platform has
 // been exercised both are nil: a receive on a nil channel blocks forever, so the supervisor's
@@ -43,8 +45,8 @@ func TestTheLinkWatchdogIsInertWhereTheLinkIsExercised(t *testing.T) {
 	}
 }
 
-// TestTheLinkWatchdogFailsWhenNothingDials is the Windows case, constructed rather than
-// depended on: the sandbox's task is running and nothing ever connects to the link socket.
+// TestTheLinkWatchdogFailsWhenNothingDials is the unexercised-platform case, constructed
+// rather than depended on: the sandbox's task is running and nothing ever connects to the link socket.
 func TestTheLinkWatchdogFailsWhenNothingDials(t *testing.T) {
 	never := make(chan struct{})
 	w := watchLink(context.Background(), unexercised, "agentbox", "/run/boks/net.sock",

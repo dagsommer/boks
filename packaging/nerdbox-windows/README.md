@@ -420,12 +420,24 @@ implemented and five of them — `setupSignals`, `newServer`, `serveListener`, `
 `reap` — have now executed; `openLog` remains unexercised, since nerdbox's shim sets
 `NoSetupLogger`. Full evidence and its limits: [`docs/verification.md`](../../docs/verification.md).
 
-The limits are worth stating in the same breath. This is `ctr`, not `boks run`; Boks' own path
-still stops earlier, at the network refusal in `internal/network/vmm_windows.go`. No network
-device has been added on Windows and no Ethernet frame has crossed one. The runs to date used
-an elevated containerd, for its task-bundle symlink — `packaging/containerd-windows/patches/0006`
-replaces that with a junction and has not been run — and they used no NIC, one container at a
-time, and a hand-made writable layer, since `mkfs.ext4` still does not exist for Windows.
+The limits are worth stating in the same breath, and three of them have since been lifted —
+recorded here rather than deleted, because this section is what *that* run proved and not what
+later runs did.
+
+*Then:* this was `ctr`, not `boks run`; Boks' own path stopped earlier at the network refusal in
+`internal/network/vmm_windows.go`; no network device had been added on Windows and no Ethernet
+frame had crossed one; and the runs used an elevated containerd for its task-bundle symlink,
+with `packaging/containerd-windows/patches/0006` replacing that symlink with a junction and
+never having been run.
+
+*Since:* the refusal is deleted, `boks run --net nat` ran the sandbox itself on 2026-08-14 with
+the guest attached to Boks' own link socket and policy enforced across it, on 2026-08-15 the
+same probe returned HTTP 200 through Boks' gvisor stack, and every step of that round ran from
+an unelevated shell with the bundle's `work` link confirmed as a junction — patch 0006 works
+([`docs/verification.md`](../../docs/verification.md)).
+
+*Still true:* one container at a time, and a hand-made writable layer, since `mkfs.ext4` does
+not exist for Windows.
 
 The build claim and the run claim remain separate: compiling a shim is not starting one, and
 patch 0005 exists because a defect survived every compile and every review in this file until

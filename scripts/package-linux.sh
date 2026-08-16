@@ -127,8 +127,10 @@ Point BOKS_RUNTIME_ASSETS at a directory holding, for this architecture:
   containerd-shim-nerdbox-v1  } artifact boks-runtime-linux-<goarch>
   libkrun.so                  } from .github/workflows/linux-runtime.yml
 
-and, when they exist, nerdbox-kernel-<arch> and nerdbox-rootfs-<arch>.erofs from the
-guest-image workflow.
+and, when they exist, nerdbox-kernel-<arch> and the guest rootfs from the guest-image
+workflow. That workflow writes the rootfs unsuffixed, as nerdbox-rootfs.erofs; the
+suffixed nerdbox-rootfs-<arch>.erofs is accepted too, and either is installed under the
+suffixed name.
 
 To build the CLI-only package on purpose, set BOKS_RUNTIME_ASSETS=none.
 EOF

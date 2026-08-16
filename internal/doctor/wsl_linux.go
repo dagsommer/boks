@@ -8,14 +8,19 @@ import (
 	"strings"
 )
 
-// WSL2 is Boks' only usable answer for Windows today (see docs/windows.md), and the way it
+// WSL2 was Boks' only usable answer for Windows when this was written. It is not any more —
+// `boks run` runs a sandbox natively on Windows, with policy enforced, since 2026-08-14 (see
+// docs/windows.md and docs/verification.md) — but it matters more than it did, not less: the
+// only end-to-end Linux verification Boks has was done *inside WSL2*, on 2026-08-15. So this
+// file is now the diagnosis for the platform Boks' Linux evidence comes from, and the way it
 // fails is different enough from bare-metal Linux that a generic "enable nested virtualisation"
-// message sends people to the wrong place. This file supplies the detection and the three
-// distinct diagnoses.
+// message sends people to the wrong place. It supplies the detection and the three distinct
+// diagnoses.
 //
-// **None of this has been executed on WSL.** No machine on this project runs Windows. The
-// signals below are taken from WSL's own source and issue tracker; the shape of the logic is
-// testable here, the values it reads are not.
+// **The remedies below have still not been executed on WSL.** The 2026-08-15 run was on a WSL2
+// distribution whose /dev/kvm worked; none of these three failure paths was reached. The
+// signals are taken from WSL's own source and issue tracker; the shape of the logic is testable
+// here, the values it reads are not.
 
 // wslMarker is the file WSL's init creates in every distribution on every boot.
 //
@@ -73,8 +78,8 @@ var cpuFlagRE = regexp.MustCompile(`(?m)^flags\s*:.*\b(vmx|svm)\b`)
 // branches rather than listing both.
 func wslKVMMissingRemedy() string {
 	const common = "\n" +
-		"Boks needs KVM inside the distribution. WSL is the only route to Boks on Windows\n" +
-		"today; see docs/windows.md."
+		"Boks needs KVM inside the distribution. If you only want a sandbox on this machine,\n" +
+		"Boks also runs natively on Windows now and does not need WSL; see docs/windows.md."
 
 	if !virtualizationExposed() {
 		// No vmx/svm: the hypervisor is not exposing virtualisation extensions to

@@ -239,7 +239,9 @@ func TestOrphanedStackWarningStatesTheMeasuredOutcome(t *testing.T) {
 }
 
 // TestUnexercisedNetworkWarningClaimsNothing covers the note printed before a sandbox is
-// created on a platform where no frame has ever crossed the link — today, Windows.
+// created on a platform where no frame has ever crossed the link. Windows was that platform
+// until 2026-08-14 and no platform is today, so this text is never printed on any host Boks
+// currently runs on — which makes constructing the condition the only way to check it at all.
 //
 // The condition is constructed rather than depended on: the warning takes the reason as an
 // argument for exactly this, so the Windows text can be rendered on a machine that is not
