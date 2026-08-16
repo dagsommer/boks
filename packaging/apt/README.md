@@ -34,8 +34,11 @@ These are Boks' private executables, not commands a user runs. A `containerd` in
 would collide at the file level with the distribution's own `containerd` package — dpkg would
 refuse the install — and would shadow on `PATH` a containerd somebody installed on purpose.
 
-The path is not free choice: `internal/daemon/locate.go` searches `<boks exe dir>` and then
-`<boks exe dir>/../libexec/boks`, which for `/usr/bin/boks` is exactly `/usr/libexec/boks`.
+The path is not free choice: `internal/daemon/locate.go` searches
+`<boks exe dir>/../libexec/boks` and then `<boks exe dir>`, which for `/usr/bin/boks` makes the
+first of those exactly `/usr/libexec/boks`. The bundle directory comes **first** on purpose:
+searching the executable's own directory first meant `/usr/bin/containerd` — the
+distribution's, at 2.2.6 — won over the 2.3.3 this package installs, measured on 2026-08-15.
 `boks daemon` then *prepends* that directory to the `PATH` it gives containerd, so containerd
 resolves the shim there and the shim — which scans its own `PATH` for libkrun and the guest
 images — finds those there too. One directory answers all four lookups.

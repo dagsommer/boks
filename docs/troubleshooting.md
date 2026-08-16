@@ -81,9 +81,11 @@ the sandbox need not be the same host: these are guest artefacts, so build once 
 architecture and copy. [Installation](install.md) has the detail.
 
 The shim accepts `nerdbox-rootfs-<arch>.erofs` as well as the unsuffixed
-`nerdbox-rootfs.erofs`; there is no unsuffixed kernel name. `doctor` scans the same places
-in the same order, with one caveat it cannot do anything about: it scans *your* `PATH`, and
-the one that decides is the containerd daemon's.
+`nerdbox-rootfs.erofs`; there is no unsuffixed kernel name. `guest-image.yml` produces the
+unsuffixed spelling, and the Linux packages rename it. `doctor` scans the same places in the
+same order, and since 2026-08-15 it scans the right `PATH`: the one `boks daemon start` gives
+containerd, which is Boks' bundle directories prepended to yours. It still cannot see a
+containerd you started yourself with a different environment.
 
 ### A pull fails partway through with an exec error
 
@@ -121,10 +123,12 @@ Two consequences are worth knowing:
 - **A multiarch directory is not searched.** `libkrun.so` in `/usr/lib/x86_64-linux-gnu` is
   invisible to the shim. Symlink it into `/usr/lib`, or set `LIBKRUN_PATH`.
 
-The check warns rather than fails, and always will: `PATH` and `LIBKRUN_PATH` are read from
-**containerd's** environment, which `doctor` cannot see. If libkrun is somewhere the daemon's
-environment covers, the warning is harmless. Note that setting `LIBKRUN_PATH` *replaces* the
-default directories rather than adding to them.
+The check warns rather than fails, and always will. `doctor` searches the `PATH` `boks daemon
+start` gives containerd — Boks' bundle directories prepended to your own — so a packaged
+install is now seen correctly, but a containerd you started yourself carries whatever
+environment you gave it, and `LIBKRUN_PATH` is read from this process either way. If libkrun
+is somewhere the daemon's environment covers, the warning is harmless. Note that setting
+`LIBKRUN_PATH` *replaces* the default directories rather than adding to them.
 
 ---
 

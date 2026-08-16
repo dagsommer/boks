@@ -3,12 +3,17 @@
 Boks enforces network policy at the virtio-net boundary. Upstream libkrun cannot provide
 that boundary on Windows, which is why `boks run` had nothing to attach to there.
 
-> **Later.** `packaging/libkrun-windows/` now carries the backend described here, `krun.dll`
-> links with `--features blk,net`, and `boks run` no longer refuses on Windows — it binds the
-> link socket and attempts the sandbox, with a bounded wait that fails legibly if nothing
-> connects (`internal/network/vmm_windows.go`, `internal/enforce/link.go`). **No frame has
-> crossed the device on Windows even so.** The refusal was removed because refusing guarantees
-> the question stays unanswered, not because it was answered.
+> **Later, and this document's premise no longer holds.**
+> `packaging/libkrun-windows/` carries the backend described here, `krun.dll` links with
+> `--features blk,net`, and `boks run` does not refuse on Windows. This banner said for a day
+> that no frame had crossed the device even so; that stopped being true on **2026-08-14**, when
+> the guest attached to Boks' own link socket and the policy engine allowed one destination and
+> refused another, and on **2026-08-15** a container in a microVM on Windows fetched **HTTP
+> 200** through Boks' gvisor stack (`docs/verification.md`). The boundary this document says
+> Windows cannot provide, Windows provides.
+>
+> What remains true is the *upstream* half: none of it is in libkrun's `main`, which is why
+> this document — the case for upstreaming it — is kept.
 
 Not because it is impossible: a shipping product drives a virtio NIC on Windows through
 libkrun's own ABI today (below). Because upstream has no virtio-net backend for it.
@@ -135,8 +140,11 @@ libkrun's virtio-net is necessary, not sufficient. Still outstanding for Windows
 - **containerd on Windows** running Linux guests the way the Boks stack assumes.
 - **Our own Windows path**: nothing in `internal/network` any more — the stream transport is
   in, `stack.go` and `gateway.go` build for `windows/amd64`, and the only Windows-specific
-  file left is `vmm_windows.go`, which since this was written holds a warning rather than a
-  refusal. What is untested is everything: no frame has crossed this link on Windows.
+  file left is `vmm_windows.go`, which since this was written holds neither a refusal nor a
+  warning. This bullet said "no frame has crossed this link on Windows"; frames crossed it on
+  2026-08-14, with the policy engine allowing one destination and refusing another, and on
+  2026-08-15 a container in a microVM on Windows fetched HTTP 200 through the stack
+  ([verification.md](verification.md)). **This item is closed.**
 
 So the realistic reading is: this removes one blocker of several. Its value is that the
 blocker is now a patch in front of libkrun's maintainers rather than an unasked question,
