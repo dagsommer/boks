@@ -922,6 +922,37 @@ nerdbox `cd2c23f`, and it found two containerd-side obstacles before anyone trie
   image is already formatted, so the bundle ships a pre-formatted `rwlayer-64m.img`. That is
   a workaround, and it is labelled as one.
 
+  **Updated 2026-08-16.** The workaround was never wired up: nothing in Boks ever put that
+  image in place, so the only thing that ever did was a human running the `Copy-Item` in
+  [windows-e2e.md](windows-e2e.md) step 5. Measured on Windows 11 the same day, from the
+  v0.1.0 archive, on an image that pulled and unpacked completely — seven `layer.erofs` files
+  on disk:
+
+  ```
+  boks: starting the io.containerd.nerdbox.v1 runtime failed: failed format
+  "…\io.containerd.snapshotter.v1.erofs\snapshots\11\rwlayer.img":
+  mkfs.ext4 failed: : exec: "mkfs.ext4": executable file not found in %PATH%
+  ```
+
+  The fix is a real `mkfs.ext4.exe`, cross-compiled from **pristine upstream e2fsprogs
+  1.47.2** with mingw-w64 — no patches, because mingw is a supported host in e2fsprogs' own
+  `configure.ac` and `lib/ext2fs/windows_io.c` is upstream. See
+  `packaging/mkfs-ext4-windows/README.md`. **It has never been executed**, on Windows or
+  anywhere: it was cross-compiled and inspected on a Linux/arm64 runner that cannot run a
+  Windows PE. `rwlayer-64m.img` still ships as the fallback until one run proves otherwise.
+
+- **macOS has the same gap, and it has never been reported.** Same platform default, same
+  block mode, same `mkfs.ext4`. Every macOS run recorded on this page happened on a host that
+  already had **e2fsprogs 1.47.4** installed — it is in the environment table above — so the
+  requirement never announced itself. Nothing in Boks checked for it: `internal/doctor` and
+  `internal/daemon/preflight.go` knew only about `mkfs.erofs`, so a Mac without e2fsprogs got
+  a green `boks doctor`, a clean `boks daemon start`, and a failure at the first `boks run`.
+  Homebrew's `e2fsprogs` is keg-only, so `brew install e2fsprogs` alone would not have been
+  enough either. Fixed on 2026-08-16 in three places, all **tested on Linux only**: the
+  formula depends on `e2fsprogs`; `internal/daemon/locate.go` appends the keg's `sbin` to the
+  PATH containerd is started with; and doctor and preflight now require `mkfs.ext4` wherever
+  block mode applies and nowhere else. **No macOS run has confirmed any of it.**
+
 **Running it found two more, 2026-08-14.** Neither was visible by reading, and one of them
 would have corrupted silently.
 

@@ -69,7 +69,7 @@ func Serve(ctx context.Context, stateDir string, stdout, stderr io.Writer) error
 		}
 	}
 
-	settings := settingsFor(dir, HasEROFS())
+	settings := settingsFor(dir, HasEROFS(), HasExt4())
 	config, err := render(settings)
 	if err != nil {
 		return err
@@ -276,6 +276,23 @@ func HasEROFS() bool {
 // PATH by this name on every platform, including Windows, where the build in
 // packaging/mkfs-erofs-windows supplies mkfs.erofs.exe.
 const erofsTool = "mkfs.erofs"
+
+// HasExt4 reports whether containerd will be able to run mkfs.ext4, which is what formats the
+// writable layer of every sandbox on a platform where the erofs snapshotter runs in block mode.
+// See writableLayerNote for what happens when it cannot.
+//
+// The lookup is LookPath for the same reason HasEROFS's is: the answer that matters is what
+// containerd's PATH contains, not what this shell's does.
+func HasExt4() bool {
+	_, err := LookPath(ext4Tool)
+	return err == nil
+}
+
+// ext4Tool is the binary containerd's mount manager shells out to in order to format a
+// snapshot's writable layer. It is looked up by this bare name on every platform
+// (core/mount/manager/mkfs.go:106,143 in containerd v2.3.3), so on Windows PATHEXT resolves it
+// to the mkfs.ext4.exe built by packaging/mkfs-ext4-windows.
+const ext4Tool = "mkfs.ext4"
 
 // Namespace is the containerd namespace Boks uses, restated for `boks daemon` so that the
 // commands which print a `ctr` line print one that works.
