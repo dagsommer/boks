@@ -247,23 +247,34 @@ func platformCheck() Check {
 				}
 				return Result{Status: StatusOK, Detail: detail}
 			case "windows":
-				// Not "blocked on runtime support", and not a platform
-				// limitation either — the stack under Boks runs a container on
-				// Windows today. What is missing is Boks' own enforcement
-				// boundary. See virt_windows.go and docs/windows.md.
-				return Result{
-					Status: StatusFail, Detail: detail,
-					Remedy: "Boks does not run sandboxes on Windows yet, and the platform is not the\n" +
-						"reason: on 2026-08-14 a Linux container ran in a microVM here, through\n" +
-						"containerd, the nerdbox shim and this project's krun.dll. That is ctr, not\n" +
-						"Boks. Boks enforces network policy at the guest's virtio-net device, no frame\n" +
-						"has yet crossed one on Windows, and it will not start a sandbox it cannot\n" +
-						"enforce. Run Boks inside WSL2 in the meantime. See docs/windows.md.",
+				// This said `fail` — "That is ctr, not Boks … run Boks inside
+				// WSL2 in the meantime" — for a day after it stopped being
+				// true. On 2026-08-14 `boks run --net nat` ran a container in a
+				// microVM on Windows 11 hardware, on Boks' own stack, with the
+				// policy engine allowing one destination and refusing another;
+				// on 2026-08-15 the same probe fetched HTTP 200 from
+				// github.com, from an unelevated shell (docs/verification.md).
+				// README.md and docs/get-started.md both promise "Nothing
+				// should be `fail`", so a failing platform line on a working
+				// host is not a stale comment — it is an instruction to give up.
+				//
+				// The architecture arm is a real limit and stays: the Windows
+				// stack is x86-64 only, because neither the krun.dll recipe nor
+				// the mkfs.erofs.exe one cross-compiles beyond it.
+				if runtime.GOARCH != "amd64" {
+					return Result{
+						Status: StatusFail, Detail: detail,
+						Remedy: "Boks on Windows is x86-64 only. There is no krun.dll and no mkfs.erofs.exe\n" +
+							"for ARM64 Windows, and neither build recipe cross-compiles beyond x86-64.\n" +
+							"Run Boks inside WSL2 with nested virtualisation instead. See docs/windows.md.",
+					}
 				}
+				return Result{Status: StatusOK, Detail: detail}
 			default:
 				return Result{
 					Status: StatusFail, Detail: detail,
-					Remedy: "Boks supports Linux today and macOS next.",
+					Remedy: "Boks runs on Linux, on Apple silicon macOS, and on x86-64 Windows.\n" +
+						"There is no VM backend for this platform.",
 				}
 			}
 		},
