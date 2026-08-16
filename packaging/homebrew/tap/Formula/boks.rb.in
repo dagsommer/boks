@@ -1,0 +1,131 @@
+#| Template for the tap's Formula/boks.rb. Do not edit a rendered formula — edit this and
+#| re-run packaging/homebrew/render.sh, which stamps {{VERSION}}, {{SHA256}} and
+#| {{GUEST_SHA256}} and strips these `#|` lines. See packaging/homebrew/README.md for what
+#| has and has not been checked, and for the publish procedure.
+#|
+#| Every dependency below was resolved against the real Homebrew on 2026-08-16 rather than
+#| assumed; the evidence, including the full macOS/arm64 keg list, is in that README.
+# The Boks CLI and the stack it needs. See
+# https://github.com/dagsommer/boks/blob/main/docs/install.md for what still has to be done
+# by hand after this, and `brew info boks` for the short version.
+class Boks < Formula
+  desc "Run coding agents in isolated microVMs, locally"
+  homepage "https://github.com/dagsommer/boks"
+  url "https://github.com/dagsommer/boks/archive/refs/tags/v{{VERSION}}.tar.gz"
+  sha256 "{{SHA256}}"
+  license "Apache-2.0"
+  head "https://github.com/dagsommer/boks.git", branch: "main"
+
+  livecheck do
+    url :stable
+    strategy :github_latest
+  end
+
+  depends_on "go" => :build
+
+  # macOS on Apple silicon is the only platform where Boks has been shown to work, and the
+  # only one where the stack below can be installed at all: libkrun's formula is arm64 and
+  # Hypervisor.framework only. Linux and Windows users are served by the release archives —
+  # see docs/install.md — which is why this formula declines rather than pretending.
+  # (`depends_on :macos` is the other half of this and sits below, where Homebrew's own
+  # ordering rules put it.)
+  depends_on arch: :arm64
+
+  # The whole stack, not just the CLI. `boks doctor` checks all of these, and a formula that
+  # installed one of five and left the user to discover the other four from failing checks
+  # would not be much of an install.
+  #
+  # The containerd floor is 2.3, not 2.2. A shim linking containerd 2.3.3 emits version-3
+  # bootstrap parameters a 2.2 daemon cannot decode; it reads the whole protobuf reply as an
+  # address and dies with `unsupported protocol: Yunix`, naming neither a version nor a shim.
+  # Homebrew cannot express a minimum version on a dependency, so this relies on
+  # homebrew-core staying at 2.3+ and on `boks doctor`'s `runtime skew` line to catch a
+  # machine that is behind anyway.
+  #
+  # nerdbox is the VM shim, from this same tap because it is packaged nowhere else. It pulls
+  # in libkrun from the libkrun/krun tap in turn, and that tap has to be trusted as a whole —
+  # see the tap README.
+  depends_on "containerd"
+  depends_on "dagsommer/boks/nerdbox"
+  depends_on "erofs-utils"
+
+  depends_on :macos
+
+  # The guest kernel and EROFS root filesystem the microVM boots.
+  #
+  # nerdbox builds these with `docker buildx bake` and publishes neither, so `nerdbox.rb`
+  # cannot produce them: a Homebrew build has no Docker and no Linux cross-toolchain. A Boks
+  # release does publish them, so they are fetched rather than built. Without them a sandbox
+  # dies at boot with `nerdbox-kernel not found in PATH or LIBKRUN_PATH` and `boks doctor`
+  # reports `guest image  fail`.
+  #
+  # The kernel is GPL-2.0 and nerdbox patches it. The archive carries a SOURCE.txt naming the
+  # cdn.kernel.org tarball, the config and the patch set it was built from, which is how the
+  # corresponding-source obligation is met.
+  resource "guest" do
+    url "https://github.com/dagsommer/boks/releases/download/v{{VERSION}}/boks-guest_{{VERSION}}_arm64.tar.gz"
+    sha256 "{{GUEST_SHA256}}"
+  end
+
+  def install
+    ldflags = "-X github.com/dagsommer/boks/internal/cli.Version=#{version}"
+    system "go", "build", *std_go_args(ldflags: ldflags), "./cmd/boks"
+
+    # `boks completion <shell>` is cobra's, and it answers to powershell as well as the three
+    # Unix shells, so the cobra format is what generates all four.
+    generate_completions_from_executable(bin/"boks", shell_parameter_format: :cobra)
+
+    # HOMEBREW_PREFIX/lib is the last directory nerdbox's shim scans on Apple silicon
+    # (internal/vm/libkrun/instance.go; mirrored in internal/doctor/libkrun.go, which appends
+    # /opt/homebrew/lib on darwin), so installing here needs no configuration to follow it.
+    resource("guest").stage do
+      lib.install "nerdbox-kernel-arm64", "nerdbox-rootfs.erofs"
+    end
+  end
+
+  # One thing remains after this formula finishes, and it is not something a package can do
+  # for you. It produces an error that does not name its own cause, which is why it is
+  # spelled out here rather than left to be discovered.
+  def caveats
+    <<~EOS
+      Run `boks doctor` now. It checks every prerequisite and prints what to do about each
+      gap. One of them is not this formula's to fix:
+
+        containerd must be running, and its state directory must be yours.
+
+        containerd derives the shim's socket path from a compile-time constant, so no
+        config setting moves it (containerd#12444). Once, as root:
+
+          sudo mkdir -p /var/run/containerd
+          sudo chown "$(id -u):$(id -g)" /var/run/containerd
+
+        This is the only step that needs root. `boks daemon start` does the rest: it starts
+        containerd itself and writes the rootless configuration by hand.
+
+      containerd resolves the nerdbox shim through the daemon's PATH, not your shell's. A
+      containerd `boks daemon start` launched inherits your shell's PATH, which already has
+      #{HOMEBREW_PREFIX}/bin on it; one launched from launchd or `brew services` probably
+      does not, and will report the shim as missing.
+
+      The guest kernel and root filesystem are installed, in #{HOMEBREW_PREFIX}/lib.
+      `boks doctor` reports them as `guest image`.
+
+      Full instructions, including what has and has not been verified on this platform:
+      https://github.com/dagsommer/boks/blob/main/docs/install.md
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/boks --version")
+
+    # `boks doctor` is deliberately not run here: it is expected to fail on a machine without
+    # a running containerd, and a test that asserts a healthy host would fail for reasons
+    # that have nothing to do with this formula. Assert instead that the binary is the real
+    # CLI, that its completions were generated, and that the guest images landed where the
+    # shim scans.
+    assert_match "sandbox", shell_output("#{bin}/boks --help")
+    assert_path_exists bash_completion/"boks"
+    assert_path_exists lib/"nerdbox-kernel-arm64"
+    assert_path_exists lib/"nerdbox-rootfs.erofs"
+  end
+end

@@ -1,48 +1,49 @@
+#| Template for the tap's Formula/nerdbox.rb. It carries no {{PLACEHOLDER}} — the nerdbox
+#| version is a Boks decision rather than a release variable — but it still goes through
+#| packaging/homebrew/render.sh so that the `#|` notes are stripped and the whole tap tree
+#| comes out of one command.
+#|
+#| The sha256 below is real and was re-verified on 2026-08-16 by downloading
+#| https://github.com/containerd/nerdbox/archive/refs/tags/v0.2.3.tar.gz and hashing it.
+#|
+#| Why this formula exists at all: nerdbox is packaged nowhere. Not homebrew-core, not the
+#| AUR, not nixpkgs, not Debian, and — checked 2026-08-13 — not by Repology in any of the
+#| ~400 repositories it tracks. Its own release workflow has failed on every tag since
+#| v0.2.0, so all ten of its GitHub releases carry zero assets. There is nothing to
+#| download, for any platform. Building it here is not a preference.
 # containerd's nerdbox VM shim, built from source and signed with the entitlement libkrun
-# needs. See packaging/homebrew/README.md for how this reaches a tap, and docs/install.md
-# for what it does and does not give you.
-#
-# Why this formula exists at all: nerdbox is packaged nowhere. Not homebrew-core, not the
-# AUR, not nixpkgs, not Debian, and — checked 2026-08-13 — not by Repology in any of the
-# ~400 repositories it tracks. Its own release workflow has failed on every tag since
-# v0.2.0, so all ten of its GitHub releases carry zero assets. There is nothing to
-# download, for any platform. Building it here is not a preference.
+# needs. `brew install boks` pulls this in; installing it on its own gives you the shim and
+# no guest images.
 class Nerdbox < Formula
-  desc "containerd shim that runs each container as a libkrun microVM"
+  desc "Containerd shim that runs each container as a libkrun microVM"
   homepage "https://github.com/containerd/nerdbox"
   url "https://github.com/containerd/nerdbox/archive/refs/tags/v0.2.3.tar.gz"
   sha256 "8eb4c638d161701f93b01ec2c84fbc4891a0be98a10d1887473095c6c309cbc1"
   license "Apache-2.0"
 
-  # This formula is pinned to a nerdbox tag on purpose, and the pin is a Boks decision
-  # rather than a packaging convenience: v0.2.3 is the release containing cd2c23f, which is
-  # the commit docs/verification.md records the VM boundary being verified against. Moving
-  # it means the shim under Boks is no longer the shim the evidence was collected with, so
-  # bump it deliberately and re-run the procedure in that document.
+  # This formula is pinned to a nerdbox tag on purpose, and the pin is a Boks decision rather
+  # than a packaging convenience: v0.2.3 is the release containing cd2c23f, the commit
+  # docs/verification.md records the VM boundary being verified against. Moving it means the
+  # shim under Boks is no longer the shim the evidence was collected with, so bump it
+  # deliberately and re-run the procedure in that document.
   livecheck do
     url :stable
     strategy :github_latest
   end
 
-  # Apple silicon only, matching libkrun: upstream supports Hypervisor.framework on arm64
-  # and nothing else, and libkrun's own formula carries the same restriction.
-  depends_on arch: :arm64
-  depends_on :macos
-
   depends_on "go" => :build
-  # libkrun lives in a third-party tap. Because it is a *dependency* rather than something
-  # you typed, Homebrew will not trust it implicitly — see the trust note in
-  # packaging/homebrew/README.md and docs/install.md.
-  #
-  # Checked against the tap rather than assumed, on 2026-08-15. The GitHub organisation is
-  # `libkrun` and the repository is `homebrew-krun`, so the tap is `libkrun/krun` and the
-  # fully-qualified formula is `libkrun/krun/libkrun` — the spelling below. It ships
-  # libkrun 1.19.4 (over the 1.18 floor) against libkrunfw 5.5.0, carries the same
-  # `depends_on arch: :arm64` this formula does, and bottles only arm64_tahoe and
-  # arm64_sequoia. Neither `libkrun` nor `krunvm` exists in homebrew-core — both 404 on
-  # formulae.brew.sh — so this tap is the only source, which is why the trust step cannot
-  # be skipped.
+
+  # Apple silicon only, matching libkrun: upstream supports Hypervisor.framework on arm64 and
+  # nothing else, and libkrun's own formula carries the same restriction. `depends_on :macos`
+  # is the other half and sits below, where Homebrew's own ordering rules put it.
+  depends_on arch: :arm64
+
+  # libkrun lives in a third-party tap, so it needs trust of its own — and trusting the one
+  # formula is not enough, because libkrun depends on libkrunfw and virglrenderer from the
+  # same tap. `brew trust libkrun/krun` is the form that works.
   depends_on "libkrun/krun/libkrun"
+
+  depends_on :macos
 
   def install
     # What nerdbox's own `task build:shim` does, minus the parts that need Docker. The
@@ -73,8 +74,8 @@ class Nerdbox < Formula
   # entitlements across. A shim signed during `install` — or baked into a bottle — could
   # therefore arrive unsigned-in-the-way-that-matters on precisely the architecture this
   # formula is restricted to. `fix_dynamic_linkage` runs before `post_install`
-  # (FormulaInstaller#finish), so signing here is applied last and survives, whether the
-  # keg was built from source or poured from a bottle.
+  # (FormulaInstaller#finish), so signing here is applied last and survives, whether the keg
+  # was built from source or poured from a bottle.
   def post_install
     system "codesign", "--sign", "-", "--force",
            "--entitlements", libexec/"containerd-shim-nerdbox-v1.entitlements",
@@ -86,12 +87,9 @@ class Nerdbox < Formula
   # nerdbox boots a Linux kernel and an EROFS root filesystem that it builds with
   # `docker buildx bake` — the kernel from a kernel.org tarball, the rootfs with mkfs.erofs
   # over a Go init and a downloaded crun. Homebrew builds have no Docker and no Linux
-  # cross-toolchain, so neither can be produced here, and there is nothing published
-  # anywhere to download instead.
-  #
-  # `boks doctor` reports the gap as `guest image`, scanning the same PATH and LIBKRUN_PATH
-  # the shim does — but it reports it after the install, to someone who may not run it.
-  # Hence the caveat too, in the loudest place available.
+  # cross-toolchain, so neither can be produced here. `boks` fetches them from a Boks release
+  # instead, which is why installing `boks` gives you a working stack and installing this
+  # formula alone does not.
   def caveats
     <<~EOS
       This formula installed the shim and signed it with com.apple.security.hypervisor.
@@ -103,27 +101,23 @@ class Nerdbox < Formula
 
       `boks doctor` reports this as `guest image`: fail.
 
-      Build them once, on any machine with Docker (they are architecture-specific but not
-      host-specific), and install them where the shim looks:
+      `brew install boks` installs them, from a Boks release. To place them by hand instead,
+      put both in #{HOMEBREW_PREFIX}/lib — which is on the shim's own search path on Apple
+      silicon — or in any directory on containerd's PATH or on LIBKRUN_PATH:
 
-        scripts/build-nerdbox-guest.sh          # in a boks checkout
-        cp nerdbox-kernel-arm64 nerdbox-rootfs.erofs #{HOMEBREW_PREFIX}/lib/
-
-      #{HOMEBREW_PREFIX}/lib is on the shim's own search path on Apple silicon, so nothing
-      else needs configuring. Any directory on containerd's PATH, or on LIBKRUN_PATH, also
-      works.
+        https://github.com/dagsommer/boks/releases
 
       containerd resolves this shim through its own PATH, which is the daemon's and not
       your shell's. If containerd cannot find #{opt_bin}, start it with that directory on
-      PATH.
+      PATH — or let `boks daemon start` do it.
     EOS
   end
 
   test do
-    # The shim is a containerd plugin: it speaks ttrpc on a socket handed to it by
-    # containerd and has no meaningful standalone invocation. What can be asserted without
-    # a hypervisor is that it is present, executable, and — the thing that actually breaks
-    # — carries the entitlement.
+    # The shim is a containerd plugin: it speaks ttrpc on a socket handed to it by containerd
+    # and has no meaningful standalone invocation. What can be asserted without a hypervisor
+    # is that it is present, executable, and — the thing that actually breaks — carries the
+    # entitlement.
     assert_predicate bin/"containerd-shim-nerdbox-v1", :executable?
 
     entitlements = shell_output(
