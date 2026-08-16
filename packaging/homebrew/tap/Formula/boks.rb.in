@@ -47,16 +47,6 @@ class Boks < Formula
   # see the tap README.
   depends_on "containerd"
   depends_on "dagsommer/boks/nerdbox"
-  depends_on "erofs-utils"
-
-  # e2fsprogs, for mkfs.ext4, and it is not optional on macOS.
-  #
-  # Off Linux the erofs snapshotter runs in block mode: containerd's defaultWritableSize is
-  # 64 MiB in erofs_other.go and 0 in erofs_linux.go, and `blockMode = defaultSize > 0`
-  # (erofs.go:187). So every active snapshot gets its own ext4 image at
-  # <erofs root>/snapshots/<id>/rwlayer.img, and containerd's mount manager formats it by
-  # running mkfs.ext4 at task start. No configuration turns that off.
-  #
   # This dependency is late because the gap was invisible: every macOS run recorded in
   # docs/verification.md happened on a machine that already had e2fsprogs 1.47.4 installed
   # (docs/verification.md:39), so the requirement never announced itself. A Mac without it
@@ -69,6 +59,16 @@ class Boks < Formula
   # appends that directory to the PATH it starts containerd with; see kegPrefixes there. Do
   # not "fix" this with a `link_overwrite` or by putting sbin on the user's PATH.
   depends_on "e2fsprogs"
+  depends_on "erofs-utils"
+
+  # e2fsprogs, for mkfs.ext4, and it is not optional on macOS.
+  #
+  # Off Linux the erofs snapshotter runs in block mode: containerd's defaultWritableSize is
+  # 64 MiB in erofs_other.go and 0 in erofs_linux.go, and `blockMode = defaultSize > 0`
+  # (erofs.go:187). So every active snapshot gets its own ext4 image at
+  # <erofs root>/snapshots/<id>/rwlayer.img, and containerd's mount manager formats it by
+  # running mkfs.ext4 at task start. No configuration turns that off.
+  #
 
   depends_on :macos
 
