@@ -224,3 +224,42 @@ func daemonPath(inherited string) string {
 	}
 	return strings.Join(out, string(filepath.ListSeparator))
 }
+
+// LookPath is exec.LookPath against the PATH containerd is started with, rather than the one
+// this process inherited.
+//
+// It exists because the two answers differ exactly where it matters. A packaged or archived
+// install puts the runtime — the shim, libkrun, mkfs.erofs — in a directory that is
+// deliberately not on anybody's PATH, and ContainerdPath prepends that directory when starting
+// containerd. So "can containerd run mkfs.erofs?" is a question about this list, and asking
+// exec.LookPath answers a different question that happens to be right on a development machine.
+//
+// Measured on Windows on 2026-08-16, from the v0.1.0 archive: `boks doctor` reported
+// `snapshotter tools ok ...\mkfs.erofs.exe` while `boks daemon start`, two commands later,
+// wrote a config saying "mkfs.erofs: not on PATH, so the erofs differ is not in the diff
+// order". The pull then failed in the Windows differ. Both were looking for the same file in
+// the same install; one of them was asking the wrong PATH.
+//
+// The executable test is delegated to exec.LookPath per directory, so the platform rules —
+// PATHEXT on Windows, the mode bits on Unix — stay in the standard library.
+func LookPath(binary string) (string, error) {
+	// An explicit directory in the name means PATH is not consulted at all, by either
+	// implementation.
+	if filepath.Base(binary) != binary {
+		return exec.LookPath(binary)
+	}
+	path := ContainerdPath(os.Getenv("PATH"))
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			dir = "."
+		}
+		if found, err := exec.LookPath(filepath.Join(dir, binary)); err == nil {
+			return found, nil
+		}
+	}
+	if path == "" {
+		// exec.LookPath's own error for an empty PATH is the clearest one to give back.
+		return exec.LookPath(binary)
+	}
+	return "", &exec.Error{Name: binary, Err: exec.ErrNotFound}
+}

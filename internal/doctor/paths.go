@@ -2,8 +2,6 @@ package doctor
 
 import (
 	"os"
-	"os/exec"
-	"path/filepath"
 
 	"github.com/dagsommer/boks/internal/daemon"
 )
@@ -38,35 +36,11 @@ func shimGetenv(key string) string {
 	return os.Getenv(key)
 }
 
-// lookPath is exec.LookPath against containerd's PATH rather than this process's.
+// lookPath is daemon.LookPath, re-exported under the name the checks here use.
 //
-// exec.LookPath consults the environment directly and cannot be pointed elsewhere, so the
-// search is done here. The executable test is delegated to exec.LookPath per directory, which
-// keeps the platform rules — PATHEXT on Windows, the mode bits on Unix — in the standard
-// library rather than reimplemented.
-func lookPath(binary string) (string, error) {
-	// An explicit directory in the name means PATH is not consulted at all, by either
-	// implementation.
-	if filepath.Base(binary) != binary {
-		return exec.LookPath(binary)
-	}
-	var firstErr error
-	for _, dir := range filepath.SplitList(shimGetenv("PATH")) {
-		if dir == "" {
-			dir = "."
-		}
-		found, err := exec.LookPath(filepath.Join(dir, binary))
-		if err == nil {
-			return found, nil
-		}
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr == nil {
-		// An empty PATH. exec.LookPath's own error for this is the clearest one to
-		// give back, so ask it.
-		return exec.LookPath(binary)
-	}
-	return "", &exec.Error{Name: binary, Err: exec.ErrNotFound}
-}
+// It delegates rather than reimplementing. An earlier version of this file carried its own
+// copy of the search, and internal/daemon carried another in HasEROFS that consulted the
+// shell's PATH instead — so `boks doctor` reported mkfs.erofs present while `boks daemon
+// start`, in the same install, wrote a config saying it was absent. Two implementations of
+// one question is how they disagreed; there is now one.
+func lookPath(binary string) (string, error) { return daemon.LookPath(binary) }
