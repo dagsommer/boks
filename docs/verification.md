@@ -1763,3 +1763,57 @@ downloads with a tool and runs it from a shell will not. `boks.exe` was the bina
 `containerd.exe`, `ctr.exe` or `mkfs.erofs.exe`.
 
 **Not measured:** whether a `winget install` trips it. Nothing here tested a winget delivery.
+
+### The erofs PATH diagnosis, confirmed — and the defect behind it, 2026-08-16
+
+**Confirmed on Windows.** With `$env:PATH = "$PWD;$env:PATH"` before `boks daemon start` and no
+other change:
+
+- `daemon start` no longer prints "mkfs.erofs: not on PATH", and the self-documenting comment
+  block it writes into the config is gone;
+- the generated diff order went `['windows', 'windows-lcow']` → `['erofs', 'windows', 'windows-lcow']`;
+- the image **pulled and unpacked completely**: eight snapshot directories and seven
+  `layer.erofs` files, one per layer of the base image, each converted by the erofs differ;
+- runtime went 2.59 s → 20.15 s, consistent with a real pull rather than an early failure.
+
+One line on `PATH` turned total failure into a full unpack. That is the diagnosis exactly, and
+the fix already in `main` — `HasEROFS` asking the PATH containerd is actually started with —
+addresses it at the source rather than by asking users to edit their environment.
+
+#### The next defect, which has never worked unattended
+
+The run then died:
+
+```
+failed format "...\io.containerd.snapshotter.v1.erofs\snapshots\11\rwlayer.img":
+mkfs.ext4 failed: : exec: "mkfs.ext4": executable file not found in %PATH%
+```
+
+Snapshot 11 is the writable layer; snapshots 4–10 are the seven read-only erofs layers. It held
+`fs\` and a zero-byte `.erofslayer`, and no `rwlayer.img` — it died at exactly that step.
+
+**This is not a regression, and it is worth being precise about why.** Windows has no
+`mkfs.ext4` in any packaged form. `packaging/containerd-windows/patches/0005` exists because of
+that: it makes containerd verify the ext4 superblock magic rather than trusting that the file
+exists, and it names **placing a pre-formatted image** as the supported route where no mkfs
+exists. The bundle ships `rwlayer-64m.img`, 67,108,864 bytes, made by `mkfs.ext4` on a CI
+runner, for precisely this.
+
+What put that file in place, every previous time, was **a human running `Copy-Item`** — step 5
+of `docs/windows-e2e.md`. Nothing in Boks does it. So the round-15 result that booted a sandbox
+unelevated was obtained with a manual step that no user of the release archive performs, and
+every `boks run` from the archive fails here.
+
+The tester established this rather than assuming it, and stopped rather than probing further:
+the archive ships `rwlayer-64m.img` and no `mkfs.ext4`; the round-15 bundle that did boot also
+had no `mkfs.ext4`; no literal `mkfs.ext4` string exists in `boks.exe`, `containerd.exe`, the
+shim or `krun.dll` — the name is built as `mkfs.` plus a filesystem name at runtime; and
+neither the shipped nor the generated `config.toml` carries any rwlayer or ext4 setting, so
+configuration is not the difference. containerd's own log records none of this: it ends at
+`containerd successfully booted`, and the error surfaced only through `boks`.
+
+**Also established on this run.** No elevation at any point. `boks ls` and `daemon stop` clean,
+no leftover `containerd`/`boks`/shim/`gvproxy` processes.
+
+**Still unrun on Windows:** `uname -a`, the boot id, and both network-policy results. No
+sandbox has started from a release archive.
