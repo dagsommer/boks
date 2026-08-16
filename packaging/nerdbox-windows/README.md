@@ -19,6 +19,13 @@ The goal is to delete this directory: patch 0001 is someone else's unmerged upst
 request that we are carrying early, and patches 0002 through 0005 belong in nerdbox. Nothing
 in Boks links against a patched nerdbox — the patches are compiled, never shipped.
 
+There is now a second nerdbox series, in [`packaging/nerdbox/patches/`](../nerdbox/patches/),
+for patches that are not about a host platform at all. New nerdbox patches belong there unless
+they are Windows-specific, because **nothing applies this directory to the artifacts Linux
+ships**: `linux-runtime.yml` asserts the nerdbox tree is pristine before building, and
+`guest-image.yml` bakes the kernel and rootfs from an equally untouched checkout. A patch that
+every host needs would compile here and reach no guest anywhere.
+
 Not every patch here is about Windows. Patch 0003 fixes a plain API drift against the libkrun
 revision Boks pins and patch 0004 an error-path stall in the shim's IO teardown; both fail
 identically on Linux — as does the `io.go` half of patch 0005, which is the only part of that
