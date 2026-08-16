@@ -3,15 +3,21 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/dagsommer/boks/internal/daemon"
+	"github.com/dagsommer/boks/internal/runtimecfg"
 )
 
 // The three repairs in this file have one cause between them: containerd generates the OCI
@@ -49,12 +55,57 @@ import (
 // The Windows branch has never been executed on Windows. It is reasoned from containerd's
 // source — mount_windows.go, spec_opts.go — and from the fact that the macOS path it copies
 // does work; that is not the same as having watched it create a container.
+//
+// The metadata-only path is also what Linux would use if it could. containerd's host-side
+// resolution is the single reason Boks needs more privilege on Linux than an ordinary user
+// has: WithAdditionalGIDs mounts the image's EROFS snapshot on the host, and that mount
+// wants CAP_SYS_ADMIN. Rootless containerd does not rescue it — `unshare -Umr mount -t
+// erofs` is EPERM, because erofs carries no FS_USERNS_MOUNT. Dropping to the metadata path
+// would drop the requirement.
+//
+// It is gated rather than taken, because taking it early is a silent privilege bug and not
+// a missing feature. The metadata path leaves an image's `USER node` in
+// Process.User.Username, and nothing downstream reads that field — see
+// guestResolvesUsernames. Switching Linux over before a guest exists that resolves it
+// would turn every name-form USER into uid 0 with no error anywhere. So the condition is
+// the guest's demonstrated ability, not the host's inability, and it currently never holds.
 func imageConfigOpt(image client.Image) oci.SpecOpts {
-	if containerdReadsGuestRootfs() {
-		return oci.WithImageConfig(image)
+	if usesMetadataImageConfig() {
+		return withImageConfigFromMetadata(image)
 	}
-	return withImageConfigFromMetadata(image)
+	return oci.WithImageConfig(image)
 }
+
+// usesMetadataImageConfig is the choice imageConfigOpt makes, separated from it so it can
+// be asserted on. An oci.SpecOpts is a closure and two of them cannot be compared, so a
+// test that went through imageConfigOpt could only check which option it got by running it
+// — which needs a containerd, a snapshotter and an image, none of which a unit test has.
+func usesMetadataImageConfig() bool {
+	return !containerdReadsGuestRootfs() || guestResolvesUsernames()
+}
+
+// guestResolvesUsernames reports whether the guest can be **confirmed** to turn an image's
+// USER name into a uid itself.
+//
+// Read internal/daemon/compat.go's ShimResolvesUsernames for what the confirmation is worth;
+// the short version is that it is a fact about the shim binary used as a proxy for the guest
+// rootfs beside it, and that every uncertainty answers false.
+//
+// Today it is false on every host, because no nerdbox revision resolves that field. The
+// effect is that Linux keeps containerd's own oci.WithImageConfig, exactly as before this
+// function existed — the switch is written down and inert, which is the point. Making it
+// true is a one-line change in compat.go once a guest that does the work can be identified,
+// and until then Boks cannot ship the regression by accident.
+//
+// Computed once. It reads a binary off disk, the answer cannot change while the process
+// runs, and this sits on the container-creation path.
+var guestResolvesUsernames = sync.OnceValue(func() bool {
+	// containerd's PATH rather than this process's: the shim is launched by containerd,
+	// and daemon.ContainerdPath is what decides which one it finds.
+	return daemon.ShimResolvesUsernames(
+		daemon.FindShim(runtimecfg.Runtime, daemon.ContainerdPath(os.Getenv("PATH"))),
+	)
+})
 
 // containerdReadsGuestRootfs reports whether containerd's own oci.WithImageConfig can be
 // used as it stands on this host.
@@ -114,15 +165,90 @@ func applyImageConfig(s *specs.Spec, config ocispec.ImageConfig) error {
 	s.Process.Cwd = cwd
 
 	if config.User != "" {
-		// Handed over verbatim rather than resolved. Username is the field containerd
-		// itself uses for exactly this case — an image user that only the guest can
-		// interpret — and guessing a uid here would be the one failure that must not
-		// happen quietly: an image saying "USER node" run as root instead.
-		s.Process.User.Username = config.User
-		s.Process.User.AdditionalGids = nil
-		ensureAdditionalGIDs(s)
+		applyImageUser(s, config.User)
 	}
 	return nil
+}
+
+// applyImageUser writes an image's USER value into the spec, resolving as much of it as can
+// be resolved without reading the image's root filesystem.
+//
+// # Two things are written, and they are for different readers
+//
+// **The name, verbatim, into Process.User.Username.** That is the field containerd itself
+// uses for a user string only the guest can interpret, and it is the only channel through
+// which the part the host cannot do can still get done. A guest that resolves it produces
+// exactly what a Linux host with a mount would have produced, supplementary groups included.
+//
+// **Whatever uid and gid the string states outright.** An image is free to say `USER 1000`
+// or `USER 1000:1000`, and those need no /etc/passwd — they are already numbers. Every host
+// can honour them, and the numbers stand whether or not the guest ever reads Username.
+//
+// # Why the second one matters more than it looks
+//
+// Before this, every USER value took the same route: record the name, leave the uid at its
+// zero value, and rely on a guest that reads Username. No runtime does read it — crun
+// consults uid, gid, umask and additional_gids and nothing else — so on the hosts that use
+// this function, Windows and macOS, `USER 1000` produced a container running as **root**.
+// Not as uid 1000, and not with an error: as root, silently.
+//
+// Numeric forms are the common case and the completely unambiguous one, so they are fixed
+// here and now, on every host, without waiting for anything in the guest. `uid:gid` becomes
+// exactly right. A bare `uid` becomes right in the uid and takes gid 0, which is what
+// containerd's own WithUserID settles on when /etc/passwd has no entry for that uid — and
+// a guest that later reads Username refines the gid to the passwd one.
+//
+// What is left is the genuinely irreducible case: a *name*, which no amount of host-side
+// parsing can turn into a number. Those still run as uid 0 on Windows and macOS. That is
+// unchanged rather than newly introduced, it is the reason for the guest patch in
+// packaging/nerdbox/patches/, and it is recorded in docs/verification.md as an open defect
+// rather than left for someone to discover.
+func applyImageUser(s *specs.Spec, userstr string) {
+	s.Process.User.AdditionalGids = nil
+	// Kept even when the numbers below are known, so that a capable guest can supply the
+	// primary group and the supplementary groups that a bare uid does not carry.
+	s.Process.User.Username = userstr
+
+	uid, haveUID, gid, haveGID := numericIDs(userstr)
+	if haveUID {
+		s.Process.User.UID = uid
+	}
+	if haveGID {
+		s.Process.User.GID = gid
+	}
+	ensureAdditionalGIDs(s)
+}
+
+// numericIDs reports the uid and gid an image's USER string states as numbers.
+//
+// The OCI image spec allows `user`, `uid`, `user:group`, `uid:gid`, `uid:group` and
+// `user:gid`, so either half may be a number or a name and they are decided separately. A
+// half that is a name reports false and is left to the guest.
+//
+// The accepted range is containerd's: 0 to MaxInt32. The kernel would take more, but runc
+// does not, and a uid that this accepts and the runtime one layer down rejects would turn a
+// silent wrong answer into a confusing failure rather than into a right answer.
+func numericIDs(userstr string) (uid uint32, haveUID bool, gid uint32, haveGID bool) {
+	const maxID = 1<<31 - 1
+	parse := func(s string) (uint32, bool) {
+		v, err := strconv.Atoi(s)
+		if err != nil || v < 0 || v > maxID {
+			return 0, false
+		}
+		return uint32(v), true
+	}
+
+	parts := strings.Split(userstr, ":")
+	if len(parts) > 2 {
+		// Not a shape the image spec defines. Nothing is claimed about it here; the
+		// string still travels in Username, where a guest can reject it knowingly.
+		return 0, false, 0, false
+	}
+	uid, haveUID = parse(parts[0])
+	if len(parts) == 2 {
+		gid, haveGID = parse(parts[1])
+	}
+	return uid, haveUID, gid, haveGID
 }
 
 // ensureAdditionalGIDs keeps the process's primary group in its supplementary set, which is

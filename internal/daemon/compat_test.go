@@ -129,3 +129,63 @@ func TestShimContainerdIsSilentOnANonGoFile(t *testing.T) {
 		t.Errorf("ShimContainerd(a missing file) = %q, want \"\"", got)
 	}
 }
+
+// ShimResolvesUsernames decides whether Boks may hand an image's `USER node` to the guest
+// instead of resolving it on the host. Answering true when the guest cannot in fact resolve
+// it produces a container running as root with nothing logged, so every case this cannot
+// answer must come back false.
+//
+// The empty allowlist is asserted directly. It is the whole safety property: while no
+// nerdbox revision resolves Process.User.Username, there is no binary anywhere that should
+// make this function true, and a revision added to the map without a guest to back it would
+// be the way the regression ships.
+func TestShimResolvesUsernamesIsFalseWithoutEvidence(t *testing.T) {
+	if len(nerdboxRevisionsResolvingUsernames) != 0 {
+		t.Errorf("nerdboxRevisionsResolvingUsernames has %d entries; no released nerdbox "+
+			"resolves Process.User.Username, so anything here lets Boks skip host-side "+
+			"resolution and run `USER node` images as root",
+			len(nerdboxRevisionsResolvingUsernames))
+	}
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "containerd-shim-nerdbox-v1")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec true\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"no shim found at all", ""},
+		{"a missing file", filepath.Join(dir, "absent")},
+		{"a file that is not a Go binary", script},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if ShimResolvesUsernames(tc.path) {
+				t.Error("ShimResolvesUsernames = true; an unknown shim must never " +
+					"be treated as one whose guest resolves USER names")
+			}
+		})
+	}
+}
+
+// A Go binary that is not nerdbox must not be mistaken for one. Boks' own binary is the
+// convenient example: it is a real, VCS-stamped Go program of the right shape whose main
+// module is something else entirely.
+func TestShimNerdboxRejectsAnotherModulesBinary(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go toolchain to build a binary with")
+	}
+	probe := filepath.Join(t.TempDir(), "probe")
+	build := exec.Command("go", "build", "-o", probe, "github.com/dagsommer/boks/cmd/boks")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Skipf("could not build a probe binary: %v\n%s", err, out)
+	}
+
+	if got := ShimNerdbox(probe); got != "" {
+		t.Errorf("ShimNerdbox(the boks binary) = %q, want \"\" — its main module is not nerdbox", got)
+	}
+	if ShimResolvesUsernames(probe) {
+		t.Error("ShimResolvesUsernames(the boks binary) = true")
+	}
+}

@@ -1643,3 +1643,85 @@ v2.3.3)`. With the guest archive unpacked into the same directory, every check p
 nothing here shows the packaged stack boots a VM — only that every component is present, the
 right version, and found. The release is a draft; `boks version --check` against it correctly
 reports "no release has been published yet", because GitHub's releases-latest excludes drafts.
+
+### An image's `USER name` never reached anything that could read it, 2026-08-16
+
+An OCI image may name its user rather than number it — `USER node` rather than `USER 1000`.
+Boks records such a name in the OCI spec's `Process.User.Username` on Windows and macOS,
+following containerd, which does the same on macOS and for LCOW. **Nothing downstream reads
+that field**, so the name is discarded and the container runs as uid 0.
+
+This was found by reading, not by running, and both halves were checked at the revisions this
+project pins rather than assumed from documentation.
+
+| Component | Revision | What it does with `Process.User.Username` |
+| --- | --- | --- |
+| `vminitd` | nerdbox `cd2c23f` (`packaging/nerdbox/NERDBOX_REV`) | Nothing. `grep -rn Username --include=*.go .` outside `vendor/` is **zero hits** in nerdbox's own code. Its only read of the spec is `ShouldKillAllOnExit` (`internal/vminit/runc/util.go:33`), which examines `Linux.Namespaces` and nothing else. |
+| `crun` | `3425c83` | Nothing. Every read of the user struct in `src/libcrun/` is one of `user->uid` (6 sites), `user->gid` (4), `user->umask{,_present}` (4), `user->additional_gids{,_len}` (2). The only `username` matches in the tree are `libcrun_set_usernamespace` — user *namespace*, unrelated. |
+| runtime-spec schema | `d64c1d9` | `username` **is** a valid property of `process.user` in `schema/config-schema.json`. |
+
+The third row is what makes this silent rather than loud. An *unknown* field would be rejected
+by libocispec and the container would fail to start — which is exactly what happened with
+`layerFolders` on 2026-08-14. A *known-but-ignored* field parses cleanly and is then dropped.
+
+#### What that meant per platform, before this change
+
+| Host | Spec path | `USER 1000` | `USER 1000:1000` | `USER node` |
+| --- | --- | --- | --- | --- |
+| Linux | `oci.WithImageConfig` — mounts the image on the host | correct | correct | correct |
+| macOS | metadata-only (containerd's own `darwin` branch) | **uid 0** | **uid 0** | **uid 0** |
+| Windows | metadata-only (`withImageConfigFromMetadata`) | **uid 0** | **uid 0** | **uid 0** |
+
+Linux is correct and expensive: the host-side mount is the reason Boks on Linux needs
+`CAP_SYS_ADMIN`. Rootless containerd does not rescue it — `unshare -Umr mount -t erofs` is
+`EPERM`, because erofs carries no `FS_USERNS_MOUNT`.
+
+#### What was fixed, and what was not
+
+The numeric forms are fixed on the host, on every platform: they need no `/etc/passwd`,
+because they are already numbers. `USER 1000:1000` is now exactly right, and `USER 1000` takes
+gid 0 — what containerd's own `WithUserID` settles on when passwd holds no matching entry.
+
+`USER node` still runs as uid 0 on Windows and macOS. It cannot be resolved without reading
+the image's filesystem, and those hosts cannot. The fix for it is guest-side and is carried,
+**unapplied**, in `packaging/nerdbox/patches/`.
+
+#### Verified by running
+
+- The nerdbox patch applies cleanly to a pristine checkout of the pinned revision, and
+  `go test ./internal/... ./pkg/...` passes there (`linux/arm64`, 2026-08-16).
+- Three mutations of the guest resolver each fail a named test: making it a no-op (the
+  pre-patch behaviour), not skipping the user's own group, and letting an unresolvable name
+  fall through to uid 0.
+- On the Boks side, `go build/vet/test ./...`, `gofmt`, `make docs` (no diff), and build+vet
+  for `GOOS=windows` and `GOOS=darwin`. Four mutations each fail a named test, including
+  opening the capability gate early — the one that would ship the regression.
+
+#### Not verified, and it is the whole runtime claim
+
+**No microVM has booted with any of this.** This machine has no `/dev/kvm`. What is proven is
+that the resolver produces the right spec from the right inputs; what is *not* proven is that a
+guest carrying it starts a container as the resolved uid, that the rewritten `config.json` is
+the file crun actually reads, or that the rewrite happens early enough in `NewContainer`. The
+last two are read from nerdbox's source and are the first things to check on a machine with a
+hypervisor.
+
+The check that would let Linux drop its `CAP_SYS_ADMIN` requirement — `ShimResolvesUsernames`
+in `internal/daemon/compat.go` — has also never returned true, because no nerdbox revision
+resolves the field yet. It is asserted false rather than exercised true, so the *closed* path
+is tested and the *open* one is not.
+
+Its *input* half, though, is measured rather than assumed. A `containerd-shim-nerdbox-v1`
+built from a real nerdbox git checkout on 2026-08-16 carries
+
+```
+mod    github.com/containerd/nerdbox  v0.2.4-0.20260816080949-5f0e4a44d293
+build  vcs.revision=5f0e4a44d29341a9391d7112756ff374726c7629
+build  vcs.modified=false
+```
+
+and `ShimNerdbox` on that binary returns the revision string exactly. So the detection reads
+what it claims to read; what is untested is only the branch taken when a revision is
+recognised. `ShimResolvesUsernames` on that same binary is `false` — correctly, since a local
+branch SHA is not an upstream revision anyone has verified a guest for, which is the
+allowlist behaving as intended rather than a limitation.
