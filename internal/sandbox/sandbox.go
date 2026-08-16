@@ -646,11 +646,33 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 }
 
 func ioCreator(tty bool, stdin io.Reader, stdout, stderr io.Writer) cio.Creator {
-	streams := []cio.Opt{cio.WithStreams(stdin, stdout, stderr)}
-	if tty {
-		streams = append(streams, cio.WithTerminal)
+	return cio.NewCreator(ioOpts(tty, stdin, stdout, stderr)...)
+}
+
+// ioOpts chooses the streams cio wires between the host and the guest process.
+//
+// The rule the whole function exists for: with a pseudo-terminal there is no stderr, and
+// Boks must not name one. A pty is a single stream — the guest's stderr is the console, and
+// its bytes arrive on stdout — which is why `boks run` already warns that a piped run and a
+// terminal run differ in exactly this way.
+//
+// Passing a stderr writer anyway does not merely add an unused stream; it makes containerd
+// announce a file that nothing ever creates. On unix, cio.NewFIFOSetInDir always fills in all
+// three paths, and cio's copyIO then skips creating the stderr FIFO when Terminal is set
+// (`if !fifos.Terminal && fifos.Stderr != ""`). The path still travels to the shim in
+// ExecProcessRequest.Stderr, and nerdbox's host-side shim opens whatever non-empty path it is
+// given — its copyStreams has no terminal case at all — so it fails with
+//
+//	containerd-shim: opening file ".../boks-exec-<id>-stderr" failed: no such file or directory
+//
+// which is the error the first Homebrew install on macOS hit on `boks run .`. Leaving stderr
+// nil makes cio blank the path, so nothing is announced that was not created. This is what
+// ctr does for the same reason: cio.WithStreams(con, con, nil) alongside cio.WithTerminal.
+func ioOpts(tty bool, stdin io.Reader, stdout, stderr io.Writer) []cio.Opt {
+	if !tty {
+		return []cio.Opt{cio.WithStreams(stdin, stdout, stderr)}
 	}
-	return cio.NewCreator(streams...)
+	return []cio.Opt{cio.WithStreams(stdin, stdout, nil), cio.WithTerminal}
 }
 
 // forwardSignals relays interrupt and termination to the guest process so that Ctrl-C
