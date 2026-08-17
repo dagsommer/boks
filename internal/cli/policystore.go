@@ -9,6 +9,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
+	"github.com/dagsommer/boks/internal/enforce"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
@@ -149,10 +151,68 @@ deny someone wrote down.
 		fmt.Fprintf(env.Stdout, "stored in %s\n", store.Path())
 		if action == policy.Allow {
 			warnIfStillDenied(env, store, scope.sandbox, args)
+			hotReloadAllows(cmd.Context(), env, scope.sandbox)
+		} else {
+			// Deny rules are not applied to running sandboxes — they take effect at
+			// the next start. Let the user know if any sandboxes are currently up.
+			stateDir := policy.StateDir()
+			running := enforce.List(stateDir)
+			if len(running) > 0 {
+				fmt.Fprintln(env.Stderr, "note: deny rules take effect when the sandbox is next started. Running sandboxes are not affected.")
+			}
 		}
 		return nil
 	}
 	return cmd
+}
+
+// hotReloadAllows attempts to apply new allow rules to running sandboxes without a restart.
+//
+// For a sandbox-scoped rule, only that sandbox is reloaded. For a global rule, every
+// running sandbox is reloaded. Sandboxes that are not running are silently skipped.
+// Any other reload failure prints a warning but does not fail the command: the rule is
+// already durable in the store and takes effect at the next start.
+func hotReloadAllows(ctx context.Context, env Env, sandbox string) {
+	stateDir := policy.StateDir()
+
+	if sandbox != "" {
+		// Scoped rule: reload only the named sandbox.
+		warnings, err := enforce.PolicyReload(ctx, stateDir, sandbox)
+		if err != nil {
+			if !errors.Is(err, enforce.ErrNoSupervisor) {
+				fmt.Fprintf(env.Stderr, "warning: could not apply the new rule to the running sandbox %s: %v\n"+
+					"  It will take effect when the sandbox is next started.\n", sandbox, err)
+				return
+			}
+			return // sandbox not running; silently skip
+		}
+		for _, w := range warnings {
+			fmt.Fprintf(env.Stderr, "note: %s\n", w)
+		}
+		fmt.Fprintf(env.Stdout, "rule applied to running sandbox %s\n", sandbox)
+		return
+	}
+
+	// Global rule: reload every running sandbox.
+	for _, st := range enforce.List(stateDir) {
+		// -net none sandboxes have no policy engine; the call() function returns a
+		// plain error (not ErrNoSupervisor) for them, so skip them explicitly here.
+		if st.Mode == string(network.ModeNone) {
+			continue
+		}
+		warnings, err := enforce.PolicyReload(ctx, stateDir, st.Sandbox)
+		if err != nil {
+			if !errors.Is(err, enforce.ErrNoSupervisor) {
+				fmt.Fprintf(env.Stderr, "warning: could not apply the new rule to the running sandbox %s: %v\n"+
+					"  It will take effect when the sandbox is next started.\n", st.Sandbox, err)
+			}
+			continue
+		}
+		for _, w := range warnings {
+			fmt.Fprintf(env.Stderr, "note: %s\n", w)
+		}
+		fmt.Fprintf(env.Stdout, "rule applied to running sandbox %s\n", st.Sandbox)
+	}
 }
 
 // warnIfStillDenied tells a user who has just written an allow that a deny still covers the

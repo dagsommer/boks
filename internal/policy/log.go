@@ -481,9 +481,12 @@ func StateDir() string {
 // Engine evaluates a policy and records every decision it takes.
 //
 // Callers use the Engine rather than the Policy directly so that no decision path can
-// forget to log. The Policy is copied in, so an Engine's behaviour cannot change under a
-// request that is already in flight.
+// forget to log. The active policy is protected by a read/write mutex so that
+// ReplacePolicy can hot-swap it between evaluations without a data race. Any single
+// evaluation snapshots the policy once under RLock, so an in-flight request always sees
+// a consistent rule set.
 type Engine struct {
+	mu      sync.RWMutex
 	policy  Policy
 	log     *Log
 	sandbox string
@@ -499,14 +502,43 @@ func NewEngine(p Policy, l *Log) *Engine {
 }
 
 // WithSandbox labels decisions with the sandbox they came from.
+//
+// It returns a new Engine that shares the same Log but has an independent mutex, so the
+// two do not contend. Called only at startup, before any concurrent access, so copying
+// the policy value is safe.
 func (e *Engine) WithSandbox(name string) *Engine {
-	c := *e
-	c.sandbox = name
-	return &c
+	e.mu.RLock()
+	pol := e.policy
+	e.mu.RUnlock()
+	return &Engine{policy: pol, log: e.log, sandbox: name, now: e.now}
 }
 
 // Policy returns the policy being enforced.
-func (e *Engine) Policy() Policy { return e.policy }
+func (e *Engine) Policy() Policy {
+	e.mu.RLock()
+	p := e.policy
+	e.mu.RUnlock()
+	return p
+}
+
+// ReplacePolicy atomically swaps the active policy. It is safe to call while other
+// goroutines are evaluating, and is how hot-reloading of allow rules takes effect without
+// restarting the sandbox.
+func (e *Engine) ReplacePolicy(p Policy) {
+	e.mu.Lock()
+	e.policy = p
+	e.mu.Unlock()
+}
+
+// Update atomically replaces the policy using a function that receives the current
+// policy and returns the new one. It is safe to call while other goroutines evaluate.
+// Using Update instead of a separate Policy() + ReplacePolicy() pair prevents two
+// concurrent reloads from racing on the read-modify-write.
+func (e *Engine) Update(fn func(current Policy) Policy) {
+	e.mu.Lock()
+	e.policy = fn(e.policy)
+	e.mu.Unlock()
+}
 
 // Log returns the decision log.
 func (e *Engine) Log() *Log { return e.log }
@@ -519,13 +551,19 @@ func (e *Engine) Check(stage Stage, t Target) Decision {
 // CheckMode is Check with the flow's disposition attached, so the log can say whether Boks
 // read the connection or only carried it.
 func (e *Engine) CheckMode(stage Stage, t Target, m Mode) Decision {
-	return e.record(stage, t, e.policy.Evaluate(t), m)
+	e.mu.RLock()
+	pol := e.policy
+	e.mu.RUnlock()
+	return e.record(stage, t, pol.Evaluate(t), m, pol.Name)
 }
 
 // CheckResolved evaluates an address a permitted hostname resolved to, against deny rules
 // only. See Policy.EvaluateDeny for why the allow rules are not consulted.
 func (e *Engine) CheckResolved(t Target, m Mode) Decision {
-	return e.record(StageDial, t, e.policy.EvaluateDeny(t), m)
+	e.mu.RLock()
+	pol := e.policy
+	e.mu.RUnlock()
+	return e.record(StageDial, t, pol.EvaluateDeny(t), m, pol.Name)
 }
 
 // NoMode marks a decision taken before the flow's disposition is known.
@@ -538,7 +576,10 @@ const NoMode Mode = ""
 //
 // The reason is written by Boks, never taken from traffic.
 func (e *Engine) Note(stage Stage, t Target, m Mode, reason string) Decision {
-	return e.record(stage, t, Verdict{Allowed: true, Reason: reason}, m)
+	e.mu.RLock()
+	name := e.policy.Name
+	e.mu.RUnlock()
+	return e.record(stage, t, Verdict{Allowed: true, Reason: reason}, m, name)
 }
 
 // NoteRefused records that a flow was refused for a reason no rule expresses — UDP and ICMP
@@ -548,10 +589,13 @@ func (e *Engine) Note(stage Stage, t Target, m Mode, reason string) Decision {
 // worse than one not recorded at all: the log would claim Boks carried traffic it threw
 // away. The reason is written by Boks, never taken from traffic.
 func (e *Engine) NoteRefused(stage Stage, t Target, m Mode, reason string) Decision {
-	return e.record(stage, t, Verdict{Allowed: false, Reason: reason}, m)
+	e.mu.RLock()
+	name := e.policy.Name
+	e.mu.RUnlock()
+	return e.record(stage, t, Verdict{Allowed: false, Reason: reason}, m, name)
 }
 
-func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode) Decision {
+func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode, policyName string) Decision {
 	resource := ResourceOf(t)
 	rule := v.Rule
 	if rule == "" {
@@ -568,7 +612,7 @@ func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode) Decision {
 		Resource: resource,
 		Reason:   v.Reason,
 		Rule:     rule,
-		Policy:   e.policy.Name,
+		Policy:   policyName,
 		Mode:     m,
 		Sandbox:  e.sandbox,
 	}
