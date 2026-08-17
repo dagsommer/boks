@@ -239,9 +239,121 @@ func trimSeparators(s string) string { return strings.Trim(s, "._-") }
 
 // pathDigest is a short, stable hash of a workspace path, used wherever a name needs to
 // distinguish two directories that would otherwise produce the same one.
-func pathDigest(hostPath string) string {
-	sum := sha256.Sum256([]byte(hostPath))
+func pathDigest(hostPath string) string { return shortDigest(hostPath) }
+
+// shortDigest is the digest both pathDigest and Hostname use: enough hex to tell one input
+// from another on one machine, short enough that the name it lands in stays typeable.
+func shortDigest(s string) string {
+	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:digestChars]
+}
+
+// maxHostnameLength is the longest hostname Boks gives a guest.
+//
+// Two limits apply and the smaller wins. Linux's is HOST_NAME_MAX — 64, which is
+// __NEW_UTS_LEN in <linux/utsname.h> and what `getconf HOST_NAME_MAX` reports; sethostname(2)
+// refuses anything longer. DNS's is 63 octets per label, from the length octet RFC 1035 gives
+// each one and inherited by the RFC 1123 §2.1 hostname grammar. 63 satisfies both, and a
+// hostname that is not a legal DNS label is one that anything trying to resolve it would
+// reject anyway.
+//
+// A sandbox name may be up to maxNameLength (76), so this is a limit that is really reached.
+const maxHostnameLength = 63
+
+// Hostname is the guest hostname for a sandbox of the given name.
+//
+// The guest used to report `(none)`, the kernel's default, because nothing set the OCI
+// spec's `hostname` field. The obvious fix — use the sandbox name — does not work as written:
+// a sandbox name is a containerd identifier, which permits uppercase, '.' and '_', and a real
+// Windows run produced `shell-boks_0.1.0_windows_amd64`. None of those are legal in an RFC
+// 1123 label, and the dots would additionally make the name read as a fully qualified domain.
+//
+// So the name is folded: lowercased, every byte outside [a-z0-9] replaced by a hyphen, runs of
+// hyphens collapsed, hyphens trimmed from both ends, and the result cut to maxHostnameLength.
+//
+// Folding is lossy, and two sandboxes that exist at the same time must not answer to the same
+// hostname — `claude-MyRepo` and `claude-myrepo` are two different sandboxes on a
+// case-sensitive filesystem, and `claude-my_repo` and `claude-my.repo` are two more. So a name
+// that is *already* a legal hostname is used verbatim, and a name that had to be folded or cut
+// carries a digest of the whole original name. That keeps the common case readable
+// (`claude-myrepo` stays `claude-myrepo`) while every folded name stays distinguishable from
+// every other folded name.
+//
+// The one collision this does not exclude is a folded name whose digest suffix happens to
+// spell an untouched name belonging to a different sandbox — `claude-my-repo-1f2e3d` reached
+// both by folding `claude-my_repo` and by naming a sandbox that. It needs a 1-in-2^24 digest
+// coincidence on top of a matching base, and the consequence is two guests printing the same
+// string. Making every hostname carry a digest would exclude it, at the cost of every prompt
+// in every ordinary sandbox reading `claude-myrepo-3f9a1c`, which is a worse trade.
+//
+// That the consequence is only cosmetic is worth stating rather than assuming, because the
+// last thing this project wants is a name that quietly decides something. Nothing reads a
+// hostname: the netstack and the proxy judge a flow by its destination, credential injection
+// matches the destination domain, and the interception CA's certificates are issued for the
+// host the guest asked for. The guest's own name reaches none of them. It is also not
+// resolvable inside the guest — nerdbox writes `/etc/hosts` with `127.0.0.1 localhost` and
+// nothing else (`internal/vminit/vmnetworking/vmnetworking.go`), which was equally true of
+// `(none)`, so a program that resolves `gethostname()` fails exactly as it did before.
+//
+// # Fixed when the sandbox is created, and no flag
+//
+// This is derived rather than recorded — there is no label for it — but it lands in the OCI
+// spec at creation, and containerd never revisits that spec, so it is fixed in the same way
+// the image and the vCPU count are (see internal/cli/fixed.go). Deriving it at boot instead
+// would buy nothing: the input is the sandbox's name, which is the sandbox's identity and
+// cannot change either. An existing sandbox keeps `(none)` until it is recreated.
+//
+// There is deliberately no `--hostname`, though Docker has one. It would be a flag in the
+// fixed-at-creation set, which means a second `boks run` naming it would have to be refused;
+// it would need its own validation, its own conflict entry, and its own place in `inspect`;
+// and it would let a user give two sandboxes the same hostname, which is the property this
+// function exists to protect. Against all that, the thing it buys is a different string in a
+// shell prompt. Functionality before abstractions: if someone turns up wanting to *use* the
+// hostname for something, the flag can be added then, with a reason attached.
+func Hostname(name string) string {
+	label := hostnameLabel(name)
+	if label == name && len(label) <= maxHostnameLength {
+		return label
+	}
+
+	digest := shortDigest(name)
+	if budget := maxHostnameLength - len(digest) - 1; len(label) > budget {
+		label = strings.Trim(label[:budget], "-")
+	}
+	if label == "" {
+		// Nothing survived folding: a name written entirely in a non-ASCII script,
+		// which containerd would reject, so this is unreachable through the CLI. The
+		// digest alone is a legal hostname and beats returning "", which would leave
+		// the guest at `(none)` again.
+		return digest
+	}
+	return label + "-" + digest
+}
+
+// hostnameLabel folds a sandbox name into the RFC 1123 label grammar, without regard to
+// length: lowercase ASCII alphanumerics and hyphens, never two hyphens in a row, never one at
+// either end. A leading digit is fine — RFC 1123 §2.1 relaxed RFC 952 exactly there.
+func hostnameLabel(name string) string {
+	var b strings.Builder
+	pendingHyphen := false
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			if pendingHyphen && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingHyphen = false
+			b.WriteByte(c)
+			continue
+		}
+		// Every other byte, including each byte of a multi-byte rune, stands for one
+		// hyphen — so "my  project" and "my--project" both fold to "my-project".
+		pendingHyphen = true
+	}
+	return b.String()
 }
 
 // validateSegment checks one half of a composed name.

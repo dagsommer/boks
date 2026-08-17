@@ -394,6 +394,37 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 		processArgs = command
 	}
 
+	specOpts := specOptions(cfg, imageConfigOpt(image), processArgs)
+
+	labels, err := containerLabels(cfg, command)
+	if err != nil {
+		return nil, err
+	}
+
+	container, err := c.NewContainer(ctx, cfg.Name,
+		client.WithImage(image),
+		client.WithSnapshotter(cfg.Snapshotter),
+		client.WithNewSnapshot(cfg.Name, image),
+		client.WithRuntime(cfg.Runtime, nil),
+		client.WithContainerLabels(labels),
+		client.WithNewSpec(specOpts...),
+	)
+	if err != nil {
+		return nil, describeCreateError(cfg, err)
+	}
+	return container, nil
+}
+
+// specOptions is the OCI spec a sandbox is created with, in the order the options are
+// applied. imageConfig is the image's own contribution — see imageConfigOpt, which needs a
+// client.Image and is therefore resolved by the caller; processArgs is the container's own
+// process, already chosen between the user's command and the keeper.
+//
+// It is a function rather than a run of appends inside create so that the spec Boks generates
+// can be asserted on without a hypervisor: no VM boots in a test, but every field written here
+// is inspectable, and two of the bugs this file carries repairs for were fields that were
+// written and never looked at again.
+func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []oci.SpecOpts {
 	specOpts := []oci.SpecOpts{
 		// Must come first: it resets the spec to the platform default, discarding
 		// anything applied before it.
@@ -405,8 +436,15 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 		// spec and nothing else.
 		withPOSIXCgroupsPath(),
 		withoutWindowsSection(),
-		imageConfigOpt(image),
+		imageConfig,
 		oci.WithAnnotations(resourceAnnotations(cfg)),
+		// The guest reported `(none)`, the kernel's default nodename, until this was
+		// set: nothing wrote the field. Hostname folds the sandbox name into
+		// something sethostname(2) will take. The guest's runtime — crun, reached
+		// through vminitd — applies it inside the UTS namespace the default spec
+		// above asks it to unshare, and refuses the container outright if that
+		// namespace is missing, so nothing between here and the guest may drop it.
+		oci.WithHostname(Hostname(cfg.Name)),
 	}
 	if len(processArgs) > 0 {
 		specOpts = append(specOpts, oci.WithProcessArgs(processArgs...))
@@ -433,24 +471,7 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 		// missing cwd (measured against runc), and the clone lands in it.
 		specOpts = append(specOpts, oci.WithProcessCwd(cfg.Workspaces[0].Root()))
 	}
-
-	labels, err := containerLabels(cfg, command)
-	if err != nil {
-		return nil, err
-	}
-
-	container, err := c.NewContainer(ctx, cfg.Name,
-		client.WithImage(image),
-		client.WithSnapshotter(cfg.Snapshotter),
-		client.WithNewSnapshot(cfg.Name, image),
-		client.WithRuntime(cfg.Runtime, nil),
-		client.WithContainerLabels(labels),
-		client.WithNewSpec(specOpts...),
-	)
-	if err != nil {
-		return nil, describeCreateError(cfg, err)
-	}
-	return container, nil
+	return specOpts
 }
 
 // containerLabels records what containerd's own container record cannot express. command is

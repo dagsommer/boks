@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"strings"
@@ -8,6 +9,12 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/dagsommer/boks/internal/runtimecfg"
 	"github.com/dagsommer/boks/internal/workspace"
 )
 
@@ -220,5 +227,71 @@ func TestGitSafeDirectoryEnv(t *testing.T) {
 	}
 	if len(gitSafeDirectoryEnv(nil)) != 0 {
 		t.Error("no workspaces should produce no configuration, not an empty count")
+	}
+}
+
+// generatedSpec is the OCI spec `create` would hand containerd, built without one.
+//
+// No sandbox boots in a test — there is no /dev/kvm on the machine this is developed on —
+// but the spec is the whole of what the guest is told, and it is an ordinary value. The
+// image's own option is the one thing that cannot be run here, since it reads a manifest
+// through a containerd client, so the caller supplies a stand-in for it.
+func generatedSpec(t *testing.T, cfg Config, imageConfig oci.SpecOpts, processArgs []string) *specs.Spec {
+	t.Helper()
+	if imageConfig == nil {
+		imageConfig = func(context.Context, oci.Client, *containers.Container, *oci.Spec) error { return nil }
+	}
+	ctx := namespaces.WithNamespace(t.Context(), runtimecfg.Namespace)
+	var s specs.Spec
+	for i, opt := range specOptions(cfg, imageConfig, processArgs) {
+		if err := opt(ctx, nil, &containers.Container{ID: cfg.Name}, &s); err != nil {
+			t.Fatalf("applying spec option %d: %v", i, err)
+		}
+	}
+	return &s
+}
+
+// The guest reported `(none)` for its hostname because nothing wrote this field. It is the
+// sandbox's name, folded to something sethostname(2) will take; see Hostname.
+func TestTheSpecNamesTheSandbox(t *testing.T) {
+	s := generatedSpec(t, Config{Name: "shell-boks_0.1.0_windows_amd64"}, nil, nil)
+	if want := "shell-boks-0-1-0-windows-amd64-d6c642"; s.Hostname != want {
+		t.Errorf("Hostname = %q, want %q", s.Hostname, want)
+	}
+
+	// And it is the same field on the same spec for an ordinary name, unfolded.
+	s = generatedSpec(t, Config{Name: "claude-boks"}, nil, nil)
+	if s.Hostname != "claude-boks" {
+		t.Errorf("Hostname = %q, want %q", s.Hostname, "claude-boks")
+	}
+}
+
+// The precondition the hostname depends on, asserted separately because breaking it turns a
+// cosmetic feature into a sandbox that will not start.
+//
+// crun — /sbin/crun in the guest, pinned at 1.24 by nerdbox's Dockerfile — refuses a spec
+// that carries a hostname without a UTS namespace to set it in: libcrun_set_hostname in
+// src/libcrun/linux.c returns "hostname requires the UTS namespace" rather than ignoring the
+// field. containerd's default Linux spec supplies that namespace with no path, meaning
+// "unshare a new one", and it does so on a Windows host too, because
+// generateDefaultSpecWithPlatform switches on the *target* platform. Nothing between here and
+// the guest removes it: nerdbox forwards the spec through internal/shim/task/bundle, and none
+// of its transformers touch Linux.Namespaces.
+func TestTheSpecKeepsTheUTSNamespaceTheHostnameNeeds(t *testing.T) {
+	s := generatedSpec(t, Config{Name: "claude-boks"}, nil, nil)
+	if s.Linux == nil {
+		t.Fatal("the spec has no Linux section")
+	}
+	idx := slices.IndexFunc(s.Linux.Namespaces, func(ns specs.LinuxNamespace) bool {
+		return ns.Type == specs.UTSNamespace
+	})
+	if idx < 0 {
+		t.Fatalf("namespaces = %+v, want a %q entry; without one crun refuses the "+
+			"spec with \"hostname requires the UTS namespace\"",
+			s.Linux.Namespaces, specs.UTSNamespace)
+	}
+	if path := s.Linux.Namespaces[idx].Path; path != "" {
+		t.Errorf("the uts namespace has Path %q; it must be empty, which is what asks "+
+			"the runtime to unshare a new one rather than join the VM's", path)
 	}
 }

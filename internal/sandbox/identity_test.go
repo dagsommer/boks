@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -292,5 +293,169 @@ func TestWorkspaceSegmentRootSpellings(t *testing.T) {
 		if got := workspaceSegment(p); got == "root" {
 			t.Errorf("workspaceSegment(%q) = %q; a named directory is not a filesystem root", p, got)
 		}
+	}
+}
+
+// The mapping from sandbox name to guest hostname, stated as the cases that motivated it.
+//
+// The digests are written out rather than recomputed from shortDigest, so that a change to
+// how the digest is derived is a test failure rather than a silent change to every hostname a
+// user has already seen.
+func TestHostname(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// The ordinary case, and the whole reason folding is conditional: a name that
+		// is already a legal RFC 1123 label is the hostname, with nothing appended.
+		{"an ordinary name is already a hostname", "claude-boks", "claude-boks"},
+		{"a digits-and-hyphens name is too", "shell-project2-3f9a1c", "shell-project2-3f9a1c"},
+
+		// The name a real Windows run produced. Underscores are not legal in a
+		// hostname and the dots would make it read as a fully qualified domain.
+		{"the Windows release directory", "shell-boks_0.1.0_windows_amd64",
+			"shell-boks-0-1-0-windows-amd64-d6c642"},
+
+		{"dots, which Boks keeps in names", "claude-finndato.no", "claude-finndato-no-3bbe04"},
+		{"uppercase, which Boks keeps in names", "shell-MyProject", "shell-myproject-c5275f"},
+		{"underscores", "shell-my_project", "shell-my-project-3408f8"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Hostname(tt.in); got != tt.want {
+				t.Errorf("Hostname(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// rfc1123Label is the grammar sethostname(2) is given and DNS will accept: lowercase ASCII
+// alphanumerics and hyphens, at least one character, never a hyphen at either end.
+var rfc1123Label = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// Whatever the name, the hostname is one the guest kernel and a resolver will both take.
+//
+// The inputs are the ones Boks itself produces — DeriveName keeps case, dots and underscores,
+// and composeName will hand back a name up to maxNameLength long — plus the shapes a `-name`
+// flag can smuggle past them.
+func TestHostnameIsAlwaysAValidLabel(t *testing.T) {
+	names := []string{
+		"claude-boks",
+		"claude-finndato.no",
+		"shell-MyProject",
+		"shell-my_project",
+		"shell-boks_0.1.0_windows_amd64",
+		"shell-root",
+		"a",
+		"0",
+		"UDI-Copilot-YOLO-efm.integrasjonspunkt",
+		strings.Repeat("a", maxNameLength),
+		"shell-" + strings.Repeat("x", maxNameLength-len("shell-")),
+		// Names ValidateName would refuse, because Hostname is not the place that
+		// check lives and a hyphen at either end is the one thing RFC 1123 forbids
+		// that folding can easily produce.
+		".hidden",
+		"_tmp",
+		"trailing.",
+		"-both-",
+		// A name long enough to be cut, arranged so that the cut lands exactly on a
+		// separator — the other way to end up with a trailing hyphen.
+		"shell-" + strings.Repeat("x", maxHostnameLength-digestChars-len("shell-")-2) + ".tail",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			got := Hostname(name)
+			if !rfc1123Label.MatchString(got) {
+				t.Errorf("Hostname(%q) = %q, which is not an RFC 1123 label", name, got)
+			}
+			if len(got) > maxHostnameLength {
+				t.Errorf("Hostname(%q) = %q, %d bytes; the limit is %d",
+					name, got, len(got), maxHostnameLength)
+			}
+			// Legal per RFC 1123, which forbids a hyphen only at the ends, but
+			// `boks--3f9a1c` reads as a mistake and as a punycode prefix. The fold
+			// collapses runs, and cutting a name must not undo that.
+			if strings.Contains(got, "--") {
+				t.Errorf("Hostname(%q) = %q, which doubles a hyphen", name, got)
+			}
+		})
+	}
+}
+
+// A hostname that changed between boots would be worse than none at all: it is the string a
+// shell prompt and a screenshot are read from. It is derived, not stored, so the only thing
+// keeping it stable is that the function is pure — which is what this asserts.
+func TestHostnameIsStable(t *testing.T) {
+	for _, name := range []string{"claude-boks", "shell-boks_0.1.0_windows_amd64", "shell-MyProject"} {
+		first := Hostname(name)
+		for range 3 {
+			if again := Hostname(name); again != first {
+				t.Fatalf("Hostname(%q) = %q, then %q", name, first, again)
+			}
+		}
+	}
+}
+
+// Folding is lossy, and the digest is what keeps it from being silently so. Each of these
+// names is a sandbox containerd will hold at the same time as the others, and each folds to
+// the same base; two of them answering to one hostname would be the bug.
+func TestHostnameDistinguishesNamesThatFoldAlike(t *testing.T) {
+	names := []string{
+		"claude-my-repo",
+		"claude-my_repo",
+		"claude-my.repo",
+		"claude-My-Repo",
+		"claude-MY_REPO",
+	}
+	seen := make(map[string]string, len(names))
+	for _, name := range names {
+		got := Hostname(name)
+		if other, dup := seen[got]; dup {
+			t.Errorf("Hostname(%q) and Hostname(%q) are both %q", other, name, got)
+			continue
+		}
+		seen[got] = name
+	}
+}
+
+// The two long-name cases are separate bugs. A name too long to fit must still be cut to
+// something the kernel takes, and cutting it must not let two names that share a long prefix
+// become one hostname.
+func TestHostnameCutsLongNamesWithoutMergingThem(t *testing.T) {
+	prefix := strings.Repeat("x", maxHostnameLength)
+	a, b := "shell-"+prefix+"-alpha", "shell-"+prefix+"-beta"
+
+	for _, name := range []string{a, b} {
+		got := Hostname(name)
+		if len(got) != maxHostnameLength {
+			t.Errorf("Hostname(%q) is %d bytes, want it cut to exactly %d",
+				name, len(got), maxHostnameLength)
+		}
+		if !rfc1123Label.MatchString(got) {
+			t.Errorf("Hostname(%q) = %q, which is not an RFC 1123 label", name, got)
+		}
+	}
+	if Hostname(a) == Hostname(b) {
+		t.Errorf("two names sharing their first %d characters both became %q",
+			maxHostnameLength, Hostname(a))
+	}
+}
+
+// The fold itself, at the edges the table above does not reach: a name that is nothing but
+// separators leaves no label, and one written in a script containerd would reject leaves no
+// ASCII. Neither may produce "", which is the value that means "leave the guest at (none)".
+func TestHostnameSurvivesNamesWithNothingUsableInThem(t *testing.T) {
+	for _, name := range []string{"---", "...", "日本語", "___"} {
+		got := Hostname(name)
+		if !rfc1123Label.MatchString(got) {
+			t.Errorf("Hostname(%q) = %q, want a usable label rather than nothing", name, got)
+		}
+	}
+	// The empty name is the one case that must stay empty: an empty `hostname` field
+	// is the one crun skips, and inventing a name for a sandbox that has none would be
+	// worse than leaving the kernel default in place.
+	if got := Hostname(""); got != "" {
+		t.Errorf("Hostname(\"\") = %q, want \"\"", got)
 	}
 }
