@@ -487,6 +487,9 @@ type Session struct {
 	listener net.Listener
 	sink     *policy.FileSink
 	served   chan error
+	// engine is kept so that the control socket can hot-reload allow rules without
+	// restarting. It is nil for a sandbox with no network (ModeNone).
+	engine *policy.Engine
 	// forwarder owns the host listeners published for this sandbox. It is nil for a
 	// sandbox with no network: there is nothing to forward into.
 	forwarder *ports.Forwarder
@@ -535,6 +538,8 @@ func Open(ctx context.Context, spec Spec, logger io.Writer) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Kept for hot-reloading allows via the control socket (see reloadPolicy).
+	s.engine = engine
 	n.SetPolicy(engine)
 	if err := n.Start(ctx); err != nil {
 		_ = s.Close()
@@ -584,6 +589,88 @@ func (s *Session) Ports() []ports.Published {
 		return nil
 	}
 	return s.forwarder.List()
+}
+
+// reloadPolicy re-reads the policy store and applies any new allow rules to the running
+// engine. New deny rules — those not present in the policy the sandbox started with — are
+// not applied: deny changes require a restart so that users can reason about the boundary.
+// Removed deny rules are also kept, for the same reason.
+//
+// It returns a warning string (non-empty when new deny rules were skipped) and an error.
+// The warning is routed through the control response so it reaches the user's terminal
+// rather than the supervisor's stderr.
+//
+// It is called by the control socket handler for opPolicyReload, which `boks policy allow`
+// triggers after writing a new rule to the store.
+func (s *Session) reloadPolicy() (string, error) {
+	if s.engine == nil || s.spec.Resolution == nil {
+		return "", errors.New("this sandbox has no policy to reload")
+	}
+
+	store, err := policy.LoadStore(policy.DefaultStorePath())
+	if err != nil {
+		return "", fmt.Errorf("reloading policy: reading the store: %w", err)
+	}
+
+	req := s.spec.Resolution.ToRequest(store)
+	newRes, err := req.Resolve()
+	if err != nil {
+		return "", fmt.Errorf("reloading policy: resolving: %w", err)
+	}
+	newPol, err := newRes.Policy()
+	if err != nil {
+		return "", fmt.Errorf("reloading policy: compiling: %w", err)
+	}
+
+	// The entire read-modify-write is done inside Update so that two concurrent reloads
+	// cannot race: the second reload sees the policy the first one produced, not a stale
+	// snapshot taken before the first one committed.
+	var warning string
+	s.engine.Update(func(oldPol policy.Policy) policy.Policy {
+		// The default action (Deny vs Allow) must never change during a hot reload.
+		// A preset or profile change that flips it from Deny to Allow would make every
+		// unlisted destination reachable in a running sandbox.
+		if newPol.Default != oldPol.Default {
+			// Pin it — do not widen the default.
+			newPol.Default = oldPol.Default
+		}
+
+		// Take a snapshot of the old deny rules. New denies are not applied — they require a
+		// restart. Removed denies are preserved so that a `boks policy deny` that a user wrote
+		// while the sandbox was running is not silently undone by a `boks policy allow`.
+		var oldDenies []policy.Rule
+		oldDenySet := make(map[string]bool)
+		for _, r := range oldPol.Rules {
+			if r.Action == policy.Deny {
+				oldDenies = append(oldDenies, r)
+				oldDenySet[r.Spec()] = true
+			}
+		}
+
+		// Build the reloaded rule list: original denies, then the new allows (preserving order
+		// so that new preset rules come before new store-derived ones, consistent with how the
+		// engine sees them normally).
+		var newDeniesCount int
+		var allows []policy.Rule
+		for _, r := range newPol.Rules {
+			if r.Action == policy.Deny {
+				if !oldDenySet[r.Spec()] {
+					newDeniesCount++
+				}
+				continue // replaced by oldDenies below
+			}
+			allows = append(allows, r)
+		}
+		newPol.Rules = append(oldDenies, allows...)
+
+		if newDeniesCount > 0 {
+			warning = fmt.Sprintf(
+				"policy reload for %s: %d new deny rule(s) will not take effect until the sandbox is restarted",
+				s.spec.Sandbox, newDeniesCount)
+		}
+		return newPol
+	})
+	return warning, nil
 }
 
 // newEngine resolves the policy and opens the decision log both enforcement points share.
