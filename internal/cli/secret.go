@@ -675,7 +675,7 @@ func describeStoredService(w io.Writer, name string) {
 // registration boks does not hold. A flag that opened a browser and did something
 // approximately login-shaped would be worse than this message.
 func errOAuthAcquisition(name string) error {
-	return fmt.Errorf("--oauth is not implemented, and the reason is worth having in full.\n\n"+
+	return fmt.Errorf("--oauth is not implemented.\n\n"+
 		"Every flow that could acquire a token here — authorization code with PKCE, or the\n"+
 		"device flow — begins by identifying *this program* to the vendor with a client id the\n"+
 		"vendor issues to a registered application. Boks is registered with none of the\n"+
@@ -696,9 +696,7 @@ func errOAuthAcquisition(name string) error {
 		"  boks run claude -- auth login\n\n"+
 		"The agent performs its own OAuth with its own client id — legitimately, because it is\n"+
 		"that program — and boks, which already terminates TLS for the token endpoint, keeps the\n"+
-		"tokens and hands the sandbox sentinels. That is the same route sbx takes for Anthropic:\n"+
-		"its own --oauth is documented for one vendor, and its answer for this one is\n"+
-		"'sbx run claude … -- auth login'.\n\n"+
+		"tokens and hands the sandbox sentinels.\n\n"+
 		"To store an API key for %q instead, drop the flag.", name)
 }
 
@@ -751,7 +749,7 @@ would leave a credential that is never used.`,
 		for _, arg := range args {
 			if _, err := secret.Profile(arg); err == nil {
 				return fmt.Errorf("%q is a credential format, not a service: 'boks secret import' now reads\n"+
-					"environment variables, as sbx's does. To adopt a stored OAuth credential:\n\n"+
+					"environment variables. To adopt a stored OAuth credential:\n\n"+
 					"  boks secret adopt %s", arg, arg)
 			}
 		}

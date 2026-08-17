@@ -366,10 +366,10 @@ func unexercisedNetworkWarning(reason error) string {
 func orphanedStackWarning(name string) string {
 	return fmt.Sprintf(
 		"WARNING: sandbox %q is running, but the process serving its network is gone.\n"+
-			"         A running guest does NOT re-attach to a new link socket — measured on\n"+
-			"         2026-08-12 — so this sandbox has no network until it is restarted, and\n"+
-			"         nothing inside it can reach anything. A fresh stack is being started for\n"+
-			"         the next boot; it will not help the VM that is up now.\n"+
+			"         A running guest does NOT re-attach to a new link socket, so this sandbox\n"+
+			"         has no network until it is restarted, and nothing inside it can reach\n"+
+			"         anything. A fresh stack is being started for the next boot; it will not\n"+
+			"         help the VM that is up now.\n"+
 			"         Restart it to get the network back:\n"+
 			"           boks stop %s && boks start %s\n"+
 			"         That kills whatever is running inside, which is why boks does not do it\n"+
