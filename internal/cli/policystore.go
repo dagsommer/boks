@@ -112,6 +112,9 @@ deny someone wrote down.
 		if err != nil {
 			return err
 		}
+		warnCount := 0
+		skippedWarns := 0
+		capWarnings := len(args) > 3
 		for _, spec := range args {
 			added, err := store.Add(ref, policy.RuleSpec{Action: action, Spec: spec, Note: note})
 			if err != nil {
@@ -122,6 +125,23 @@ deny someone wrote down.
 				continue
 			}
 			fmt.Fprintf(env.Stdout, "added: %s %s to %s\n", action, spec, ref)
+			if action == policy.Allow {
+				if rule, parseErr := policy.ParseRule(action, spec); parseErr == nil && rule.WarnSingleLabel() {
+					if !capWarnings || warnCount < 2 {
+						fmt.Fprintf(env.Stderr,
+							"warning: %q looks like a local name or shell glob expansion mistake — single-label hostnames are rarely real network destinations.\n"+
+								"If you meant to allow all traffic, use: boks policy %s '*'\n"+
+								"Remove it with 'boks policy rm %s' if it was a mistake.\n",
+							spec, action, spec)
+						warnCount++
+					} else {
+						skippedWarns++
+					}
+				}
+			}
+		}
+		if skippedWarns > 0 {
+			fmt.Fprintf(env.Stderr, "warning: %d more single-label hostname(s) skipped (same issue)\n", skippedWarns)
 		}
 		if err := store.Save(); err != nil {
 			return err
