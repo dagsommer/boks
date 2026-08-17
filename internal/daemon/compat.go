@@ -238,8 +238,7 @@ func CheckSkew(daemonVersion, shimVersion string) *Skew {
 		Remedy: fmt.Sprintf(
 			"The runtime shim was built against containerd %s and this daemon is %s.\n"+
 				"A shim emits bootstrap parameters in its own containerd's encoding, and an\n"+
-				"older daemon cannot decode them. Measured on 2026-08-15 with a shim linking\n"+
-				"2.3.3 against containerd 2.2.2, the sandbox fails at task start with\n\n"+
+				"older daemon cannot decode them. The sandbox fails at task start with\n\n"+
 				"    unsupported protocol: Yunix\n\n"+
 				"which is protobuf framing read as an address and names nothing that is wrong.\n"+
 				"Upgrade containerd to %s or later, or rebuild the shim against %s.",

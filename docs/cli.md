@@ -942,8 +942,8 @@ Restores the defaults, destroying stored rules. With no scope it clears everythi
 global rules, every sandbox's rules and every profile, and returns the base posture to the
 default preset. With --sandbox or --profile it clears only that scope.
 
-It asks first, as 'sbx reset' does, unless -f is given. Sandboxes that are already running
-keep the policy they started with; this changes what the next run resolves to.
+It asks first unless -f is given. Sandboxes that are already running keep the policy they
+started with; this changes what the next run resolves to.
 
 | Flag | Default | Meaning |
 |---|---|---|
