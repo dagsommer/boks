@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/doctor"
+	"github.com/dagsommer/boks/internal/policy"
 )
 
 // reportHealth prints a report and exits on the verdict that printing it produced.
@@ -36,6 +37,7 @@ Which containerd, runtime and snapshotter are checked follows --containerd-addre
 				ContainerdAddress: dev.address,
 				Runtime:           dev.runtimeID,
 				Snapshotter:       dev.snapshotter,
+				StateDir:          policy.StateDir(),
 			}))
 		},
 	}

@@ -33,6 +33,10 @@ brew trust libkrun/krun
 brew install boks
 ```
 
+To reverse it later, `brew uninstall boks` is the second of two steps — see
+[Uninstalling](#uninstalling--two-steps-not-one). Homebrew does not remove the gigabyte of
+image layers Boks writes to `~/Library/Application Support/boks`.
+
 > [!NOTE]
 > **Not published yet.** The tap does not exist. The formulae are written and reviewed — they
 > are in [`packaging/homebrew/`](../packaging/homebrew/) with the procedure for creating the
@@ -184,6 +188,10 @@ tar -xzf boks_0.1.0_linux_amd64.tar.gz
 sudo install -m0755 boks_0.1.0_linux_amd64/boks /usr/local/bin/boks
 ```
 
+Removing the package later does not remove what Boks writes to `~/.local/state/boks`, which
+reaches a gigabyte after one image pull — see
+[Uninstalling](#uninstalling--two-steps-not-one).
+
 > [!NOTE]
 > **Not published yet.** The release workflow that builds these packages exists and the
 > files above are what it names — but no release has been cut, so there is nothing to
@@ -238,6 +246,10 @@ quickly ([verification.md](verification.md) has all of it):
 ```powershell
 winget install boks
 ```
+
+To reverse it later, `winget uninstall boks` is the second of two steps — see
+[Uninstalling](#uninstalling--two-steps-not-one). Measured on
+2026-08-16, `winget uninstall` on its own leaves `%LOCALAPPDATA%\boks` behind at 1,768.8 MB.
 
 > [!NOTE]
 > **Not published yet.** The manifests are written and schema-checked — they are in
@@ -371,6 +383,72 @@ WSL ≥ 2.5.1, `kvm` and `erofs` modules loaded, and `/dev/kvm` made group-acces
 Choosing between them: the native route needs no elevation, and the WSL2 route currently does
 need root inside the distribution (see the Linux section above). That is the reverse of what
 anyone would guess, and it is the current state rather than the intended one.
+
+## Uninstalling — two steps, not one
+
+**Removing the package does not remove Boks' state, and that state is measured in
+gigabytes.** On Windows on 2026-08-16, `winget uninstall` left `%LOCALAPPDATA%\boks` behind
+at **59 files and 1,768.8 MB**. On Linux on the same day, a single `boks create shell` grew
+`~/.local/state/boks` from 300 KiB to **1005 MiB** — 219 MiB of compressed image blobs in
+containerd's content store, and 785 MiB of the same layers unpacked by the erofs snapshotter.
+
+A package manager owning only the files it installed is correct behaviour. What was not
+correct is that until now no `boks` command removed the rest either, so the only route to
+that gigabyte was knowing where it was.
+
+```sh
+boks daemon stop      # nothing may be using the state while it is removed
+boks purge --all      # the state: containerd's root, the CA, credentials, rules, the log
+                      # it prints what it will take, and asks, before removing anything
+```
+
+`boks purge` refuses while the managed containerd or a sandbox's network is still up, and
+names what to stop — so a forgotten daemon is a message rather than a wedged one.
+
+Then remove the package:
+
+```sh
+brew uninstall boks                    # macOS
+sudo dpkg -r boks                      # Debian, Ubuntu
+sudo rpm -e boks                       # Fedora, RHEL, openSUSE
+sudo rm /usr/local/bin/boks            # tarball install
+```
+
+```powershell
+winget uninstall boks                  # Windows
+```
+
+Do it in that order. `boks purge` needs the binary it is part of, and once the package is
+gone the state is only removable by hand.
+
+> [!NOTE]
+> On Windows, `winget uninstall` was observed on 2026-08-16 to reject both `boks` and
+> `dagsommer.boks` after a `--manifest` install, and to succeed against the ARP identifier
+> (`ARP\User\X64\dagsommer.boks__DefaultSource`). That is believed to be an artefact of
+> installing from a local manifest rather than from a source; `winget list boks` prints the
+> id it will accept. See [verification.md](verification.md).
+
+### Just getting the disk back
+
+`boks purge` without `--all` is the same command with the four things you would be upset to
+lose left in place — the local certificate authority, credentials stored with `boks secret
+set`, the rules added with `boks policy allow`, and the decision log:
+
+```sh
+boks purge --dry-run   # what is there, what each part is, and what it would free
+boks purge             # take containerd's root and the per-sandbox state
+```
+
+It still destroys sandboxes. containerd keeps image layers and each sandbox's filesystem in
+one root, so there is no way to drop the images and keep the sandboxes — run `boks ls` first.
+
+Both forms refuse while the managed containerd is running or a sandbox's network is up, and
+name what to stop. Neither ever touches anything outside the state directory, or anything
+inside it that Boks did not write: the entries removed come from a fixed list of names rather
+than from walking the directory, and anything else is reported as left alone.
+
+`boks doctor` names the state directory and its size, so the question "where has my disk
+gone" has an answer on the screen someone is already looking at.
 
 ## What a sandbox needs
 
