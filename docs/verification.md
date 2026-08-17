@@ -2273,3 +2273,68 @@ lives in a few dozen inodes.
 - **Purging with a sandbox actually running.** This host cannot boot one. The refusal is
   driven by the same lock files `boks ls` and `boks net ls` read, and the test holds those
   locks for real, but no purge has been attempted against a live guest.
+
+### The guest called itself `(none)`, and the field that fixes it is one somebody reads, 2026-08-17
+
+A user ran `boks run shell . -- uname -a` and got:
+
+```
+Linux (none) 6.12.44 #1 SMP … x86_64 GNU/Linux
+```
+
+`(none)` is the kernel's default nodename. Boks set the OCI spec's `hostname` nowhere —
+`grep -rn Hostname internal/` found no write of the field — so the guest never got one.
+
+The obvious fix is to set it, and this project has twice set a spec field that nothing read:
+`Process.User.Username`, which crun parses and drops (2026-08-16, above), and `layerFolders`,
+which crun rejects outright (2026-08-14). So the chain was read end to end **before** any
+Boks-side change, at the revisions this project pins.
+
+#### Read, not run: does anything honour `hostname`?
+
+| Component | Revision | What it does with `Spec.Hostname` |
+| --- | --- | --- |
+| shim (`containerd-shim-nerdbox-v1`) | nerdbox `cd2c23f` (`packaging/nerdbox/NERDBOX_REV`) | **Forwards it.** `internal/shim/task/bundle/bundle.go` unmarshals the host's `config.json` into a `specs.Spec`, applies its transformers, and re-marshals the whole struct as the guest's `config.json`. `grep -rn hostname --include=*.go` outside `vendor/` is **zero hits**, so no transformer touches the field — and none touches `Linux.Namespaces` either. |
+| `vminitd` | same | **Hands it to a runtime.** `internal/vminit/runc/container.go` has `const runtimePath = "/sbin/crun"`; the guest's container is created by crun from the forwarded bundle. |
+| `crun` | 1.24, pinned in nerdbox's `Dockerfile` (`crun-1.24-linux-${TARGETARCH}-disable-systemd`) | **Calls `sethostname(2)`.** `libcrun_set_hostname` in `src/libcrun/linux.c` — and it is not a no-op on the empty case either: given a hostname *without* a UTS namespace it fails the container with `hostname requires the UTS namespace`. |
+| containerd | v2.2.6 | **Supplies that namespace.** `pkg/oci/spec.go`'s `defaultUnixNamespaces()` includes `{Type: uts}` with no path, and `generateDefaultSpecWithPlatform` switches on the *target* platform, so a Windows host building a Linux spec gets it too. |
+
+So the field is honoured, which is the opposite of the `Username` result, and no nerdbox patch
+is needed. It is also why the UTS namespace now has a test of its own: removing it would turn
+a cosmetic feature into a sandbox that refuses to start.
+
+A microVM changes the reading only in that the container's UTS namespace is unshared from the
+VM's rather than from the host's. `sethostname` inside it is the guest's own; nothing on the
+host sees it.
+
+#### What was run, on a host with no hypervisor
+
+The spec is an ordinary value and needs no VM to inspect. `internal/sandbox`:
+
+- `TestTheSpecNamesTheSandbox` applies the real option list from `specOptions` and asserts
+  `spec.Hostname`.
+- `TestTheSpecKeepsTheUTSNamespaceTheHostnameNeeds` asserts the `uts` entry is present with an
+  empty `Path`, which is the precondition crun checks.
+- Six tests over `Hostname` itself: the mapping, RFC 1123 validity and length for every name
+  Boks can produce, stability across calls, and that names folding to the same base stay
+  distinct. Each was confirmed to fail with the corresponding line of `Hostname` broken.
+
+#### Not verified: that `uname -a` prints it
+
+No sandbox has booted here. On a machine with a hypervisor:
+
+```bash
+boks run shell . -- uname -a          # nodename, not (none)
+boks run shell . -- hostname          # the same string, via gethostname(2)
+boks run shell . -- cat /proc/sys/kernel/hostname
+```
+
+All three must show the sandbox's name — `boks ls` says what that is — folded per
+[`Hostname`](../internal/sandbox/identity.go). The failure to watch for is not a wrong name
+but a container that does not start at all, with `hostname requires the UTS namespace` from
+crun; that would mean something between the shim and the guest dropped the namespace, and the
+test above is the thing that should have caught it.
+
+Only a sandbox created *after* this change has the field: it is written into the OCI spec once,
+when the sandbox is created, and containerd never revisits it. An existing sandbox keeps
+`(none)` until it is recreated.
