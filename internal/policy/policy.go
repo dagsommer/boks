@@ -90,6 +90,14 @@ func (r Rule) WithScope(scope string) Rule {
 	return r
 }
 
+// WarnSingleLabel reports whether the rule's host pattern looks like a single-label
+// hostname — no dot, not an IP, not a wildcard — which almost always means a shell
+// glob expansion or tab-completion mishap that will silently never match any real
+// network destination.
+func (r Rule) WarnSingleLabel() bool {
+	return r.Host.IsSingleLabel()
+}
+
 // ParseRule builds a rule from an action and a "host[:ports]" specification.
 //
 // Examples: "github.com", "github.com:443", "*.githubusercontent.com:443",

@@ -126,6 +126,13 @@ func (p Pattern) Match(t Target) bool {
 // accept a catch-all — credential injection, above all — check this.
 func (p Pattern) IsAny() bool { return p.kind == patternAny }
 
+// IsSingleLabel reports whether the pattern is an exact hostname with no dot — e.g. "go"
+// or "Applications". These are almost always mistakes from shell glob expansion or
+// tab-completion and will silently never match any real network destination.
+func (p Pattern) IsSingleLabel() bool {
+	return p.kind == patternExact && !strings.Contains(p.host, ".")
+}
+
 // MatchesNameOnly reports whether this pattern can only ever match a hostname, and so can
 // never permit a connection made straight to an address.
 //
