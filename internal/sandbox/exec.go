@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -89,7 +88,18 @@ func execProcess(ctx context.Context, container client.Container, task client.Ta
 	process := *spec.Process
 	process.Args = cfg.Command
 	process.Terminal = cfg.TTY
-	process.Env = append(slices.Clone(spec.Process.Env), cfg.Env...)
+	// Build the process env in three layers, each able to override the previous:
+	//   1. spec env (image ENV + whatever was set at create time)
+	//   2. live terminal vars — appended as overrides so the *current* terminal wins
+	//      over anything baked into the spec at create time from a different terminal
+	//   3. explicit --env flags from the user, which win over everything
+	// replaceOrAppendEnv handles collision by replacing in place, so the guest never
+	// sees duplicate keys.
+	baseEnv := spec.Process.Env
+	if cfg.TTY {
+		baseEnv = replaceOrAppendEnv(baseEnv, terminalEnv())
+	}
+	process.Env = replaceOrAppendEnv(baseEnv, cfg.Env)
 	if cfg.Cwd != "" {
 		process.Cwd = cfg.Cwd
 	}
