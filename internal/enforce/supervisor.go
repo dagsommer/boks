@@ -242,7 +242,7 @@ func Stop(stateDir, sandbox string) error {
 // whenever the sandbox stops; the certificate directory is the source of a mount and has to
 // survive a stop, so that the sandbox can be started again. Only removal takes it.
 func Forget(stateDir, sandbox string) error {
-	dir := filepath.Join(stateDir, "certs", sanitize(sandbox))
+	dir := CertDir(stateDir, sandbox)
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("enforce: removing %s: %w", dir, err)
 	}
