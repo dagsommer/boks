@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -71,12 +72,11 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 	}
 	got := errOut.String()
 	for _, want := range []string{
-		"example.com",                   // the policy it resolved to
-		"TLS INTERCEPTION",              // the notice that had no call site before
-		"api.anthropic.com",             // and the host it applies to
-		"terminated on the host",        // where enforcement actually happens
-		"Measured against a real guest", // and the evidence for it
-		"Linux is not covered",          // and the limit of that evidence
+		"example.com",            // the policy it resolved to
+		"TLS INTERCEPTION",       // the notice that had no call site before
+		"api.anthropic.com",      // and the host it applies to
+		"terminated on the host", // where enforcement actually happens
+		"docs/security-model.md", // and where the limits of that are written down
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the description does not mention %q:\n%s", want, got)
@@ -90,7 +90,19 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 			t.Errorf("obsolete wording %q is still printed:\n%s", stale, got)
 		}
 	}
+	// And no lab notebook. This used to close with the date, the host and the hypervisor
+	// that the claim was measured against, and a pointer to docs/verification.md. A user
+	// can act on none of that: they need to know what boks does to their traffic, not which
+	// machine proved it. The evidence record keeps the transcript; this text keeps the fact.
+	if when := citationDate.FindString(got); when != "" {
+		t.Errorf("the description cites a measurement date (%s), which belongs in "+
+			"docs/verification.md and not in front of a user:\n%s", when, got)
+	}
 }
+
+// citationDate matches a date printed at a user. Nothing describing a network says one
+// except as a citation of when it was measured.
+var citationDate = regexp.MustCompile(`\b20\d\d-\d\d-\d\d\b`)
 
 // TestDescribeNetworkForNoNetwork: -net none has no policy to describe and must not imply
 // one, but it must say what it is, because it is the strongest containment on offer.
@@ -216,15 +228,18 @@ func TestUnexercisedWarningIsNotSaidWhenThereIsNoLinkToDial(t *testing.T) {
 	}
 }
 
-// TestOrphanedStackWarningStatesTheMeasuredOutcome: this text used to say that whether a
-// running guest re-attaches to a fresh link socket was "unverified", which a reader takes as
-// "probably fine". It was measured on 2026-08-12 and it does not re-attach, so the sandbox
-// has no network until it is restarted. Hedging here costs the user a debugging session.
-func TestOrphanedStackWarningStatesTheMeasuredOutcome(t *testing.T) {
+// TestOrphanedStackWarningStatesTheOutcome: this text used to say that whether a running
+// guest re-attaches to a fresh link socket was "unverified", which a reader takes as
+// "probably fine". It does not re-attach, so the sandbox has no network until it is
+// restarted. Hedging here costs the user a debugging session.
+//
+// The date that outcome was measured on used to be pinned here too, and printed. It is in
+// docs/verification.md, where a reader who wants the transcript can find it; in the warning
+// it was a line of noise between the user and the command that fixes their sandbox.
+func TestOrphanedStackWarningStatesTheOutcome(t *testing.T) {
 	got := orphanedStackWarning("web")
 	for _, want := range []string{
-		"does NOT re-attach", // the measured outcome, not a hope
-		"2026-08-12",         // when it was measured
+		"does NOT re-attach", // the outcome, stated, not a hope
 		"no network until it is restarted",
 		"boks stop web && boks start web",  // the remedy, spelled out
 		"kills whatever is running inside", // and its cost, so the user can decide
@@ -235,6 +250,10 @@ func TestOrphanedStackWarningStatesTheMeasuredOutcome(t *testing.T) {
 	}
 	if strings.Contains(got, "unverified") {
 		t.Errorf("the warning still calls a measured outcome unverified:\n%s", got)
+	}
+	if when := citationDate.FindString(got); when != "" {
+		t.Errorf("the warning cites a measurement date (%s); a user restarting a sandbox "+
+			"cannot act on it:\n%s", when, got)
 	}
 }
 
