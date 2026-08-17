@@ -137,11 +137,16 @@ func TestPolicyLsShowsResolvedRules(t *testing.T) {
 		}
 	}
 	// The user must be able to read this output and know exactly how far the protection
-	// goes: what enforces it, what has been measured, and where that measurement stops.
-	for _, want := range []string{"terminated on the host", "Measured against a real guest", "Linux is not covered"} {
+	// goes: what enforces it, and where the limits of that are written down. It used to
+	// have to say when and on which machine that was measured, too; that is the evidence
+	// record's job, and in front of a user it is a citation nobody can act on.
+	for _, want := range []string{"terminated on the host", "docs/security-model.md"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not say %q:\n%s", want, out)
 		}
+	}
+	if when := citationDate.FindString(out); when != "" {
+		t.Errorf("the policy output cites a measurement date (%s):\n%s", when, out)
 	}
 	// A policy written only in hostnames cannot match a raw connection, which surprised a
 	// tester badly enough to be worth saying where the rules are shown.

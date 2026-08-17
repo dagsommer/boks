@@ -332,8 +332,7 @@ func RequireConfigured(s Service) error {
 		"Store it under a name of your own and say where it goes:\n"+
 		"  boks secret set my-%s\n"+
 		"  boks run --inject 'my-%s@api.example.com=Authorization:Bearer %%s' \\\n"+
-		"           --guest-credential 'my-%s=SOME_API_KEY=placeholder' ...\n\n"+
-		"If you have the vendor's documentation, the row to fill in is in internal/secret/service.go.",
+		"           --guest-credential 'my-%s=SOME_API_KEY=placeholder' ...",
 		s.Name, s.Name, s.Name, s.Name)
 }
 

@@ -37,12 +37,11 @@ func Preflight(settings Settings) []Note {
 			Name:   "mkfs.erofs",
 			Detail: "not on PATH, so the erofs differ is not in the diff order",
 			Remedy: "containerd's erofs differ shells out to mkfs.erofs and skips itself without it,\n" +
-				"and naming a skipped differ in the diff order fails the diff service — measured\n" +
-				"2026-08-15 on containerd v2.2.6, seven plugins including the diff gRPC service.\n" +
-				"The daemon would keep running and answering, with no way to unpack an image.\n" +
-				"So this one is configured without erofs instead, and cannot unpack a sandbox's\n" +
-				"root filesystem either way. Install erofs-utils 1.8 or later (apt: erofs-utils,\n" +
-				"brew: erofs-utils) and run 'boks daemon start' again.",
+				"and naming a skipped differ in the diff order takes the diff service down with\n" +
+				"it — so this daemon is configured without erofs instead. It will start and\n" +
+				"answer, but it cannot unpack a sandbox's root filesystem either way. Install\n" +
+				"erofs-utils 1.8 or later (apt: erofs-utils, brew: erofs-utils) and run\n" +
+				"'boks daemon start' again.",
 		})
 	}
 	if n := writableLayerNote(settings); n != nil {
@@ -160,9 +159,9 @@ func shimSocketRootNote(goos string) *Note {
 func shimSocketRemedy(root string) string {
 	return fmt.Sprintf(
 		"containerd puts each shim's socket under %s, and that path is a compile-time\n"+
-			"constant (containerd#12444) — no configuration moves it, so Boks cannot put it\n"+
-			"under your state directory with everything else. The daemon will start and can\n"+
-			"pull images; starting a sandbox will fail with\n\n"+
+			"constant: no configuration moves it, so it cannot live under your state\n"+
+			"directory with everything else. The daemon will start and can pull images;\n"+
+			"starting a sandbox will fail with\n\n"+
 			"    creating sandbox process: mkdir %s: permission denied\n\n"+
 			"This is the one step that needs root, and it is needed once:\n\n"+
 			"    sudo mkdir -p %s\n"+
