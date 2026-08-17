@@ -221,6 +221,24 @@ func TestPurgeDryRunReportsWhatWouldRefuse(t *testing.T) {
 	}
 }
 
+// --dry-run says not to remove anything and --yes says to remove it without asking. A caller
+// that passed both has a bug, and either answer would be somebody's surprise.
+func TestPurgeRefusesDryRunWithYes(t *testing.T) {
+	root := purgeState(t)
+	writeState(t, root, filepath.Join("containerd", "root", "layer"), 4096)
+
+	_, errOut, code := mainExitCode(t, "purge", "--dry-run", "--yes")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 — contradictory flags are a usage error", code)
+	}
+	if !strings.Contains(errOut, "cannot be combined") {
+		t.Errorf("stderr does not name the conflict:\n%s", errOut)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "containerd")); err != nil {
+		t.Errorf("the refused invocation removed something: %v", err)
+	}
+}
+
 // A machine that has never run Boks, and a machine that was purged a minute ago, both have to
 // exit 0 rather than report a missing directory as a failure.
 func TestPurgeOnAMachineWithNoState(t *testing.T) {
