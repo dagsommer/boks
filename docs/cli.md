@@ -1068,6 +1068,52 @@ boks proxy --policy standard
 | `--secrets string` |  | encrypted secret store (default: the one 'boks secret' uses) |
 | `-v`, `--verbose` |  | print every decision as it is made |
 
+## boks purge
+
+Remove the host-side state Boks has written, and report what it frees
+
+```
+boks purge [flags]
+```
+
+Removes what Boks has written outside its own installation, and prints what that is and
+how much it frees before removing anything.
+
+Almost all of it is containerd's: compressed image blobs in its content store, and those same
+layers unpacked by the snapshotter. One 'boks create' of the base image costs about a
+gigabyte, and nothing ever collects it. Uninstalling Boks does not, either — a package
+manager owns the files it installed, not the ones a program later wrote — so this is the
+command that does.
+
+By default it takes containerd's root and the per-sandbox state, and keeps the four things
+you would be upset to lose without being asked: the local certificate authority, credentials
+stored with 'boks secret set', the rules added with 'boks policy allow', and the decision log.
+\--all removes those too and leaves nothing of Boks on this machine.
+
+It destroys sandboxes even without --all. containerd keeps image layers and each sandbox's
+filesystem in one root, so there is no way to drop the images and keep the sandboxes. Run
+'boks ls' first; 'boks rm' is the command for one sandbox.
+
+Removal is refused while the managed containerd is running or a sandbox's network is up, so
+that nothing is deleted from under a process still using it. Stop them, or pass --force.
+
+Nothing outside the state directory is ever touched, and neither is anything inside it that
+Boks did not write: the entries removed come from a fixed list of names, not from walking the
+directory, and everything else is reported as left alone.
+
+```
+boks purge --dry-run     # what is there, and what it would free
+  boks purge               # give the disk back, keep the CA and your rules
+  boks purge --all         # leave nothing behind, before uninstalling
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--all` |  | also remove the CA, stored credentials, policy rules and the decision log |
+| `--dry-run` |  | print what would be removed and stop |
+| `--force` |  | remove even though the daemon or a sandbox network is running |
+| `-y`, `--yes` |  | do not ask for confirmation |
+
 ## boks rm
 
 Delete a sandbox and its filesystem
