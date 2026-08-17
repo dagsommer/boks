@@ -235,8 +235,14 @@ func (f *policyFlags) credentialRules() ([]secret.Credential, error) {
 // The distinction it draws is the one that matters: the network stack is the control, and
 // it holds whether or not the guest cooperates; the proxy variables are how a cooperating
 // guest gets hostname rules, credentials and a readable refusal instead of a socket that
-// fails. What is still unproven is stated in the same breath, because this project has
-// never seen a policy applied to a real VM.
+// fails.
+//
+// It used to close with the transcript that established all of this — the date, the host, the
+// hypervisor, a pointer to docs/verification.md. That belongs in the evidence record and not
+// in front of a user, who can act on none of it: they need to know what boks does to their
+// traffic, not which machine proved it. The claim's provenance is docs/verification.md's job.
+// What survives is the pointer to docs/security-model.md, because "here is what this boundary
+// does not cover" is something a reader decides with.
 const enforcementNote = `The sandbox's network is terminated on the host: the guest's NIC ends in a network
 stack in a boks process, which judges every TCP connection the guest opens against
 these rules — from the address and port in the packet — before it dials anything.
@@ -250,11 +256,7 @@ and readable refusals, and gains it nothing: a raw socket is still judged, just 
 addresses rather than names. A policy written only in hostnames therefore denies raw
 flows rather than permitting the addresses those names resolve to.
 
-Measured against a real guest on 2026-08-12, on macOS with a hypervisor: a sandbox
-with every proxy variable unset was refused a denied host and a denied address, and
-reached an allowed address end to end with the origin's own certificate. Both showed
-up in the log as transparent. See docs/verification.md for the transcript, and
-docs/security-model.md for what is still open — Linux is not covered by that run.`
+See docs/security-model.md for the limits of this boundary and what is still open.`
 
 // noNetworkNotice is what -net none says for itself. It is the strongest containment Boks
 // offers and the only one whose enforcement does not depend on code that has yet to meet a
