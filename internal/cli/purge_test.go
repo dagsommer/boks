@@ -57,8 +57,11 @@ func TestPurgeReclaimsDiskAndKeepsIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boks purge: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "4.0 KiB") {
-		t.Errorf("the output never says how much it freed:\n%s", out)
+	// The removal line specifically, not just the figure: the plan printed above already
+	// carries "4.0 KiB", so an assertion on the number alone would hold even if the
+	// command never reported what it actually did.
+	if !strings.Contains(out, "removed 4.0 KiB from "+root) {
+		t.Errorf("the output never says how much it freed and from where:\n%s", out)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "containerd")); !os.IsNotExist(err) {
 		t.Errorf("containerd's root survived: %v", err)
