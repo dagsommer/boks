@@ -217,11 +217,18 @@ func (s Spec) proxyPort() int {
 // simply not logged in.
 func (s Spec) intercepts() bool { return s.Intercept && (len(s.Inject) > 0 || len(s.OAuth) > 0) }
 
-// certDir is the host directory shared into the guest as GuestCADir. It is per-sandbox and
+// CertDir is the host directory shared into the guest as GuestCADir. It is per-sandbox and
 // contains public certificates only.
-func (s Spec) certDir() string {
-	return filepath.Join(s.StateDir, "certs", sanitize(s.Sandbox))
+//
+// Exported because three places need the same answer and used to compute it separately: the
+// spec that mounts it, Forget that removes it when a sandbox is removed, and `boks purge`,
+// whose whole correctness rests on knowing every directory Boks writes.
+func CertDir(stateDir, sandbox string) string {
+	return filepath.Join(stateDir, "certs", sanitize(sandbox))
 }
+
+// certDir is CertDir for a spec.
+func (s Spec) certDir() string { return CertDir(s.StateDir, s.Sandbox) }
 
 // Guest is what a sandbox has to be created and started with for the network to reach it.
 type Guest struct {
