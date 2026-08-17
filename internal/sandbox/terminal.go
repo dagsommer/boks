@@ -8,6 +8,39 @@ import (
 	"github.com/containerd/containerd/v2/client"
 )
 
+// terminalEnv returns the host's terminal environment variables in KEY=VALUE form, for
+// forwarding into the guest when a TTY is in use. Only variables that are set on the host
+// are included. Callers use replaceOrAppendEnv to layer these as overrides, so explicit
+// --env flags passed by the user take precedence.
+//
+// The five vars included:
+//
+//   - TERM: the terminfo key — colors, cursor movement, and everything terminfo provides.
+//   - COLORTERM: signals true-color support to clients that check it ("truecolor" / "24bit").
+//   - TERM_PROGRAM: the terminal emulator's identity, used by some apps for keyboard-protocol
+//     and feature negotiation (e.g. Kitty keyboard protocol, Shift-Enter handling in Claude Code).
+//   - TERM_PROGRAM_VERSION: complements TERM_PROGRAM for version-gated features.
+//   - TERMINAL_EMULATOR: the JetBrains terminal emulator identity, set instead of TERM_PROGRAM.
+//   - NO_COLOR: user intent to suppress color output. Checked for presence, not value — the
+//     convention is "set at all, even to empty".
+//
+// Deliberately excluded: TERMINFO / TERMINFO_DIRS (host paths, meaningless in the guest);
+// TMUX, STY, ITERM_SESSION_ID, KITTY_LISTEN_ON (session handles for sockets not in the guest).
+func terminalEnv() []string {
+	var env []string
+	for _, k := range []string{"TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERMINAL_EMULATOR"} {
+		if v := os.Getenv(k); v != "" {
+			env = append(env, k+"="+v)
+		}
+	}
+	// NO_COLOR: the convention is "variable is set, value is irrelevant" — include it even
+	// when empty so the guest respects the user's intent.
+	if _, ok := os.LookupEnv("NO_COLOR"); ok {
+		env = append(env, "NO_COLOR="+os.Getenv("NO_COLOR"))
+	}
+	return env
+}
+
 // attachTerminal prepares the host terminal for a process running with a TTY, and returns a
 // function that puts it back.
 //
