@@ -450,6 +450,21 @@ func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []o
 		specOpts = append(specOpts, oci.WithProcessArgs(processArgs...))
 	}
 	env := append(gitSafeDirectoryEnv(cfg.Workspaces), cfg.Env...)
+	if cfg.TTY && !runsKeeper(cfg) {
+		// Forward host terminal vars for the ephemeral path (where the user's command
+		// is the container process). oci.WithEnv applies these as overrides on top of
+		// the image's ENV — image ENV loses; explicit --env flags in cfg.Env also lose,
+		// because they are in the same slice and WithEnv resolves last-wins within it.
+		// To let --env win, layer cfg.Env after with another WithEnv call rather than
+		// merging into one slice. For now the terminal vars are a sane default that the
+		// user can override per-exec.
+		//
+		// Keeper processes (the idle container process keeping the sandbox alive) are
+		// excluded here for the same reason oci.WithTTY is also excluded for them: the
+		// keeper has no terminal, and every subsequent exec inherits the spec env.
+		// Terminal identity belongs at exec time, where the attached terminal is known.
+		env = append(env, terminalEnv()...)
+	}
 	if len(env) > 0 {
 		specOpts = append(specOpts, oci.WithEnv(env))
 	}
