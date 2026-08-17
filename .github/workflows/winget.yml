@@ -20,10 +20,11 @@
 #
 # WHAT A GREEN RUN MEANS. The manifests render with no placeholder left behind, and the three
 # rendered documents are schema-valid against microsoft/winget-cli's own JSON schemas for the
-# ManifestVersion they declare. It does NOT mean `winget validate` passed, that winget can
-# install the package, or that winget-pkgs' submission pipeline will accept it — nobody on
-# this project has a Windows machine and none of those has ever been run. See
-# packaging/winget/README.md.
+# ManifestVersion they declare. It does NOT mean winget-pkgs' submission pipeline will accept
+# them, which has never been run. `winget validate` and `winget install --manifest` HAVE been
+# run once, by hand, against the rendered v0.1.1 manifests on Windows 11 — see
+# docs/verification.md — but neither runs here: both need Windows, and a job on a Linux runner
+# cannot be the thing that catches a regression in them. See packaging/winget/README.md.
 name: winget
 
 on:
@@ -76,6 +77,41 @@ jobs:
             "$PWD/dist/winget"
           echo "--- rendered:"
           cat dist/winget/manifests/d/dagsommer/boks/9.9.9/*.yaml
+
+      # The house style winget-pkgs enforces on every file in it, which the JSON schemas
+      # cannot express and validate.py therefore cannot check. `.editorconfig` in winget-pkgs
+      # sets `end_of_line = crlf` for `[*]` and `charset = utf-8`, and every manifest merged
+      # there is CRLF with no BOM. render.sh emits that; without this step nothing would
+      # notice if it stopped, because a manifest with the wrong line endings is still
+      # schema-valid, still parses, and still installs.
+      - name: The rendered manifests are CRLF, UTF-8, and carry no BOM
+        run: |
+          set -euo pipefail
+          rendered=dist/winget/manifests/d/dagsommer/boks/9.9.9
+          for f in "$rendered"/*.yaml; do
+            # Every line must end CRLF: no line may end in a byte other than \r before \n.
+            if grep -qU $'[^\r]$' "$f"; then
+              echo "NOT CRLF: $f has at least one line without a carriage return" >&2
+              grep -nU $'[^\r]$' "$f" >&2
+              exit 1
+            fi
+            # A BOM would be the first three bytes EF BB BF. winget-pkgs is utf-8, not
+            # utf-8-bom, and Tools/YamlCreate.ps1 writes with $Utf8NoBomEncoding.
+            if [ "$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then
+              echo "BOM PRESENT: $f starts with a UTF-8 byte order mark" >&2
+              exit 1
+            fi
+            echo "  crlf, no bom: $(basename "$f")"
+          done
+          # And the control: an LF copy must be rejected by the same test, or the test above
+          # is passing for a reason other than the one it claims.
+          rm -rf /tmp/wg-lf && mkdir -p /tmp/wg-lf
+          tr -d '\r' <"$rendered/dagsommer.boks.yaml" >/tmp/wg-lf/dagsommer.boks.yaml
+          if ! grep -qU $'[^\r]$' /tmp/wg-lf/dagsommer.boks.yaml; then
+            echo "CONTROL FAILED: an LF manifest was not detected as one" >&2
+            exit 1
+          fi
+          echo "  rejected, as it must: an LF-terminated manifest"
 
       # ---------------------------------------------------------------------------------
       # NEGATIVE CONTROLS, in the shape linux-runtime.yml uses for assert-elf.py. Each is a

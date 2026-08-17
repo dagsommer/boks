@@ -10,10 +10,31 @@
 #|
 #| No ArchiveBinariesDependOnPath
 #|     Setting it true would put the whole extracted directory on the user's PATH —
-#|     containerd.exe and ctr.exe included, shadowing a containerd they installed on
-#|     purpose. Omitting it makes winget create one alias, `boks`, and leave the rest
-#|     invisible. Boks finds its own bundle without PATH's help: internal/daemon/locate.go
-#|     resolves the executable, follows the symlink, and searches the directory it lands in.
+#|     containerd.exe, ctr.exe, mkfs.erofs.exe and mkfs.ext4.exe included, shadowing a
+#|     containerd the user installed on purpose. Leaving it unset does NOT reliably avoid
+#|     that, and saying it did was this file's mistake. winget's own documentation states
+#|     the fallback: unset or false "will use the default behavior of adding a symlink to
+#|     the links folder, if supported, or adding the install location directly to PATH if
+#|     symlinks are not supported" (doc/manifest/schema/1.12.0/installer.md). On 2026-08-16
+#|     symlinks were NOT supported on the test machine — Developer Mode off, unelevated,
+#|     `SYMLINK REFUSED: Administrator privilege required` — so winget took the second
+#|     branch and put this directory on the User PATH. Three other winget packages on that
+#|     machine were on PATH the same way, so it is winget's ordinary unprivileged outcome
+#|     rather than one machine's quirk.
+#|
+#|     Unset is still the right value, because it is the only one that lets a machine which
+#|     CAN make symlinks get the clean outcome; true would force the shadowing everywhere.
+#|     But the honest description is "one alias where symlinks work, the whole directory on
+#|     PATH where they do not", and the second case is the common one. The real fix is an
+#|     archive layout change, not a field here: winget adds
+#|     `symlinkTargetPath.parent_path()` — the directory holding the nested exe — so a
+#|     `bin/boks.exe` beside `libexec/boks/` would put only `bin/` on PATH. See
+#|     packaging/winget/README.md; it is not done at 0.1.1 because the published archive is
+#|     flat and this manifest must describe the archive that exists.
+#|
+#|     None of this affects Boks finding its own runtime: internal/daemon/locate.go resolves
+#|     the running executable, follows symlinks, and searches the directory it lands in, and
+#|     on 2026-08-16 every runtime path resolved inside the winget package directory.
 #|
 #| MinimumOSVersion: 10.0.22000.0
 #|     Windows 11 RTM. The Windows Hypervisor Platform predates it, but Windows 11 is the
@@ -23,16 +44,28 @@
 #| x64 only
 #|     There is no Windows arm64 build. libkrun's WHP backend here is x86_64, and so is the
 #|     guest kernel that has booted under it.
+#|
+#| RelativeFilePath uses a FORWARD slash, deliberately
+#|     Merged manifests use both. BurntSushi.ripgrep.MSVC 14.1.1 writes a backslash;
+#|     sharkdp.fd 10.4.2 — ManifestVersion 1.12.0, written by komac, merged 2026-03 — writes
+#|     a forward slash. The forward slash is also what the archive's own central directory
+#|     contains, which is what the zip format requires. `winget install --manifest` accepted
+#|     it on 2026-08-16. Do not "correct" this to a backslash.
+#|
+#| Field order follows the JSON schema's own property order — Platform and MinimumOSVersion
+#| come BEFORE InstallerType, which is not where this file used to put them. Same reasoning
+#| as the locale manifest: nothing rejects the other order, but every tool that might ever
+#| rewrite this manifest emits the schema order.
 # Created by packaging/winget/render.sh in github.com/dagsommer/boks
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
 
 PackageIdentifier: dagsommer.boks
 PackageVersion: {{VERSION}}
-InstallerType: zip
-NestedInstallerType: portable
 Platform:
 - Windows.Desktop
 MinimumOSVersion: 10.0.22000.0
+InstallerType: zip
+NestedInstallerType: portable
 Commands:
 - boks
 ReleaseDate: {{RELEASE_DATE}}

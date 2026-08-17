@@ -1,11 +1,51 @@
 #| Lines beginning "#|" are stripped by render.sh.
 #|
 #| `Copyright` is deliberately absent. The repository's LICENSE is the plain Apache-2.0 text
-#| with no copyright line in it, and inventing one for a package manifest would assert
-#| something no file in this project asserts. The field is optional.
+#| and its APPENDIX is unfilled — no file in this project asserts a copyright holder, so a
+#| manifest submitted to someone else's repository must not be the first thing that does.
+#| The field is optional (doc/manifest/schema/1.12.0/defaultLocale.md).
 #|
 #| `Icons` is absent because winget-pkgs populates it in its own validation pipeline; it is
 #| not authorable in a pull request.
+#|
+#| FIELD ORDER follows the JSON schema's own property order, which is also the order komac
+#| serialises in (winget-types, src/manifests/locale/mod.rs): ... Moniker, Tags, Agreements,
+#| ReleaseNotes, ReleaseNotesUrl, PurchaseUrl, InstallationNotes, Documentations, Icons,
+#| ManifestType, ManifestVersion. Note that this DISAGREES with the YAML sketch at the top of
+#| doc/manifest/schema/1.12.0/defaultLocale.md, which lists Documentations before
+#| ReleaseNotes; the schema and the tooling agree with each other and the sketch is the
+#| outlier, so we follow the schema. This file used to put Documentations before
+#| InstallationNotes. Nothing rejects either order — the point is that any tool which ever
+#| rewrites this manifest will emit the schema order, and a gratuitous reordering diff on a
+#| later version is a question we would rather not be asked.
+#|
+#| Every github.com URL below is pinned to the RELEASE TAG, not to `main`. winget-pkgs asks
+#| for this explicitly for the licence — "If this is a link to the license file for an open
+#| source project, it should be specific to the version for the package" — and the same
+#| argument holds for the documents: a manifest for 0.1.1 that links `blob/main/` describes
+#| whatever those files say years later, and 404s outright if one is renamed. A merged
+#| manifest is never revised, so the URL has to be one that keeps meaning what it meant.
+#| `PublisherUrl`, `PublisherSupportUrl` and `PackageUrl` stay unpinned on purpose: they name
+#| the account, the issue tracker and the project, none of which is version-specific.
+#|
+#| `ReleaseNotes` is absent — render.sh has no input for it and inventing prose per release
+#| is the kind of step nobody remembers. `ReleaseNotesUrl` carries the same information and
+#| cannot go stale. If winget-releaser ever drives this package, komac fills `ReleaseNotes`
+#| in from the GitHub release body by itself.
+#|
+#| `PrivacyUrl` is absent because there is no privacy policy to point at, which is the
+#| honest answer for software that makes no network call of its own.
+#|
+#| `InstallationNotes` is what winget prints AFTER the install finishes, so it is written for
+#| somebody who has just installed the thing and wants to use it — three commands, and the
+#| one prerequisite that is not ours to install. Two things it used to say are gone. It said
+#| "so the `boks` alias is on PATH": on 2026-08-16 winget created no alias, because symlink
+#| creation was refused without Developer Mode and winget fell back to putting the package
+#| directory on PATH, so the sentence named a mechanism that had not happened. And it carried
+#| a paragraph explaining that a winget install does not raise SmartScreen — true, and
+#| measured, but it is an explanation of something that did NOT occur, addressed to a reader
+#| of the manifest rather than to the person who just installed Boks. docs/install.md is
+#| where that belongs and is where it still is.
 # Created by packaging/winget/render.sh in github.com/dagsommer/boks
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
 
@@ -19,7 +59,7 @@ Author: Dag Sommer
 PackageName: Boks
 PackageUrl: https://github.com/dagsommer/boks
 License: Apache-2.0
-LicenseUrl: https://github.com/dagsommer/boks/blob/main/LICENSE
+LicenseUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/LICENSE
 ShortDescription: Run coding agents and other untrusted developer tooling in local microVMs
 Description: >-
   Boks runs coding agents and other untrusted developer tooling inside isolated microVMs on
@@ -46,23 +86,20 @@ Tags:
 - security
 - virtualization
 ReleaseNotesUrl: https://github.com/dagsommer/boks/releases/tag/v{{VERSION}}
-Documentations:
-- DocumentLabel: Installing Boks
-  DocumentUrl: https://github.com/dagsommer/boks/blob/main/docs/install.md
-- DocumentLabel: What has actually been verified
-  DocumentUrl: https://github.com/dagsommer/boks/blob/main/docs/verification.md
-- DocumentLabel: Boks on Windows
-  DocumentUrl: https://github.com/dagsommer/boks/blob/main/docs/windows.md
 InstallationNotes: |-
-  Open a new terminal so the `boks` alias is on PATH, then:
+  Open a new terminal so that boks is on PATH, then:
 
     boks doctor          check every prerequisite and print a remedy for each gap
     boks daemon start    start the containerd this package ships, configured for Boks
     boks run shell .     run a sandbox over the current directory
 
-  This package is not code-signed. A winget install did not raise SmartScreen when this
-  was measured, because winget verifies the installer hash itself rather than launching
-  the binary through Explorer; a browser download of the same archive does raise it. See
-  docs/install.md.
+  Boks needs the Windows Hypervisor Platform. It is not code-signed; see docs/install.md.
+Documentations:
+- DocumentLabel: Installing Boks
+  DocumentUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/docs/install.md
+- DocumentLabel: What has actually been verified
+  DocumentUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/docs/verification.md
+- DocumentLabel: Boks on Windows
+  DocumentUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/docs/windows.md
 ManifestType: defaultLocale
 ManifestVersion: 1.12.0
