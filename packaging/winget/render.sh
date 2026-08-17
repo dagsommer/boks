@@ -19,10 +19,12 @@
 # Template lines beginning `#|` are our own notes and are stripped, so what reaches
 # winget-pkgs is a manifest rather than a manifest plus an essay about it.
 #
-# This has never been run against winget itself. See packaging/winget/README.md: no one on
-# this project has a Windows machine, `winget validate` has not been run on these files,
-# and the only checking they have had is the schema validation this script performs at the
-# end, on Linux, against the JSON schemas winget-pkgs' own tooling targets.
+# What this output has been through, as of 2026-08-16: `winget validate` passed on it and
+# `winget install --manifest` installed and ran it on Windows 11, unelevated
+# (docs/verification.md, "winget delivery, tested locally before any submission"). What it
+# has NOT been through is winget-pkgs' submission pipeline, which re-downloads the archive,
+# scans it, and installs it as a standard user on a machine we do not control. The schema
+# validation this script runs at the end is a document check and is the weakest of the three.
 set -euo pipefail
 
 version="${1:?usage: render.sh <version> <sha256-or-zip-path> [outdir]}"
@@ -84,11 +86,22 @@ for template in "$here"/manifests/*.yaml.in; do
 	# `#|` lines are notes to us. They are deleted first, so a note may mention a
 	# placeholder without the substitutions below turning it into nonsense — and so the
 	# file that reaches winget-pkgs carries a manifest and not our reasoning about it.
+	#
+	# The last expression makes every line CRLF. That is not cosmetic and it is not a
+	# preference: winget-pkgs' own `.editorconfig` sets `end_of_line = crlf` for `[*]`,
+	# with only three spell-check text files exempted, and every manifest merged into that
+	# repository is CRLF on the wire — checked against BurntSushi.ripgrep.MSVC 14.1.1 and
+	# sharkdp.fd 10.4.2, the latter written by komac at ManifestVersion 1.12.0. LF cost us
+	# nothing technically (YAML normalises line breaks, which is why a CRLF block scalar
+	# like fd's ReleaseNotes parses at all) but it made every line of our submission differ
+	# in whitespace from every neighbouring file, which is a reviewer's comment waiting to
+	# happen. The templates stay LF; only the rendered output changes.
 	sed \
 		-e '/^#|/d' \
 		-e "s|{{VERSION}}|${version}|g" \
 		-e "s|{{INSTALLER_SHA256}}|${sha256}|g" \
 		-e "s|{{RELEASE_DATE}}|${release_date}|g" \
+		-e 's/$/\r/' \
 		"$template" >"$dest/$name"
 done
 
