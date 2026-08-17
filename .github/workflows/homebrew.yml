@@ -1,0 +1,113 @@
+# Render the Homebrew tap formulae and push them to dagsommer/homebrew-boks on every
+# published release.
+#
+# The release workflow builds the binaries and uploads SHA256SUMS; this one stamps the
+# formula templates with the version and the two digests it needs, then commits the result
+# to the tap repository. `brew update` on a tap repository is a git pull, so a new commit
+# there is what `brew upgrade boks` pulls.
+#
+# TWO DIGESTS, FROM TWO DIFFERENT SOURCES
+#
+# The formula's `url` points at GitHub's auto-generated source tarball:
+#
+#   https://github.com/dagsommer/boks/archive/refs/tags/v{{VERSION}}.tar.gz
+#
+# GitHub generates it from the tag, not from this project, so it is not in SHA256SUMS.
+# This job fetches it and hashes it directly.
+#
+# The formula's `guest` resource points at the guest archive in the release:
+#
+#   boks-guest_{{VERSION}}_arm64.tar.gz
+#
+# That IS in SHA256SUMS, so render.sh reads it from there rather than fetching it again.
+#
+# CREDENTIALS
+#
+# GITHUB_TOKEN is scoped to dagsommer/boks and cannot write to dagsommer/homebrew-boks,
+# even though both repositories are in the same account. HOMEBREW_TAP_TOKEN must be a
+# fine-grained PAT with Contents: read+write and Pull requests: read+write on
+# dagsommer/homebrew-boks only. Store it in dagsommer/boks → Settings → Secrets → Actions.
+#
+# The tap repository must exist before this workflow can push to it. Create it with
+# `gh repo create dagsommer/homebrew-boks --public` (or via the GitHub UI) if it does not.
+name: homebrew
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  tap:
+    name: Update dagsommer/homebrew-boks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Strip the leading v from the tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "version=${version}" >>"$GITHUB_OUTPUT"
+          echo "tag=${tag}"
+          echo "version=${version}"
+
+      - name: Download SHA256SUMS from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir dist/
+
+      - name: Hash the GitHub source tarball
+        id: source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${VERSION}.tar.gz"
+          echo "Fetching ${url}"
+          sha256="$(curl -sL "$url" | sha256sum | cut -d' ' -f1)"
+          echo "sha256=${sha256}" >>"$GITHUB_OUTPUT"
+          echo "source sha256: ${sha256}"
+
+      - name: Render the formulae
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_SHA256: ${{ steps.source.outputs.sha256 }}
+        run: |
+          packaging/homebrew/render.sh \
+            "$VERSION" \
+            "$SOURCE_SHA256" \
+            dist/SHA256SUMS
+
+      - name: Checkout the tap repository
+        uses: actions/checkout@v5
+        with:
+          repository: dagsommer/homebrew-boks
+          path: tap-repo
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Copy rendered files into the tap
+        run: |
+          cp -r dist/homebrew/Formula tap-repo/
+          cp dist/homebrew/README.md tap-repo/
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd tap-repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ README.md
+          if git diff --cached --quiet; then
+            echo "Nothing changed in the tap — already up to date."
+            exit 0
+          fi
+          git commit -m "boks ${VERSION}"
+          git push
