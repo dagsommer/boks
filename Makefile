@@ -84,6 +84,24 @@ release-notes:
 	@test -n "$(TAG)" || { echo "usage: make release-notes TAG=vX.Y.Z [INSERT=--insert]" >&2; exit 2; }
 	./scripts/release-notes.sh $(INSERT) $(TAG)
 
+# Bump the version, commit, tag, and push. The tag push triggers release.yml, which builds
+# and publishes the GitHub release; homebrew.yml then fires on the published event and
+# updates the tap. `brew upgrade boks` picks it up from there.
+#
+# Usage: make release VERSION=0.1.2
+release:
+	@test -n "$(VERSION)" || { echo "usage: make release VERSION=x.y.z" >&2; exit 2; }
+	@git diff --quiet && git diff --cached --quiet || { echo "release: working tree is dirty; commit or stash first" >&2; exit 2; }
+	perl -i -pe 's/^(const ImageTag = )"[^"]*"/$${1}"$(VERSION)"/' internal/agent/agent.go
+	git add internal/agent/agent.go
+	git commit -m "release: $(VERSION)"
+	git tag v$(VERSION)
+	git push origin main
+	git push origin v$(VERSION)
+	@echo ""
+	@echo "v$(VERSION) tagged and pushed. The release pipeline is now running:"
+	@echo "  https://github.com/dagsommer/boks/actions"
+
 # --- winget manifests ---------------------------------------------------------------
 #
 # Renders packaging/winget/manifests/*.yaml.in and checks the result against winget's own
