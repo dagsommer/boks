@@ -320,7 +320,11 @@ func Builtin() *Registry {
 		},
 		{
 			Name: "claude", Summary: "Claude Code", Image: Image("claude"),
-			Command: []string{"claude"},
+			// --dangerously-skip-permissions suppresses Claude Code's per-action
+			// permission prompts. The VM boundary is the containment layer here;
+			// asking the agent to confirm its own actions inside the sandbox adds
+			// friction without adding isolation.
+			Command: []string{"claude", "--dangerously-skip-permissions"},
 			Allow: []Destination{
 				// Observed: a real `boks run claude` under the standard preset was
 				// refused here, and the agent could not start work until it was
