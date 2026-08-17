@@ -3,11 +3,12 @@
 
     packaging/winget/validate.py dist/winget/manifests/d/dagsommer/boks/0.1.0
 
-This exists because the real validator, `winget validate`, runs only on Windows and nobody
-on this project has a Windows machine to run it on. What this does instead is the part that
-is portable: winget's manifest schemas are ordinary draft-07 JSON Schema, published in
-microsoft/winget-cli, so the same documents winget checks against can be checked against
-here.
+This exists because the real validator, `winget validate`, runs only on Windows, so no CI job
+here can run it and no change under packaging/winget/ can be checked by it. What this does
+instead is the part that is portable: winget's manifest schemas are ordinary draft-07 JSON
+Schema, published in microsoft/winget-cli, so the same documents winget checks against can be
+checked against here. `winget validate` has been run by hand, once, on the rendered v0.1.1
+manifests (docs/verification.md, 2026-08-16); this script is what runs on every commit.
 
 Be precise about what a pass means and does not mean. It means ALL THREE files are present,
 parse as YAML, carry the fields the schema requires, violate none of its patterns, enums or

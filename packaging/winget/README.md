@@ -4,13 +4,19 @@ The manifests that put Boks in `winget install boks`, and the part of getting th
 that a repository cannot do for itself.
 
 > [!IMPORTANT]
-> **None of this has been run.** Nobody on this project has a Windows machine to hand while
-> writing it, `winget validate` runs only on Windows, and no manifest here has been
-> submitted anywhere. What *has* been run is the schema validation described under
-> [What has actually been checked](#what-has-actually-been-checked) — on Linux, against
-> winget's own published JSON schemas, with a negative control. That is a document check and
-> not an install. Treat the first `winget install boks` as the test, and expect it to fail
-> the first time.
+> **What has been run, and what has not.** On 2026-08-16 the rendered v0.1.1 manifests were
+> put through `winget validate` and `winget install --manifest` on Windows 11: the install
+> succeeded unelevated in 8.68 s, `boks doctor` was green, and `boks run shell .` booted a
+> sandbox. That is recorded in
+> [`docs/verification.md`](../../docs/verification.md#winget-delivery-tested-locally-before-any-submission-2026-08-16),
+> together with the two things it did *not* establish — no symlink was created, so the
+> symlink indirection is still untested, and `winget uninstall dagsommer.boks` by identifier
+> failed.
+>
+> **Nothing has been submitted to `microsoft/winget-pkgs`.** That pipeline re-downloads the
+> archive, scans it with multiple AV engines, and installs it as a standard user on a machine
+> we do not control; none of that has happened. The local install is the strongest evidence
+> here and it is still one machine.
 
 ## What is here
 
@@ -105,25 +111,59 @@ the directory it lands in — the "tarball, everything side by side" case named 
 comment. So an extracted bundle needs no configuration, no environment variable and no PATH
 entry for Boks to find its own containerd, shim and guest images.
 
-### `ArchiveBinariesDependOnPath` is deliberately absent
+### `ArchiveBinariesDependOnPath` is deliberately absent — and the fallback is the normal case
 
 Setting it `true` tells winget to put the whole extracted directory on the user's `PATH`.
-That would place `containerd.exe` and `ctr.exe` there too, shadowing a containerd the user
-installed on purpose — the exact harm `docs/distribution.md` gives as the reason a `.deb`
-should put the runtime in `/usr/libexec/boks/` rather than on `PATH`.
+That would place `containerd.exe`, `ctr.exe`, `mkfs.erofs.exe` and `mkfs.ext4.exe` there too,
+shadowing a containerd the user installed on purpose — the exact harm `docs/distribution.md`
+gives as the reason a `.deb` should put the runtime in `/usr/libexec/boks/` rather than on
+`PATH`.
 
-Leaving it unset makes winget create one symlink named `boks` in its own links directory,
-which is already on `PATH`, and leave everything else invisible. Read from
-`winget-cli/src/AppInstallerCLICore/PortableInstaller.cpp`, that path is safe unelevated:
-when `CreateSymlink` fails, winget falls back to adding the package directory to `PATH`
-rather than failing the install. **The consequence worth naming: on a machine where symlink
-creation fails, the fallback puts the bundle directory on `PATH` and the shadowing above
-happens anyway.** If that turns out to matter, the fix is small and already supported at the
-other end — lay the archive out as `bin/boks.exe` beside `libexec/boks/`, which `locate.go`
-already searches as `<exe dir>/../libexec/boks`. Three lines move together: `RelativeFilePath`
-here, the layout in `release.yml`'s `assemble` job, and the assertion in it that checks the
-path. The flat layout is what ships because it is what this manifest already declared, and
-because the shadowing needs a symlink failure first.
+winget's own documentation states what unset means, and it is not "no `PATH` changes":
+
+> Specifying `false` or leaving the value unset will use the default behavior of adding a
+> symlink to the `links` folder, if supported, or **adding the install location directly to
+> `PATH` if symlinks are not supported**.
+>
+> — `winget-pkgs/doc/manifest/schema/1.12.0/installer.md`
+
+**This file used to say the fallback was an edge case. It is the ordinary outcome.** On
+2026-08-16, on Windows 11 with Developer Mode off and no elevation, `WinGet\Links` was empty
+and not on `PATH`; winget created no symlink (`SYMLINK REFUSED: Administrator privilege
+required`) and put the package directory on the User `PATH` instead. Three other winget
+packages on the same machine were installed the same way. So on a default unprivileged
+Windows install, everything in the bundle is on `PATH` today.
+
+Unset is still the right value, because it is the only one under which a machine that *can*
+create symlinks gets the clean outcome; `true` would force the shadowing everywhere. But the
+accurate description of the package's behaviour is "one alias where symlinks work, the whole
+directory on `PATH` where they do not, and the second is what an ordinary user gets".
+
+**Restructuring the archive would fix it, and the winget source says exactly how.** Both
+branches in `winget-cli/src/AppInstallerCLICore/PortableInstaller.cpp` put the same thing on
+`PATH` — `symlinkTargetPath.parent_path()`, the directory *containing the nested target
+executable*, not the package root:
+
+```cpp
+// ArchiveBinariesDependOnPath == true
+std::filesystem::path installDirectory = symlinkTargetPath.parent_path();
+AddToPathVariable(installDirectory);
+...
+// symlink creation failed
+AddToPathVariable(symlinkTargetPath.parent_path());
+```
+
+Because the archive is flat, that parent directory is the one holding `containerd.exe`. Lay
+it out as `bin/boks.exe` beside `libexec/boks/` and only `bin/` is ever added — the runtime
+stays off `PATH` in every branch, including `true`. Boks would still find it: `locate.go`
+searches `<exe dir>/../libexec/boks` before the executable's own directory.
+
+That change is **not** made here, because it would mean the manifest described an archive
+different from the one already published and install-tested at v0.1.1. It is a release-layout
+decision, and three things move together when it is taken: `RelativeFilePath` here, the layout
+in `release.yml`'s `assemble` job, and that job's assertion on the path. What *is* fixed here
+is this file, which claimed the shadowing needed "a symlink failure first" as though that were
+rare. It is the default outcome on an unprivileged machine.
 
 ### Other choices
 
@@ -183,11 +223,26 @@ skipped schema validation" becomes a failure rather than a green run that checke
 documented here and in `docs/distribution.md` and invoked by no workflow, no Makefile target
 and no test, so the first thing to exercise them would have been a release.
 
-**What a pass does not mean.** It does not mean winget will install the package. It says
-nothing about whether the installer URL resolves, whether the SHA-256 matches the archive at
-that URL, whether `boks.exe` is at that path inside the archive, whether the symlink is
-created, whether `boks --version` runs afterwards, or whether winget-pkgs' pipeline accepts
-the submission. Those are runtime facts and this is a document check.
+**4. The house style winget-pkgs enforces on every file in it.** Added 2026-08-17, after an
+audit against `doc/README.md#authoring-a-manifest` and everything it links. Two of these are
+things a JSON schema cannot see:
+
+- **CRLF line endings.** winget-pkgs' `.editorconfig` sets `end_of_line = crlf` for `[*]`,
+  exempting only three spell-check text files, and every manifest merged there is CRLF on the
+  wire — checked against `BurntSushi.ripgrep.MSVC` 14.1.1 and `sharkdp.fd` 10.4.2, the latter
+  written by komac at ManifestVersion 1.12.0. `render.sh` now emits CRLF. UTF-8 **without** a
+  BOM, which is what those two files are and what `YamlCreate.ps1` writes
+  (`$Utf8NoBomEncoding`).
+- **Field order follows the JSON schema's property order**, which is also komac's
+  serialisation order. Two keys were out of place and are now fixed; the reasoning is in the
+  templates.
+
+**What a pass does not mean.** It does not mean winget-pkgs' pipeline will accept the
+submission — that pipeline is ten steps long and only one of them is a schema check. Three
+things this validator cannot see were settled by the 2026-08-16 install instead of by
+inference: the URL resolves, the SHA-256 matches the archive at it, and `boks.exe` is at the
+declared path inside it. One thing it still cannot see, and neither could that install: the
+symlink was never created, so nothing has yet exercised the indirection.
 
 ## Submitting to microsoft/winget-pkgs
 
@@ -218,12 +273,10 @@ release plan acquires a step nobody owns.
    contributors get more scrutiny, and a first-ever package from an unknown publisher is as
    infrequent as it gets. If it sits more than a day, the documented remedy is to ping a
    moderator.
-7. **Then, and only then, automate the next one.** `vedantmgoyal9/winget-releaser` (which
-   drives Komac) updates an existing package from a release: it needs a **classic** PAT with
-   `public_repo` scope — fine-grained tokens are not supported — and a fork of winget-pkgs
-   under the same account. **It cannot bootstrap the first submission**, because it derives
-   the new manifests from a previous version that has to already be in the repository. So
-   step 4 is a human step exactly once.
+7. **Do the next one by hand too.** This step used to say "then automate it with
+   `vedantmgoyal9/winget-releaser`". That was read from the action's README and is now
+   read from its source, and the source says the automation cannot author *this* package.
+   See [Automating later versions](#automating-later-versions-and-why-winget-releaser-is-not-wired-in-yet).
 
 ### What we should expect to go wrong
 
@@ -248,21 +301,144 @@ Ownership is *not* a problem: winget-pkgs is a community repository and third pa
 packages they do not own routinely. What it enforces is the provenance of the URL, not the
 identity of the submitter.
 
+## Automating later versions, and why winget-releaser is not wired in yet
+
+`vedantmgoyal9/winget-releaser` is the obvious candidate: a GitHub Action that drives
+[Komac](https://github.com/russellbanks/Komac) to open the winget-pkgs pull request from a
+published release. It is **not** in `.github/workflows/`, and the reason is not caution in
+general — it is a specific, sourced defect that would produce an invalid manifest for this
+package every single time.
+
+### It cannot make the first submission. Confirmed, three ways.
+
+1. Its README: *"At least **one** version of your package should already be present in the
+   Windows Package Manager Community Repository. The action will use that version as a base
+   to create manifests for new versions of the package."*
+2. `action.yml`'s first step is a `HEAD` request against
+   `github.com/microsoft/winget-pkgs/tree/master/manifests/<d>/<Publisher>/<Package>` and
+   `exit 1` with *"Package … does not exist in the winget-pkgs repository"* if it 404s.
+3. It runs `komac update`, never `komac new`. Komac's own help strings are
+   *"Add a version to a pre-existing package"* against *"Create a package from scratch"*, and
+   `update` resolves the base through `get_versions()`, which maps a missing package to
+   `PackageNonExistent`. (`komac new` would work, but it is interactive — `inquire` prompts
+   throughout — so it is not a CI path either.)
+
+**So step 4 above is a human step at least once, and that is not the reason it stays human.**
+
+### The blocking defect: it cannot describe this archive
+
+Komac regenerates `Installers` wholesale from binary analysis on every run. For a zip it uses
+`Zip::new` (`src/analysis/installers/zip.rs`), which auto-detects the nested installer **only
+when exactly one extension category in the archive contains exactly one file**:
+
+```rust
+if installer_type_counts.values().filter(|&&count| count == 1).count() == 1 {
+```
+
+`boks_0.1.1_windows_amd64.zip` contains **six** `.exe` files — measured by listing the
+published archive, whose SHA-256 matches the release's `SHA256SUMS`:
+
+```
+boks.exe  containerd.exe  ctr.exe  containerd-shim-nerdbox-v1.exe  mkfs.erofs.exe  mkfs.ext4.exe
+```
+
+The count for `exe` is 6 and every other category is 0, so no category has exactly 1, the
+condition is false, and the fallback runs:
+
+```rust
+installers: installers.unwrap_or_else(|| vec![Installer {
+    r#type: Some(InstallerType::Zip),
+    nested_installer_files,      // still the empty BTreeSet
+    ..Installer::default()
+}]),
+```
+
+That is `InstallerType: zip` with **no `NestedInstallerFiles`** — which the schema requires
+for an archive type, and which `validate.py`'s own cross-file check would reject. The
+interactive `Zip::prompt()` is what picks the file and asks for a `PortableCommandAlias`, and
+`update_version.rs` never calls it; on the automatic path `portable_command_alias` is
+hard-coded `None`. So even in the one-exe case we would silently lose `PortableCommandAlias:
+boks`, the field that makes `boks` a command at all.
+
+**This is not fixable by archive layout.** The count is over every entry in the zip, whatever
+directory it sits in, so the `bin/` + `libexec/` restructure discussed above does not change
+it. The count only drops to one if the archive stops carrying the runtime — which is the
+whole reason this package exists.
+
+### What it does get right, for whenever the shape changes
+
+Read from `winget-types/src/manifests/locale/mod.rs` and Komac's `LocaleExt::update`, the
+hand-written locale fields **are** carried forward from the previous version verbatim:
+`InstallationNotes`, `Documentations`, `Description`, `ShortDescription`, `Moniker`,
+`License`, `PackageName`, `Publisher`. `Tags` survives too — it is only backfilled from the
+GitHub repository's topics when already empty. `PublisherUrl`, `PublisherSupportUrl`,
+`PackageUrl` and `LicenseUrl` are likewise only filled when unset.
+
+Two are *not* preserved: `ReleaseNotes` and `ReleaseNotesUrl` are overwritten on every run
+from the GitHub release body, and **deleted** if the release has no body. Ours is set from a
+template, so it would be replaced by Komac's equivalent rather than lost — but note that our
+version-pinned `LicenseUrl` and `Documentations` would survive, which is the outcome we want.
+`ReleaseDate` is set automatically from each asset's HTTP `Last-Modified` header, not from the
+release's publish date.
+
+### If it is ever wired in, these are the terms
+
+- **Token: a *classic* PAT with `public_repo`.** Fine-grained PATs do not work, and this is a
+  GitHub platform limitation rather than an action bug: a fine-grained token's resource owner
+  must match the resource's owner, and the resource here is `microsoft/winget-pkgs`. Komac
+  documents the same constraint independently. The workflow `GITHUB_TOKEN` cannot work either
+  — it is scoped to this repository, and the action needs to push to a fork and open a PR
+  against a third repository.
+- **Blast radius if it leaks:** `public_repo` is *"read/write access to code, commit statuses,
+  repository projects, collaborators, and deployment statuses for **public** repositories"* —
+  every public repository the token's owner can push to, including `dagsommer/boks` itself and
+  its releases. Classic PATs have no per-repository selector, so this cannot be narrowed.
+  **Use a dedicated bot account** whose only write access is its own winget-pkgs fork.
+- **A fork of `microsoft/winget-pkgs` must already exist** under the token owner's account,
+  named exactly `winget-pkgs`. Nothing in Komac creates it — there is no `create_fork` call in
+  the source. `fork-user` selects whose fork to use.
+- **`installers-regex` must be set.** Its default is
+  `.(exe|msi|msix|appx)(bundle){0,1}$`, which matches no asset we publish. Worse, a loose
+  `\.zip$` would match **two** assets — `boks_<v>_windows_amd64.zip` and
+  `boks-runtime_<v>_windows_amd64.zip` — and Komac hard-errors on an asset extension it cannot
+  parse rather than skipping it.
+- **Pin it by commit SHA, not by tag.** `v2` is the repository's only tag and points at a
+  commit from 2024-11-27; `main` has moved several times since, and the action's own README
+  tells you to use `@main`. Note that pinning the action does **not** pin what it runs: it
+  invokes `cargo-bins/cargo-binstall@main` and then `cargo-binstall komac -y` with no version
+  constraint, so the Komac binary that authors the manifest is whatever is newest that day.
+- **Leave `max-versions-to-keep` at `0`.** Above zero it runs `komac remove --submit`, opening
+  deletion pull requests against the community repository under your name.
+
+None of this is currently exercised by anything in this repository, and none of it should be
+turned on without a person deciding to.
+
 ## What is still missing before any of this can be submitted
 
-Not opinions — things that do not exist:
+Both items that used to be on this list are done. `v0.1.1` is published and not a draft, so
+the `InstallerUrl` resolves and the digest is computable — and `mkfs.ext4.exe` is built and
+is in the archive, so the pre-formatted writable-layer workaround is gone. Listing the
+archive at that URL confirms both, and its SHA-256 matches the release's `SHA256SUMS`.
 
-1. **A tag.** `release.yml` assembles `boks_<version>_windows_amd64.zip` and the four items
-   that used to be on this list are all in it — the CLI, `krun.dll`, the Windows containerd
-   bundle and the nerdbox shim, and the guest kernel and root filesystem. But no tag has ever
-   run that workflow, so there is no `InstallerUrl` that resolves and no digest to compute.
-   Step 2 of the sequence above is not a formality: the submission pipeline re-downloads the
-   archive and compares its hash, and a draft release is not publicly downloadable.
-2. **`mkfs.ext4` for Windows**, which has no build anywhere. containerd wants it for a
-   container's writable layer; the archive ships a pre-formatted 64 MiB image instead, which
-   is a workaround and is labelled as one in `docs/install.md`.
+What remains is not a missing artefact:
 
-Item 2 is not this directory's to solve and is tracked in `docs/distribution.md`.
+1. **A signed CLA and a fork**, neither of which a repository can do for itself.
+2. **The manifests have never met winget-pkgs' pipeline.** They have met `winget validate`
+   and `winget install --manifest` on one Windows 11 machine. The pipeline additionally
+   re-downloads the 58 MB archive, runs multiple AV engines over it, and installs *and
+   uninstalls* it as a standard user in an environment we do not control.
+3. **Two known risks that a local install could not surface**, both worth expecting rather
+   than being surprised by:
+   - `winget uninstall dagsommer.boks` failed by identifier in the local test, and the
+     pipeline exercises uninstall (`Validation-Uninstall-Error`). It was inferred there that
+     this is an artefact of `--manifest` installs having no source to resolve against; that
+     inference is exactly what a real submission tests.
+   - The pipeline's install validation runs in an isolated environment, and
+     `Tools/SandboxTest.ps1` runs in **Windows Sandbox**, which is itself a VM. Boks needs
+     the Windows Hypervisor Platform. `boks.exe` will install and be discoverable there, but
+     `boks run` cannot be expected to work inside it, and a moderator who tries will see that.
+     The moderator labels to be ready for are `Portable-Archive` (*"the installer is a
+     portable archive that may need special handling"*) and `Hardware`.
 
 **The guest is in the archive**, which is what makes a `winget install` boot a sandbox with no
 further download and is why this package is worth submitting at all. The kernel is GPL-2.0, so
