@@ -91,11 +91,13 @@ import (
 // for a sandbox whose link socket fit.
 const controlSocket = "ctl.sock"
 
-// Control verbs. The set is closed, and each one is here because `boks ports` needs it.
+// Control verbs. The set is closed, and each one is here because `boks ports` or
+// `boks policy allow` needs it.
 const (
-	opList      = "list"
-	opPublish   = "publish"
-	opUnpublish = "unpublish"
+	opList         = "list"
+	opPublish      = "publish"
+	opUnpublish    = "unpublish"
+	opPolicyReload = "policy-reload"
 )
 
 // controlRequest is one command. Specs are the strings the user typed, parsed in the
@@ -110,9 +112,10 @@ type controlRequest struct {
 // controlResponse is the answer. Ports is always the full list after the change, so a caller
 // never has to reconstruct the state from a delta.
 type controlResponse struct {
-	Error   string            `json:"error,omitempty"`
-	Ports   []ports.Published `json:"ports,omitempty"`
-	Changed []ports.Published `json:"changed,omitempty"`
+	Error    string            `json:"error,omitempty"`
+	Ports    []ports.Published `json:"ports,omitempty"`
+	Changed  []ports.Published `json:"changed,omitempty"`
+	Warnings []string          `json:"warnings,omitempty"`
 }
 
 const (
@@ -290,6 +293,19 @@ func Unpublish(ctx context.Context, stateDir, sandbox string, specs []string) ([
 		return nil, nil, err
 	}
 	return resp.Ports, resp.Changed, nil
+}
+
+// PolicyReload asks a running sandbox's supervisor to re-read the policy store and apply
+// any new allow rules immediately. New deny rules are not applied — they require a
+// restart. Returns ErrNoSupervisor when the sandbox has no running network stack.
+// Any warnings produced by the reload (e.g. skipped deny rules) are returned as strings
+// for the caller to display to the user.
+func PolicyReload(ctx context.Context, stateDir, sandbox string) ([]string, error) {
+	resp, err := call(ctx, stateDir, sandbox, controlRequest{Op: opPolicyReload})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Warnings, nil
 }
 
 // call performs one exchange with a sandbox's supervisor.
