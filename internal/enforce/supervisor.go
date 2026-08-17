@@ -579,6 +579,21 @@ func (p *publishedState) write(list []ports.Published) {
 // protection is the socket's permissions alone, and one control is not enough for something
 // that opens a hole into a VM.
 func handleControl(session *Session, req controlRequest) controlResponse {
+	// opPolicyReload is handled before the forwarder guard because policy enforcement is
+	// independent of port forwarding: a sandbox with a network but no published ports still
+	// has a policy, and the engine that enforces it is separate from the forwarder.
+	if req.Op == opPolicyReload {
+		warning, err := session.reloadPolicy()
+		if err != nil {
+			return controlResponse{Error: err.Error()}
+		}
+		var warnings []string
+		if warning != "" {
+			warnings = []string{warning}
+		}
+		return controlResponse{Warnings: warnings}
+	}
+
 	if session.forwarder == nil {
 		return controlResponse{Error: "this sandbox has no virtual network to publish a port into"}
 	}
@@ -624,7 +639,7 @@ func handleControl(session *Session, req controlRequest) controlResponse {
 		// here reads a secret, a policy or a log — and a supervisor that quietly
 		// accepted an unknown one would be a supervisor whose surface nobody can state.
 		return controlResponse{Error: fmt.Sprintf("unknown control operation %q; this socket accepts "+
-			"only %s, %s and %s", req.Op, opList, opPublish, opUnpublish)}
+			"only %s, %s, %s and %s", req.Op, opList, opPublish, opUnpublish, opPolicyReload)}
 	}
 }
 

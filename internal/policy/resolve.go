@@ -398,6 +398,50 @@ func writeRuleSection(b *strings.Builder, title string, rules []RuleSpec) {
 	}
 }
 
+// ToRequest reconstructs the policy request from a resolution so that the supervisor can
+// hot-reload store-derived rules (global and sandbox-scoped allows) without restarting.
+//
+// The reconstructed request uses the provided store in place of the original, which is
+// what lets new store rules take effect. The base preset, profile selection, agent allows
+// and per-run flag rules are all recovered from the resolution itself, so the base policy
+// and every rule that was fixed at startup time remain unchanged.
+func (r *Resolution) ToRequest(store *Store) Request {
+	req := Request{
+		Store:   store,
+		Sandbox: r.Sandbox,
+		Profile: r.Profile,
+		Agent:   r.Agent,
+	}
+	// Recover the exact preset from the first layer. When the first layer's source starts
+	// with "preset " the supervisor was launched with an explicit preset (via --policy or
+	// via the store's own setting). Setting it explicitly here locks the base to that
+	// value so that a later change to the store's preset cannot silently widen the sandbox
+	// while it is running.
+	//
+	// When the first layer's source starts with "profile " no --policy override was given,
+	// and the profile selects the preset; req.Profile is already set above.
+	if len(r.Layers) > 0 {
+		if src := r.Layers[0].Source; strings.HasPrefix(src, "preset ") {
+			req.Preset = strings.TrimPrefix(src, "preset ")
+		}
+	}
+	// Extract flag rules and agent allows from the compiled rule list so that per-run
+	// --allow/--deny flags and the agent's own allowlist are preserved exactly as at startup.
+	for _, rule := range r.Rules {
+		switch rule.Scope {
+		case scopeFlagAllow:
+			req.Allow = append(req.Allow, rule.Spec)
+		case scopeFlagDeny:
+			req.Deny = append(req.Deny, rule.Spec)
+		default:
+			if r.Agent != "" && rule.Scope == "agent "+r.Agent {
+				req.AgentAllow = append(req.AgentAllow, rule)
+			}
+		}
+	}
+	return req
+}
+
 // SandboxPolicy is what a sandbox remembers about how its policy was chosen.
 //
 // It is recorded on the container when the sandbox is created and read back by every later
