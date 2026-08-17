@@ -56,9 +56,8 @@ func virtualizationCheck() Check {
 				Status: StatusWarn,
 				Detail: "Windows Hypervisor Platform assumed available",
 				Remedy: "Boks cannot probe the Windows Hypervisor Platform without booting a VM, so\n" +
-					"this line reports platform support only. A sandbox has been run here — on\n" +
-					"2026-08-14 and 2026-08-15, from an unelevated shell, with network policy\n" +
-					"enforced (docs/verification.md) — but not on this machine by this command.\n" +
+					"this line reports platform support only: Windows is supported, but nothing here\n" +
+					"has started a VM on this machine.\n" +
 					"\n" +
 					"If a sandbox fails to start, the pieces that decide it are checked by name on\n" +
 					"the lines above: hypervisor library (krun.dll), vm runtime (the shim), guest\n" +
