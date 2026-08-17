@@ -96,11 +96,9 @@ release:
 	git add internal/agent/agent.go
 	git commit -m "release: $(VERSION)"
 	git tag v$(VERSION)
-	git push origin main
-	git push origin v$(VERSION)
 	@echo ""
-	@echo "v$(VERSION) tagged and pushed. The release pipeline is now running:"
-	@echo "  https://github.com/dagsommer/boks/actions"
+	@echo "v$(VERSION) committed and tagged. To publish:"
+	@echo "  git push origin main && git push origin v$(VERSION)"
 
 # --- winget manifests ---------------------------------------------------------------
 #
