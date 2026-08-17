@@ -9,7 +9,7 @@ import (
 
 // Pattern matches the host part of a Target.
 //
-// Five forms, deliberately few — a policy language you cannot predict the behaviour of is
+// Six forms, deliberately few — a policy language you cannot predict the behaviour of is
 // worse than one that cannot express everything:
 //
 //   - "example.com" — exactly that hostname
@@ -17,6 +17,8 @@ import (
 //   - "203.0.113.7" — exactly that address literal
 //   - "203.0.113.0/24" — any address literal in that prefix
 //   - "*" — any destination at all, including IP literals
+//   - "**" — a shell-safe alias for "*", useful when "*" would be expanded by the shell
+//     before reaching boks (zsh and bash expand bare "*" in many contexts)
 //
 // The wildcard follows the TLS certificate rule: `*.example.com` covers `a.example.com`
 // and `a.b.example.com` but not the apex. Certificates behave this way, so it is the
@@ -26,8 +28,8 @@ import (
 //
 // Hostname patterns never match IP literals and address patterns never match hostnames.
 // Boks decides before it resolves, so it cannot know that `example.com` is `203.0.113.7`;
-// pretending otherwise would produce confident, wrong decisions. `*` is the exception and
-// matches everything by definition.
+// pretending otherwise would produce confident, wrong decisions. `*` and `**` are the
+// exceptions and match everything by definition.
 type Pattern struct {
 	kind   patternKind
 	host   string // exact hostname, or the suffix of a wildcard without its leading dot
@@ -54,6 +56,9 @@ func ParsePattern(s string) (Pattern, error) {
 		return Pattern{}, fmt.Errorf("empty host pattern")
 	}
 	if text == "*" {
+		return Pattern{kind: patternAny, text: "*"}, nil
+	}
+	if text == "**" {
 		return Pattern{kind: patternAny, text: "*"}, nil
 	}
 	if strings.Contains(text, "/") {
