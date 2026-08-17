@@ -87,7 +87,7 @@ func newDaemonStopCommand(env Env) *cobra.Command {
 
 containerd's root is left alone, so the images it has already pulled are still there when it
 is started again. Only 'boks daemon' state — the socket and the record of the running process
-— is removed.`,
+— is removed. That root is where the disk goes, and 'boks purge' is what removes it.`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stateDir := policy.StateDir()
