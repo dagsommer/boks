@@ -44,6 +44,13 @@ boks cp ./file.txt <name>:/root/file.txt
 boks rm <name>               # deletes the sandbox and its filesystem
 ```
 
+`boks rm` is one sandbox. The images those sandboxes were built from stay in containerd's
+store, and that is where the disk goes: one agent image is about a gigabyte, written twice —
+compressed, then unpacked. `boks purge` is the command for all of it, and `boks purge
+--dry-run` shows what is there and what each part is before anything is removed. `boks doctor`
+names the same directory and its size. See
+[Uninstalling](install.md#uninstalling--two-steps-not-one).
+
 A sandbox is called `<agent>-<workspace directory>` — `shell-boks` for the `shell` agent in
 `~/git_repos/boks`. That derived name is what a second run looks up, so **naming and
 re-attach are the same mechanism**. Two different directories that would derive the same name

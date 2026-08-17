@@ -2212,3 +2212,64 @@ said this was unmeasured; both now say which route raises it.
 
 Also observed: the two streams arrive `err` then `out`. They are independently buffered, so
 this is not an ordering guarantee and was not treated as one.
+
+### `boks purge` gives the disk back, measured on Linux, 2026-08-16
+
+The Windows finding above — `%LOCALAPPDATA%\boks` surviving uninstall at 59 files and
+1,768.8 MB, with no `boks` command that removes it — has a command now. This is what was
+established by running it on the Linux development host, and what was not.
+
+#### The state directory, measured before and after
+
+`~/.local/state/boks` was 300 KiB. One `boks create shell .` — which pulls the base image and
+then fails at the erofs mount, this host being unprivileged with no `/dev/kvm` — took it to
+**1005 MiB**:
+
+| | |
+|---|---|
+| `containerd/root/io.containerd.snapshotter.v1.erofs` | 785 MiB — the image layers, unpacked |
+| `containerd/root/io.containerd.content.v1.content` | 219 MiB — the same layers, compressed |
+| `containerd/root/io.containerd.metadata.v1.bolt` | 632 KiB |
+| `containerd/state` | 228 KiB |
+| `ca`, `notices`, `net`, `secrets.json`, `policy-log.jsonl` | 12 KiB, 12 KiB, 8 KiB, 4 KiB, 4 KiB |
+
+That is the same shape as the Windows measurement, and it explains the file count: the erofs
+snapshotter writes one `layer.erofs` per layer rather than an unpacked tree, so a gigabyte
+lives in a few dozen inodes.
+
+#### Run, not read
+
+- **The default scope reclaims the gigabyte and keeps identity.** `boks purge` answered `y`
+  took the directory from **1005 MiB to 24 KiB** and left `ca/`, `secrets.json` and
+  `policy-log.jsonl` exactly where they were. Checked with `ls` afterwards, not from the
+  command's own output.
+- **It refuses while the managed containerd is running.** With `boks daemon start` up,
+  `boks purge` printed the plan and then exited 1 naming the socket and `boks daemon stop`.
+  Nothing was removed.
+- **`--dry-run` warns about that refusal** rather than showing a plan that the next command
+  will reject.
+- **Neither confirmation can be given by accident.** Empty stdin refused. `y` to
+  `boks purge --all` refused — that scope takes the CA's private key, so the answer has to be
+  the word `purge`.
+- **Files Boks did not write survive, and keep the directory.** A `my-notes.txt` placed in the
+  state directory was listed as left alone by `--all`, was still there afterwards, and stopped
+  the now-empty directory from being removed. With it gone, a second `--all` removed the
+  directory itself.
+- **`boks purge` on a machine with no state exits 0**, saying there is nothing to purge.
+- **`boks doctor` names the directory and its size**: `state directory  ok  /home/…/boks
+  (273 KiB, 'boks purge' reclaims 273 KiB)`.
+
+#### Read, not run
+
+- **Windows and macOS.** Both compile and vet (`GOOS=windows`, `GOOS=darwin`), and every path
+  the command reasons about comes from the same constructors the rest of Boks uses — but
+  neither has been run. On Windows in particular, `os.UserHomeDir`, `filepath.EvalSymlinks`
+  over a state directory that is a junction, and whether `%LOCALAPPDATA%\boks` deletes cleanly
+  while Explorer or an antivirus holds a handle are all unverified. The 1,768.8 MB figure that
+  motivated this has **not** been re-measured after a purge on Windows.
+- **The refusals against a home directory and a filesystem root** are covered by tests that
+  were confirmed to fail when each refusal is removed, but no run of the real command has been
+  pointed at either — deliberately.
+- **Purging with a sandbox actually running.** This host cannot boot one. The refusal is
+  driven by the same lock files `boks ls` and `boks net ls` read, and the test holds those
+  locks for real, but no purge has been attempted against a live guest.

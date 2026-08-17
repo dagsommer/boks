@@ -80,6 +80,10 @@ type Env struct {
 	Runtime string
 	// Snapshotter is the snapshotter the runtime requires, e.g. "erofs".
 	Snapshotter string
+	// StateDir is where Boks keeps its host-side state. Empty means the caller did not
+	// resolve one, and the check that reads it skips rather than resolving its own — this
+	// package does not read global state.
+	StateDir string
 }
 
 // Report is the outcome of a full run.
@@ -185,6 +189,7 @@ func Checks() []Check {
 		runtimeSkewCheck(),
 		hypervisorLibraryCheck(),
 		guestImageCheck(),
+		stateCheck(),
 	}
 	// Platforms contribute their own requirements rather than every check having to
 	// declare itself irrelevant elsewhere.

@@ -130,6 +130,38 @@ environment you gave it, and `LIBKRUN_PATH` is read from this process either way
 is somewhere the daemon's environment covers, the warning is harmless. Note that setting
 `LIBKRUN_PATH` *replaces* the default directories rather than adding to them.
 
+### Boks has taken a gigabyte of disk, or several
+
+That is containerd's, and it is expected: pulling one agent image writes the layers twice —
+compressed into the content store, and unpacked by the erofs snapshotter. Measured on Linux
+on 2026-08-16, a single `boks create shell` took `~/.local/state/boks` from 300 KiB to
+**1005 MiB** (219 MiB compressed, 785 MiB unpacked). Nothing collects it by itself.
+
+`boks doctor` names the directory and its size on the `state directory` line. `boks purge`
+gives it back:
+
+```sh
+boks purge --dry-run   # what is there, what each part is, and what it would free
+boks purge             # take it, keeping the CA, credentials, policy rules and the log
+boks purge --all       # take those too — this is the uninstall step
+```
+
+It destroys sandboxes, because containerd keeps image layers and each sandbox's filesystem in
+one root; run `boks ls` first. It refuses while the managed daemon or a sandbox's network is
+up, and names what to stop. See
+[Uninstalling](install.md#uninstalling--two-steps-not-one).
+
+### `boks purge` says it is refusing to treat a directory as a state directory
+
+`BOKS_STATE_DIR` is pointing somewhere `purge` will not delete from — your home directory, a
+directory that contains it, or a filesystem root. The message names which. Check the variable;
+unset, Boks uses `$XDG_STATE_HOME/boks` or `~/.local/state/boks` on Linux,
+`~/Library/Application Support/boks` on macOS, and `%LOCALAPPDATA%\boks` on Windows.
+
+Even where it does run, `purge` removes only names Boks itself writes. A file of your own in
+the state directory is reported as left alone and survives, including a `--all` — which is
+also why the directory itself can outlive one.
+
 ---
 
 ## Linux
