@@ -478,7 +478,7 @@ Stops the managed containerd. Stopping one that is not running is not an error.
 
 containerd's root is left alone, so the images it has already pulled are still there when it
 is started again. Only 'boks daemon' state — the socket and the record of the running process
-— is removed.
+— is removed. That root is where the disk goes, and 'boks purge' is what removes it.
 
 ## boks doctor
 

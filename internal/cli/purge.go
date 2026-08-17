@@ -76,6 +76,12 @@ directory, and everything else is reported as left alone.`,
 		"remove even though the daemon or a sandbox network is running")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		// One flag says do not do it and the other says do it without asking. A caller
+		// that passed both has a bug, and guessing which they meant is not this
+		// command's business.
+		if dryRun && yes {
+			return usagef("--dry-run and --yes cannot be combined: one says not to remove anything")
+		}
 		stateDir := policy.StateDir()
 		scope := purge.ScopeReclaim
 		if all {
