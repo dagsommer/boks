@@ -19,12 +19,19 @@ func TestStateCheckReportsTheSizeAndTheRemedy(t *testing.T) {
 		make([]byte, 3*1024*1024), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// A megabyte of state that a plain `boks purge` keeps, so that the total and the
+	// reclaimable figure are different numbers and the check cannot quote one for the
+	// other. `boks purge` without --all does not touch the credential store.
+	if err := os.WriteFile(filepath.Join(root, "secrets.json"),
+		make([]byte, 1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	res := stateCheck().Run(context.Background(), Env{StateDir: root})
 	if res.Status != StatusOK {
 		t.Errorf("Status = %v, want ok — a disk-space figure is never a reason a host cannot run", res.Status)
 	}
-	for _, want := range []string{root, "3.0 MiB", "boks purge"} {
+	for _, want := range []string{root, "4.0 MiB", "'boks purge' reclaims 3.0 MiB"} {
 		if !strings.Contains(res.Detail, want) {
 			t.Errorf("detail %q does not mention %q", res.Detail, want)
 		}
