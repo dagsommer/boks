@@ -28,9 +28,9 @@ import (
 // imageConfigOpt applies the guest image's own configuration — environment, argv, working
 // directory and user — to the spec.
 //
-// On every host where containerd's own oci.WithImageConfig works, this is that option,
+// On the host where containerd's own oci.WithImageConfig works, this is that option,
 // unchanged, because a subtly different reimplementation of a well-exercised one is not worth
-// having and Linux and macOS already work.
+// having. That host is Linux, and only Linux; see containerdReadsGuestRootfs.
 //
 // Windows cannot read it. oci.WithImageConfig finishes by resolving the process's
 // supplementary groups out of the image's /etc/group, and it does that by mounting the
@@ -46,11 +46,13 @@ import (
 // Process.User.Username for the guest to resolve instead of resolving it here. Windows is
 // absent from those guards only because containerd on Windows builds Windows specs, which
 // never reach the Linux branch at all. So the Windows path below is not a new behaviour: it
-// is the macOS behaviour, which Boks already ships and runs, on the other host that cannot
-// mount a Linux filesystem.
+// is the macOS behaviour, on the other host that cannot mount a Linux filesystem.
 //
-// What that costs, stated plainly: on Windows the guest process gets no supplementary groups
-// from the image, exactly as on macOS today.
+// macOS now takes this same path rather than containerd's version of it, because containerd's
+// skip is only a skip: it abandons the numeric ids too. See containerdReadsGuestRootfs.
+//
+// What that costs, stated plainly: off Linux the guest process gets no supplementary groups
+// from the image. That is not a change — containerd's darwin guard skipped them already.
 //
 // The Windows branch has never been executed on Windows. It is reasoned from containerd's
 // source — mount_windows.go, spec_opts.go — and from the fact that the macOS path it copies
@@ -81,7 +83,16 @@ func imageConfigOpt(image client.Image) oci.SpecOpts {
 // test that went through imageConfigOpt could only check which option it got by running it
 // — which needs a containerd, a snapshotter and an image, none of which a unit test has.
 func usesMetadataImageConfig() bool {
-	return !containerdReadsGuestRootfs() || guestResolvesUsernames()
+	return usesMetadataImageConfigOn(runtime.GOOS, guestResolvesUsernames())
+}
+
+// usesMetadataImageConfigOn is the rule itself, with the host and the guest's ability as
+// parameters so that every host's branch can be exercised from any host. No machine on this
+// project runs macOS, and the macOS branch is the one this rule was just corrected on, so a
+// rule that could only be tested where it happens to run would be untested where it matters —
+// the same reason internal/doctor/libkrun.go takes goos as an argument.
+func usesMetadataImageConfigOn(goos string, guestResolves bool) bool {
+	return !containerdReadsGuestRootfsOn(goos) || guestResolves
 }
 
 // guestResolvesUsernames reports whether the guest can be **confirmed** to turn an image's
@@ -107,16 +118,40 @@ var guestResolvesUsernames = sync.OnceValue(func() bool {
 	)
 })
 
-// containerdReadsGuestRootfs reports whether containerd's own oci.WithImageConfig can be
-// used as it stands on this host.
+// containerdReadsGuestRootfs reports whether containerd's own oci.WithImageConfig actually
+// opens the image's root filesystem on this host — which is the only thing that makes it
+// better than the reimplementation below.
 //
-// It can on Linux, where the host mounts the guest's filesystem for real, and on macOS, where
-// containerd's internal guards skip the attempt. Only Windows is left, and only because
-// containerd never anticipated a Linux spec being generated there. Deciding by what is
-// *excluded* rather than by what is included is deliberate: adding a host to this list is a
-// claim about a platform, and the platform this project can make claims about is the one it
-// leaves alone.
-func containerdReadsGuestRootfs() bool { return runtime.GOOS != "windows" }
+// Linux is the only host where it does. There the host mounts the guest's EROFS snapshot for
+// real, so `USER node` becomes a uid and /etc/group becomes supplementary groups.
+//
+// **macOS was on this list until 2026-08-17 and should never have been.** containerd cannot
+// mount a Linux filesystem on a Mac either, and its guards say so — but they are guards
+// against *reading*, not implementations of anything. WithUser (spec_opts.go:625 at v2.2.6)
+// opens with
+//
+//	if (s.Windows != nil && s.Linux != nil) || runtime.GOOS == "darwin" {
+//	        s.Process.User.Username = userstr
+//	        return nil
+//	}
+//
+// and that return is before every line that parses the string. So on macOS containerd stored
+// the image's USER verbatim and left Process.User.UID at its zero value **for every USER
+// value, numeric ones included**: an image saying `USER 1000` ran as root, with the number
+// right there in the spec and nobody reading it. WithAdditionalGIDs returns early on darwin
+// too, so nothing was resolved there either, and appendOSMounts is a no-op off FreeBSD.
+//
+// applyImageUser below does parse numeric ids, so moving macOS to the metadata path loses
+// nothing containerd was doing and gains every image that numbers its user. Names remain
+// unresolvable on both hosts, which is a guest problem — see packaging/nerdbox/patches/.
+//
+// Linux is decided by inclusion rather than by excluding Windows, because that is the claim
+// being made: this host mounts the image. A host that does not belongs on the metadata path.
+func containerdReadsGuestRootfs() bool { return containerdReadsGuestRootfsOn(runtime.GOOS) }
+
+// containerdReadsGuestRootfsOn takes the host so the rule can be asserted for every platform
+// from whichever one the tests run on. See usesMetadataImageConfigOn.
+func containerdReadsGuestRootfsOn(goos string) bool { return goos == "linux" }
 
 // withImageConfigFromMetadata applies the image config from the image's own metadata alone,
 // touching no filesystem. See imageConfigOpt for when it is used and why.
