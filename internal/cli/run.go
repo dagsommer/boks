@@ -113,6 +113,11 @@ Agents:
 		}
 
 		ctx := cmd.Context()
+		// Before the first thing that talks to containerd, and after everything that can
+		// be decided without one: a mistyped flag should not start a daemon.
+		if err := ensureDaemon(ctx, dev, env.Stderr); err != nil {
+			return err
+		}
 		inv, err := flags.resolve(ctx, agents, positional, env)
 		if err != nil {
 			return err

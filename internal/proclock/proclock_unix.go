@@ -72,3 +72,7 @@ func terminate(pid int) error {
 func detach(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }
+
+// noConsole does nothing here. A Unix process has no console to be given, and a child whose
+// standard streams point at a file is silent whatever terminal its parent had.
+func noConsole(cmd *exec.Cmd) {}

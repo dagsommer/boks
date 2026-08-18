@@ -60,6 +60,9 @@ Agents:
 		if err := netFlags.checkPublish(); err != nil {
 			return err
 		}
+		if err := ensureDaemon(ctx, dev, env.Stderr); err != nil {
+			return err
+		}
 
 		inv, err := flags.resolve(ctx, agents, positional, env)
 		if err != nil {

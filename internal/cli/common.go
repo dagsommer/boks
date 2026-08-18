@@ -34,9 +34,15 @@ type devFlags struct {
 	snapshotter string
 	address     string
 	insecure    bool
+	// fs is the set these were registered on, kept so that "the user named a containerd"
+	// can be told apart from "this is where Boks would look anyway". ensureDaemon turns
+	// on that difference: a named address is an instruction, and Boks must not answer a
+	// daemon that is down by starting a different one.
+	fs *pflag.FlagSet
 }
 
 func (d *devFlags) register(fs *pflag.FlagSet) {
+	d.fs = fs
 	fs.StringVar(&d.runtimeID, "runtime", runtimecfg.Runtime, "containerd runtime handler")
 	fs.StringVar(&d.snapshotter, "snapshotter", runtimecfg.Snapshotter, "containerd snapshotter")
 	// The default is resolved rather than constant: a containerd started by `boks daemon`
@@ -51,6 +57,15 @@ func (d *devFlags) register(fs *pflag.FlagSet) {
 	for _, name := range []string{"runtime", "snapshotter", "containerd-address", "i-know-this-is-not-isolated"} {
 		_ = fs.MarkHidden(name)
 	}
+}
+
+// addressNamed reports whether the user pointed Boks at a particular containerd, rather than
+// letting it resolve one. Both spellings count: the flag and BOKS_CONTAINERD_ADDRESS.
+func (d *devFlags) addressNamed() bool {
+	if _, ok := runtimecfg.AddressOverride(); ok {
+		return true
+	}
+	return d.fs != nil && d.fs.Changed("containerd-address")
 }
 
 // requireIsolation refuses to present a container-only runtime as a sandbox, unless the
