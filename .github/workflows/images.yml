@@ -160,25 +160,39 @@ jobs:
               echo "  $name: $tar does not exist — the build did not produce it" >&2
               fail=1; continue
             fi
-            # The OCI layout: index.json -> a manifest -> the config blob holding .config.User.
-            # Read out of the archive with tar rather than unpacking the whole thing.
+            # index.json -> possibly a NESTED index -> the image manifest -> its config
+            # blob, which is where .config.User lives. Read out of the archive with tar
+            # rather than unpacking the whole thing.
             #
-            # NOT .manifests[0]. The build above passes --provenance=mode=max and --sbom=true,
-            # so the index holds attestation manifests beside the image and their order is not
-            # promised. An attestation's config has no .config.User, so picking the wrong entry
-            # would report every image as root — a false failure, which is worse here than no
-            # check at all. The attestation manifests are the ones carrying
-            # vnd.docker.reference.type, so they are excluded by name.
-            manifest_digest="$(tar -xOf "$tar" index.json | jq -r '
-              [.manifests[] | select((.annotations["vnd.docker.reference.type"] // "")
-                                     != "attestation-manifest")][0].digest // ""' | cut -d: -f2)"
-            if [ -z "$manifest_digest" ]; then
-              echo "  $name: no image manifest in $tar" >&2; fail=1; continue
-            fi
-            config_digest="$(tar -xOf "$tar" "blobs/sha256/${manifest_digest}" \
-              | jq -r '.config.digest // ""' | cut -d: -f2)"
+            # The descent is a loop because the depth is not fixed and guessing it was the
+            # last bug here. Reading index.json's first entry as an image manifest reported
+            # "names no config blob" for all nine images: with --provenance=mode=max and
+            # --sbom=true, buildx writes index.json pointing at an image INDEX, which then
+            # holds the image manifest beside its attestation manifests. So one level down is
+            # still an index, and .config only appears one level below that.
+            #
+            # Attestation manifests are skipped wherever they appear rather than at a fixed
+            # position: their order is not promised, and an attestation's config carries no
+            # .config.User, so selecting one would report a correct image as root. They are
+            # the entries carrying vnd.docker.reference.type.
+            pick='[.manifests[]? | select((.annotations["vnd.docker.reference.type"] // "")
+                                         != "attestation-manifest")][0].digest // ""'
+            digest="$(tar -xOf "$tar" index.json | jq -r "$pick" | cut -d: -f2)"
+            config_digest=""
+            # Bounded, so a cyclic or unexpectedly deep index cannot spin here.
+            for _ in 1 2 3 4; do
+              [ -n "$digest" ] || break
+              blob="$(tar -xOf "$tar" "blobs/sha256/${digest}")"
+              cfg="$(printf '%s' "$blob" | jq -r '.config.digest // ""')"
+              if [ -n "$cfg" ]; then
+                config_digest="${cfg#sha256:}"
+                break
+              fi
+              digest="$(printf '%s' "$blob" | jq -r "$pick" | cut -d: -f2)"
+            done
             if [ -z "$config_digest" ]; then
-              echo "  $name: manifest ${manifest_digest} names no config blob" >&2
+              echo "  $name: no image config found in $tar — index.json led to no manifest" \
+                "carrying .config" >&2
               fail=1; continue
             fi
             user="$(tar -xOf "$tar" "blobs/sha256/${config_digest}" \
