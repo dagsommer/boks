@@ -122,6 +122,24 @@ jobs:
           fi
           echo "using ${configs[*]}"
 
+      # KERNEL_ARCH is the kernel's variable and only the kernel's. The rootfs takes its
+      # architecture from the TARGET PLATFORM, which nerdbox's bake file never sets for that
+      # target — `target "rootfs"` inherits `_guest_common`, and only `_host_common` and
+      # `libkrun` reference the `_DOCKER_ARCH` mapping. With no platform, buildx builds for
+      # this runner, which is x86_64, and the Dockerfile's rootfs stages follow it:
+      # `vminit-build` is `GOARCH=${TARGETARCH} go build`, `crun-build` wgets
+      # `crun-…-linux-${TARGETARCH}`.
+      #
+      # So every arm64 guest this workflow published up to v0.1.1 carried an ARM64 kernel and
+      # an x86_64 /sbin/vminitd — byte-identical to the x86_64 archive's — and a Mac booting
+      # it panicked with `Requested init /sbin/vminitd failed (error -8)`, ENOEXEC, naming
+      # neither architecture nor file. Setting the platform is the fix; the assertion below
+      # reading vminitd's own e_machine is what stops it coming back.
+      #
+      # Cross-building needs no QEMU here: every stage that runs a command is
+      # `FROM --platform=$BUILDPLATFORM`, so the platform changes TARGETARCH and not where
+      # the work happens. Only `rootfs` is pinned — the kernel target already cross-compiles
+      # from KERNEL_ARCH with an explicit CROSS_COMPILE, and is proven to by the same script.
       - name: Build the guest kernel and rootfs
         working-directory: nerdbox
         env:
@@ -129,9 +147,22 @@ jobs:
           DESTDIR: ./_output
         run: |
           set -euo pipefail
+          case "${KERNEL_ARCH}" in
+            arm64)  docker_arch=arm64 ;;
+            x86_64) docker_arch=amd64 ;;
+            *) echo "no Docker platform mapping for KERNEL_ARCH=${KERNEL_ARCH}" >&2; exit 1 ;;
+          esac
           docker buildx bake kernel
-          docker buildx bake rootfs
+          docker buildx bake rootfs --set "rootfs.platform=linux/${docker_arch}"
           ls -l _output/
+
+      # assert-guest-image.py opens the rootfs to read /sbin/vminitd out of it, and the rootfs
+      # is a compressed EROFS image, so it needs fsck.erofs to do that. Without erofs-utils
+      # the script exits 2 — "the check could not be made" — which is deliberately not the
+      # same as a pass, so a runner image that stops shipping this package turns the job red
+      # instead of silently dropping the only assertion that catches the bug above.
+      - name: Install erofs-utils, which the rootfs assertion reads the image with
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends erofs-utils
 
       # ---------------------------------------------------------------------------------
       # Assert what was BUILT, not what was asked for. Until 2026-08-16 nothing in this
@@ -145,9 +176,13 @@ jobs:
       #
       # assert-guest-image.py checks the filenames the shim looks these up by, refuses a
       # kernel named for any other architecture, reads the architecture out of the kernel
-      # image itself, and requires the rootfs to carry the EROFS superblock magic. It uses
-      # assert-elf.py's reader for the x86_64 vmlinux; the arm64 build is an arm64 Image and
-      # not an ELF at all, so the format is identified rather than assumed — see the script.
+      # image itself, and — since 2026-08-17 — extracts /sbin/vminitd from the rootfs and
+      # reads its e_machine too. The rootfs half is the one that matters most: the kernel's
+      # architecture is at least in its filename, while the rootfs is called
+      # `nerdbox-rootfs.erofs` in every archive of every architecture, so a mismatched one is
+      # invisible to every other check in this repository. It uses assert-elf.py's reader for
+      # both the x86_64 vmlinux and vminitd; the arm64 kernel is an arm64 Image and not an ELF
+      # at all, so the kernel's format is identified rather than assumed — see the script.
       # ---------------------------------------------------------------------------------
       - name: Assert the built guest image is the architecture it will be labelled
         run: |
@@ -185,6 +220,53 @@ jobs:
           fi
           echo "  rejected, as it must: a $arch kernel offered as $other"
           rm -rf /tmp/guest-control
+
+      # The rootfs control, and it needs to be its own step rather than to lean on the one
+      # above. That control stages a wrong-arch KERNEL, which fails the kernel assertion, so
+      # it would exit 1 whether or not the rootfs were ever opened — it cannot tell whether
+      # check 5 ran. This one leaves the kernel correct and correctly named, so exit 1 can
+      # only have come from the rootfs.
+      #
+      # What it stages is this build's own rootfs with ONE FIELD CHANGED: /sbin/vminitd's
+      # e_machine, flipped to the other architecture and repacked. That is exactly the defect
+      # that shipped — an init binary for the wrong machine inside an otherwise valid image —
+      # rather than a corrupt file that any check might reject for any reason.
+      - name: Prove the rootfs assertion can fail
+        run: |
+          set -euo pipefail
+          arch='${{ inputs.arch || 'x86_64' }}'
+          rm -rf /tmp/rootfs-control /tmp/rootfs-control-dir
+          mkdir -p /tmp/rootfs-control/sbin /tmp/rootfs-control-dir
+          fsck.erofs --extract=/tmp/rootfs-control/sbin/vminitd --path=/sbin/vminitd \
+            nerdbox/_output/nerdbox-rootfs.erofs
+          # e_machine is Elf64_Half at offset 18. 183 is aarch64, 62 is x86-64; whichever it
+          # is, write the other one. Python because this is a two-byte poke in a 13 MB file.
+          python3 - <<'PY'
+          import struct
+          path = "/tmp/rootfs-control/sbin/vminitd"
+          data = bytearray(open(path, "rb").read())
+          was = struct.unpack_from("<H", data, 18)[0]
+          struct.pack_into("<H", data, 18, 62 if was == 183 else 183)
+          open(path, "wb").write(data)
+          print(f"  staged a vminitd with e_machine {was} rewritten to "
+                f"{struct.unpack_from('<H', data, 18)[0]}")
+          PY
+          mkfs.erofs -zlz4 /tmp/rootfs-control-dir/nerdbox-rootfs.erofs /tmp/rootfs-control \
+            >/dev/null
+          cp "nerdbox/_output/nerdbox-kernel-$arch" /tmp/rootfs-control-dir/
+          set +e
+          python3 boks/packaging/linux/assert-guest-image.py /tmp/rootfs-control-dir \
+            --arch "$arch" >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 1 ]; then
+            echo "CONTROL FAILED: a rootfs whose /sbin/vminitd is not $arch was not rejected" >&2
+            echo "expected exit 1 (ran and rejected), got $rc" >&2
+            echo "rc=2 means fsck.erofs was missing and check 5 never ran at all" >&2
+            exit 1
+          fi
+          echo "  rejected, as it must: a rootfs holding a non-$arch /sbin/vminitd"
+          rm -rf /tmp/rootfs-control /tmp/rootfs-control-dir
 
       # The names in SHA256SUMS are bare, not `_output/`-prefixed, because the artifact is
       # flattened: whoever downloads it gets the files at the top level and needs
