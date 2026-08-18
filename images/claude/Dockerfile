@@ -39,6 +39,13 @@ RUN set -eux; \
     rm -f /tmp/claude; \
     claude --version
 
+# Answers Claude Code's trust prompt and its bypass-permissions warning for the workspace, at
+# start-up rather than at build time: the directory is only known once the sandbox runs. The
+# base image's boks-prepare runs everything here. IS_SANDBOX is Claude Code's own switch and
+# is read straight from the environment, so it is set here rather than written into a file.
+COPY --chmod=0755 prepare.d/ /etc/boks/prepare.d/
+ENV IS_SANDBOX=1
+
 # Numeric on purpose: `USER agent` silently means uid 0 off Linux. The full reason is
 # in images/base/Dockerfile, above its own USER line.
 USER 1000:1000

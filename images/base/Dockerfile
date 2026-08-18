@@ -84,7 +84,17 @@ RUN set -eux; \
     chown agent:agent /usr/local/share/ca-certificates /etc/ssl/certs /etc/ca-certificates.conf; \
     chown agent:agent /etc/ssl/certs/ca-certificates.crt
 
-COPY --chmod=0755 boks-install-ca boks-entrypoint /usr/local/bin/
+COPY --chmod=0755 boks-install-ca boks-entrypoint boks-open boks-prepare /usr/local/bin/
+
+# The names a program reaches for when it wants a browser, all pointing at the one that says
+# there isn't one. xdg-open is the Linux convention and `open` is the macOS one, which agents
+# built for both platforms try in turn; BROWSER is what everything else honours. An agent's
+# OAuth login is the case that matters, and before this it failed with the URL unprinted.
+RUN set -eux; \
+    ln -s boks-open /usr/local/bin/xdg-open; \
+    ln -s boks-open /usr/local/bin/open; \
+    mkdir -p /etc/boks/prepare.d
+ENV BROWSER=/usr/local/bin/boks-open
 
 # Node and Python carry their own trust stores and ignore the system one, so they need to be
 # pointed at a bundle explicitly. All three name the *system* bundle rather than the injected

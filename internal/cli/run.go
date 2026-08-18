@@ -43,6 +43,9 @@ dropped, and the refusal names the value the sandbox has. Remove it, or name a n
 Arguments after '--' are passed to the agent. For the shell agent they are the command to
 run, since that is what arguments to a shell are.
 
+An interactive run clears the terminal first, so the agent's own interface has the window
+rather than drawing over your shell history. Set BOKS_NO_CLEAR to keep the screen as it is.
+
 Agents:
 %s`, agentList(agents)),
 		Example: `  boks run                              # a shell in the current directory
@@ -151,6 +154,25 @@ Agents:
 		// directory Boks will not clone costs a message rather than a sandbox.
 		if err := applyCloneMode(flags, inv, &cfg, env); err != nil {
 			return err
+		}
+
+		// Hand the agent a clean window. An agent's terminal interface draws itself over
+		// whatever the screen already held, so a full-screen UI came up underneath the
+		// user's shell history and had to be scrolled away from. Clearing here rather than
+		// after the lines below means the network summary is the first thing on the new
+		// screen and the agent starts under it, instead of the summary being wiped by the
+		// clear that was supposed to tidy up for it.
+		//
+		// Only for an interactive run, on stderr, and only when both streams really are a
+		// terminal — the same condition cfg.TTY uses below, and for the same reason. A
+		// piped or detached run must never receive escape codes.
+		if !detached && !quiet && isTerminal(env.Stdin) && isTerminal(env.Stdout) &&
+			os.Getenv("BOKS_NO_CLEAR") == "" {
+			// Screen, then scrollback, then home. Scrollback is included deliberately: a
+			// clear that leaves the history one keypress above the agent has not given
+			// the window over to it. BOKS_NO_CLEAR is for anyone who disagrees, and for
+			// a terminal that renders any of this badly.
+			fmt.Fprint(env.Stderr, "\033[2J\033[3J\033[H")
 		}
 
 		// The network is decided, described and started before the sandbox: its

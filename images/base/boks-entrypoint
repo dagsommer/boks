@@ -6,6 +6,7 @@
 set -eu
 
 boks-install-ca
+boks-prepare
 
 if [ "$#" -eq 0 ]; then
 	set -- /bin/bash

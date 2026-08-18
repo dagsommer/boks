@@ -1174,6 +1174,9 @@ dropped, and the refusal names the value the sandbox has. Remove it, or name a n
 Arguments after '--' are passed to the agent. For the shell agent they are the command to
 run, since that is what arguments to a shell are.
 
+An interactive run clears the terminal first, so the agent's own interface has the window
+rather than drawing over your shell history. Set BOKS_NO_CLEAR to keep the screen as it is.
+
 ```
 Agents:
   shell          a plain shell in the Boks base image
