@@ -19,9 +19,14 @@ import (
 // one now (see internal/network/vmm_windows.go), so stub primitives would make `boks run` fail
 // on Windows for a reason that is no longer the real one — the worst kind of error message.
 //
-// **Nothing in this file has ever been executed.** It compiles for windows/amd64 and
-// windows/arm64 and follows the APIs as Microsoft documents them; that is the whole of the
-// claim.
+// **What has and has not run here.** acquire and locked have now executed on Windows: the
+// native job in .github/workflows/windows.yml runs internal/cli's tests, whose holdDaemonLock
+// takes a real lock, and `boks purge` correctly refused while it was held. terminate and detach
+// have still never run — they compile for windows/amd64 and windows/arm64 and follow the APIs
+// as Microsoft documents them, which is the whole of the claim for those two.
+//
+// openLockFile's share mode is reasoned from documented behaviour plus Go's own delete path,
+// not from a run: what proves it is that same job going green on the --force case.
 
 // acquire takes the lock for the life of the process, as an exclusive byte-range lock on the
 // lock file.
@@ -35,8 +40,54 @@ import (
 // The returned function releases the lock explicitly. That is not decoration on this platform:
 // see locked for why the implicit release at process death is the part that cannot be relied
 // on to be prompt.
+// openLockFile opens the lock file so that another process may still DELETE it.
+//
+// This is the whole reason it exists rather than os.OpenFile. Go opens files on Windows with
+// FILE_SHARE_READ|FILE_SHARE_WRITE and no FILE_SHARE_DELETE, and a Windows file open without
+// that flag cannot be unlinked by anybody: the attempt fails with a sharing violation. On Unix
+// an flock does not stand in the way of unlink at all, so a lock file held by a live process is
+// still deletable, and code written against that behaviour breaks here in a way that names the
+// wrong thing.
+//
+// What it broke: `boks purge --force`. The purge refuses while the managed daemon is up and
+// documents --force as the override, but the override could not remove the tree — RemoveAll
+// reached daemon.lock and stopped with "The process cannot access the file because it is being
+// used by another process". The refusal was overridable on Unix and not on Windows, and the
+// error named a file rather than the daemon holding it.
+//
+// Deleting an open file is then permitted but not automatic: os.Remove asks for POSIX
+// semantics (FILE_DISPOSITION_POSIX_SEMANTICS, Windows 10 1607 and later), which unlinks the
+// name immediately instead of leaving a directory entry behind until the last handle closes.
+// Without that the name would linger and RemoveAll would fail one level up with
+// ERROR_DIR_NOT_EMPTY, so both halves are needed and only one of them is here.
+//
+// The share mode does not weaken the lock. Exclusion is LockFileEx's byte-range lock, not the
+// share mode, and that is unchanged: a second acquire still fails with ERROR_LOCK_VIOLATION.
+// What changes is only that the file may be removed while held, which is what the Unix side
+// has always allowed.
+func openLockFile(path string, create bool) (*os.File, error) {
+	wide, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	disposition := uint32(windows.OPEN_EXISTING)
+	if create {
+		disposition = windows.OPEN_ALWAYS
+	}
+	h, err := windows.CreateFile(wide,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, disposition, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		// A PathError carrying the Errno, so that os.IsNotExist works on the result the
+		// way it did for os.OpenFile — locked() reads a missing file as "nothing runs".
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(h), path), nil
+}
+
 func acquire(path string) (func(), error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := openLockFile(path, true)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +147,7 @@ func acquire(path string) (func(), error) {
 // have to sleep on the common path (a live holder, which is exactly what a held lock usually
 // means) to soften a rare one, and `boks net ls` walks every sandbox.
 func locked(path string) bool {
-	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	f, err := openLockFile(path, false)
 	if err != nil {
 		return false // no lock file at all: nothing is running
 	}
