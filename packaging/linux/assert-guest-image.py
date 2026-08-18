@@ -38,12 +38,23 @@ identical in both archives. A Mac booting the result panicked with
 release. Reading the init binary the kernel will actually exec is the assertion that would
 have turned that into a red build.
 
-HOW IT READS THE ROOTFS. `fsck.erofs --extract=<file> --path=/sbin/vminitd`, from erofs-utils,
-because the image is lz4-compressed and a byte scan for `\x7fELF` finds only compressed noise
-— tried first, and it reported four "ELF headers" with impossible e_machine values. When
-fsck.erofs is missing this script exits 2, "the check could not be made", which is
-deliberately distinct from a pass: a CI runner that stops shipping erofs-utils must go red,
-not quietly drop the only assertion that catches this.
+HOW IT READS THE ROOTFS. Two ways, and the caller picks.
+
+`--init-binary PATH` reads a /sbin/vminitd the caller already extracted. This is what CI does,
+because extraction is the part that needs a current erofs-utils and a GitHub runner does not
+have one: `fsck.erofs --path=` arrived in 1.8 and Ubuntu 24.04 ships 1.7.1, where the option is
+rejected, usage is printed and the exit status is 1. Reading an ELF header needs no erofs
+support at all, so the two halves are split and the extraction happens in a container running
+the same Debian whose mkfs.erofs wrote the image.
+
+Otherwise the script extracts for itself, with `fsck.erofs --extract=<file>
+--path=/sbin/vminitd`. A byte scan for `\x7fELF` was tried first and is useless: the image is
+lz4-compressed, and the scan reported four "ELF headers" with impossible e_machine values.
+
+Either way, a check that could not be MADE exits 2 and not 0 — no fsck.erofs, one too old to
+have --path, an --init-binary that is not there. That is deliberately distinct from a pass,
+because the failure this script exists to catch is invisible everywhere else, and a run that
+silently skipped it would look exactly like a run that made it.
 
 WHY THE KERNEL IS NOT SIMPLY AN ELF CHECK. It is one on x86_64 — nerdbox's recipe produces an
 ELF `vmlinux` there, deliberately not a bzImage, because `krun_set_kernel` takes ELF. It is
@@ -66,6 +77,7 @@ EXIT STATUS IS PART OF THE CONTRACT, because the controls in CI depend on tellin
 import argparse
 import importlib.util
 import pathlib
+import re
 import shutil
 import struct
 import subprocess
@@ -88,6 +100,14 @@ ROOTFS_NAME = "nerdbox-rootfs.erofs"
 # installs the binary there, and a boot log says so in as many words: `Run /sbin/vminitd as
 # init process`. It is the one file whose architecture decides whether the VM comes up at all.
 INIT_PATH = "/sbin/vminitd"
+
+# fsck.erofs grew --path in 1.8, and it is the only reason this script needs the tool at all:
+# without it the whole image has to be unpacked to reach one file. Ubuntu 24.04 ships 1.7.1,
+# where the option does not exist — fsck rejects it, prints its usage, and exits 1. That looked
+# like a broken artifact and is not, which is why this is checked up front and reported as
+# "cannot check" rather than as a wrong rootfs. The same floor internal/doctor/erofs.go keeps
+# for the snapshotter, for unrelated reasons.
+EROFS_UTILS_MINIMUM = (1, 8)
 
 
 class CannotCheck(Exception):
@@ -153,6 +173,34 @@ def kernel_format(data: bytes):
     return (None, None)
 
 
+def erofs_utils_version(fsck: str):
+    """Return (major, minor) for the fsck.erofs at fsck, or None if it cannot be read."""
+    try:
+        out = subprocess.run([fsck, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (out.stdout or "") + (out.stderr or "")
+    match = re.search(r"(\d+)\.(\d+)", text.splitlines()[0] if text.splitlines() else "")
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def elf_arch(data: bytes, where: str):
+    """Return (architecture, description) for an ELF64 blob, or raise BadRootfs."""
+    elf_module = load_elf_reader()
+    try:
+        elf = elf_module.ELF64(data)
+    except elf_module.NotELF as exc:
+        raise BadRootfs(f"{where} is not an ELF64 executable ({exc})") from exc
+    name = next(
+        (n for n, v in elf_module.MACHINES.items() if v == elf.e_machine),
+        f"unknown e_machine {elf.e_machine}",
+    )
+    found = next((a for a, spec in ARCHES.items() if spec["elf_machine"] == name), None)
+    return found, f"ELF64 {name}, {len(data)} bytes"
+
+
 def init_binary_arch(rootfs: pathlib.Path):
     """Return (architecture, description) for the rootfs's /sbin/vminitd.
 
@@ -170,6 +218,16 @@ def init_binary_arch(rootfs: pathlib.Path):
             f"a pass: the check was not made."
         )
 
+    version = erofs_utils_version(fsck)
+    if version is None or version < EROFS_UTILS_MINIMUM:
+        shown = "unreadable" if version is None else "%d.%d" % version
+        raise CannotCheck(
+            f"{fsck} is erofs-utils {shown}, and --path needs at least "
+            f"%d.%d. Extract {INIT_PATH} with a newer tool and pass it as --init-binary, "
+            f"which is what .github/workflows/guest-image.yml does. This is exit 2, not a "
+            f"pass: the check was not made." % EROFS_UTILS_MINIMUM
+        )
+
     with tempfile.TemporaryDirectory() as tmp:
         # --path extracts that one inode, and writes it AT the --extract path rather than
         # under it, so this names a file that does not exist yet rather than a directory.
@@ -180,30 +238,22 @@ def init_binary_arch(rootfs: pathlib.Path):
             text=True,
         )
         if proc.returncode != 0 or not target.is_file():
+            # Every line, indented. Reporting only the last one printed "Supported
+            # algorithms are: lz4, lz4hc, …" — the tail of an old erofs-utils' USAGE banner —
+            # which reads as "the image uses an algorithm I lack" and sent the diagnosis
+            # after a compression problem that did not exist. The real message was above it.
             said = (proc.stderr or proc.stdout or "").strip().splitlines()
+            detail = "".join("\n      " + line for line in said)
             raise BadRootfs(
                 f"{INIT_PATH} could not be extracted from {rootfs.name} "
-                f"(fsck.erofs exit {proc.returncode}"
-                + (f": {said[-1]}" if said else "")
-                + ")"
+                f"(fsck.erofs exit {proc.returncode}):{detail}"
             )
         data = target.read_bytes()
 
-    elf_module = load_elf_reader()
-    try:
-        elf = elf_module.ELF64(data)
-    except elf_module.NotELF as exc:
-        raise BadRootfs(f"{INIT_PATH} is not an ELF64 executable ({exc})") from exc
-
-    name = next(
-        (n for n, v in elf_module.MACHINES.items() if v == elf.e_machine),
-        f"unknown e_machine {elf.e_machine}",
-    )
-    found = next((a for a, spec in ARCHES.items() if spec["elf_machine"] == name), None)
-    return found, f"ELF64 {name}, {len(data)} bytes"
+    return elf_arch(data, INIT_PATH)
 
 
-def check(directory: pathlib.Path, arch: str) -> bool:
+def check(directory: pathlib.Path, arch: str, init_binary: pathlib.Path | None = None) -> bool:
     problems = []
     kernel_name = f"nerdbox-kernel-{arch}"
 
@@ -260,7 +310,14 @@ def check(directory: pathlib.Path, arch: str) -> bool:
         else:
             print(f"  {ROOTFS_NAME}: EROFS superblock, {rootfs.stat().st_size} bytes")
             try:
-                found, detail = init_binary_arch(rootfs)
+                if init_binary is not None:
+                    # Extracted by the caller, because the tool here may be too old to do
+                    # it — see EROFS_UTILS_MINIMUM. The assertion is the same either way:
+                    # what this reads is the init binary the kernel will exec.
+                    found, detail = elf_arch(init_binary.read_bytes(),
+                                             f"{init_binary} ({INIT_PATH})")
+                else:
+                    found, detail = init_binary_arch(rootfs)
             except BadRootfs as exc:
                 problems.append(str(exc))
             else:
@@ -290,6 +347,12 @@ def main(argv) -> int:
     )
     p.add_argument("directory")
     p.add_argument("--arch", required=True, choices=sorted(ARCHES))
+    p.add_argument(
+        "--init-binary",
+        help=f"a {INIT_PATH} already extracted from the rootfs, read instead of extracting "
+        "one here. For callers whose erofs-utils is older than "
+        "%d.%d and so has no --path." % EROFS_UTILS_MINIMUM,
+    )
     args = p.parse_args(argv[1:])
 
     directory = pathlib.Path(args.directory)
@@ -298,7 +361,11 @@ def main(argv) -> int:
         return 2
 
     try:
-        held = check(directory, args.arch)
+        init_binary = pathlib.Path(args.init_binary) if args.init_binary else None
+        if init_binary is not None and not init_binary.is_file():
+            print(f"--init-binary {init_binary}: not a file", file=sys.stderr)
+            return 2
+        held = check(directory, args.arch, init_binary)
     except CannotCheck as exc:
         print(f"cannot check {directory}: {exc}", file=sys.stderr)
         return 2
