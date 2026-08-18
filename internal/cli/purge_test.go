@@ -26,8 +26,21 @@ func purgeState(t *testing.T) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(policy.StateDirEnv, dir)
-	return dir
+	// Resolved, because purge.Root resolves symlinks before it reports anything (see its
+	// doc comment) and these tests compare printed paths against this one. The two forms
+	// differ on two of the three platforms: macOS temp dirs live under /var, a symlink to
+	// /private/var, and on Windows the runner's TEMP is the 8.3 short name
+	// C:\Users\RUNNER~1\... which resolves to C:\Users\runneradmin\....
+	//
+	// That is what made TestPurgeReclaimsDiskAndKeepsIdentity fail on Windows while the
+	// command was doing exactly the right thing: it printed the resolved path, the test
+	// wanted the short one, and the log showed two paths a human reads as identical.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(policy.StateDirEnv, resolved)
+	return resolved
 }
 
 // writeState creates one file's worth of a named piece of state, so a plan has something to
