@@ -143,17 +143,44 @@ jobs:
       - name: Assert every built image runs as a numeric non-root user
         env:
           AGENT_IMAGES: ${{ join(fromJSON(needs.tag.outputs.images), ' ') }}
+          # ARCH is set on the build step above rather than on the job, so it has to be
+          # repeated here. Without it `set -u` aborted this step on the first expansion, and
+          # the failure printed NOTHING — no verdict, no archive name, just exit 1 — which is
+          # a worse way to fail than the bug this step exists to catch.
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           fail=0
           for name in base $AGENT_IMAGES; do
             tar="oci/${name}-${ARCH}.tar"
+            # Said out loud, because everything below is a pipeline under `set -e`: an
+            # archive that is missing or not an OCI layout would otherwise kill the step
+            # with no indication of which image or which step of the read went wrong.
+            if [ ! -f "$tar" ]; then
+              echo "  $name: $tar does not exist — the build did not produce it" >&2
+              fail=1; continue
+            fi
             # The OCI layout: index.json -> a manifest -> the config blob holding .config.User.
             # Read out of the archive with tar rather than unpacking the whole thing.
-            manifest_digest="$(tar -xOf "$tar" index.json \
-              | jq -r '.manifests[0].digest' | cut -d: -f2)"
+            #
+            # NOT .manifests[0]. The build above passes --provenance=mode=max and --sbom=true,
+            # so the index holds attestation manifests beside the image and their order is not
+            # promised. An attestation's config has no .config.User, so picking the wrong entry
+            # would report every image as root — a false failure, which is worse here than no
+            # check at all. The attestation manifests are the ones carrying
+            # vnd.docker.reference.type, so they are excluded by name.
+            manifest_digest="$(tar -xOf "$tar" index.json | jq -r '
+              [.manifests[] | select((.annotations["vnd.docker.reference.type"] // "")
+                                     != "attestation-manifest")][0].digest // ""' | cut -d: -f2)"
+            if [ -z "$manifest_digest" ]; then
+              echo "  $name: no image manifest in $tar" >&2; fail=1; continue
+            fi
             config_digest="$(tar -xOf "$tar" "blobs/sha256/${manifest_digest}" \
-              | jq -r '.config.digest' | cut -d: -f2)"
+              | jq -r '.config.digest // ""' | cut -d: -f2)"
+            if [ -z "$config_digest" ]; then
+              echo "  $name: manifest ${manifest_digest} names no config blob" >&2
+              fail=1; continue
+            fi
             user="$(tar -xOf "$tar" "blobs/sha256/${config_digest}" \
               | jq -r '.config.User // ""')"
 
