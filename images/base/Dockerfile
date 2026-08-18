@@ -98,7 +98,27 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
     LANG=C.UTF-8 \
     PIP_BREAK_SYSTEM_PACKAGES=1
 
-USER agent
+# 1000:1000, not `agent`, and the numbers are load-bearing rather than a style choice.
+#
+# An image may name its user or number it, and only one of those survives the trip to a
+# non-Linux host. Resolving `agent` to a uid means reading /etc/passwd out of this image's
+# root filesystem, which is a Linux filesystem: containerd does it on Linux by mounting the
+# snapshot, and on macOS it cannot mount it at all. Its answer there is to give up and store
+# the string in Process.User.Username (spec_opts.go, `runtime.GOOS == "darwin"`), leaving
+# Process.User.UID at zero — and nothing in the guest reads Username back, so `USER agent`
+# meant **uid 0** on every Mac. Not as an error: the container simply ran as root.
+#
+# That is how a sandboxed agent ended up refusing to start, since Claude Code declines
+# `--dangerously-skip-permissions` as root, which is the symptom that found this.
+#
+# Numbers need no filesystem, so every host honours them — see applyImageUser in
+# internal/sandbox/imageconfig.go. Nothing is lost by spelling it this way: uid/gid 1000 is
+# the `agent` created above, HOME still comes from this image's own /etc/passwd (crun calls
+# set_home_env with the container uid, which finds /home/agent), and on Linux containerd
+# still reads /etc/group for supplementary groups afterwards, of which this image has none.
+#
+# Keep it numeric. `USER agent` reads better and silently means root off Linux.
+USER 1000:1000
 WORKDIR /home/agent
 
 # tini first so it reaps; the entrypoint installs the CA and then execs, so it does not

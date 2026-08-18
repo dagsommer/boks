@@ -29,5 +29,7 @@ RUN set -eux; \
     rm -f /tmp/codex.tar.gz "/tmp/codex-${target}"; \
     codex --version
 
-USER agent
+# Numeric on purpose: `USER agent` silently means uid 0 off Linux. The full reason is
+# in images/base/Dockerfile, above its own USER line.
+USER 1000:1000
 CMD ["codex"]

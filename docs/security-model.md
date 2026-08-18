@@ -38,7 +38,10 @@ Out of scope, for now:
 ```
 
 The **hypervisor boundary is the primary control**. Everything else is defence in depth.
-In-guest permissions are not a boundary: the agent has root in the guest, by design.
+In-guest permissions are not a boundary, and nothing here depends on them: the guest is
+disposable and its entire filesystem is the agent's to ruin. (The agent process itself
+runs as uid 1000 with no sudo — see images/base/Dockerfile — but treat that as hygiene,
+not containment.)
 
 ### Guest → host
 

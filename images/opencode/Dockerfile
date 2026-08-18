@@ -32,5 +32,7 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/opencode; \
     opencode --version
 
-USER agent
+# Numeric on purpose: `USER agent` silently means uid 0 off Linux. The full reason is
+# in images/base/Dockerfile, above its own USER line.
+USER 1000:1000
 CMD ["opencode"]

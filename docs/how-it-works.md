@@ -25,7 +25,9 @@ produce none of that, which is what makes the boundary checkable rather than mer
 see [Verification](verification.md).
 
 **Assume code in the sandbox is hostile.** The hypervisor is the boundary; permissions
-*inside* the guest are not, and the agent has root there by design.
+*inside* the guest are not — the guest is disposable, and its whole filesystem is the
+agent's to ruin. The agent runs as uid 1000 rather than root, which is hygiene rather
+than containment.
 
 ## The workspace is the only thing it can see
 
