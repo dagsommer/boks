@@ -156,31 +156,22 @@ jobs:
           docker buildx bake rootfs --set "rootfs.platform=linux/${docker_arch}"
           ls -l _output/
 
-      # /sbin/vminitd has to come out of a compressed EROFS image, and this runner cannot do
-      # it: `fsck.erofs --path=` needs erofs-utils 1.8, and Ubuntu 24.04 ships 1.7.1. Given
-      # that option it rejects it, prints its usage and exits 1 — which the first version of
-      # this step reported as a broken rootfs, blaming the artifact for the tool.
+      # assert-guest-image.py unpacks the rootfs to read /sbin/vminitd out of it, which needs
+      # erofs-utils. The runner's own is enough: --extract has been in fsck.erofs since at
+      # least 1.7.1, which is what Ubuntu 24.04 ships.
       #
-      # So the extraction happens in a container instead, in the same Debian release whose
-      # mkfs.erofs wrote the image (nerdbox's Dockerfile installs erofs-utils from Debian), so
-      # the reader is by construction able to read what the writer produced. The script then
-      # takes the extracted file with --init-binary and does the ELF reading, which needs no
-      # erofs support at all. It still exits 2 rather than 0 if it is ever asked to extract
-      # with a tool that cannot — "the check could not be made" is not a pass.
-      - name: Extract the guest init binary for the assertion below
-        working-directory: nerdbox
-        run: |
-          set -euo pipefail
-          rm -rf /tmp/guest-init && mkdir -p /tmp/guest-init
-          docker run --rm \
-            -v "$PWD/_output:/out:ro" -v /tmp/guest-init:/work \
-            debian:trixie-slim sh -euc '
-              apt-get update >/dev/null
-              apt-get install -y --no-install-recommends erofs-utils >/dev/null
-              fsck.erofs --version | head -1
-              fsck.erofs --extract=/work/vminitd --path=/sbin/vminitd /out/nerdbox-rootfs.erofs
-            '
-          ls -l /tmp/guest-init/vminitd
+      # It asks for the whole image rather than one file. `--path=` would be neater and is not
+      # portable — it arrived in erofs-utils 1.9.1, so both Ubuntu's 1.7.1 and the Debian
+      # 1.8.6 tried next reject it, print their usage and exit 1. That usage banner ends with
+      # "Supported algorithms are: lz4, …", which reads as a compression problem and is not
+      # one; two rounds of CI went into that sentence.
+      #
+      # Without erofs-utils the script exits 2 — "the check could not be made" — which is
+      # deliberately not a pass, so a runner image that stops shipping the package turns the
+      # job red instead of silently dropping the only assertion that catches a wrong-arch
+      # rootfs.
+      - name: Install erofs-utils, which the rootfs assertion unpacks the image with
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends erofs-utils
 
       # ---------------------------------------------------------------------------------
       # Assert what was BUILT, not what was asked for. Until 2026-08-16 nothing in this
@@ -206,8 +197,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 boks/packaging/linux/assert-guest-image.py nerdbox/_output \
-            --arch '${{ inputs.arch || 'x86_64' }}' \
-            --init-binary /tmp/guest-init/vminitd
+            --arch '${{ inputs.arch || 'x86_64' }}'
 
       # The control. The assertion above is only evidence if it can fail, and the way it
       # would fail in production is precisely a kernel built for the other architecture — so
@@ -261,7 +251,9 @@ jobs:
         run: |
           set -euo pipefail
           arch='${{ inputs.arch || 'x86_64' }}'
-          cp /tmp/guest-init/vminitd /tmp/guest-init/vminitd.flipped
+          rm -rf /tmp/guest-init && mkdir -p /tmp/guest-init
+          fsck.erofs --extract=/tmp/guest-init --overwrite nerdbox/_output/nerdbox-rootfs.erofs
+          cp /tmp/guest-init/sbin/vminitd /tmp/guest-init/vminitd.flipped
           # e_machine is Elf64_Half at offset 18. 183 is aarch64, 62 is x86-64; whichever it
           # is, write the other one. Python because this is a two-byte poke in a 13 MB file.
           python3 - <<'PY'
