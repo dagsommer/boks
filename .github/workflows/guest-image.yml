@@ -156,13 +156,31 @@ jobs:
           docker buildx bake rootfs --set "rootfs.platform=linux/${docker_arch}"
           ls -l _output/
 
-      # assert-guest-image.py opens the rootfs to read /sbin/vminitd out of it, and the rootfs
-      # is a compressed EROFS image, so it needs fsck.erofs to do that. Without erofs-utils
-      # the script exits 2 — "the check could not be made" — which is deliberately not the
-      # same as a pass, so a runner image that stops shipping this package turns the job red
-      # instead of silently dropping the only assertion that catches the bug above.
-      - name: Install erofs-utils, which the rootfs assertion reads the image with
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends erofs-utils
+      # /sbin/vminitd has to come out of a compressed EROFS image, and this runner cannot do
+      # it: `fsck.erofs --path=` needs erofs-utils 1.8, and Ubuntu 24.04 ships 1.7.1. Given
+      # that option it rejects it, prints its usage and exits 1 — which the first version of
+      # this step reported as a broken rootfs, blaming the artifact for the tool.
+      #
+      # So the extraction happens in a container instead, in the same Debian release whose
+      # mkfs.erofs wrote the image (nerdbox's Dockerfile installs erofs-utils from Debian), so
+      # the reader is by construction able to read what the writer produced. The script then
+      # takes the extracted file with --init-binary and does the ELF reading, which needs no
+      # erofs support at all. It still exits 2 rather than 0 if it is ever asked to extract
+      # with a tool that cannot — "the check could not be made" is not a pass.
+      - name: Extract the guest init binary for the assertion below
+        working-directory: nerdbox
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/guest-init && mkdir -p /tmp/guest-init
+          docker run --rm \
+            -v "$PWD/_output:/out:ro" -v /tmp/guest-init:/work \
+            debian:trixie-slim sh -euc '
+              apt-get update >/dev/null
+              apt-get install -y --no-install-recommends erofs-utils >/dev/null
+              fsck.erofs --version | head -1
+              fsck.erofs --extract=/work/vminitd --path=/sbin/vminitd /out/nerdbox-rootfs.erofs
+            '
+          ls -l /tmp/guest-init/vminitd
 
       # ---------------------------------------------------------------------------------
       # Assert what was BUILT, not what was asked for. Until 2026-08-16 nothing in this
@@ -188,7 +206,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 boks/packaging/linux/assert-guest-image.py nerdbox/_output \
-            --arch '${{ inputs.arch || 'x86_64' }}'
+            --arch '${{ inputs.arch || 'x86_64' }}' \
+            --init-binary /tmp/guest-init/vminitd
 
       # The control. The assertion above is only evidence if it can fail, and the way it
       # would fail in production is precisely a kernel built for the other architecture — so
@@ -223,27 +242,31 @@ jobs:
 
       # The rootfs control, and it needs to be its own step rather than to lean on the one
       # above. That control stages a wrong-arch KERNEL, which fails the kernel assertion, so
-      # it would exit 1 whether or not the rootfs were ever opened — it cannot tell whether
+      # it would exit 1 whether or not the init binary were ever read — it cannot tell whether
       # check 5 ran. This one leaves the kernel correct and correctly named, so exit 1 can
-      # only have come from the rootfs.
+      # only have come from the init binary.
       #
-      # What it stages is this build's own rootfs with ONE FIELD CHANGED: /sbin/vminitd's
-      # e_machine, flipped to the other architecture and repacked. That is exactly the defect
-      # that shipped — an init binary for the wrong machine inside an otherwise valid image —
-      # rather than a corrupt file that any check might reject for any reason.
-      - name: Prove the rootfs assertion can fail
+      # What it stages is this build's own vminitd with ONE FIELD CHANGED: e_machine, flipped
+      # to the other architecture. That is exactly the defect that shipped — an init binary for
+      # the wrong machine — rather than a corrupt file that any check might reject for any
+      # reason.
+      #
+      # It reuses the binary extracted above and passes it with --init-binary, so it needs no
+      # erofs-utils on the runner: repacking an image here would only re-test the extraction,
+      # which this runner's 1.7.1 cannot do anyway. Exit status EXACTLY 1 — the script exits 2
+      # for a bad path or a check it could not make, and accepting any non-zero status would
+      # let "could not check" pass as "correctly rejected", which is the failure mode this
+      # whole control exists to rule out.
+      - name: Prove the init-binary assertion can fail
         run: |
           set -euo pipefail
           arch='${{ inputs.arch || 'x86_64' }}'
-          rm -rf /tmp/rootfs-control /tmp/rootfs-control-dir
-          mkdir -p /tmp/rootfs-control/sbin /tmp/rootfs-control-dir
-          fsck.erofs --extract=/tmp/rootfs-control/sbin/vminitd --path=/sbin/vminitd \
-            nerdbox/_output/nerdbox-rootfs.erofs
+          cp /tmp/guest-init/vminitd /tmp/guest-init/vminitd.flipped
           # e_machine is Elf64_Half at offset 18. 183 is aarch64, 62 is x86-64; whichever it
           # is, write the other one. Python because this is a two-byte poke in a 13 MB file.
           python3 - <<'PY'
           import struct
-          path = "/tmp/rootfs-control/sbin/vminitd"
+          path = "/tmp/guest-init/vminitd.flipped"
           data = bytearray(open(path, "rb").read())
           was = struct.unpack_from("<H", data, 18)[0]
           struct.pack_into("<H", data, 18, 62 if was == 183 else 183)
@@ -251,22 +274,19 @@ jobs:
           print(f"  staged a vminitd with e_machine {was} rewritten to "
                 f"{struct.unpack_from('<H', data, 18)[0]}")
           PY
-          mkfs.erofs -zlz4 /tmp/rootfs-control-dir/nerdbox-rootfs.erofs /tmp/rootfs-control \
-            >/dev/null
-          cp "nerdbox/_output/nerdbox-kernel-$arch" /tmp/rootfs-control-dir/
           set +e
-          python3 boks/packaging/linux/assert-guest-image.py /tmp/rootfs-control-dir \
-            --arch "$arch" >/dev/null 2>&1
+          python3 boks/packaging/linux/assert-guest-image.py nerdbox/_output \
+            --arch "$arch" --init-binary /tmp/guest-init/vminitd.flipped >/dev/null 2>&1
           rc=$?
           set -e
           if [ "$rc" -ne 1 ]; then
-            echo "CONTROL FAILED: a rootfs whose /sbin/vminitd is not $arch was not rejected" >&2
+            echo "CONTROL FAILED: a vminitd that is not $arch was not rejected" >&2
             echo "expected exit 1 (ran and rejected), got $rc" >&2
-            echo "rc=2 means fsck.erofs was missing and check 5 never ran at all" >&2
+            echo "rc=2 means the assertion could not be made and check 5 never ran" >&2
             exit 1
           fi
-          echo "  rejected, as it must: a rootfs holding a non-$arch /sbin/vminitd"
-          rm -rf /tmp/rootfs-control /tmp/rootfs-control-dir
+          echo "  rejected, as it must: a non-$arch /sbin/vminitd"
+          rm -f /tmp/guest-init/vminitd.flipped
 
       # The names in SHA256SUMS are bare, not `_output/`-prefixed, because the artifact is
       # flattened: whoever downloads it gets the files at the top level and needs
