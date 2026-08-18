@@ -77,7 +77,6 @@ EXIT STATUS IS PART OF THE CONTRACT, because the controls in CI depend on tellin
 import argparse
 import importlib.util
 import pathlib
-import re
 import shutil
 import struct
 import subprocess
@@ -101,13 +100,13 @@ ROOTFS_NAME = "nerdbox-rootfs.erofs"
 # init process`. It is the one file whose architecture decides whether the VM comes up at all.
 INIT_PATH = "/sbin/vminitd"
 
-# fsck.erofs grew --path in 1.8, and it is the only reason this script needs the tool at all:
-# without it the whole image has to be unpacked to reach one file. Ubuntu 24.04 ships 1.7.1,
-# where the option does not exist — fsck rejects it, prints its usage, and exits 1. That looked
-# like a broken artifact and is not, which is why this is checked up front and reported as
-# "cannot check" rather than as a wrong rootfs. The same floor internal/doctor/erofs.go keeps
-# for the snapshotter, for unrelated reasons.
-EROFS_UTILS_MINIMUM = (1, 8)
+# The whole image is unpacked to reach one file, rather than asking for that one file with
+# `fsck.erofs --path=`. --path is worth wanting and cannot be relied on: it arrived in 1.9.1,
+# while Ubuntu 24.04 ships erofs-utils 1.7.1 and Debian trixie 1.8.6, and both of those reject
+# the option, print their usage and exit 1. Reported as an error that named an algorithm list,
+# that cost two CI rounds. --extract has been there since at least 1.7.1, so unpacking is the
+# portable spelling, and a rootfs is some tens of megabytes — a cost worth paying to have one
+# code path that works everywhere.
 
 
 class CannotCheck(Exception):
@@ -173,17 +172,19 @@ def kernel_format(data: bytes):
     return (None, None)
 
 
-def erofs_utils_version(fsck: str):
-    """Return (major, minor) for the fsck.erofs at fsck, or None if it cannot be read."""
+def supports_extract(fsck: str) -> bool:
+    """Report whether this fsck.erofs can unpack an image at all.
+
+    Asked of the tool rather than derived from its version number. A version floor was tried
+    first and got the number wrong — --path was assumed to be 1.8 and is 1.9.1 — which failed a
+    build for a reason that had nothing to do with the artifact. What matters is whether the
+    option exists, and the tool will say.
+    """
     try:
-        out = subprocess.run([fsck, "--version"], capture_output=True, text=True, timeout=30)
+        out = subprocess.run([fsck, "--help"], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
-        return None
-    text = (out.stdout or "") + (out.stderr or "")
-    match = re.search(r"(\d+)\.(\d+)", text.splitlines()[0] if text.splitlines() else "")
-    if not match:
-        return None
-    return (int(match.group(1)), int(match.group(2)))
+        return False
+    return "--extract" in (out.stdout or "") + (out.stderr or "")
 
 
 def elf_arch(data: bytes, where: str):
@@ -218,22 +219,21 @@ def init_binary_arch(rootfs: pathlib.Path):
             f"a pass: the check was not made."
         )
 
-    version = erofs_utils_version(fsck)
-    if version is None or version < EROFS_UTILS_MINIMUM:
-        shown = "unreadable" if version is None else "%d.%d" % version
+    if not supports_extract(fsck):
         raise CannotCheck(
-            f"{fsck} is erofs-utils {shown}, and --path needs at least "
-            f"%d.%d. Extract {INIT_PATH} with a newer tool and pass it as --init-binary, "
-            f"which is what .github/workflows/guest-image.yml does. This is exit 2, not a "
-            f"pass: the check was not made." % EROFS_UTILS_MINIMUM
+            f"{fsck} has no --extract, so {INIT_PATH} cannot be read out of {rootfs.name}. "
+            f"Unpack it with a tool that can and pass it as --init-binary. This is exit 2, "
+            f"not a pass: the check was not made."
         )
 
     with tempfile.TemporaryDirectory() as tmp:
-        # --path extracts that one inode, and writes it AT the --extract path rather than
-        # under it, so this names a file that does not exist yet rather than a directory.
-        target = pathlib.Path(tmp) / "vminitd"
+        # The whole image, into a directory of its own; INIT_PATH is then an ordinary path
+        # inside it. --overwrite because the directory already exists.
+        root = pathlib.Path(tmp) / "rootfs"
+        root.mkdir()
+        target = root / INIT_PATH.lstrip("/")
         proc = subprocess.run(
-            [fsck, f"--extract={target}", f"--path={INIT_PATH}", str(rootfs)],
+            [fsck, f"--extract={root}", "--overwrite", str(rootfs)],
             capture_output=True,
             text=True,
         )
@@ -349,9 +349,9 @@ def main(argv) -> int:
     p.add_argument("--arch", required=True, choices=sorted(ARCHES))
     p.add_argument(
         "--init-binary",
-        help=f"a {INIT_PATH} already extracted from the rootfs, read instead of extracting "
-        "one here. For callers whose erofs-utils is older than "
-        "%d.%d and so has no --path." % EROFS_UTILS_MINIMUM,
+        help=f"a {INIT_PATH} already extracted from the rootfs, read instead of unpacking "
+        "the image here. For a caller whose erofs-utils cannot unpack it, and for the CI "
+        "control, which flips one byte in this file to prove the check can fail.",
     )
     args = p.parse_args(argv[1:])
 
