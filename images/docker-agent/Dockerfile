@@ -26,7 +26,9 @@ RUN set -eux; \
     rm -f /tmp/docker-agent; \
     docker-agent version
 
-USER agent
+# Numeric on purpose: `USER agent` silently means uid 0 off Linux. The full reason is
+# in images/base/Dockerfile, above its own USER line.
+USER 1000:1000
 
 # Docker Agent collects anonymous usage data unless told not to. Boks reports no telemetry of
 # its own, and an image that quietly phones home from inside a sandbox would make that claim

@@ -31,5 +31,7 @@ RUN set -eux; \
     ln -s /opt/gemini-cli/gemini.js /usr/local/bin/gemini; \
     gemini --version
 
-USER agent
+# Numeric on purpose: `USER agent` silently means uid 0 off Linux. The full reason is
+# in images/base/Dockerfile, above its own USER line.
+USER 1000:1000
 CMD ["gemini"]
