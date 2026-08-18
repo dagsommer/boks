@@ -1,0 +1,26 @@
+#!/bin/sh
+# Stand in for a web browser, because a sandbox has none.
+#
+# An agent that logs in through OAuth asks the desktop to open a URL: `xdg-open` on Linux,
+# `open` on a Mac, or whatever $BROWSER names. Inside the guest all three are absent, so the
+# agent either fails quietly or reports that it could not launch a browser — and the URL, the
+# one thing the user needs, is what it was about to hand to a program that does not exist.
+#
+# There is no way to reach the host's browser from here and there should not be: the guest can
+# talk to the proxy and to nothing else, which is the point of the sandbox. So this prints the
+# URL where the user can see and copy it, and exits 0, because from the agent's point of view
+# the browser was launched.
+set -eu
+
+if [ "$#" -eq 0 ]; then
+	echo "boks: nothing to open" >&2
+	exit 64
+fi
+
+printf '\n'
+printf '  This sandbox has no browser. Open this on your host:\n'
+printf '\n'
+for url in "$@"; do
+	printf '    %s\n' "$url"
+done
+printf '\n'
