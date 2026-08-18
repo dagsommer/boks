@@ -1,0 +1,27 @@
+#!/bin/sh
+# Run whatever each image left in /etc/boks/prepare.d, in name order, before the agent starts.
+#
+# The base image cannot know what any one agent needs prepared — Claude Code records trusted
+# directories in ~/.claude.json, and every other agent has its own file in its own shape — and
+# an entrypoint that grew a branch per agent would put that knowledge in the one image that
+# does not install any of them. So each agent image drops a script in here instead, next to the
+# CLI it belongs to.
+#
+# A script that fails does NOT stop the sandbox. These prepare conveniences: a trusted
+# directory, a suppressed first-run prompt. None of them is worth refusing to start an agent
+# over, and a sandbox that would not boot because a config file could not be written would be a
+# far worse bug than the prompt it was avoiding. Failures are reported and stepped over.
+set -u
+
+dir=/etc/boks/prepare.d
+[ -d "$dir" ] || exit 0
+
+for script in "$dir"/*; do
+	[ -f "$script" ] || continue
+	[ -x "$script" ] || continue
+	if ! "$script"; then
+		echo "boks: $script failed; continuing without what it prepares" >&2
+	fi
+done
+
+exit 0
