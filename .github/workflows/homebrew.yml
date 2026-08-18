@@ -35,6 +35,19 @@ name: homebrew
 on:
   release:
     types: [published]
+  # Runnable by hand, and this is not a convenience: for most of this repository's life the
+  # trigger above could not fire at all. release.yml creates the release with `gh release
+  # create` under the default GITHUB_TOKEN, and GitHub does not start workflow runs from events
+  # raised by that token — so `release: published` never arrived and this workflow had never
+  # run once, while the tap sat on v0.1.1 pointing its `guest` resource at the broken x86_64
+  # rootfs. release.yml now dispatches this explicitly; the input is what lets that work, and
+  # what lets a human repair a tap for a release that has already gone out.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to render the tap from, e.g. v0.1.5"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -48,9 +61,20 @@ jobs:
 
       - name: Strip the leading v from the tag
         id: version
+        env:
+          # On a release event the ref IS the tag; on workflow_dispatch it is the branch the
+          # run was started from, which is not a release and would render a tap for "main".
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          tag="${GITHUB_REF_NAME}"
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "refusing to render a tap for '$tag': expected a vX.Y.Z release tag" >&2
+               exit 1 ;;
+          esac
           version="${tag#v}"
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
           echo "version=${version}" >>"$GITHUB_OUTPUT"
           echo "tag=${tag}"
           echo "version=${version}"
@@ -59,7 +83,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "$GITHUB_REF_NAME" \
+          gh release download "${{ steps.version.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern SHA256SUMS \
             --dir dist/
