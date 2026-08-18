@@ -54,6 +54,12 @@ Flags must come before the sandbox name; everything after the name belongs to th
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		name, command := args[0], commandFor(args)
 
+		// `boks exec` can be the first command after a reboot, and the sandbox it names
+		// is in a containerd database that outlived the daemon. See ensureDaemon.
+		if err := ensureDaemon(cmd.Context(), dev, env.Stderr); err != nil {
+			return err
+		}
+
 		// `boks exec` starts a stopped sandbox, so it can be the command that boots the
 		// VM — and a VM that boots without something holding its link socket comes up
 		// with a NIC connected to nothing. The stack it starts outlives this command, as

@@ -35,13 +35,19 @@ erofs differ fails during an image unpack naming a differ, and a ttrpc socket co
 to chown to uid 0 fails at startup naming a file. 'boks daemon start' writes a configuration
 that has neither problem and runs containerd with it.
 
+You do not have to run it. 'boks run', 'boks create', 'boks exec' and 'boks start' do it for
+you when nothing else is serving, because needing a daemon first is Boks' problem rather than
+yours. This command is for starting one on purpose, and for the questions the others cannot
+answer: what is running, what it said, and what configuration it was given.
+
 The daemon is Boks' own. Its root, its state and its endpoint are under your state directory,
 so it cannot disturb — or be disturbed by — a containerd that Docker or your distribution is
-running. Nothing is installed as a service and nothing runs at boot: a host that has not run
-'boks daemon start' runs no Boks process at all.
+running. Nothing is installed as a service and nothing runs at boot: it is started by a
+command you ran, it runs in the background, and 'boks daemon stop' ends it.
 
 Once it is running, Boks talks to it by default. An explicit --containerd-address, or
-BOKS_CONTAINERD_ADDRESS, still wins.`,
+BOKS_CONTAINERD_ADDRESS, still wins — and pins the choice: Boks starts no daemon of its own
+when you have named one.`,
 	}
 	cmd.AddCommand(
 		newDaemonStartCommand(env),
@@ -61,8 +67,14 @@ func newDaemonStartCommand(env Env) *cobra.Command {
 		Long: `Starts a containerd configured for Boks, and waits until it answers its own API before
 reporting success — a socket that exists is not a daemon that is serving.
 
+It returns to your prompt: the daemon is a background process with no terminal of its own, and
+this command is finished once that process is serving. There is no flag for that because there
+is no other mode; 'boks daemon serve' is the one that stays in the foreground, and it exists
+for watching a daemon that will not start.
+
 Starting one that is already running is not an error and does not restart it: this command
 means "make sure it is up", and a restart would take down every sandbox the daemon is serving.
+'boks run' does the same thing by itself, so this is only needed to start one on purpose.
 
 If containerd refuses to start, what it said is printed here rather than left in a log file
 for you to find.`,

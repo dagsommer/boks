@@ -97,6 +97,12 @@ func Serve(ctx context.Context, stateDir string, stdout, stderr io.Writer) error
 	// containerd logs to stderr. Both streams go to ours, which is the log file, so that
 	// anything it writes on its way down is what `boks daemon logs` shows.
 	cmd.Stdout, cmd.Stderr = stderr, stderr
+	// Nothing here is meant to be seen. On Windows a console program whose parent has no
+	// console is given a new one, window and all: this supervisor is started detached, so
+	// without this line `boks daemon start` left a terminal window open on the user's screen
+	// for as long as the daemon ran, showing nothing — containerd's output is this log file.
+	// A no-op on Unix.
+	proclock.NoConsole(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting %s: %w", binary, err)
 	}

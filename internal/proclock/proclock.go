@@ -63,3 +63,15 @@ func Terminate(pid int) error { return terminate(pid) }
 //
 // It must be called before Start.
 func Detach(cmd *exec.Cmd) { detach(cmd) }
+
+// NoConsole configures cmd so that the process it starts shows no console window. It is a
+// no-op everywhere except Windows, where a console program with nothing to inherit is given
+// a console of its own — and that console is a window on the user's screen.
+//
+// It is not Detach. Detach is for a process that must survive this one; this is for a child
+// whose output is already going somewhere else and whose window would be noise. The two are
+// separate because they are not the same statement, and on Windows they resolve to different
+// creation flags for a reason worth knowing — see the implementation.
+//
+// It must be called before Start.
+func NoConsole(cmd *exec.Cmd) { noConsole(cmd) }
