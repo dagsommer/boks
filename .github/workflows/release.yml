@@ -591,6 +591,7 @@ jobs:
       contents: write # create the release and upload assets
       id-token: write # sign the provenance attestation
       attestations: write # record it
+      actions: write # dispatch homebrew.yml, which the release event cannot start itself
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -776,3 +777,33 @@ jobs:
             --notes-file "$notes" \
             "${draft[@]}" \
             dist/*
+
+      # The tap does not update itself, and the reason is a rule rather than a bug: GitHub does
+      # not start workflow runs from events raised by the default GITHUB_TOKEN, and the release
+      # above is created with it. So `on: release: [published]` in homebrew.yml never fired —
+      # it had not run once, and the tap stayed on v0.1.1 while five releases went out, still
+      # pointing its `guest` resource at a rootfs with the wrong architecture in it.
+      #
+      # Dispatching it explicitly is the fix that needs no new secret. The alternative is a PAT
+      # for `gh release create`, which would make the release event real but puts a
+      # contents:write token for this repository in a job that also runs release tooling.
+      #
+      # Not `needs:`-ordered because it cannot be: homebrew.yml downloads SHA256SUMS from the
+      # release, so it has to start after the assets exist, which is here.
+      #
+      # Tag runs only. A manual `publish` dispatch makes a DRAFT (see the `draft` array above),
+      # and the tap must never point at a release nobody can download — `gh release download`
+      # on a draft would fail anyway. The same condition, spelled the same way as the draft
+      # decision it mirrors.
+      - name: Update the Homebrew tap, which the release event cannot trigger
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh workflow run homebrew.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            -f tag="$TAG"
+          echo "dispatched homebrew.yml for $TAG"
