@@ -882,7 +882,9 @@ func mentionsCommand(msg, command string) bool {
 //
 // A workspace is a live virtiofs mount of a host directory, so inside the guest it is owned
 // by the host user's uid — 501 on a Mac — while the process runs as whatever the image
-// specifies, usually root. Git refuses that combination:
+// specifies, which for a Boks image is uid 1000. (It was root on macOS until the images were
+// given numeric users; either way the two uids differ, so this is needed regardless.) Git
+// refuses that combination:
 //
 //	fatal: detected dubious ownership in repository at '/private/tmp/project'
 //

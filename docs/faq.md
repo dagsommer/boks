@@ -95,7 +95,8 @@ says so out loud the first time a sandbox meets each one, including under `--qui
 ## What can escape the sandbox?
 
 Assume code in the sandbox is hostile. The hypervisor is the boundary; in-guest permissions
-are not — the agent has root in the guest by design.
+are not — the guest is disposable, and its whole filesystem is the agent's to ruin. The
+agent runs as uid 1000 rather than root, which is hygiene rather than containment.
 
 The two things most likely to surprise you:
 

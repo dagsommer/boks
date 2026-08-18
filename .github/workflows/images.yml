@@ -126,6 +126,58 @@ jobs:
               "images/${name}"
           done
 
+      # Assert what the BUILT images will actually run as, out of each OCI archive's own
+      # config, rather than trusting the Dockerfiles the previous step read.
+      #
+      # internal/agent's TestAgentImagesRunAsANumericNonRootUser covers the source side; this
+      # covers the artifact, and the two fail for different reasons. A Dockerfile can be right
+      # while the image is wrong — a base rebuilt from a stale cache, a `--build-arg
+      # BASE_IMAGE` pointing at an older base whose USER was still a name — and the config in
+      # the archive is the only place the effective user, inherited or not, is a single value.
+      #
+      # Why it matters: an image whose USER is a NAME runs as uid 0 on macOS and Windows,
+      # because resolving the name needs a mount of the image's Linux filesystem that neither
+      # host can perform (see internal/sandbox/imageconfig.go). Nothing errors — the container
+      # just runs as root — and the agent that notices is `claude`, which refuses
+      # `--dangerously-skip-permissions` as root and so will not start at all.
+      - name: Assert every built image runs as a numeric non-root user
+        env:
+          AGENT_IMAGES: ${{ join(fromJSON(needs.tag.outputs.images), ' ') }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for name in base $AGENT_IMAGES; do
+            tar="oci/${name}-${ARCH}.tar"
+            # The OCI layout: index.json -> a manifest -> the config blob holding .config.User.
+            # Read out of the archive with tar rather than unpacking the whole thing.
+            manifest_digest="$(tar -xOf "$tar" index.json \
+              | jq -r '.manifests[0].digest' | cut -d: -f2)"
+            config_digest="$(tar -xOf "$tar" "blobs/sha256/${manifest_digest}" \
+              | jq -r '.config.digest' | cut -d: -f2)"
+            user="$(tar -xOf "$tar" "blobs/sha256/${config_digest}" \
+              | jq -r '.config.User // ""')"
+
+            case "$user" in
+              # uid:gid, both non-zero. The leading digit check rejects names, and the
+              # explicit 0 cases reject root written either way.
+              0|0:*|root|root:*|"")
+                echo "  $name: USER '${user:-<unset>}' — runs as ROOT" >&2; fail=1 ;;
+              [1-9]*:[1-9]*)
+                echo "  $name: USER $user" ;;
+              [1-9]*:0)
+                echo "  $name: USER '$user' — uid is fine, but the group is root's" >&2; fail=1 ;;
+              [0-9]*)
+                echo "  $name: USER '$user' — needs the numeric uid:gid form" >&2; fail=1 ;;
+              *)
+                echo "  $name: USER '$user' — a NAME becomes uid 0 off Linux" >&2; fail=1 ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more images would run as root, or as a user only Linux can resolve." >&2
+            echo "See images/base/Dockerfile above its USER line for why this is numeric." >&2
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: oci-${{ matrix.arch }}
