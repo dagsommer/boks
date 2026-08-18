@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -57,20 +58,49 @@ func TestPullOptionsAskForTheGuestPlatform(t *testing.T) {
 	}
 }
 
-// On a Windows host containerd's own oci.WithImageConfig cannot be used: it finishes by
-// mounting the image's snapshot on the host to read /etc/group, and a Windows host cannot
-// mount a Linux EROFS filesystem. Which option is chosen is decided by the host, so this is
-// the one assertion that has to know what host it is on.
+// Linux is the only host on which containerd's own oci.WithImageConfig opens the image. On
+// Windows it cannot (it would mount an EROFS snapshot on a Windows host), and on macOS it
+// does not (WithUser and WithAdditionalGIDs both return early on darwin, before the line that
+// would parse a numeric uid). Which option is chosen is decided by the host, so this is the
+// one assertion that has to know what host it is on.
 func TestImageConfigOptFollowsTheHost(t *testing.T) {
-	if got, want := containerdReadsGuestRootfs(), runtime.GOOS != "windows"; got != want {
+	if got, want := containerdReadsGuestRootfs(), runtime.GOOS == "linux"; got != want {
 		t.Errorf("containerdReadsGuestRootfs() = %v on %s, want %v", got, runtime.GOOS, want)
 	}
-	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
-		// Unix must keep containerd's option. The reimplementation exists for the host
-		// that cannot use it and must not quietly take over the hosts that can.
-		if !containerdReadsGuestRootfs() {
-			t.Error("a Unix host would use the Windows stand-in for the image config")
-		}
+	if runtime.GOOS == "linux" && !containerdReadsGuestRootfs() {
+		// Linux must keep containerd's option: it is the host where the mount succeeds and
+		// a `USER node` really does become a uid.
+		t.Error("a Linux host would use the metadata stand-in for the image config")
+	}
+}
+
+// Every host's branch, from whichever host runs the tests. The macOS row is the one that
+// matters most and the one no machine here can reach natively: it asserts that a Mac takes
+// the metadata path even though containerd's darwin guards make oci.WithImageConfig *appear*
+// to cope, because those guards skip the work rather than doing it differently. Before this
+// was corrected, macOS sat on containerd's path and every image's USER became uid 0.
+func TestMetadataImageConfigRulePerHost(t *testing.T) {
+	for _, tc := range []struct {
+		goos          string
+		guestResolves bool
+		wantMetadata  bool
+		why           string
+	}{
+		{"linux", false, false, "Linux mounts the image, so containerd resolves names for real"},
+		{"darwin", false, true, "macOS cannot mount it; containerd's guard drops even numeric ids"},
+		{"windows", false, true, "Windows cannot mount an EROFS snapshot at all"},
+		// Once a guest resolves Username itself, Linux may stop needing the host mount —
+		// which is the privilege reduction imageConfigOpt describes. Nothing flips this on
+		// today; see TestLinuxKeepsContainerdsImageConfigUntilTheGuestCanResolveNames.
+		{"linux", true, true, "a capable guest lets Linux drop the CAP_SYS_ADMIN mount"},
+		{"darwin", true, true, "still no mount available"},
+	} {
+		t.Run(tc.goos+"/guestResolves="+strconv.FormatBool(tc.guestResolves), func(t *testing.T) {
+			if got := usesMetadataImageConfigOn(tc.goos, tc.guestResolves); got != tc.wantMetadata {
+				t.Errorf("usesMetadataImageConfigOn(%q, %v) = %v, want %v: %s",
+					tc.goos, tc.guestResolves, got, tc.wantMetadata, tc.why)
+			}
+		})
 	}
 }
 
@@ -231,16 +261,17 @@ func TestLinuxKeepsContainerdsImageConfigUntilTheGuestCanResolveNames(t *testing
 		t.Fatal("guestResolvesUsernames() is true, but no nerdbox revision resolves " +
 			"Process.User.Username and daemon.nerdboxRevisionsResolvingUsernames is empty")
 	}
-	if runtime.GOOS == "windows" {
-		// Windows has no choice: it cannot mount the image at all.
+	if runtime.GOOS != "linux" {
+		// Neither Windows nor macOS has a choice: containerd resolves nothing on either,
+		// so the metadata path is the only one that reads even the numeric ids.
 		if !usesMetadataImageConfig() {
-			t.Error("Windows must use the metadata-only image config")
+			t.Errorf("%s must use the metadata-only image config", runtime.GOOS)
 		}
 		return
 	}
 	if usesMetadataImageConfig() {
-		t.Errorf("%s took the metadata-only image config while the guest cannot resolve "+
-			"USER names — an image saying `USER node` would run as root", runtime.GOOS)
+		t.Error("linux took the metadata-only image config while the guest cannot resolve " +
+			"USER names — an image saying `USER node` would run as root")
 	}
 }
 
