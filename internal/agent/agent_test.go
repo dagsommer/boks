@@ -166,11 +166,24 @@ func TestAnAgentWithoutAnImageExplainsItself(t *testing.T) {
 // not exist. Bare is what keeps the command runnable there.
 func TestBareDropsTheInitPrefix(t *testing.T) {
 	claude, _ := Builtin().Lookup("claude")
-	if got := claude.Argv(nil); !slices.Equal(got, append(slices.Clone(initArgv), "claude")) {
-		t.Errorf("Argv = %v, want the init prefix in front of the command", got)
+	// Read the command off the agent rather than repeating it. This test hardcoded
+	// []string{"claude"} and went red the day the definition gained
+	// --dangerously-skip-permissions: it was asserting the flag's absence, which was never
+	// the point. What it is for is the init PREFIX, so only the prefix is spelled out here.
+	want := append(slices.Clone(initArgv), claude.Command...)
+	if got := claude.Argv(nil); !slices.Equal(got, want) {
+		t.Errorf("Argv = %v, want %v — the init prefix in front of the command", got, want)
 	}
-	if got := claude.Bare().Argv(nil); !slices.Equal(got, []string{"claude"}) {
-		t.Errorf("Bare().Argv = %v, want just the command", got)
+	if got := claude.Bare().Argv(nil); !slices.Equal(got, claude.Command) {
+		t.Errorf("Bare().Argv = %v, want just the command %v", got, claude.Command)
+	}
+	// The assertion above compares two things derived from the same agent, so it would hold
+	// even if Argv returned the command with no prefix at all. This is what rules that out.
+	if len(initArgv) == 0 {
+		t.Fatal("initArgv is empty, so the test above compares nothing")
+	}
+	if got := claude.Argv(nil); len(got) != len(initArgv)+len(claude.Command) {
+		t.Errorf("Argv = %v, want %d elements", got, len(initArgv)+len(claude.Command))
 	}
 }
 
