@@ -227,8 +227,14 @@ func TestPackagedLayoutResolvesThroughTheProductionPath(t *testing.T) {
 	}
 	// A containerd in both places, as a package install produces: the distribution's in
 	// /usr/bin and the vendored one beside the rest of the runtime.
+	//
+	// Named the way the platform names it. This test does not run the file — it asserts which
+	// PATH entry wins — but FindContainerd looks for containerd.exe on Windows, so a fixture
+	// called plainly "containerd" made the lookup miss and the test fail there for a reason
+	// that had nothing to do with ordering.
+	binary := ContainerdBinaryName()
 	for _, d := range []string{bin, libexec} {
-		if err := os.WriteFile(filepath.Join(d, "containerd"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(d, binary), []byte("#!/bin/sh\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -246,7 +252,7 @@ func TestPackagedLayoutResolvesThroughTheProductionPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindContainerd(): %v", err)
 	}
-	if want := filepath.Join(libexec, "containerd"); got != want {
+	if want := filepath.Join(libexec, binary); got != want {
 		t.Errorf("FindContainerd() = %q, want %q — a packaged install would run the "+
 			"distribution's containerd instead of the one it shipped", got, want)
 	}
