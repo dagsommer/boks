@@ -74,6 +74,13 @@ EXIT STATUS IS PART OF THE CONTRACT, because the controls in CI depend on tellin
     2   the directory could not be read, or the arguments made no sense
 """
 
+# Annotations are not evaluated, so this file keeps working on older interpreters. It is run
+# by hand — scripts/build-nerdbox-guest.sh calls it, and so does anyone checking a guest image
+# they were given — and macOS ships Python 3.9, where `pathlib.Path | None` in a signature is a
+# TypeError at import: "unsupported operand type(s) for |". CI never saw it, since its runner
+# has 3.12. One line here is cheaper than remembering which syntax is safe.
+from __future__ import annotations
+
 import argparse
 import importlib.util
 import pathlib
