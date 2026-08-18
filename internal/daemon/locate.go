@@ -132,10 +132,7 @@ func FindContainerd() (string, error) {
 		}
 		return path, nil
 	}
-	name := "containerd"
-	if runtime.GOOS == "windows" {
-		name += ".exe"
-	}
+	name := ContainerdBinaryName()
 	for _, dir := range RuntimeDirs() {
 		candidate := filepath.Join(dir, name)
 		if executable(candidate) {
@@ -181,6 +178,20 @@ func FindShim(handler string, path string) string {
 //
 // The mode is not consulted on Windows, where it means nothing: a .exe is executable by being
 // a .exe, and Go reports 0666 for it.
+// ContainerdBinaryName is the filename containerd has on this platform.
+//
+// Exported so a test can build a fixture under the name the lookup will actually use. That
+// sounds like a convenience and is not: TestPackagedLayoutResolvesThroughTheProductionPath
+// wrote a plain "containerd" on every platform, so on Windows FindContainerd looked for
+// containerd.exe, found nothing, and the test failed while the code it tested was correct.
+// One spelling, in one place, used by both sides.
+func ContainerdBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "containerd.exe"
+	}
+	return "containerd"
+}
+
 func executable(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
