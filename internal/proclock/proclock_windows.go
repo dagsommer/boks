@@ -216,3 +216,26 @@ func detach(cmd *exec.Cmd) {
 		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS,
 	}
 }
+
+// noConsole starts the process with a console that has no window.
+//
+// A console program inherits its parent's console, and is given a brand new one — with a
+// visible window — when the parent has none to give. detach deliberately leaves the process
+// it starts with none, so every console program started *below* a detached process pops a
+// window on the user's screen unless it says otherwise. That is what `boks daemon start` did
+// on Windows: the supervisor was invisible, as intended, and containerd underneath it opened
+// a terminal window that stayed on screen for as long as the daemon ran.
+//
+// CREATE_NO_WINDOW rather than DETACHED_PROCESS, and the difference decides the case this
+// function exists for. DETACHED_PROCESS gives the child no console at all, which hides its
+// own window and hands the same problem to *its* children: containerd starts a shim per
+// sandbox, and each of those would then allocate the window containerd no longer has.
+// CREATE_NO_WINDOW gives the child a console and does not show it, and a console that exists
+// is a console its children inherit. One flag, one window suppressed, all the way down.
+//
+// It says nothing about lifetime. Neither flag decides whether a child outlives its parent on
+// Windows — nothing does, by default — so the containerd supervisor's guarantee that it never
+// returns while containerd runs is unaffected, and remains where it is written, in Serve.
+func noConsole(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+}

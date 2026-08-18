@@ -16,13 +16,14 @@
 //
 // # What this is not
 //
-// It is not always-on. Nothing is installed as a service, nothing runs at boot, and a host
-// that has not run `boks daemon start` runs no Boks process at all. It is not a replacement
-// for a containerd the user already has either: `boks daemon` uses its own root, its own
-// state and its own endpoint, so a machine running Docker's containerd keeps doing so and the
-// two never see each other. And it is not required — Boks still talks to whatever
-// --containerd-address names, and a user who has containerd set up the way they want should
-// keep using it.
+// It is not always-on. Nothing is installed as a service and nothing runs at boot: it is
+// started by a command the user ran — `boks daemon start`, or the `boks run` that needed one
+// and started it rather than reporting a missing socket (see cli.ensureDaemon) — and `boks
+// daemon stop` ends it. It is not a replacement for a containerd the user already has either:
+// `boks daemon` uses its own root, its own state and its own endpoint, so a machine running
+// Docker's containerd keeps doing so and the two never see each other. And it is not required
+// — Boks still talks to whatever --containerd-address names, and a user who has containerd set
+// up the way they want should keep using it.
 //
 // # The supervisor
 //
@@ -231,6 +232,16 @@ func probe(ctx context.Context, address string) (string, error) {
 		return "", err
 	}
 	return version.Version, nil
+}
+
+// Serving reports whether some containerd answers at address.
+//
+// It asks for a version rather than looking for a socket, because the question a caller has is
+// "can I use this", and a socket left behind by a daemon that died answers that wrongly. It is
+// the same probe `boks daemon status` makes for the same reason.
+func Serving(ctx context.Context, address string) bool {
+	_, err := probe(ctx, address)
+	return err == nil
 }
 
 // Start makes sure a managed containerd is running and returns its state.

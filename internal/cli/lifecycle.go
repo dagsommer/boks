@@ -22,6 +22,12 @@ func newStartCommand(env Env, dev *devFlags) *cobra.Command {
 a sandbox that is already running does nothing.`,
 		Args: sandboxNames("start"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// A stopped sandbox lives in containerd's database, which survives the
+			// daemon exiting: after a reboot this command is the one that needs it
+			// back, so it is one of the four that start it. See ensureDaemon.
+			if err := ensureDaemon(cmd.Context(), dev, env.Stderr); err != nil {
+				return err
+			}
 			return eachSandbox(args, env, func(name string) error {
 				// A sandbox that is about to boot needs its link socket held
 				// before it does, so the network comes up first. `start` has no
