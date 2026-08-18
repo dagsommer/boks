@@ -80,14 +80,64 @@ echo "${NERDBOX_SHA256}  $work/nerdbox.tar.gz" | sha256sum -c -
 tar -xzf "$work/nerdbox.tar.gz" -C "$work"
 src="$work/nerdbox-${NERDBOX_VERSION}"
 
-# KERNEL_ARCH drives both the cross-compiler choice and the kernel's filename. The bake
-# file maps it to a Docker platform itself (x86_64 -> amd64), so it is the only variable
-# that needs setting.
+# KERNEL_ARCH drives the kernel's cross-compiler and its filename, and NOTHING ELSE. The
+# rootfs needs the platform set explicitly, and this was wrong here until 2026-08-17.
+#
+# nerdbox's bake file does define `_DOCKER_ARCH` mapping KERNEL_ARCH to a Docker platform,
+# which is where the old comment's claim came from — but only `_host_common` (the shim) and
+# `libkrun` reference it. `target "rootfs"` inherits `_guest_common`, which sets no
+# `platforms` at all, so buildx builds it for the BUILDER's architecture. The Dockerfile's
+# rootfs stages then follow that: `vminit-build` is `GOARCH=${TARGETARCH} go build` and
+# `crun-build` wgets `crun-…-linux-${TARGETARCH}`. Only the kernel reads KERNEL_ARCH.
+#
+# So `KERNEL_ARCH=arm64` on an x86_64 builder produced an arm64 kernel beside an x86_64
+# vminitd, and the VM died at boot with a kernel panic naming neither architecture:
+#
+#   Kernel panic - not syncing: Requested init /sbin/vminitd failed (error -8).
+#
+# -8 is ENOEXEC. Every published guest archive up to and including v0.1.1 has this, because
+# CI builds on x86_64 runners; building on an aarch64 host hid it, since native then happened
+# to be right. assert-guest-image.py now reads vminitd's own e_machine, so a repeat is a red
+# build rather than a panic on someone's Mac.
+#
+# No emulation is needed for the cross build: the Go and mkfs.erofs stages are all
+# `FROM --platform=$BUILDPLATFORM`, so setting the platform changes TARGETARCH and nothing
+# about where the work runs.
+case "$arch" in
+arm64) docker_arch=arm64 ;;
+x86_64) docker_arch=amd64 ;;
+esac
+
 echo "==> building the guest kernel and rootfs for $arch (this takes a while)"
-(cd "$src" && KERNEL_ARCH="$arch" docker buildx bake kernel rootfs)
+(cd "$src" && KERNEL_ARCH="$arch" docker buildx bake kernel rootfs \
+	--set "rootfs.platform=linux/$docker_arch")
 
 mkdir -p "$outdir"
 cp "$src/_output/nerdbox-kernel-$arch" "$src/_output/nerdbox-rootfs.erofs" "$outdir/"
+
+# The same assertion CI runs, on the same two files, because this script's output is copied
+# straight into $(brew --prefix)/lib by hand and a mismatch here surfaces as a kernel panic
+# rather than as an error naming the file.
+#
+# Exit 2 means the check could not be MADE — no python3, or no fsck.erofs to open the rootfs
+# with — and that is a warning rather than a failure: this script is meant to run on any
+# Docker host, including one that is not a Boks host and has neither. Exit 1 means it was
+# made and the artifact is wrong, which is fatal.
+echo
+echo "==> checking the built guest is really $arch"
+if command -v python3 >/dev/null; then
+	set +e
+	python3 "$root/packaging/linux/assert-guest-image.py" "$outdir" --arch "$arch"
+	rc=$?
+	set -e
+	case "$rc" in
+	0) ;;
+	1) exit 1 ;;
+	*) echo "    (could not check: see above; the files are still in $outdir)" >&2 ;;
+	esac
+else
+	echo "    (skipped: no python3 on this machine)" >&2
+fi
 
 echo
 echo "==> built into $outdir"
