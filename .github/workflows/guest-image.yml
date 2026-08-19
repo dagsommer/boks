@@ -152,8 +152,40 @@ jobs:
             x86_64) docker_arch=amd64 ;;
             *) echo "no Docker platform mapping for KERNEL_ARCH=${KERNEL_ARCH}" >&2; exit 1 ;;
           esac
-          docker buildx bake kernel
-          docker buildx bake rootfs --set "rootfs.platform=linux/${docker_arch}"
+          # Retried, because the kernel bake fetches a ~140 MB tarball from cdn.kernel.org
+          # inside nerdbox's Dockerfile and that fetch fails intermittently — twice in two
+          # releases, both times as "Connection closed at byte N. Retrying." followed by a
+          # 503 on wget's own retry, at different byte offsets and from different Fastly
+          # edges. Nothing about it is specific to Boks: it is one unauthenticated download
+          # of a large file from a busy CDN.
+          #
+          # Not fixable where it happens. The download is a RUN in nerdbox's Dockerfile,
+          # which this repository builds UNPATCHED on purpose (see packaging/nerdbox/README),
+          # so neither `wget -c` nor a mirror can be added without forking the recipe.
+          # Retrying the bake is the fix available from outside it, and it is cheap: every
+          # layer before the failing RUN is cached, so an attempt that gets past the download
+          # costs the download alone.
+          #
+          # Three attempts with a pause between. A failure that survives all three is not a
+          # flake and should be read, so the last attempt's output is not swallowed.
+          bake() {
+            local target=$1; shift
+            local attempt
+            for attempt in 1 2 3; do
+              if docker buildx bake "$target" "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::bake $target failed (attempt $attempt/3), retrying in 30s" >&2
+                sleep 30
+              fi
+            done
+            echo "bake $target failed three times — this is not a flake" >&2
+            return 1
+          }
+
+          bake kernel
+          bake rootfs --set "rootfs.platform=linux/${docker_arch}"
           ls -l _output/
 
       # assert-guest-image.py unpacks the rootfs to read /sbin/vminitd out of it, which needs
