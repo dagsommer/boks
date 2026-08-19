@@ -143,9 +143,17 @@ permissions:
 ```
 
 ```console
-$ boks run claude . --kit ./vale
+$ boks run claude . --kit ./vale -v
+sandbox: claude-myrepo (agent claude, ghcr.io/dagsommer/boks/claude:0.1.5)
+command: claude --dangerously-skip-permissions
+kit: vale (mixin) from ./vale — 2 allow, 0 deny
+workspace: /home/me/myrepo → /home/me/myrepo (rw)
+image: ghcr.io/dagsommer/boks/claude:0.1.5 (already present)
 network: nat · policy standard+agent:claude+kit:vale · … allow, 0 deny
 ```
+
+Without `-v` a run prints nothing about the kit unless the policy changed. See
+[Output](#output).
 
 ### Deny a host the agent would otherwise reach
 
@@ -212,6 +220,22 @@ agentInstructions:                      # not applied
   filename: AGENT.md
   content: "Do not commit without asking."
 ```
+
+## Output
+
+A run is quiet by default. Two things print anyway, because they are news rather than
+description:
+
+- **A host whose TLS Boks is about to terminate**, the first time a sandbox sees it. Asking
+  for less output is not consent to being decrypted silently.
+- **A policy that differs from the one this sandbox last ran under**, including the first run
+  of a new sandbox.
+
+Everything else — the standing network summary, which kit was applied, the image, the command,
+the workspace mounts, the network stack's own progress — waits for `-v`.
+
+`-q`/`--quiet` still parses so that scripts written against 0.1.5 keep working. It does
+nothing: quiet is the default now.
 
 ## Schema versions
 

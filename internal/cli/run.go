@@ -61,15 +61,29 @@ Agents:
 		detached  bool
 		ephemeral bool
 		quiet     bool
+		verbose   bool
 	)
 	cmd.Flags().BoolVarP(&detached, "detached", "d", false,
 		"print the sandbox name and exit instead of attaching")
 	cmd.Flags().BoolVar(&ephemeral, "rm", false, "destroy the sandbox when the command exits")
-	// --quiet drops the network summary. It cannot drop the announcement of a host whose
-	// TLS boks is about to terminate and has not announced before: asking for less output
-	// is not consent to being decrypted silently. See internal/cli/notice.go.
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false,
-		"suppress the network summary (a new TLS-interception host is still announced)")
+	// -v adds detail; it does not gate anything a user needs to be told. The two things
+	// that are news rather than chatter — a host whose TLS boks is about to terminate for
+	// the first time, and a policy that has changed since this sandbox last ran — are
+	// printed at every level. Asking for less output is not consent to being decrypted
+	// silently, nor to a rule set changing without a word. See internal/cli/notice.go.
+	//
+	// This used to be --quiet, defaulting to loud. It was the wrong default: the summary
+	// is identical on every run of an unchanged sandbox, so the routine case paid for the
+	// exceptional one and people learned to skip past the network lines — which is exactly
+	// how a NEW interception host goes unread.
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false,
+		"describe what is happening: the image, the kit, the command, and the network summary")
+	// Kept so that a script written against 0.1.5 keeps working. It is now the default,
+	// so it does nothing; hidden because advertising two spellings of one idea is worse
+	// than a flag that quietly still parses.
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "")
+	_ = cmd.Flags().MarkHidden("quiet")
+	_ = cmd.Flags().MarkDeprecated("quiet", "output is quiet by default; use -v for detail")
 
 	// The network policy flags decide what the sandbox's network is and what may cross
 	// it. Their definitions live in netflags.go so that `run`, `proxy` and `policy ls`
@@ -172,7 +186,7 @@ Agents:
 		// Only for an interactive run, on stderr, and only when both streams really are a
 		// terminal — the same condition cfg.TTY uses below, and for the same reason. A
 		// piped or detached run must never receive escape codes.
-		if !detached && !quiet && isTerminal(env.Stdin) && isTerminal(env.Stdout) &&
+		if !detached && isTerminal(env.Stdin) && isTerminal(env.Stdout) &&
 			os.Getenv("BOKS_NO_CLEAR") == "" {
 			// Screen, then scrollback, then home. Scrollback is included deliberately: a
 			// clear that leaves the history one keypress above the agent has not given
@@ -184,7 +198,7 @@ Agents:
 		// The network is decided, described and started before the sandbox: its
 		// annotations have to be on the container when it is created, and the host-side
 		// stack has to be holding the link socket before the VM boots and connects to it.
-		started, err := attachSandboxNetwork(ctx, &netFlags, inv, &cfg, requestedMode, quiet, env)
+		started, err := attachSandboxNetwork(ctx, &netFlags, inv, &cfg, requestedMode, verbose, env)
 		if err != nil {
 			return err
 		}
@@ -213,6 +227,21 @@ Agents:
 		cfg.Stdin = env.Stdin
 		cfg.Stdout = env.Stdout
 		cfg.Stderr = env.Stderr
+		if verbose {
+			cfg.Progress = env.Stderr
+			// Before the image, because it is the fastest thing to establish and the
+			// order reads as a sequence: what will run, out of what, with which rules.
+			fmt.Fprintf(env.Stderr, "sandbox: %s (agent %s, %s)\n",
+				inv.name, inv.agent.Name, cfg.Image)
+			if len(cfg.Command) > 0 {
+				fmt.Fprintf(env.Stderr, "command: %s\n", strings.Join(cfg.Command, " "))
+			}
+			netFlags.describeKit(env.Stderr)
+			for _, ws := range cfg.Workspaces {
+				fmt.Fprintf(env.Stderr, "workspace: %s → %s (%s)\n",
+					ws.HostPath, ws.GuestPath, ws.Mode)
+			}
+		}
 		// An interactive session needs a pseudo-terminal, and a piped one must not have
 		// one: with a pty the guest's output would come back with carriage returns and
 		// no distinct stderr. The host terminal is the only thing that can decide this,
