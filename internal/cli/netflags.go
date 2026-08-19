@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/pflag"
 
 	"github.com/dagsommer/boks/internal/agent"
+	"github.com/dagsommer/boks/internal/kit"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
@@ -35,6 +38,10 @@ type policyFlags struct {
 	// their own --agent flag; `run` and `create` from the resolved invocation; `start`
 	// and `exec` from what the sandbox recorded when it was created.
 	agent agent.Agent
+	// kitRef is the --kit reference, and kitSpec is what it loaded. The reference is kept
+	// so that an error can name what the user typed rather than the kit's internal name.
+	kitRef  string
+	kitSpec *kit.Spec
 }
 
 // forAgent labels the flags with the agent whose allowlist applies.
@@ -54,6 +61,8 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	fs.StringVar(&f.preset, "policy", "", "network policy preset: "+strings.Join(policy.PresetNames(), ", ")+
 		" (default "+policy.DefaultPreset+")")
 	fs.StringVar(&f.profile, "profile", "", "stored policy profile to apply ('boks policy profile ls')")
+	fs.StringVar(&f.kitRef, "kit", "", "kit to apply: a directory containing "+kit.SpecFileName+
+		", or a path to one")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
 	fs.StringArrayVar(&f.allow, "allow", nil, "allow a destination, host[:ports] (repeatable)")
@@ -163,6 +172,16 @@ func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (
 	// from the sandbox, so that it is always this build's definition of what that agent
 	// needs — including when an entry is removed.
 	req.Agent, req.AgentAllow = f.agent.Name, f.agent.AllowRules()
+	// A kit's network rules enter as their own layer, labelled with the kit's name so that
+	// `boks policy ls` can point at the file a destination came from. They are added, never
+	// subtracted: a deny in any scope still beats a kit's allow, which is the engine's
+	// invariant rather than this function's — see internal/policy.
+	if f.kitSpec != nil {
+		allow, deny := kit.NetworkRules(f.kitSpec)
+		req.Kit = f.kitSpec.Name
+		req.KitAllow = kitRules(policy.Allow, allow, f.kitSpec.Name)
+		req.KitDeny = kitRules(policy.Deny, deny, f.kitSpec.Name)
+	}
 	if f.preset != "" {
 		req.Preset = f.preset
 	}
@@ -174,6 +193,53 @@ func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (
 	}
 	req.Deny = unionDenies(req.Deny, f.deny)
 	return req.Resolve()
+}
+
+// kitRules turns a kit's destination list into policy rules, labelled so that a reader of
+// `boks policy ls` can tell where each came from.
+//
+// The note names the kit rather than describing the rule, because that is the question a
+// destination in this layer raises: an agent's allowlist is in the Boks binary and auditable by
+// reading the release, while a kit is a file on the user's disk that Boks was pointed at.
+func kitRules(action policy.Action, specs []string, name string) []policy.RuleSpec {
+	if len(specs) == 0 {
+		return nil
+	}
+	rules := make([]policy.RuleSpec, 0, len(specs))
+	for _, spec := range specs {
+		rules = append(rules, policy.RuleSpec{
+			Action: action,
+			Spec:   spec,
+			Note:   "declared by kit " + name,
+		})
+	}
+	return rules
+}
+
+// loadKit reads the --kit reference, if one was given, and reports what the kit warned about.
+//
+// Called before anything is created, so a kit that does not parse costs nothing: the failure a
+// user gets is "this file is wrong", not a half-built sandbox holding rules from a spec that
+// turned out to be invalid.
+func (f *policyFlags) loadKit(stderr io.Writer) error {
+	if f.kitRef == "" {
+		return nil
+	}
+	spec, warnings, err := kit.Load(f.kitRef)
+	if err != nil {
+		return err
+	}
+	if err := kit.Validate(spec); err != nil {
+		return fmt.Errorf("kit %s: %w", f.kitRef, err)
+	}
+	// Warnings are the loader's way of saying a field parsed and will not be honoured —
+	// a v1 field accepted for compatibility, or a composition key whose runtime support is
+	// pending upstream. Silence there would be a promise Boks cannot keep.
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "kit %s: %s\n", f.kitRef, w)
+	}
+	f.kitSpec = spec
+	return nil
 }
 
 // unionDenies merges a sandbox's recorded denies with this run's, keeping each destination

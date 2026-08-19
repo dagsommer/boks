@@ -467,6 +467,12 @@ credential-bearing host would get.`,
 		if err := applyAgentFlag(&flags, agentName); err != nil {
 			return err
 		}
+		// So that `boks policy check --kit ./x https://host` answers the question the
+		// user actually has — would this destination be reachable WITH that kit — rather
+		// than silently answering it without.
+		if err := flags.loadKit(env.Stderr); err != nil {
+			return err
+		}
 		resolution, err := flags.resolution(sandbox, nil)
 		if err != nil {
 			return err
