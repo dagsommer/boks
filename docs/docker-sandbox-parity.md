@@ -73,7 +73,8 @@ output, plus a live `sbx ls`.
 | Run output volume | A line or two per run | Full policy, TLS notice and enforcement note on a sandbox's first run and whenever its policy changes; two lines otherwise; `--quiet` for none. An interception host never announced before is announced whatever else is true. Fifty lines per run is how you train someone to grep past a security notice | P1 | done |
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
 | `-p/--publish` | Publishes a sandbox port on the host at creation; ignored when re-attaching | Same flag, same short form, same rule — a re-attaching run says so rather than looking obeyed, and points at `boks ports` | P1 | done |
-| `--clone`, `--kit` | Run flags for clone mode and kits | Not implemented; nothing in the current design blocks them | P1 | none |
+| `--clone` | Run flag for clone mode | Implemented — `internal/cli/common.go` registers it, `internal/sandbox/clone.go` is the machinery | P1 | done |
+| `--kit` | Run flag naming a kit to apply | Not implemented; nothing in the current design blocks it. The argument is a *reference*, not a name — see 2e | P1 | none |
 | `--profile` | "Governance profile to assign to the sandbox" | `-profile NAME` on `run` and `create`, selecting a stored profile — a named preset plus rules. Local rules still apply on top of it, and a deny in any scope still wins | P1 | done |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
@@ -124,7 +125,7 @@ website documents.
 | `ports` | Manage port publishing | `ports`, same flags: `--publish`, `--unpublish`, `--json` |
 | `policy` | `allow`, `deny`, `check`, `init`, `inspect`, `log`, `ls`, `profile`, `reset`, `rm` | all ten, same spellings; rules are durable and scoped global or per-sandbox |
 | `secret` | `set`, `import`, `ls`, `rm`, `set-custom`; **secrets are keyed by a known service name**, not a free-form label | `secret set/import/adopt/login/ls/services/rm/reset`; keyed by service name, free-form names still work | P0 | done | The registry landed — see 5a. `import` now means sbx's thing (host environment variables); reading a stored OAuth credential is `adopt`; `login` arms one for the agent to acquire inside a sandbox, which is sbx's `run … -- auth login` made explicit — see 5b. `services` prints the registry, empty rows included |
-| `kit` | (Experimental) Manage kit artifacts | none |
+| `kit` | (Experimental) Manage kit artifacts | none. See 2e: a kit is *referenced* by filepath, HTTPS URL or git URL, and both schema v1 and v2 exist |
 | `template` | Manage sandbox templates (the image an agent runs in) | none; `-t, --template` flag only |
 | `skills` | (Experimental) Shared agent skills store | **won't** — Docker documents it as a cross-sandbox trust hole |
 | `daemon` | `start`, `stop`, `status`, `log-level` for the `sandboxd` daemon | no daemon; `boks net ls\|stop` covers the one background process Boks has — see below |
@@ -248,6 +249,47 @@ What matters for Boks' own design:
 - **`ports[]`**, `security.privileged`, and `sandbox.resources.{cpu,memory,gpu}` round it out.
 - `sandbox.command` splits `default` from `interactive`, so an agent can behave differently
   with and without a TTY.
+
+### 2e. How a kit is named, and which schema versions to accept
+
+Recorded here because it is the half of kits that section 2d leaves out, and because getting
+it wrong is not a small mistake: it decides what `--kit` *is*, and it puts a fetch on the path
+of starting a sandbox.
+
+**A kit is referenced, not named.** `--kit` takes one of three forms:
+
+- a **local filepath** to a kit file or directory,
+- an **HTTPS URL**,
+- a **git URL**.
+
+So `--kit` is not a lookup in a registry Boks controls. Two of the three forms reach the
+network, and what comes back is configuration that names an image, an entrypoint, setup
+commands that run as root, and network rules. That is remote input deciding what a sandbox is.
+
+**Support both v1 and v2.** Both are in the wild — the production kit read for section 2d is
+`schemaVersion: "1"` while the documented grammar is v2 — so a reader that accepts only the
+newer one refuses files people actually have. The differences are not merely additive:
+`agentInstructions.{filename,content}` in v2 is `agentContext` with `sandbox.aiFilename` in v1,
+which means a v1 reader is a translation and not a subset check. Accept both, translate v1
+forward into whatever internal shape Boks ends up with, and keep `schemaVersion` in the error
+message when neither matches, so an unsupported version says which version it was.
+
+**What this project's own habits imply for the fetching forms.** Everything else Boks pulls
+from the network is pinned: `packaging/nerdbox/NERDBOX_REV` pins a commit, the Homebrew formula
+and `scripts/build-nerdbox-guest.sh` pin source tarballs by SHA-256, images are pulled by
+digest through the guest platform. A kit fetched from an HTTPS or git URL and applied
+unpinned would be the one exception, and it would be the most powerful one — `setup.install[]`
+runs as uid 0. Whatever kits become here, the remote forms need the same discipline the rest
+of the project already applies: a pin, a checksum, or an explicit "I know this is unpinned"
+from the user. Deciding that when kits are built, rather than after, is the point of writing
+it down now.
+
+**Not yet verified in this repository.** The three reference forms and the two schema versions
+are recorded from Docker's kit reference as reported on 2026-08-19; no kit has been fetched,
+parsed or applied by anything here, and the precedence rules between a kit's settings and
+Boks' own flags, presets and policy scopes are not worked out. `boks policy ls` already has an
+ordered scope model that a kit's rules would have to enter as a named layer, and that is the
+first question to answer, not the schema.
 
 `permissions.network.{allow,deny}` documents the pattern forms supported: exact host, host
 with port, single-label wildcard, **multi-label wildcard**, port ranges, port wildcard and
