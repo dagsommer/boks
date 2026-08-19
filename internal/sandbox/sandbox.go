@@ -136,6 +136,24 @@ type Config struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+
+	// Progress is where this package narrates what it is doing — pulling an image,
+	// unpacking it for the snapshotter. Nil means say nothing, which is the default and
+	// what an unattended caller wants.
+	//
+	// Separate from Stderr because the two answer to different things: Stderr belongs to
+	// the guest's process and carries its output, while this is Boks talking about itself.
+	// A caller that wants both sends both to the same writer; one that wants the agent's
+	// output clean sets only Stderr.
+	Progress io.Writer
+}
+
+// say writes a line of progress, if the caller asked for any.
+func (c Config) say(format string, args ...any) {
+	if c.Progress == nil {
+		return
+	}
+	fmt.Fprintf(c.Progress, format+"\n", args...)
 }
 
 // Run executes the configured command in the sandbox and returns its exit code.
@@ -324,6 +342,7 @@ func connect(ctx context.Context, address string) (*client.Client, error) {
 func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Image, error) {
 	image, err := c.GetImage(ctx, cfg.Image)
 	if err == nil {
+		cfg.say("image: %s (already present)", cfg.Image)
 		// A locally present image may still be unpacked for a different snapshotter.
 		unpacked, uErr := image.IsUnpacked(ctx, cfg.Snapshotter)
 		if uErr != nil {
@@ -332,6 +351,7 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 		if unpacked {
 			return image, nil
 		}
+		cfg.say("image: unpacking for the %s snapshotter", cfg.Snapshotter)
 		if err := image.Unpack(ctx, cfg.Snapshotter); err != nil {
 			return nil, fmt.Errorf("unpacking image %s for snapshotter %q: %w", cfg.Image, cfg.Snapshotter, err)
 		}
@@ -341,10 +361,15 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 		return nil, fmt.Errorf("looking up image %s: %w", cfg.Image, err)
 	}
 
+	// Said BEFORE the pull rather than after. A pull of a few hundred megabytes is the
+	// longest silence in `boks run`, and a line that appears once it finishes explains a
+	// wait that has already happened.
+	cfg.say("image: pulling %s for %s", cfg.Image, runtimecfg.GuestPlatform())
 	image, err = c.Pull(ctx, cfg.Image, pullOptions(cfg)...)
 	if err != nil {
 		return nil, fmt.Errorf("pulling image %s: %w", cfg.Image, err)
 	}
+	cfg.say("image: pulled and unpacked")
 	return image, nil
 }
 
