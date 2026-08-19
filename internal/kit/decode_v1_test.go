@@ -175,3 +175,63 @@ network:
 //     are gone rather than ignore them silently, and today nothing checks either way.
 //
 // None of these is claimed to work.
+
+// The OTHER v1 spelling of a command: `kind: agent` gives the executable and its arguments as
+// three flat fields rather than an entrypoint mapping.
+//
+// Until this was added, a kit using them was REFUSED — "field binary not found" — by the
+// decoder whose whole job is reading v1. It was found by diffing this package's yaml tags
+// against the field set in Docker's own spec library, not by meeting such a kit, which is the
+// argument for doing that diff rather than waiting.
+func TestV1AgentBlockCommandFields(t *testing.T) {
+	doc := `schemaVersion: "1"
+kind: agent
+name: legacy
+agent:
+  image: example/agent:1
+  binary: copilot
+  runOptions: ["--headless"]
+  interactiveOptions: ["--tui"]
+`
+	spec, warnings, err := ParseSpec([]byte(doc))
+	if err != nil {
+		t.Fatalf("a v1 agent block was refused: %v", err)
+	}
+	if spec.Sandbox == nil {
+		t.Fatal("the agent block produced no sandbox")
+	}
+	// binary is the entrypoint's HEAD, per the normative library: "in v2 this is
+	// entrypoint[1:] plus sandbox.command.default".
+	if got := spec.Sandbox.Entrypoint; len(got) != 1 || got[0] != "copilot" {
+		t.Errorf("Entrypoint = %v, want [copilot]", got)
+	}
+	if got := spec.Sandbox.Command.Default; len(got) != 1 || got[0] != "--headless" {
+		t.Errorf("Command.Default = %v, want [--headless]", got)
+	}
+	if got := spec.Sandbox.Command.Interactive; len(got) != 1 || got[0] != "--tui" {
+		t.Errorf("Command.Interactive = %v, want [--tui]", got)
+	}
+	if len(warnings) == 0 {
+		t.Error("no deprecation warning for the v1 agent-block fields")
+	}
+
+	// The mapping form still wins where both are present: a kit carrying both spellings is
+	// not something either grammar defines, and preferring the documented one beats
+	// picking by field order.
+	both := `schemaVersion: "1"
+kind: agent
+name: legacy
+agent:
+  image: example/agent:1
+  binary: ignored
+  entrypoint:
+    run: [chosen]
+`
+	spec, _, err = ParseSpec([]byte(both))
+	if err != nil {
+		t.Fatalf("both spellings together were refused: %v", err)
+	}
+	if got := spec.Sandbox.Entrypoint; len(got) != 1 || got[0] != "chosen" {
+		t.Errorf("Entrypoint = %v, want the entrypoint mapping to win", got)
+	}
+}
