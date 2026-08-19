@@ -1,0 +1,42 @@
+schemaVersion: "1"
+kind: sandbox
+name: sample-agent
+version: "1.0.0"
+displayName: Sample Agent
+description: "A test-only agent that exercises agent-specific spec fields"
+sourceURL: https://example.com/sample-agent
+
+sandbox:
+  image: "docker/sandbox-templates:shell-docker"
+  aiFilename: SAMPLE.md
+  entrypoint:
+    run: ["sample-bin", "--verbose"]
+    args: ["--task-mode"]
+
+network:
+  allowedDomains:
+    - sample-agent.example.com
+  deniedDomains:
+    - telemetry.sample-agent.example.com
+  publishedPorts:
+    - container: 8080
+      protocol: tcp
+      name: web
+
+environment:
+  variables:
+    SAMPLE_AGENT_HOME: /home/agent/.sample-agent
+
+commands:
+  install:
+    - command: "echo agent-installed"
+      user: "0"
+      description: Sample agent install
+  startup:
+    - command: ["echo", "agent-started"]
+      user: "1000"
+      background: true
+      description: Sample agent startup
+
+agentContext: |
+  This is sample agent memory content for TCK testing.
