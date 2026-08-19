@@ -61,8 +61,11 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	fs.StringVar(&f.preset, "policy", "", "network policy preset: "+strings.Join(policy.PresetNames(), ", ")+
 		" (default "+policy.DefaultPreset+")")
 	fs.StringVar(&f.profile, "profile", "", "stored policy profile to apply ('boks policy profile ls')")
-	fs.StringVar(&f.kitRef, "kit", "", "kit to apply: a directory containing "+kit.SpecFileName+
-		", or a path to one")
+	// The help says what it DOES, not what a kit is, because a kit declares an image, an
+	// entrypoint, setup commands and credentials too and none of those are applied yet. A
+	// flag advertised as "apply this kit" would be read as all of it.
+	fs.StringVar(&f.kitRef, "kit", "", "apply a kit's network rules: a directory containing "+
+		kit.SpecFileName+", or a path to one (local only)")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
 	fs.StringArrayVar(&f.allow, "allow", nil, "allow a destination, host[:ports] (repeatable)")

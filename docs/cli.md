@@ -346,7 +346,7 @@ boks create shell .
 | `--env stringArray` |  | extra environment variable KEY=VALUE (repeatable) |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | kit to apply: a directory containing spec.yaml, or a path to one |
+| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, or a path to one (local only) |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
@@ -713,7 +713,7 @@ boks policy check github.com:443
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | kit to apply: a directory containing spec.yaml, or a path to one |
+| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, or a path to one (local only) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
@@ -868,7 +868,7 @@ Presets:
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | kit to apply: a directory containing spec.yaml, or a path to one |
+| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, or a path to one (local only) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
@@ -1072,7 +1072,7 @@ boks proxy --policy standard
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | kit to apply: a directory containing spec.yaml, or a path to one |
+| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, or a path to one (local only) |
 | `--listen string` | `127.0.0.1:0` | address to listen on |
 | `--log string` | `~/.local/state/boks/policy-log.jsonl` | append decisions to this file |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
@@ -1214,7 +1214,7 @@ boks run                              # a shell in the current directory
 | `--env stringArray` |  | extra environment variable KEY=VALUE (repeatable) |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | kit to apply: a directory containing spec.yaml, or a path to one |
+| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, or a path to one (local only) |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |

@@ -74,7 +74,7 @@ output, plus a live `sbx ls`.
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
 | `-p/--publish` | Publishes a sandbox port on the host at creation; ignored when re-attaching | Same flag, same short form, same rule — a re-attaching run says so rather than looking obeyed, and points at `boks ports` | P1 | done |
 | `--clone` | Run flag for clone mode | Implemented — `internal/cli/common.go` registers it, `internal/sandbox/clone.go` is the machinery | P1 | done |
-| `--kit` | Run flag naming a kit to apply | Not implemented. `internal/kit` parses a kit's `spec.yaml` (both schema versions); nothing fetches or applies one. Design and slices in [kits.md](kits.md) | P1 | partial |
+| `--kit` | Run flag naming a kit to apply | Partial: `--kit <dir>` applies a kit's `permissions.network` as its own policy layer. Local references only — git, OCI and ZIP are refused by name. Image, entrypoint, setup, files, credentials and ports are parsed and not applied. Usage in [kits.md](kits.md); design and slices in [kits-design.md](kits-design.md) | P1 | partial |
 | `--profile` | "Governance profile to assign to the sandbox" | `-profile NAME` on `run` and `create`, selecting a stored profile — a named preset plus rules. Local rules still apply on top of it, and a deny in any scope still wins | P1 | done |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
@@ -252,7 +252,7 @@ What matters for Boks' own design:
 
 ### 2e. How a kit is named, and which schema versions to accept
 
-**Superseded by [kits.md](kits.md), which is written from the primary sources.** This section
+**Superseded by [kits-design.md](kits-design.md), which is written from the primary sources.** This section
 is kept because it is where the question was first asked, and shortened to the answers.
 
 A kit is a directory containing `spec.yaml` and an optional `files/` tree. It is *referenced*,
@@ -269,7 +269,7 @@ Docker's *normative* spec requires remote references to be pinned — an OCI ref
 digest, and a Git `#ref=` MUST be a full 40-character commit SHA, with tags and branches
 rejected — while the product documentation shows tag-based examples. So the pinning discipline
 this project applies everywhere else is not a Boks house rule imposed on kits; it is what the
-kit specification already demands, and the two Docker sources disagree about it. See kits.md
+kit specification already demands, and the two Docker sources disagree about it. See kits-design.md
 §2 for both quotations.
 
 ## 3. Workspace and filesystem

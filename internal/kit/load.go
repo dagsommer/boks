@@ -23,7 +23,7 @@ import (
 //
 // Docker's own normative specification agrees, and more strictly than its tutorials do: an OCI
 // reference MUST be a digest and a Git ref MUST be a full 40-character commit SHA, with tags
-// and branches rejected (see docs/kits.md §2, which quotes both sides of that disagreement).
+// and branches rejected (see docs/kits-design.md §2, which quotes both sides of that disagreement).
 // Shipping the fetch before the pinning would ship the one form of this feature that cannot be
 // made safe afterwards, because by then people would have unpinned references written down.
 //
@@ -34,11 +34,18 @@ func Load(reference string) (*Spec, []string, error) {
 		return nil, nil, fmt.Errorf("no kit reference given")
 	}
 	if scheme, ok := remoteForm(reference); ok {
-		return nil, nil, fmt.Errorf("kit %q is a %s reference, which Boks cannot load yet: "+
+		// "a"/"an" from the word itself: "a OCI reference" is the kind of wrongness that
+		// makes an error read as machine output nobody proofread.
+		article := "a"
+		if strings.ContainsRune("AEIOU", rune(scheme[0])) {
+			article = "an"
+		}
+		return nil, nil, fmt.Errorf("kit %q is %s %s reference, which Boks cannot load yet: "+
 			"only a local directory or a path to %s works today. Fetching a kit is not "+
 			"implemented rather than not written — a kit sets network rules and runs "+
 			"commands as root, so it has to be pinned the way Boks pins everything else "+
-			"it downloads. See docs/kits.md", reference, scheme, SpecFileName)
+			"it downloads. See docs/kits.md for how to use one, and docs/kits-design.md for why",
+			reference, article, scheme, SpecFileName)
 	}
 
 	path := reference
