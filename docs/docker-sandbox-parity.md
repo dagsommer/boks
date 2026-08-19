@@ -74,7 +74,7 @@ output, plus a live `sbx ls`.
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
 | `-p/--publish` | Publishes a sandbox port on the host at creation; ignored when re-attaching | Same flag, same short form, same rule — a re-attaching run says so rather than looking obeyed, and points at `boks ports` | P1 | done |
 | `--clone` | Run flag for clone mode | Implemented — `internal/cli/common.go` registers it, `internal/sandbox/clone.go` is the machinery | P1 | done |
-| `--kit` | Run flag naming a kit to apply | Partial: `--kit <dir>` applies a kit's `permissions.network` as its own policy layer. Local references only — git, OCI and ZIP are refused by name. Image, entrypoint, setup, files, credentials and ports are parsed and not applied. Usage in [kits.md](kits.md); design and slices in [kits-design.md](kits-design.md) | P1 | partial |
+| `--kit` | Run flag naming a kit to apply | Partial: `--kit <dir>` applies a kit's `permissions.network` as its own policy layer. Local directories and `git+https`/`git+ssh` references work; OCI and ZIP are refused by name. Image, entrypoint, setup, files, credentials and ports are parsed and not applied. Usage in [kits.md](kits.md); design and slices in [kits-design.md](kits-design.md) | P1 | partial |
 | `--profile` | "Governance profile to assign to the sandbox" | `-profile NAME` on `run` and `create`, selecting a stored profile — a named preset plus rules. Local rules still apply on top of it, and a deny in any scope still wins | P1 | done |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
@@ -264,13 +264,21 @@ Two schema versions, since sbx 0.36. The loader **forks** on `schemaVersion`: a 
 decoded against the v2 grammar alone, and a legacy v1 field inside it is rejected during decode
 rather than folded in. `internal/kit` implements both and translates v1 forward.
 
-The correction worth recording, because this section originally got it wrong from a summary:
-Docker's *normative* spec requires remote references to be pinned — an OCI ref MUST be a
-digest, and a Git `#ref=` MUST be a full 40-character commit SHA, with tags and branches
-rejected — while the product documentation shows tag-based examples. So the pinning discipline
-this project applies everywhere else is not a Boks house rule imposed on kits; it is what the
-kit specification already demands, and the two Docker sources disagree about it. See kits-design.md
-§2 for both quotations.
+Docker's two sources disagree about pinning, and Boks follows the product one. The *normative*
+spec requires an immutable remote reference — an OCI ref MUST be a digest, a Git `#ref=` MUST
+be a full 40-character commit SHA, tags and branches rejected. The *product* documentation says
+`#ref=<branch|tag|commit>`, "Defaults to the repository's default branch", and uses a tag in its
+own example. Real kits are published and referenced by tag, so Boks accepts all three forms and
+**reports the commit it resolved**, warning when the reference was mutable. That keeps what the
+pinning rule is for — knowing exactly what ran — without refusing references that work in
+`sbx`. Both quotations are in kits-design.md §2.
+
+Recorded because the first version of this section drew the opposite conclusion: it treated the
+normative rule as binding and refused git and OCI outright, which would have made a kit written
+for `sbx` fail to load in Boks. The security argument for refusing was also weaker than it
+looked — a kit's `setup.install` runs as uid 0 *inside the guest*, and this project's own threat
+model says in-guest permissions are not a boundary and nothing depends on them
+(security-model.md).
 
 ## 3. Workspace and filesystem
 

@@ -85,24 +85,40 @@ permitted it.
 |---|---|---|
 | Local directory | `--kit ./my-kit` | **works** |
 | Path to a spec | `--kit ./my-kit/spec.yaml` | **works** |
-| Git | `--kit git+https://example.com/repo.git#ref=<sha>` | refused |
-| OCI artifact | `--kit ghcr.io/org/kit@sha256:…` | refused |
-| ZIP | `--kit ./my-kit-1.0.zip` | refused |
+| Git over HTTPS | `--kit "git+https://github.com/org/repo.git#ref=v1.0&dir=vale"` | **works** |
+| Git over SSH | `--kit "git+ssh://git@example.com/org/repo.git#dir=vale"` | **works** |
+| OCI artifact | `--kit ghcr.io/org/kit@sha256:…` | not yet |
+| ZIP | `--kit ./my-kit-1.0.zip` | not yet |
 
-The refusals name the form and say they are deliberate:
+### Git references
+
+`#ref=` takes a branch, a tag or a commit, and defaults to the repository's default branch —
+the same grammar `sbx` uses. `#dir=` names the subdirectory holding `spec.yaml`. **Quote the
+whole reference**: `&` backgrounds the command in most shells.
 
 ```console
-$ boks run claude . --kit oci://ghcr.io/org/kit@sha256:abc
-boks: kit "oci://ghcr.io/org/kit@sha256:abc" is an OCI reference, which Boks cannot
-      load yet: only a local directory or a path to spec.yaml works today. …
+$ boks run claude . --kit "git+https://github.com/docker/sbx-kits-contrib.git#ref=v0.1.0&dir=code-server"
+kit …: fetched from https://github.com/docker/sbx-kits-contrib.git at commit d4de09c8…
+kit …: v0.1.0 is not a fixed commit, so this kit may differ on the next run;
+       use #ref=d4de09c88bef5bcf62aa80543a098c1392506b38 to pin it
 ```
 
-Fetching a kit is not a missing convenience. A kit sets network rules and runs
-`setup.install` as uid 0, so a fetched one is remote input with more authority than anything
-else Boks downloads — and everything else Boks downloads is pinned by digest or commit.
-Docker's own kit specification agrees, and requires an OCI reference to be a digest and a git
-ref to be a full 40-character commit SHA. Boks will fetch kits when it can do so under that
-rule, not before.
+The fetch is shallow and the clone is discarded once the spec is read. `git` does the
+fetching, so an SSH agent, a credential helper, `.netrc` and a proxy all work as they do for
+any other repository — and a private repository never prompts: if there is no usable
+credential it fails rather than hanging on a password prompt you cannot see.
+
+**Boks always reports the commit it resolved, and warns when the reference was mutable.** A
+branch or tag can move, so the kit you ran today is not necessarily the one you run tomorrow;
+the warning names the exact SHA to write if you want that guaranteed. Docker's normative
+specification goes further and *requires* an immutable reference, but its product
+documentation says `#ref=<branch|tag|commit>` and uses a tag in its own example — and real
+kits are published and referenced by tag, so refusing them would mean a kit written for `sbx`
+does not load in Boks. Reporting the commit keeps what the pinning rule is for — knowing
+exactly what ran — without refusing the reference.
+
+`git://` is refused: it is unauthenticated and unencrypted, and nothing that sets a sandbox's
+network rules should arrive that way.
 
 ## Examples
 
@@ -229,8 +245,13 @@ reach it is the network stack's job, verified separately in
 
 ## Troubleshooting
 
-**`kit "…" is a git reference, which Boks cannot load yet`** — see [Reference forms](#reference-forms).
-Clone the repository and point `--kit` at the directory.
+**A git reference fails to fetch** — the error carries git's own message, which names the real
+cause (no such ref, authentication failed, host unreachable). For a private repository, check
+that the credential git would use outside Boks is available: Boks never prompts, so a missing
+credential is a failure rather than a hang.
+
+**`unknown fragment key`** — the grammar is `#ref=…&dir=…` and nothing else. `#branch=` is a
+common guess and is not it.
 
 **A destination the kit allows is still denied** — something denies it, and a deny always
 wins. `boks policy ls --sandbox <name>` shows every layer; the denying rule is named in the
