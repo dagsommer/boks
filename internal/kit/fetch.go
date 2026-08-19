@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -83,13 +84,22 @@ func parseGitRef(reference string) (gitRef, error) {
 			return gitRef{}, fmt.Errorf("kit %q: dir=%q must be relative to the repository",
 				reference, g.Dir)
 		}
-		for _, part := range strings.Split(filepath.ToSlash(g.Dir), "/") {
+		// `path`, not `filepath`. This names a directory INSIDE A GIT REPOSITORY, where
+		// the separator is always "/" whatever host is doing the reading. Cleaning it
+		// with host semantics made `dir=vale` come out as `\vale` on Windows — caught by
+		// the Windows CI job, and the reason this distinction is spelled out rather than
+		// left to whoever edits next. It becomes a host path once, at the join below.
+		//
+		// A backslash is checked for too: it is not a separator here, so a `..\..` that
+		// git would read as one odd directory name should still not slip past the guard
+		// on a host where it might later be treated as a path.
+		for _, part := range strings.FieldsFunc(g.Dir, func(r rune) bool { return r == '/' || r == '\\' }) {
 			if part == ".." {
 				return gitRef{}, fmt.Errorf("kit %q: dir=%q leaves the repository",
 					reference, g.Dir)
 			}
 		}
-		g.Dir = strings.TrimPrefix(filepath.Clean("/"+g.Dir), "/")
+		g.Dir = strings.TrimPrefix(path.Clean("/"+g.Dir), "/")
 		if g.Dir == "" {
 			return gitRef{}, fmt.Errorf("kit %q: dir=%q names no directory", reference, values.Get("dir"))
 		}
@@ -186,7 +196,9 @@ func loadGit(reference string) (*Spec, []string, error) {
 		return nil, nil, err
 	}
 
-	specPath := filepath.Join(dest, g.Dir, SpecFileName)
+	// FromSlash: g.Dir is a repository path and dest is a host path, so this is the one
+	// place the two meet.
+	specPath := filepath.Join(dest, filepath.FromSlash(g.Dir), SpecFileName)
 	data, err := os.ReadFile(specPath)
 	if err != nil {
 		where := "the repository root"
