@@ -485,3 +485,179 @@ func TestSandboxPolicyRecord(t *testing.T) {
 		t.Errorf("record did not rebuild its request: %+v", req)
 	}
 }
+
+// kitRequest is a run with a kit applied: one destination the kit's spec declares under
+// permissions.network.allow, on a machine whose stored policy is whatever the test sets up.
+func kitRequest(s *Store, host string) Request {
+	return Request{
+		Store:    s,
+		Sandbox:  "web",
+		Agent:    "claude",
+		Kit:      "vale",
+		KitAllow: []RuleSpec{{Action: Allow, Spec: host + ":443", Note: "the kit's own service"}},
+	}
+}
+
+// TestKitAllowlistIsItsOwnLayer: a kit's destinations are permitted, and the verdict names the
+// KIT rather than the agent or a preset.
+//
+// The naming is the whole point of the layer. A kit's rules are the only ones in this file that
+// can arrive from outside the machine — a kit is a file, possibly fetched from a URL — so
+// "why can this sandbox reach that?" has to answer with the thing the user can go and read.
+// Folding them into the agent layer would have been less code and would have made a
+// downloaded rule indistinguishable from one compiled into Boks.
+func TestKitAllowlistIsItsOwnLayer(t *testing.T) {
+	const host = "api.kit.test"
+	res, err := kitRequest(storeWith(t, PresetStandard, nil, nil), host).Resolve()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	p, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := p.Evaluate(target(t, host, 443))
+	if !v.Allowed {
+		t.Fatalf("the kit's own destination was denied: %s", v.Reason)
+	}
+	if v.Scope != "kit vale" {
+		t.Errorf("scope = %q, want %q — a kit's rule must not be attributed to the agent "+
+			"or to a preset", v.Scope, "kit vale")
+	}
+	out := res.Describe()
+	for _, want := range []string{"kit vale", host + ":443", "the kit's own service"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("describe output is missing %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(res.Name, "kit:vale") {
+		t.Errorf("Name = %q, want it to record the kit layer", res.Name)
+	}
+}
+
+// The invariant that matters most, stated as a test because a kit is remote input: a kit
+// cannot widen a sandbox past a deny the user or the machine has written.
+//
+// If this ever fails, a file fetched from a URL can reach a destination the machine forbids,
+// which is the single worst outcome this feature could have.
+//
+// Worth knowing what actually guarantees it, because it is not the layer's position: Evaluate
+// scans every deny before it looks at any allow (policy.go), so a kit's allow cannot beat a
+// deny no matter which layer it sits in. Verified by mutation — injecting a kit allow for the
+// denied host leaves this test passing, while disabling the deny-first scan fails it. So the
+// placement of the kit layer is a provenance and display decision, and THIS invariant is the
+// engine's. That is the right place for it to live; this test is here to make sure the new
+// layer is subject to it rather than to prove the ordering.
+func TestKitCannotOverrideADeny(t *testing.T) {
+	const host = "blocked.kit.test"
+	for _, tc := range []struct {
+		name  string
+		store func(t *testing.T) *Store
+		req   func(s *Store) Request
+	}{
+		{
+			name: "a global deny beats the kit",
+			store: func(t *testing.T) *Store {
+				return storeWith(t, PresetStandard, []RuleSpec{
+					{Action: Deny, Spec: host, Note: "forbidden on this machine"},
+				}, nil)
+			},
+			req: func(s *Store) Request { return kitRequest(s, host) },
+		},
+		{
+			name: "a --deny flag beats the kit",
+			store: func(t *testing.T) *Store {
+				return storeWith(t, PresetStandard, nil, nil)
+			},
+			req: func(s *Store) Request {
+				r := kitRequest(s, host)
+				r.Deny = []string{host}
+				return r
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.req(tc.store(t)).Resolve()
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			p, err := res.Policy()
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := p.Evaluate(target(t, host, 443))
+			if v.Allowed {
+				t.Fatalf("a kit's allow overrode a deny: %s (scope %q). A kit is a file, "+
+					"possibly fetched from a URL; it must never widen a sandbox past "+
+					"what the machine forbids", v.Reason, v.Scope)
+			}
+		})
+	}
+}
+
+// A kit's own denies are honoured, because a deny only ever narrows. This is the half of a
+// kit's rules that is safe to take at face value however the kit arrived.
+func TestKitDenyIsApplied(t *testing.T) {
+	const host = "telemetry.kit.test"
+	// The destination must be OPEN before the kit denies it, or the test proves nothing.
+	// The first version of this test denied a host the preset never allowed, so it was
+	// denied by default and passed with the kit's deny deleted — an assertion that could
+	// not fail. A global allow is what makes the kit's deny the thing under test.
+	store := storeWith(t, PresetStandard, []RuleSpec{
+		{Action: Allow, Spec: host + ":443", Note: "open on this machine"},
+	}, nil)
+	req := kitRequest(store, "api.kit.test")
+	req.KitDeny = []RuleSpec{{Action: Deny, Spec: host, Note: "the kit forbids its own telemetry"}}
+
+	// The control: without the kit's deny, this host is reachable. If this fails, the
+	// setup is wrong and the assertion below is meaningless again.
+	open, err := kitRequest(store, "api.kit.test").Resolve()
+	if err != nil {
+		t.Fatalf("resolve control: %v", err)
+	}
+	openPolicy, err := open.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := openPolicy.Evaluate(target(t, host, 443)); !v.Allowed {
+		t.Fatalf("control failed: %s is not reachable even without the kit's deny, so "+
+			"this test cannot show that the deny did anything", host)
+	}
+
+	res, err := req.Resolve()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	p, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := p.Evaluate(target(t, host, 443)); v.Allowed {
+		t.Errorf("a kit's own deny was not applied: %s", v.Reason)
+	}
+}
+
+// Locked means locked, for kits exactly as for agents. A user who asked for the locked preset
+// asked for "only what I write", and a kit is emphatically not something they wrote.
+func TestKitLayerIsDroppedUnderLocked(t *testing.T) {
+	const host = "api.kit.test"
+	req := kitRequest(storeWith(t, PresetStandard, nil, nil), host)
+	req.Preset = PresetLocked
+
+	res, err := req.Resolve()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	p, err := res.Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := p.Evaluate(target(t, host, 443)); v.Allowed {
+		t.Errorf("the kit layer applied under the locked preset: %s", v.Reason)
+	}
+	// Listed even though it is not applied, so that its absence is a statement rather than
+	// a gap — the same contract the agent layer keeps.
+	if out := res.Describe(); !strings.Contains(out, "kit vale") {
+		t.Errorf("the dropped kit layer is not shown at all:\n%s", out)
+	}
+}

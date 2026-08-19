@@ -127,6 +127,14 @@ func policyLs(env Env, flags *policyFlags, sandbox string, stored bool) error {
 		return nil
 	}
 
+	// `boks policy ls --kit ./x` previews what a kit would add before any sandbox exists.
+	// That is the whole reason this command takes the flag: a kit is a file that grants
+	// network access, and being able to read its effect in the same table as every other
+	// layer is what makes it auditable rather than something you find out by running it.
+	if err := flags.loadKit(env.Stderr); err != nil {
+		return err
+	}
+
 	resolution, err := flags.resolution(sandbox, nil)
 	if err != nil {
 		return err
