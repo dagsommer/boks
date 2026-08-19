@@ -223,16 +223,17 @@ agentInstructions:                      # not applied
 
 ## Output
 
-A run is quiet by default. Two things print anyway, because they are news rather than
-description:
+A run prints nothing about the network by default. How Boks works — that it terminates TLS
+for a credential's hosts, and what the policy allows — is documented and askable at any moment
+with `boks policy ls`, so volunteering it on every run only teaches people to skip the output.
 
-- **A host whose TLS Boks is about to terminate**, the first time a sandbox sees it. Asking
-  for less output is not consent to being decrypted silently.
-- **A policy that differs from the one this sandbox last ran under**, including the first run
-  of a new sandbox.
+One thing still speaks up unprompted: **interception getting wider**. A sandbox that decrypted
+one host yesterday and three today is a change to what is being read, and a kit, a profile or
+a new credential can make that change without the user doing it deliberately.
 
-Everything else — the standing network summary, which kit was applied, the image, the command,
-the workspace mounts, the network stack's own progress — waits for `-v`.
+Everything else — the policy table, the standing summary, which kit was applied, the image and
+its download progress, the command, the workspace mounts, the network stack's own progress —
+waits for `-v`.
 
 `-q`/`--quiet` still parses so that scripts written against 0.1.5 keep working. It does
 nothing: quiet is the default now.

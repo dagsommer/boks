@@ -67,7 +67,9 @@ func TestDescribeNetworkTellsTheUserWhatWillHappen(t *testing.T) {
 		Intercept:  true,
 	}
 	var errOut bytes.Buffer
-	if err := describeNetwork(flags, spec, network.ModeNAT, false, &errOut); err != nil {
+	// true: this asserts WHAT is said when the user asks, which is -v's job since the
+	// summary stopped printing unprompted.
+	if err := describeNetwork(flags, spec, network.ModeNAT, true, &errOut); err != nil {
 		t.Fatalf("describeNetwork: %v", err)
 	}
 	got := errOut.String()
@@ -111,7 +113,7 @@ func TestDescribeNetworkForNoNetwork(t *testing.T) {
 
 	flags := &policyFlags{mode: "none", allow: []string{"example.com"}}
 	var errOut bytes.Buffer
-	if err := describeNetwork(flags, enforce.Spec{Sandbox: "boks-test"}, network.ModeNone, false, &errOut); err != nil {
+	if err := describeNetwork(flags, enforce.Spec{Sandbox: "boks-test"}, network.ModeNone, true, &errOut); err != nil {
 		t.Fatalf("describeNetwork: %v", err)
 	}
 	got := errOut.String()

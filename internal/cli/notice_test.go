@@ -44,9 +44,12 @@ func mustAgent(t *testing.T, name string) agent.Agent {
 func TestTheSecondRunIsQuiet(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
-	first := describeRun(t, "boks-test", false, []string{"example.com:443"}, nil)
+	// -v: the long explanation is what a user gets when they ASK what is going on. It is
+	// no longer volunteered, because volunteering it on every run is what this flag
+	// inverted to stop.
+	first := describeRun(t, "boks-test", true, []string{"example.com:443"}, nil)
 	if !strings.Contains(first, "example.com:443") || !strings.Contains(first, "terminated on the host") {
-		t.Fatalf("the first run did not explain itself:\n%s", first)
+		t.Fatalf("the first run did not explain itself under -v:\n%s", first)
 	}
 	if lineCount(first) < 20 {
 		t.Errorf("the first run should be the educational one, got %d lines:\n%s", lineCount(first), first)
@@ -84,7 +87,7 @@ func TestTheSecondRunIsQuiet(t *testing.T) {
 
 	// Another sandbox has been told nothing, so it gets the whole thing. The memory is
 	// per sandbox because the text describes a sandbox's containment.
-	other := describeRun(t, "boks-other", false, []string{"example.com:443"}, nil)
+	other := describeRun(t, "boks-other", true, []string{"example.com:443"}, nil)
 	if !strings.Contains(other, "terminated on the host") {
 		t.Errorf("a sandbox that had never been told got the short form:\n%s", other)
 	}
@@ -95,10 +98,13 @@ func TestTheSecondRunIsQuiet(t *testing.T) {
 func TestAChangedPolicyIsShownAgain(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
-	describeRun(t, "boks-test", false, []string{"example.com:443"}, nil)
-	changed := describeRun(t, "boks-test", false, []string{"example.com:443", "second.test:443"}, nil)
+	describeRun(t, "boks-test", true, []string{"example.com:443"}, nil)
+	// Under -v a changed policy is shown in full rather than summarised — the summary
+	// would say "unchanged", which would be false. Without -v nothing prints at all;
+	// TestTheDefaultSaysNothing covers that.
+	changed := describeRun(t, "boks-test", true, []string{"example.com:443", "second.test:443"}, nil)
 	if !strings.Contains(changed, "second.test:443") {
-		t.Errorf("a changed policy was not shown:\n%s", changed)
+		t.Errorf("a changed policy was not shown under -v:\n%s", changed)
 	}
 	// The mechanism has not changed, though, so the paragraph about it is not repeated.
 	if strings.Contains(changed, "terminated on the host") {
@@ -113,9 +119,9 @@ func TestAChangedPolicyIsShownAgain(t *testing.T) {
 func TestANewInterceptionHostIsAlwaysAnnounced(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
-	first := describeRun(t, "boks-test", false, nil, []string{"anthropic@api.anthropic.com=x-api-key"})
+	first := describeRun(t, "boks-test", true, nil, []string{"anthropic@api.anthropic.com=x-api-key"})
 	if !strings.Contains(first, "TLS INTERCEPTION") || !strings.Contains(first, "api.anthropic.com") {
-		t.Fatalf("the first interception was not announced:\n%s", first)
+		t.Fatalf("the first interception was not announced under -v:\n%s", first)
 	}
 
 	// Same host, second run: it has been said, and saying it again every time is what
@@ -147,21 +153,24 @@ func TestANewInterceptionHostIsAlwaysAnnounced(t *testing.T) {
 	}
 }
 
-// TestTheFirstExplanationSurvivesAQuietRun: the default is quiet, and quiet may suppress only
-// things a user can ask for again at any time. The first encounter with a policy is not one of
-// those, so it is still printed — and if it were ever suppressed, it must not be recorded as
-// having been shown, or the explanation would be consumed by a run that never made it.
-func TestTheFirstExplanationSurvivesAQuietRun(t *testing.T) {
+// TestTheDefaultSaysNothing: a run with no -v prints nothing about the network, on the first
+// run as on the hundredth.
+//
+// And, the part that is easy to get wrong: a silent run must not RECORD the explanation as
+// having been given. The record exists so the long form appears once; consuming it on a run
+// that printed nothing would mean the first -v run gets the two-line summary and the
+// explanation is never seen at all.
+func TestTheDefaultSaysNothing(t *testing.T) {
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 
-	// A first run with no -v still explains itself: a changed policy is news.
-	first := describeRun(t, "boks-test", false, []string{"example.com:443"}, nil)
-	if !strings.Contains(first, "terminated on the host") {
-		t.Errorf("the first run did not explain itself without -v:\n%s", first)
+	for i := range 3 {
+		if out := describeRun(t, "boks-test", false, []string{"example.com:443"}, nil); strings.TrimSpace(out) != "" {
+			t.Errorf("run %d printed without -v:\n%s", i+1, out)
+		}
 	}
-	// The second says nothing, which is the point of the inversion.
-	if out := describeRun(t, "boks-test", false, []string{"example.com:443"}, nil); strings.TrimSpace(out) != "" {
-		t.Errorf("an unchanged policy printed on a later run:\n%s", out)
+	// The explanation was not spent by those three runs.
+	if out := describeRun(t, "boks-test", true, []string{"example.com:443"}, nil); !strings.Contains(out, "terminated on the host") {
+		t.Errorf("the long explanation was consumed by runs that printed nothing:\n%s", out)
 	}
 }
 
@@ -173,7 +182,7 @@ func TestNoNetworkIsStatedOnceThenSummarised(t *testing.T) {
 	flags := &policyFlags{mode: "none"}
 	spec := enforce.Spec{Sandbox: "boks-test"}
 	var first, second bytes.Buffer
-	if err := describeNetwork(flags, spec, network.ModeNone, false, &first); err != nil {
+	if err := describeNetwork(flags, spec, network.ModeNone, true, &first); err != nil {
 		t.Fatal(err)
 	}
 	// The second run asks for detail; without -v it says nothing at all, which is asserted
@@ -183,7 +192,7 @@ func TestNoNetworkIsStatedOnceThenSummarised(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(first.String(), "NETWORK: none") {
-		t.Errorf("-net none did not announce itself without -v:\n%s", first.String())
+		t.Errorf("-net none did not announce itself under -v:\n%s", first.String())
 	}
 	if got := second.String(); !strings.Contains(got, "network: none") || lineCount(got) != 1 {
 		t.Errorf("the second -net none run under -v should be one line, got:\n%s", got)
