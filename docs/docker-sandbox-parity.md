@@ -74,7 +74,7 @@ output, plus a live `sbx ls`.
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
 | `-p/--publish` | Publishes a sandbox port on the host at creation; ignored when re-attaching | Same flag, same short form, same rule — a re-attaching run says so rather than looking obeyed, and points at `boks ports` | P1 | done |
 | `--clone` | Run flag for clone mode | Implemented — `internal/cli/common.go` registers it, `internal/sandbox/clone.go` is the machinery | P1 | done |
-| `--kit` | Run flag naming a kit to apply | Not implemented; nothing in the current design blocks it. The argument is a *reference*, not a name — see 2e | P1 | none |
+| `--kit` | Run flag naming a kit to apply | Not implemented. `internal/kit` parses a kit's `spec.yaml` (both schema versions); nothing fetches or applies one. Design and slices in [kits.md](kits.md) | P1 | partial |
 | `--profile` | "Governance profile to assign to the sandbox" | `-profile NAME` on `run` and `create`, selecting a stored profile — a named preset plus rules. Local rules still apply on top of it, and a deny in any scope still wins | P1 | done |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
@@ -252,93 +252,25 @@ What matters for Boks' own design:
 
 ### 2e. How a kit is named, and which schema versions to accept
 
-Recorded here because it is the half of kits that section 2d leaves out, and because getting
-it wrong is not a small mistake: it decides what `--kit` *is*, and it puts a fetch on the path
-of starting a sandbox.
+**Superseded by [kits.md](kits.md), which is written from the primary sources.** This section
+is kept because it is where the question was first asked, and shortened to the answers.
 
-**A kit is referenced, not named.** `--kit` takes one of three forms:
+A kit is a directory containing `spec.yaml` and an optional `files/` tree. It is *referenced*,
+not named, in five forms: a built-in name, a local directory, a local ZIP, a Git URL
+(`git+https://` or `git+ssh://`), and an OCI artifact. Two of those reach the network and
+return configuration that names an image, sets network rules, and runs commands as uid 0.
 
-- a **local filepath** to a kit file or directory,
-- an **HTTPS URL**,
-- a **git URL**.
+Two schema versions, since sbx 0.36. The loader **forks** on `schemaVersion`: a v2 document is
+decoded against the v2 grammar alone, and a legacy v1 field inside it is rejected during decode
+rather than folded in. `internal/kit` implements both and translates v1 forward.
 
-So `--kit` is not a lookup in a registry Boks controls. Two of the three forms reach the
-network, and what comes back is configuration that names an image, an entrypoint, setup
-commands that run as root, and network rules. That is remote input deciding what a sandbox is.
-
-**Support both v1 and v2.** Both are in the wild — the production kit read for section 2d is
-`schemaVersion: "1"` while the documented grammar is v2 — so a reader that accepts only the
-newer one refuses files people actually have. The differences are not merely additive:
-`agentInstructions.{filename,content}` in v2 is `agentContext` with `sandbox.aiFilename` in v1,
-which means a v1 reader is a translation and not a subset check. Accept both, translate v1
-forward into whatever internal shape Boks ends up with, and keep `schemaVersion` in the error
-message when neither matches, so an unsupported version says which version it was.
-
-**What this project's own habits imply for the fetching forms.** Everything else Boks pulls
-from the network is pinned: `packaging/nerdbox/NERDBOX_REV` pins a commit, the Homebrew formula
-and `scripts/build-nerdbox-guest.sh` pin source tarballs by SHA-256, images are pulled by
-digest through the guest platform. A kit fetched from an HTTPS or git URL and applied
-unpinned would be the one exception, and it would be the most powerful one — `setup.install[]`
-runs as uid 0. Whatever kits become here, the remote forms need the same discipline the rest
-of the project already applies: a pin, a checksum, or an explicit "I know this is unpinned"
-from the user. Deciding that when kits are built, rather than after, is the point of writing
-it down now.
-
-**Not yet verified in this repository.** The three reference forms and the two schema versions
-are recorded from Docker's kit reference as reported on 2026-08-19; no kit has been fetched,
-parsed or applied by anything here, and the precedence rules between a kit's settings and
-Boks' own flags, presets and policy scopes are not worked out. `boks policy ls` already has an
-ordered scope model that a kit's rules would have to enter as a named layer, and that is the
-first question to answer, not the schema.
-
-`permissions.network.{allow,deny}` documents the pattern forms supported: exact host, host
-with port, single-label wildcard, **multi-label wildcard**, port ranges, port wildcard and
-CIDR. Boks' policy engine implements one wildcard form, not two — a real gap, recorded here
-rather than silently absent.
-
-### 2c. Proxy modes, inferred from a real decision log
-
-Real `sbx policy log` output shows a `PROXY` column with **three** values — `forward`,
-`forward-bypass` and `transparent` — and their distribution across hosts is diagnostic:
-
-| Mode | Hosts observed |
-|---|---|
-| `forward` | `api.anthropic.com`, `platform.claude.com`, `mcp-proxy.anthropic.com`, `github.com`, `api.github.com`, `raw.githubusercontent.com`, `auth.docker.io`, `registry-1.docker.io`, `ports.ubuntu.com:80` |
-| `forward-bypass` | `proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`, `docs.docker.com`, `download.docker.com`, `production.cloudfront.docker.com`, `downloads.claude.ai`, `www.apache.org`, a Datadog log intake |
-| `transparent` | `example.com:443`, `github.com:22` |
-
-Every `forward` host is one with a credential to inject — Anthropic, GitHub, Docker registry
-auth — plus one plaintext HTTP host. Every `forward-bypass` host has no credential: module
-proxies, checksum databases, CDNs, telemetry, documentation. `transparent` covers flows that
-never used the proxy at all, including SSH on port 22, which cannot traverse a `CONNECT`.
-
-The reading Boks builds on — **inference from correlation, not documented fact**:
-
-- **`forward`** — handled at HTTP level: plaintext HTTP directly, or HTTPS terminated and
-  re-originated. Readable, and therefore injectable. The intercepted case.
-- **`forward-bypass`** — tunnelled via `CONNECT` without terminating. Unreadable. "Bypass"
-  means bypassing *inspection*, not bypassing the proxy.
-- **`transparent`** — caught at the network layer without proxy cooperation. TCP-level policy
-  only, so hostname rules cannot apply and IP/port rules are all there is.
-
-Boks adopts these three names. Matching the reference vocabulary is worth more than inventing
-clearer terms, and the semantics coincide with the design already chosen: interception is
-opt-in per destination, and the mode is precisely "did this host have a credential rule".
-
-**Log shape.** Columns are `SANDBOX  TYPE  HOST  PROXY  RULE  REASON  LAST SEEN  COUNT`,
-split into blocked and allowed sections, and **aggregated** rather than one line per request —
-one host showed 480 hits on a single row. `TYPE` is `network`, leaving room for the MCP and
-filesystem policies documented elsewhere.
-
-**Structured decisions.** A blocked row's rule reads:
-
-```
-no applicable policies for op(action=net:connect:tcp, resource=net:domain:api.anthropic.com:443)
-```
-
-So decisions are expressed over a typed action/resource vocabulary rather than free text,
-which generalises to non-network policy cleanly. Boks' decision log should record an action
-and a typed resource, leaving formatting and aggregation to the display layer.
+The correction worth recording, because this section originally got it wrong from a summary:
+Docker's *normative* spec requires remote references to be pinned — an OCI ref MUST be a
+digest, and a Git `#ref=` MUST be a full 40-character commit SHA, with tags and branches
+rejected — while the product documentation shows tag-based examples. So the pinning discipline
+this project applies everywhere else is not a Boks house rule imposed on kits; it is what the
+kit specification already demands, and the two Docker sources disagree about it. See kits.md
+§2 for both quotations.
 
 ## 3. Workspace and filesystem
 
