@@ -521,6 +521,9 @@ func TestAnUnreadableStoreDoesNotFailARunThatAskedForNothing(t *testing.T) {
 // With no passphrase at all there is nothing in the store that could be attached, so a run
 // with no credential flags proceeds in silence rather than failing.
 func TestNoPassphraseMeansNoStoredCredentials(t *testing.T) {
+	// Keyring off: with one available there IS a store without a passphrase, and this
+	// test is about the file store's behaviour when its passphrase is missing.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 	t.Setenv(secret.PassphraseEnv, "")
 
@@ -534,7 +537,8 @@ func TestNoPassphraseMeansNoStoredCredentials(t *testing.T) {
 		t.Errorf("plan = %v, stderr = %q", plan.inject, stderr.String())
 	}
 
-	// Naming one still fails, and says which variable is missing.
+	// Naming one still fails, and says which variable is missing. The keyring is off for
+	// this whole test — see the top of it — so the missing thing really is the passphrase.
 	flags = policyFlags{inject: []string{"x@api.example.com=bearer"}}
 	if _, _, err := flags.resolveCredentials(context.Background(), &stderr); err == nil {
 		t.Fatal("a credential rule was accepted with no store to read it from")
