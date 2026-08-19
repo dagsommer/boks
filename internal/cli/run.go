@@ -134,6 +134,18 @@ Agents:
 		if err := netFlags.loadKit(env.Stderr); err != nil {
 			return err
 		}
+		// A `kind: sandbox` kit defines an agent, so it has to be in the registry before
+		// the positional arguments are read — `boks run udi-copilot-default --kit …`
+		// names an agent that exists only in the file on the same command line, and
+		// splitAgent decides what the first positional IS by asking the registry.
+		//
+		// The TTY test is made here rather than inside, because it is the same one
+		// cfg.TTY makes below and the two must agree: a kit whose command.interactive
+		// was chosen for a terminal that then is not allocated would run the wrong argv.
+		if err := registerKitAgent(agents, netFlags.kitSpec,
+			isTerminal(env.Stdin) && isTerminal(env.Stdout)); err != nil {
+			return err
+		}
 
 		ctx := cmd.Context()
 		// Before the first thing that talks to containerd, and after everything that can

@@ -60,8 +60,15 @@ type credentialPlan struct {
 // for would be the wrong trade. A run that *did* name a credential still fails, later and by
 // name, when the value it needs cannot be read.
 func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error) {
+	// A kit's credentials are rendered into --inject's own grammar and prepended, so the
+	// user's flags come last and therefore win: --inject is how someone overrides what a
+	// kit asked for, and a kit must not be able to override the person running it.
+	kitSpecs, err := kitInjectSpecs(f.kitSpec)
+	if err != nil {
+		return credentialPlan{}, err
+	}
 	plan := credentialPlan{
-		inject: slices.Clone(f.inject),
+		inject: append(kitSpecs, f.inject...),
 		guest:  slices.Clone(f.guest),
 		oauth:  slices.Clone(f.oauth),
 	}
