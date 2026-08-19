@@ -464,15 +464,13 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, verbo
 		// Nothing leaves this sandbox, so there is no policy to show and no traffic to
 		// decrypt. The mode is fixed when a sandbox is created, so this is the same
 		// statement on every run: worth making once in full.
-		// The one-line restatement is chatter and waits for -v; the full notice the
-		// first time is news and prints regardless. Getting this backwards — which an
-		// earlier version of this function did — means a sandbox with no network never
-		// says so, and "why can nothing reach the internet" becomes a support question
-		// rather than a line that was already on screen.
+		// Silent unless asked. `-net none` is what the user typed; being told that the
+		// sandbox they asked to have no network has no network is the definition of
+		// output nobody reads.
+		if !verbose {
+			return nil
+		}
 		if shown.Policy == digest(noNetworkNotice) {
-			if !verbose {
-				return nil
-			}
 			fmt.Fprintf(stderr, "network: none — nothing leaves sandbox %s.\n", spec.Sandbox)
 			return nil
 		}
@@ -502,26 +500,39 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, verbo
 	hosts := secret.CredentialHosts(credentials)
 	fresh := shown.newHosts(hosts)
 
-	// A host whose traffic boks is about to decrypt, and that this sandbox has not been
-	// told about, is announced before anything else and regardless of --quiet. Asking for
-	// less output is not consent to silent interception.
-	if len(fresh) > 0 {
-		if len(shown.Intercept) > 0 {
-			fmt.Fprintf(stderr, "NEW: interception now covers %s.\n\n", strings.Join(fresh, ", "))
-		}
+	// Interception is announced when it CHANGES, not when it exists.
+	//
+	// The rule used to be "announce a host this sandbox has not been told about, whatever
+	// else is true", on the grounds that asking for less output is not consent to silent
+	// interception. With -v that argument still holds for one case and not the other. That
+	// boks terminates TLS for a credential's hosts is how boks works and is documented; a
+	// user who set up a credential asked for it, and repeating the explanation to everyone
+	// who ever runs that sandbox is the noise this flag inverted to remove.
+	//
+	// What is not "how boks works" is the SET growing later: a sandbox that decrypted one
+	// host yesterday and three today is a change to what is being read, and the user did
+	// not necessarily make it — a kit, a profile or a new credential can. So the widening
+	// still speaks up unprompted, and the standing explanation waits for -v.
+	widened := len(fresh) > 0 && len(shown.Intercept) > 0
+	if widened {
+		fmt.Fprintf(stderr, "NEW: interception now covers %s.\n\n", strings.Join(fresh, ", "))
+	}
+	if len(fresh) > 0 && (verbose || widened) {
 		fmt.Fprint(stderr, interceptionNotice(credentials))
 		fmt.Fprintln(stderr)
 	}
 
 	switch {
+	case !verbose:
+		// Nothing. The policy a sandbox runs under is a thing the user can ask for at
+		// any moment with `boks policy ls`, and printing it unprompted — even when it
+		// has changed — is the behaviour that made people skip the network output.
+		//
+		// Deliberately NOT recorded as shown. The record exists so that the long
+		// explanation is given once; consuming it on a run that printed nothing would
+		// mean the first -v run gets the short form and the explanation is never seen
+		// at all. So a run that says nothing also remembers nothing.
 	case digest(table) != shown.Policy:
-		// A policy that differs from the one this sandbox last ran under is NEWS, and
-		// is printed whether or not -v was given. This is the case the old --quiet
-		// deliberately skipped so that a quiet run "must not consume the one loud
-		// explanation a sandbox gets" — but with quiet as the default that reasoning
-		// inverts: skipping it would mean the explanation is never given at all, and a
-		// rule set changing under a sandbox would be the one thing Boks stayed silent
-		// about. So it prints, and is recorded as shown.
 		fmt.Fprint(stderr, table)
 		if !shown.Enforcement {
 			fmt.Fprintf(stderr, "\n%s\n", enforcementNote)

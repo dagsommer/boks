@@ -365,6 +365,14 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 	// longest silence in `boks run`, and a line that appears once it finishes explains a
 	// wait that has already happened.
 	cfg.say("image: pulling %s for %s", cfg.Image, runtimecfg.GuestPlatform())
+	// Progress runs alongside the pull and stops with it, however the pull ends. Only
+	// started when someone is listening: polling the content store every couple of seconds
+	// to build strings nobody reads is work for nothing.
+	if cfg.Progress != nil {
+		progressCtx, stop := context.WithCancel(ctx)
+		defer stop()
+		go reportPullProgress(progressCtx, c, cfg.say)
+	}
 	image, err = c.Pull(ctx, cfg.Image, pullOptions(cfg)...)
 	if err != nil {
 		return nil, fmt.Errorf("pulling image %s: %w", cfg.Image, err)
