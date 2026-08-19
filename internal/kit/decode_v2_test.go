@@ -107,7 +107,11 @@ func TestV2RejectsLegacyV1Fields(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := mustNotParse(t, minimalV2+tc.legacy, "not found")
+			// "not valid in schemaVersion" rather than yaml.v3's own "not found in
+			// type kit.Spec": what is asserted is that the field is refused and the
+			// author is told why, not the decoder's phrasing, which this package
+			// rewrites precisely so it can change without breaking anyone.
+			err := mustNotParse(t, minimalV2+tc.legacy, "not valid in schemaVersion")
 			// The key itself must appear, or the author is told only that "a" field is
 			// unknown and has to find which.
 			if !strings.Contains(err.Error(), tc.wantKey) {
@@ -232,7 +236,7 @@ func TestV2RejectsTypos(t *testing.T) {
 		minimalV2 + "permissions:\n  netwrok:\n    allow: [a.example.com]\n",
 		minimalV2 + "credenta:\n  - service: x\n",
 	} {
-		mustNotParse(t, doc, "not found")
+		mustNotParse(t, doc, "not valid in schemaVersion")
 	}
 }
 
@@ -515,4 +519,39 @@ func TestResolvedResponseFields(t *testing.T) {
 	if got.Scope != "scope" {
 		t.Errorf("scope = %q, want scope", got.Scope)
 	}
+}
+
+// A half-migrated spec is the likeliest reason a v2 decode fails, so the error has to be
+// migration advice rather than a decoder's complaint.
+//
+// yaml.v3 says "field network not found in type kit.Spec", which names a Go type the reader
+// has no access to and invites them to go looking for a struct. What they need is: which
+// field, which line, and what v2 calls it instead.
+func TestUnknownFieldErrorsExplainTheMigration(t *testing.T) {
+	t.Run("a v1 field names its v2 spelling", func(t *testing.T) {
+		err := mustNotParse(t, "schemaVersion: \"2\"\nkind: mixin\nname: x\nnetwork:\n  allowedDomains: [a]\n",
+			"permissions.network.allow")
+		for _, want := range []string{`"network"`, "v1", "line 4"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q is missing %q", err, want)
+			}
+		}
+		// The Go type must not appear. This is the whole reason the rewrite exists.
+		if strings.Contains(err.Error(), "kit.Spec") {
+			t.Errorf("error %q leaks the Go type name", err)
+		}
+	})
+
+	t.Run("a typo says it is not in the grammar", func(t *testing.T) {
+		err := mustNotParse(t, "schemaVersion: \"2\"\nkind: mixin\nname: x\nnotAField: 1\n",
+			`"notAField"`)
+		if strings.Contains(err.Error(), "kit.Spec") {
+			t.Errorf("error %q leaks the Go type name", err)
+		}
+		// It must NOT claim a typo is a v1 field, which would send the reader to a
+		// migration table that does not mention it.
+		if strings.Contains(err.Error(), "v1") {
+			t.Errorf("error %q calls an unknown field a v1 field", err)
+		}
+	})
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -121,7 +123,7 @@ func decodeV2(data []byte) (*Spec, error) {
 			// bare error message ("EOF") tells the author nothing about what is wrong.
 			return nil, errors.New("spec.yaml is empty")
 		}
-		return nil, err
+		return nil, explainUnknownFields(err)
 	}
 
 	// A second YAML document is silently ignored by a single Decode call, so a spec.yaml
@@ -140,4 +142,60 @@ func decodeV2(data []byte) (*Spec, error) {
 	}
 
 	return &s, nil
+}
+
+// v1Fields maps a v1 key to how v2 spells the same thing, from the reference's "What changed
+// in v2" table. It exists to turn a strict-decode rejection into migration advice: hitting one
+// of these means a spec is half-migrated, which is the single likeliest reason a v2 decode
+// fails, and the raw message says nothing about it.
+var v1Fields = map[string]string{
+	"network":        "permissions.network.allow / .deny (and credentials[].apiKey.inject for serviceDomains/serviceAuth, top-level ports for publishedPorts)",
+	"memory":         "agentInstructions.content",
+	"agentContext":   "agentInstructions.content",
+	"oauth":          "credentials[].oauth",
+	"commands":       "setup (commands.initFiles becomes setup.files)",
+	"settings":       "removed in v2",
+	"kitDir":         "removed in v2",
+	"persistence":    "removed in v2",
+	"tmpfs":          "volumes entries with type: tmpfs",
+	"agent":          "sandbox (and kind: agent becomes kind: sandbox)",
+	"aiFilename":     "agentInstructions.filename",
+	"allowedDomains": "permissions.network.allow",
+	"deniedDomains":  "permissions.network.deny",
+	"serviceDomains": "credentials[].apiKey.inject",
+	"serviceAuth":    "credentials[].apiKey.inject",
+	"publishedPorts": "top-level ports",
+	"proxyManaged":   "credentials[].apiKey.proxyManaged",
+	"sources":        "credentials list entries with a service",
+}
+
+// unknownFieldRe matches yaml.v3's strict-decode complaint. The Go type name in it is an
+// implementation detail of this package and must not reach a user: "field network not found in
+// type kit.Spec" invites the reader to go looking for a struct.
+var unknownFieldRe = regexp.MustCompile(`field ([A-Za-z0-9_.-]+) not found in type [^\s]+`)
+
+// explainUnknownFields rewrites a strict-decode error so it names the field, says it is not
+// part of the v2 grammar, and — when the field is a v1 key — says what v2 calls it instead.
+//
+// The rewrite keeps the line numbers yaml.v3 provides, because those are the most useful part
+// of the original and the whole point of decoding strictly is to point at a specific line.
+func explainUnknownFields(err error) error {
+	msg := err.Error()
+	if !unknownFieldRe.MatchString(msg) {
+		return err
+	}
+	out := unknownFieldRe.ReplaceAllStringFunc(msg, func(match string) string {
+		field := unknownFieldRe.FindStringSubmatch(match)[1]
+		if v2, ok := v1Fields[field]; ok {
+			return fmt.Sprintf("field %q is v1 and not valid in schemaVersion \"2\" "+
+				"(v2 spells this: %s)", field, v2)
+		}
+		// Same opening as the v1 case, so that a caller (and a test) can key on one
+		// phrase for "this field is refused" without caring which kind it is.
+		return fmt.Sprintf("field %q is not valid in schemaVersion \"2\": it is not part "+
+			"of the grammar", field)
+	})
+	// The prefix yaml.v3 adds is noise once the body says what is wrong.
+	out = strings.TrimPrefix(out, "yaml: unmarshal errors:\n  ")
+	return errors.New(strings.ReplaceAll(out, "\n  ", "\n"))
 }
