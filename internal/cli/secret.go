@@ -429,7 +429,7 @@ listen on a port inside the sandbox, which is why this works with no port publis
 // Arming a name empties it: the record it writes has no tokens. Doing that silently over a
 // working login would log the user out of every sandbox with no warning and no undo, which is
 // worse than any of the failures --force exists to override.
-func refuseToOverwriteALogin(store *secret.FileStore, name string, force bool) error {
+func refuseToOverwriteALogin(store secret.Store, name string, force bool) error {
 	if force {
 		return nil
 	}
@@ -521,9 +521,15 @@ rule says where it goes.`,
 			return nil
 		},
 	}
-	var value, path string
+	var value, path, sandbox string
 	var oauth bool
 	cmd.Flags().StringVar(&value, "value", "", "the credential; omit to read it from stdin")
+	// Scoped to one sandbox rather than the machine. The resolution order is the same one
+	// the policy scopes use — the sandbox's own wins, the machine's serves everything that
+	// has not overridden it — so a per-sandbox credential is an addition and never takes
+	// anything away from the others. See secret.ForSandbox.
+	cmd.Flags().StringVar(&sandbox, "sandbox", "",
+		"store this credential for one sandbox only, in preference to the machine-wide one")
 	cmd.Flags().BoolVar(&oauth, "oauth", false, "acquire the credential by logging in (see 'boks secret set --help')")
 	storeFlag(cmd, &path)
 
@@ -531,6 +537,13 @@ rule says where it goes.`,
 		name := args[0]
 		if oauth {
 			return errOAuthAcquisition(name)
+		}
+
+		// Judged before anything is read, for the same reason the service check below is:
+		// finding out that a name cannot be stored AFTER the credential has been typed
+		// twice would mean typing it twice again.
+		if err := secret.ValidateScopedName(sandbox, name); err != nil {
+			return err
 		}
 
 		// The name is judged before anything is read. A service boks knows but has no
@@ -552,19 +565,31 @@ rule says where it goes.`,
 
 		raw := value
 		if raw == "" {
-			data, err := io.ReadAll(env.Stdin)
+			// Prompts when stdin is a terminal and reads the pipe when it is not.
+			// Before this, typing the command with no pipe printed nothing and waited
+			// for Ctrl-D. See readSecretValue.
+			raw, err = confirmSecretValue(env.Stdin, env.Stdout, name)
 			if err != nil {
-				return fmt.Errorf("reading the credential from stdin: %w", err)
+				return err
 			}
-			raw = strings.TrimRight(string(data), "\r\n")
 		}
 		if raw == "" {
 			return errors.New("the credential is empty")
 		}
-		if err := store.Set(name, secret.NewValue(raw)); err != nil {
+		// The stored name carries the scope; everything downstream — the index, the
+		// keyring, the listing — sees one name and needs to know nothing about scopes.
+		stored := name
+		if sandbox != "" {
+			stored = secret.ScopedName(sandbox, name)
+		}
+		if err := store.Set(stored, secret.NewValue(raw)); err != nil {
 			return explainSecretFailure(store.Path(), err)
 		}
-		fmt.Fprintf(env.Stdout, "stored %q in %s\n", name, store.Path())
+		if sandbox != "" {
+			fmt.Fprintf(env.Stdout, "stored %q for sandbox %s in %s\n", name, sandbox, store.Path())
+		} else {
+			fmt.Fprintf(env.Stdout, "stored %q in %s\n", name, store.Path())
+		}
 		describeStoredService(env.Stdout, name)
 		noteAnOverlappingLogin(cmd.Context(), env.Stdout, store, name)
 		return nil
@@ -578,7 +603,7 @@ rule says where it goes.`,
 // Refusing would be wrong — the two names are two credentials, and the user may want the key
 // for something else — but staying silent would leave them with a key that is stored, listed,
 // and never used, and no way to find out why. So it is stored, and said.
-func noteAnOverlappingLogin(ctx context.Context, w io.Writer, store *secret.FileStore, name string) {
+func noteAnOverlappingLogin(ctx context.Context, w io.Writer, store secret.Store, name string) {
 	service, ok := knownServices.Lookup(name)
 	if !ok || !service.Configured() {
 		return
@@ -620,7 +645,7 @@ func noteAnOverlappingLogin(ctx context.Context, w io.Writer, store *secret.File
 // would either replace a working login with a value that may be stale, or — if the store
 // kept both — leave a key that is never used and no way to tell why. Skipping and saying so
 // is the only outcome the user can act on.
-func refuseToShadowOAuth(store *secret.FileStore, name string) error {
+func refuseToShadowOAuth(store secret.Store, name string) error {
 	entries, err := store.Entries()
 	if err != nil {
 		return explainSecretFailure(store.Path(), err)

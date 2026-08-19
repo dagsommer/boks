@@ -189,7 +189,7 @@ func (s stderrSink) Record(d policy.Decision) { fmt.Fprintln(s.w, d) }
 // stored record rather than from a flag, because it is a property of the credential that was
 // imported and not of this run. `--oauth NAME` is therefore all a user has to type, and two
 // commands cannot disagree about what a credential means.
-func oauthCredentials(ctx context.Context, store *secret.FileStore, names []string) ([]secret.Credential, error) {
+func oauthCredentials(ctx context.Context, store secret.Store, names []string) ([]secret.Credential, error) {
 	var out []secret.Credential
 	for _, name := range names {
 		record, err := store.LookupOAuthRecord(ctx, name)
@@ -210,7 +210,7 @@ func oauthCredentials(ctx context.Context, store *secret.FileStore, names []stri
 
 // oauthRecords reads the named OAuth credentials out of the store whole — tokens included —
 // for handing to a sandbox's network supervisor. Nothing prints its result.
-func oauthRecords(ctx context.Context, store *secret.FileStore, names []string) (map[string]secret.OAuthRecord, error) {
+func oauthRecords(ctx context.Context, store secret.Store, names []string) (map[string]secret.OAuthRecord, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -230,7 +230,36 @@ func oauthRecords(ctx context.Context, store *secret.FileStore, names []string) 
 
 // openSecretStore opens the encrypted store, reporting clearly when the passphrase is
 // missing rather than failing later inside a request.
-func openSecretStore(path string) (*secret.FileStore, error) {
+func openSecretStore(path string) (secret.Store, error) {
+	// An explicit --secret-store path names a FILE, so it selects the file store and the
+	// passphrase with it. Someone who points Boks at a particular file is not asking for
+	// the OS keyring.
+	if path != "" {
+		return openFileStore(path)
+	}
+	// The keyring first, because it is the one that needs nothing configured. A host
+	// without one — a container, an SSH session with no login keyring, a service account —
+	// falls back to the encrypted file, which is what BOKS_SECRETS_PASSPHRASE is for.
+	if os.Getenv(secret.PassphraseEnv) == "" {
+		ring, err := secret.OpenKeyring(context.Background())
+		if err == nil {
+			return secret.NewKeyringStore(ring, secret.DefaultIndexPath(policy.StateDir())), nil
+		}
+		if !errors.Is(err, secret.ErrNoKeyring) {
+			// The keyring exists and refused. Falling back here would answer a locked
+			// keychain by asking for a passphrase the user never set, which reads as
+			// "boks lost my credentials".
+			return nil, err
+		}
+		return nil, fmt.Errorf("no credential store is available: this host has no usable OS "+
+			"keyring (%w), and %s is not set for the encrypted file store", err, secret.PassphraseEnv)
+	}
+	return openFileStore(secret.DefaultPath(policy.StateDir()))
+}
+
+// openFileStore opens the passphrase-encrypted file, reporting clearly when the passphrase is
+// missing rather than failing later inside a request.
+func openFileStore(path string) (secret.Store, error) {
 	if path == "" {
 		path = secret.DefaultPath(policy.StateDir())
 	}
