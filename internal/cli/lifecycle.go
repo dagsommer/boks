@@ -143,7 +143,11 @@ func ensureNetworkForExisting(ctx context.Context, name, address string, stderr 
 		fmt.Fprintf(stderr, "network: starting a %s stack for %s under policy %s (%s).\n",
 			mode, name, pol.Name, info.Policy.String())
 	}
-	_, _, err = attachNetwork(ctx, spec, info.Status == sandbox.StatusRunning, stderr)
+	// verbose: true, because this path belongs to `boks start` and `boks exec`, which have
+	// no -v of their own. Starting the stack is the thing those commands were asked to do,
+	// so its progress is their output rather than chatter — and silencing it here would
+	// leave no way to ask for it back.
+	_, _, err = attachNetwork(ctx, spec, info.Status == sandbox.StatusRunning, true, stderr)
 	return err
 }
 

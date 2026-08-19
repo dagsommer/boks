@@ -43,9 +43,15 @@ Agents:
 	var netFlags policyFlags
 	netFlags.register(cmd.Flags())
 	netFlags.registerPublish(cmd.Flags())
-	var quiet bool
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false,
-		"suppress the network summary (a new TLS-interception host is still announced)")
+	// See newRunCommand for why this inverted: the summary is identical on every run of an
+	// unchanged sandbox, so paying for it routinely taught people to skip the network lines.
+	// What is news — a first-time TLS-interception host, a changed policy — prints anyway.
+	var quiet, verbose bool
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false,
+		"describe what is happening: the image, the kit, the command, and the network summary")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "")
+	_ = cmd.Flags().MarkHidden("quiet")
+	_ = cmd.Flags().MarkDeprecated("quiet", "output is quiet by default; use -v for detail")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
@@ -90,6 +96,9 @@ Agents:
 			return err
 		}
 		cfg.Stderr = env.Stderr
+		if verbose {
+			cfg.Progress = env.Stderr
+		}
 
 		// Only the wiring, not the stack: nothing starts here, so there is no VM to
 		// serve and no socket to hold. `run`, `exec` or `start` brings the network up
@@ -111,7 +120,7 @@ Agents:
 		if err != nil {
 			return err
 		}
-		if err := describeNetwork(&netFlags, spec, mode, quiet, env.Stderr); err != nil {
+		if err := describeNetwork(&netFlags, spec, mode, verbose, env.Stderr); err != nil {
 			return err
 		}
 		guest, err := spec.Prepare()

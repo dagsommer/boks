@@ -355,8 +355,8 @@ boks create shell .
 | `--policy string` |  | network policy preset: open, standard, locked (default standard) |
 | `--profile string` |  | stored policy profile to apply ('boks policy profile ls') |
 | `-p`, `--publish stringArray` |  | publish a sandbox port on the host, bound to loopback (repeatable): [[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL] |
-| `-q`, `--quiet` |  | suppress the network summary (a new TLS-interception host is still announced) |
 | `-t`, `--template string` |  | OCI image for the guest root filesystem (default: the agent's image) |
+| `-v`, `--verbose` |  | describe what is happening: the image, the kit, the command, and the network summary |
 
 ## boks daemon
 
@@ -1223,9 +1223,9 @@ boks run                              # a shell in the current directory
 | `--policy string` |  | network policy preset: open, standard, locked (default standard) |
 | `--profile string` |  | stored policy profile to apply ('boks policy profile ls') |
 | `-p`, `--publish stringArray` |  | publish a sandbox port on the host, bound to loopback (repeatable): [[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL] |
-| `-q`, `--quiet` |  | suppress the network summary (a new TLS-interception host is still announced) |
 | `--rm` |  | destroy the sandbox when the command exits |
 | `-t`, `--template string` |  | OCI image for the guest root filesystem (default: the agent's image) |
+| `-v`, `--verbose` |  | describe what is happening: the image, the kit, the command, and the network summary |
 
 ## boks secret
 

@@ -177,7 +177,7 @@ func unwiredSandboxWarning(name string) string {
 // because the VM connects to it during boot. It returns whether this invocation started the
 // stack, which is what tells the caller whether it owns cleaning it up.
 func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocation, cfg *sandbox.Config,
-	requested network.Mode, quiet bool, env Env) (bool, error) {
+	requested network.Mode, verbose bool, env Env) (bool, error) {
 
 	mode, wired := networkFor(inv, requested, env.Stderr)
 	if !wired {
@@ -207,7 +207,7 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 	if err != nil {
 		return false, err
 	}
-	if err := describeNetwork(flags, spec, mode, quiet, env.Stderr); err != nil {
+	if err := describeNetwork(flags, spec, mode, verbose, env.Stderr); err != nil {
 		return false, err
 	}
 	guest, err := spec.Prepare()
@@ -223,7 +223,7 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 	cfg.Mounts = guest.Mounts
 
 	running := inv.exists && inv.info.Status == sandbox.StatusRunning
-	_, started, err := attachNetwork(ctx, spec, running, env.Stderr)
+	_, started, err := attachNetwork(ctx, spec, running, verbose, env.Stderr)
 	return started, err
 }
 
@@ -270,7 +270,7 @@ func withNetworkAnnotations(fromNetwork, user map[string]string) map[string]stri
 //
 // It must be called before the sandbox's task starts: the VM connects to the link socket
 // while it boots, so a socket that appears afterwards is a boot failure rather than a retry.
-func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr io.Writer) (enforce.State, bool, error) {
+func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, verbose bool, stderr io.Writer) (enforce.State, bool, error) {
 	if state, alive := enforce.Lookup(spec.StateDir, spec.Sandbox); alive {
 		// Reuse, and say nothing: this is the ordinary case of a second command
 		// attaching to a sandbox that is already up. The rules it is running under are
@@ -291,7 +291,14 @@ func attachNetwork(ctx context.Context, spec enforce.Spec, running bool, stderr 
 	if unexercised := network.Unexercised(); warnUnexercisedNetwork(unexercised, spec.Plan.Mode) {
 		fmt.Fprint(stderr, unexercisedNetworkWarning(unexercised))
 	}
-	state, err := enforce.Ensure(ctx, spec, stderr)
+	// The supervisor's own progress — "network: nat stack for X, proxy at …, pid N" — is
+	// detail about a process the user did not ask to know about, so it goes to -v. A
+	// FAILURE to start it is not progress and comes back as an error either way.
+	progress := io.Discard
+	if verbose {
+		progress = stderr
+	}
+	state, err := enforce.Ensure(ctx, spec, progress)
 	if err != nil {
 		return enforce.State{}, false, err
 	}
@@ -450,17 +457,22 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 // is that the first encounter with anything consequential is loud, an unchanged policy is two
 // lines, and an interception host that has never been announced is loud whatever else is
 // true — including under --quiet.
-func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, quiet bool, stderr io.Writer) error {
+func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, verbose bool, stderr io.Writer) error {
 	shown := loadNotices(policy.StateDir(), spec.Sandbox)
 
 	if mode == network.ModeNone {
 		// Nothing leaves this sandbox, so there is no policy to show and no traffic to
 		// decrypt. The mode is fixed when a sandbox is created, so this is the same
 		// statement on every run: worth making once in full.
-		if quiet {
-			return nil
-		}
+		// The one-line restatement is chatter and waits for -v; the full notice the
+		// first time is news and prints regardless. Getting this backwards — which an
+		// earlier version of this function did — means a sandbox with no network never
+		// says so, and "why can nothing reach the internet" becomes a support question
+		// rather than a line that was already on screen.
 		if shown.Policy == digest(noNetworkNotice) {
+			if !verbose {
+				return nil
+			}
 			fmt.Fprintf(stderr, "network: none — nothing leaves sandbox %s.\n", spec.Sandbox)
 			return nil
 		}
@@ -502,14 +514,14 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, quiet
 	}
 
 	switch {
-	case quiet:
-		// Everything else here describes a state the user can ask for at any time
-		// with `boks policy ls`. The one thing that is not — a host about to be
-		// decrypted for the first time — has already been printed above.
-		//
-		// Nothing is recorded as shown, because nothing was: a quiet run must not
-		// consume the one loud explanation a sandbox gets.
 	case digest(table) != shown.Policy:
+		// A policy that differs from the one this sandbox last ran under is NEWS, and
+		// is printed whether or not -v was given. This is the case the old --quiet
+		// deliberately skipped so that a quiet run "must not consume the one loud
+		// explanation a sandbox gets" — but with quiet as the default that reasoning
+		// inverts: skipping it would mean the explanation is never given at all, and a
+		// rule set changing under a sandbox would be the one thing Boks stayed silent
+		// about. So it prints, and is recorded as shown.
 		fmt.Fprint(stderr, table)
 		if !shown.Enforcement {
 			fmt.Fprintf(stderr, "\n%s\n", enforcementNote)
@@ -518,11 +530,14 @@ func describeNetwork(f *policyFlags, spec enforce.Spec, mode network.Mode, quiet
 			fmt.Fprint(stderr, "\n")
 		}
 		shown.Policy = digest(table)
-	default:
+	case verbose:
+		// Unchanged since the last run, and the user asked. This is the line that used
+		// to print on every single run of every sandbox: identical each time, three
+		// lines long, and directly above the agent's own output.
 		fmt.Fprint(stderr, steadyStateLine(pol, mode, spec.Sandbox, f.agent.Name, hosts))
 	}
 
-	// The announced hosts are recorded whether or not this run was quiet, because they
+	// The announced hosts are recorded whether or not this run was verbose, because they
 	// were announced whether or not it was.
 	shown.withHosts(hosts).save(policy.StateDir(), spec.Sandbox)
 	return nil

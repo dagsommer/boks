@@ -245,6 +245,52 @@ func (f *policyFlags) loadKit(stderr io.Writer) error {
 	return nil
 }
 
+// describeKit says what a kit contributed, for -v.
+//
+// It reports the rule COUNTS rather than the rules themselves: the destinations are already
+// in the policy table that -v prints a moment later, and printing them twice would make the
+// verbose output something to skim rather than read. What is not in that table, and is the
+// reason this line exists, is which file the rules came from and what kind of kit it is —
+// a kit that declares an image and an entrypoint (kind: sandbox) is doing far more in Docker
+// than Boks applies today, and a user should be able to see that from the run rather than by
+// reading the spec.
+func (f *policyFlags) describeKit(w io.Writer) {
+	if f.kitSpec == nil || w == nil {
+		return
+	}
+	allow, deny := kit.NetworkRules(f.kitSpec)
+	fmt.Fprintf(w, "kit: %s (%s) from %s — %d allow, %d deny\n",
+		f.kitSpec.Name, f.kitSpec.Kind, f.kitRef, len(allow), len(deny))
+
+	// Named individually rather than as "some fields are ignored", because the point is
+	// for the user to recognise the one they were relying on.
+	var ignored []string
+	if f.kitSpec.Sandbox != nil && f.kitSpec.Sandbox.Image != "" {
+		ignored = append(ignored, "image "+f.kitSpec.Sandbox.Image)
+	}
+	if f.kitSpec.Setup != nil {
+		if n := len(f.kitSpec.Setup.Install); n > 0 {
+			ignored = append(ignored, fmt.Sprintf("%d install command(s)", n))
+		}
+		if n := len(f.kitSpec.Setup.Startup); n > 0 {
+			ignored = append(ignored, fmt.Sprintf("%d startup command(s)", n))
+		}
+		if n := len(f.kitSpec.Setup.Files); n > 0 {
+			ignored = append(ignored, fmt.Sprintf("%d file(s)", n))
+		}
+	}
+	if n := len(f.kitSpec.Credentials); n > 0 {
+		ignored = append(ignored, fmt.Sprintf("%d credential(s)", n))
+	}
+	if n := len(f.kitSpec.Ports); n > 0 {
+		ignored = append(ignored, fmt.Sprintf("%d port(s)", n))
+	}
+	if len(ignored) > 0 {
+		fmt.Fprintf(w, "kit: NOT applied — %s. Boks applies a kit's network rules only.\n",
+			strings.Join(ignored, ", "))
+	}
+}
+
 // unionDenies merges a sandbox's recorded denies with this run's, keeping each destination
 // once.
 //
