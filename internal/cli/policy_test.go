@@ -397,6 +397,13 @@ func TestAForgottenPassphraseHasAWayOut(t *testing.T) {
 }
 
 func TestSecretRequiresAPassphrase(t *testing.T) {
+	// The keyring is turned off explicitly, or this test asserts a different thing on
+	// every platform: with an OS keyring available — a Mac, the Windows runner — storing
+	// a secret without a passphrase SUCCEEDS, which is the whole point of the keyring.
+	// What is under test here is the other store: the encrypted file still needs its
+	// passphrase, and says so. Verified by running it with a stand-in secret-tool on
+	// PATH, where without this line it fails exactly as the Windows job did.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv(secret.PassphraseEnv, "")
 	t.Setenv("BOKS_STATE_DIR", t.TempDir())
 	_, _, err := runCLI(t, "value\n", "secret", "set", "github")
