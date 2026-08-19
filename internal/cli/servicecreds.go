@@ -2,9 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strings"
 
@@ -204,17 +204,31 @@ func (p credentialPlan) describe(w io.Writer) {
 	}
 }
 
-// openSecretStoreIfAvailable opens the store when there is a passphrase to open it with, and
-// reports no store rather than an error when there is not.
+// openSecretStoreIfAvailable opens the store when there is one to open, and reports no store
+// rather than an error when there is not.
 //
-// The distinction matters for a command that did not ask for a credential: without a
-// passphrase there is nothing in the store that could be attached, so "no store" and "an
-// empty store" are the same thing, and only one of them is worth failing over.
+// The distinction matters for a command that did not ask for a credential: with no store there
+// is nothing that could be attached, so "no store" and "an empty store" are the same thing, and
+// only one of them is worth failing over.
+//
+// This used to ask whether BOKS_SECRETS_PASSPHRASE was set, which was the same question while
+// the encrypted file was the only store. It stopped being so the moment the OS keyring arrived:
+// on a Mac with credentials in the Keychain and no passphrase set — which is now the ordinary
+// case — it answered "no store", and every `boks run` silently attached nothing. The store's
+// own opener is the only thing that knows whether a store exists, so it is asked.
 func openSecretStoreIfAvailable(path string) (secret.Store, error) {
-	if os.Getenv(secret.PassphraseEnv) == "" {
+	store, err := openSecretStore(path)
+	if err == nil {
+		return store, nil
+	}
+	// No store of any kind: no keyring on this host and no passphrase for the file. That
+	// is a machine with no credentials rather than a failure, and a command that never
+	// asked for one must not be stopped by it. A store that EXISTS and refuses — a locked
+	// keychain, a file that will not decrypt — is a real error and is returned.
+	if errors.Is(err, secret.ErrNoKeyring) {
 		return nil, nil
 	}
-	return openSecretStore(path)
+	return nil, err
 }
 
 // resolveCredentials builds the plan for a run: what the flags asked for, what the store adds,

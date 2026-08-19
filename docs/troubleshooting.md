@@ -570,3 +570,24 @@ connection you make.
 - [Verification](verification.md) for what has actually been observed, including the failures
   — several entries there are things that were measured broken.
 - [FAQ](faq.md) for the questions that are not failures.
+
+## Credentials
+
+**`boks secret set` asks for a passphrase, or says no credential store is available**
+
+Boks keeps credentials in the operating system's own store — the macOS Keychain, the Linux
+Secret Service, the Windows Credential Manager — and needs no configuration when one is
+available. A host without one (a container, an SSH session with no login keyring, a service
+account) falls back to a passphrase-encrypted file, and `BOKS_SECRETS_PASSPHRASE` is that
+passphrase. The error names whichever is missing.
+
+On Linux the Secret Service usually means installing `secret-tool`, from `libsecret-tools`
+(Debian/Ubuntu) or `libsecret` (Fedora/Arch), and having a session bus — which a desktop
+session provides and a bare SSH login does not.
+
+**Making Boks use the encrypted file even where a keyring exists**
+
+Set `BOKS_NO_KEYRING=1`. That is the switch for a shared account, a machine whose keychain
+prompts more than you want, or a setup where the credentials have to travel with the state
+directory. It needs `BOKS_SECRETS_PASSPHRASE` set as well, since the file is what it falls
+back to.

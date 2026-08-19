@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -59,7 +60,26 @@ const keyringService = "boks"
 // that exists but cannot reach a keychain, or a secret-tool with no session bus behind it,
 // both look installed and both fail at the first Set. Finding that out at store-open time
 // gives a clear message; finding it out later gives a failed `boks run`.
-func OpenKeyring(ctx context.Context) (Keyring, error) { return openKeyring(ctx) }
+func OpenKeyring(ctx context.Context) (Keyring, error) {
+	// An explicit opt-out, for two callers who need the same thing for different reasons.
+	//
+	// A user may prefer the encrypted file — a shared account, a machine whose keychain
+	// prompts more than they want, a setup where the credentials must travel with the
+	// state directory. Without a way to say so, the keyring being preferred would be a
+	// decision Boks makes and they cannot unmake.
+	//
+	// And a test needs the answer to be the same on every platform. "No passphrase means
+	// no store" is true on a host without a keyring and false on one with it, so a test
+	// asserting either would pass on this project's Linux machines and fail on the Mac and
+	// the Windows runner — which is precisely what happened.
+	if os.Getenv(DisableKeyringEnv) != "" {
+		return nil, keyringUnavailable(DisableKeyringEnv+" is set", nil)
+	}
+	return openKeyring(ctx)
+}
+
+// DisableKeyringEnv turns the OS keyring off, leaving the passphrase-encrypted file.
+const DisableKeyringEnv = "BOKS_NO_KEYRING"
 
 // keyringUnavailable builds the ErrNoKeyring an implementation returns, keeping the reason.
 func keyringUnavailable(reason string, err error) error {
