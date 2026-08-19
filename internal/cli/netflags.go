@@ -65,7 +65,7 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	// entrypoint, setup commands and credentials too and none of those are applied yet. A
 	// flag advertised as "apply this kit" would be read as all of it.
 	fs.StringVar(&f.kitRef, "kit", "", "apply a kit's network rules: a directory containing "+
-		kit.SpecFileName+", or a path to one (local only)")
+		kit.SpecFileName+", a path to one, or git+https://…#ref=<branch|tag|commit>&dir=<path>")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
 	fs.StringArrayVar(&f.allow, "allow", nil, "allow a destination, host[:ports] (repeatable)")

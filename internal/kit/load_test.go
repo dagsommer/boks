@@ -41,8 +41,8 @@ permissions:
 // was never a filename and sends the reader looking for a typo.
 func TestLoadRefusesRemoteFormsByName(t *testing.T) {
 	for _, tc := range []struct{ ref, want string }{
-		{"git+https://example.com/repo.git#ref=abc", "git"},
-		{"git+ssh://git@example.com/repo.git", "git"},
+		// git+https and git+ssh are NOT here: they are fetched, see fetch_test.go.
+		{"git://example.com/repo.git", "unencrypted git"},
 		{"https://example.com/kit.tar.gz", "HTTPS"},
 		{"oci://ghcr.io/org/kit@sha256:abc", "OCI"},
 		{"ghcr.io/org/kit:1.0", "OCI"},
