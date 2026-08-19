@@ -122,12 +122,36 @@ func fetchGit(ctx context.Context, g gitRef, dest string) (string, error) {
 		return "", fmt.Errorf("git is needed to fetch a kit from %s and is not on PATH", g.URL)
 	}
 
+	// Whether git may ask the user for credentials, which is not the same question as
+	// whether it should be allowed to hang.
+	//
+	// This was GIT_TERMINAL_PROMPT=0 unconditionally, to stop a private repository parking
+	// `boks run` on a prompt nobody could see. That reasoning holds for a pipe and fails at
+	// a terminal, where the prompt IS visible and answering it is exactly what the user
+	// wants — a private GitHub Enterprise over HTTPS came back
+	//
+	//	fatal: could not read Username for 'https://…': terminal prompts disabled
+	//
+	// which reads as a refusal by Boks rather than a credential that was never offered.
+	//
+	// So: at a terminal git may prompt, and the fetch inherits the user's stdin so the
+	// answer reaches it. Anywhere else — a pipe, CI, `boks run` under a supervisor —
+	// prompting is still off, because there nobody can answer and a prompt is a hang.
+	interactive := isTerminal(os.Stdin) && isTerminal(os.Stderr)
+
 	run := func(args ...string) ([]byte, error) {
 		cmd := exec.CommandContext(ctx, "git", args...)
 		cmd.Dir = dest
-		// Never prompt. Without this a private repository with no usable credential
-		// stops `boks run` on a password prompt the user cannot see the reason for.
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if interactive {
+			// git writes its prompt to the terminal and reads the answer from it. Its
+			// output is still captured for the error path, which is why only stdin is
+			// wired: a password typed at a prompt must not end up in a buffer Boks
+			// might print back.
+			cmd.Stdin = os.Stdin
+			cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=1")
+		} else {
+			cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		}
 		return cmd.CombinedOutput()
 	}
 
@@ -156,6 +180,19 @@ func fetchGit(ctx context.Context, g gitRef, dest string) (string, error) {
 			what := g.URL
 			if g.Ref != "" {
 				what += " at " + g.Ref
+			}
+			// Authentication is the failure worth explaining, because git's own
+			// message names a symptom ("could not read Username") and the fix is a
+			// choice between three things Boks cannot make for the user.
+			if isAuthFailure(detail) {
+				return "", fmt.Errorf("fetching %s: %w\n%s\n\n"+
+					"That repository needs credentials git does not have here. Either:\n"+
+					"  - use SSH: --kit \"git+ssh://git@host/org/repo.git#dir=…\", or the\n"+
+					"    scp form \"git+user@host:org/repo.git#dir=…\", which uses your SSH agent\n"+
+					"  - configure a credential helper for that host, so git can answer itself:\n"+
+					"    git config --global credential.helper osxkeychain   (or libsecret, manager)\n"+
+					"  - clone it yourself and point --kit at the directory",
+					what, err, detail)
 			}
 			return "", fmt.Errorf("fetching %s: %w\n%s", what, err, detail)
 		}
@@ -235,4 +272,46 @@ func loadGit(reference string) (*Spec, []string, error) {
 				"use #ref=%s to pin it", named, commit))
 	}
 	return spec, warnings, nil
+}
+
+// isTerminal reports whether f is a character device — a terminal rather than a pipe or file.
+//
+// Its own copy rather than a shared helper, because internal/kit must not import internal/cli:
+// the dependency runs the other way and always has. The test is the same one run.go makes,
+// deliberately: a fetch that decides "interactive" differently from the command that started
+// it would prompt where nothing can answer, or stay silent where someone is waiting.
+func isTerminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// isAuthFailure reports whether git's output describes a credential problem rather than a
+// missing ref or an unreachable host.
+//
+// Matched on git's text because git offers nothing better: every one of these exits 128, so
+// the status cannot tell them apart. The strings are the ones git prints for the three ways
+// this shows up — no username at all, a rejected one, and SSH refusing a key — and a match
+// only ADDS advice, so a phrase that changes in a future git costs the guidance and not the
+// error.
+func isAuthFailure(output string) bool {
+	lower := strings.ToLower(output)
+	for _, phrase := range []string{
+		"could not read username",
+		"could not read password",
+		"authentication failed",
+		"terminal prompts disabled",
+		"permission denied (publickey",
+		"invalid username or password",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }

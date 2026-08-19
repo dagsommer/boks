@@ -194,3 +194,29 @@ func containsSubstring(all []string, want string) bool {
 	}
 	return false
 }
+
+// git exits 128 for a missing ref, an unreachable host and a credential problem alike, so the
+// status cannot tell them apart and the advice has to key on the text. A false positive would
+// tell someone with a typo'd branch to configure a credential helper.
+func TestIsAuthFailure(t *testing.T) {
+	for _, out := range []string{
+		"fatal: could not read Username for 'https://host': terminal prompts disabled",
+		"fatal: Authentication failed for 'https://host/repo.git/'",
+		"git@host: Permission denied (publickey).",
+		"remote: Invalid username or password.",
+	} {
+		if !isAuthFailure(out) {
+			t.Errorf("isAuthFailure(%q) = false, want true", out)
+		}
+	}
+	for _, out := range []string{
+		"fatal: couldn't find remote ref no-such-branch",
+		"fatal: unable to access 'https://host/': Could not resolve host: host",
+		"fatal: repository 'https://host/repo.git/' not found",
+		"",
+	} {
+		if isAuthFailure(out) {
+			t.Errorf("isAuthFailure(%q) = true, want false — this is not a credential problem", out)
+		}
+	}
+}
