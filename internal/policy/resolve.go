@@ -100,6 +100,9 @@ type Resolution struct {
 	Sandbox string `json:"sandbox,omitempty"`
 	// Agent is the agent whose own allowlist contributed a layer, if any.
 	Agent string `json:"agent,omitempty"`
+	// Kit is the kit whose rules are in this resolution, so a reader of the JSON can tell a
+	// destination that came from a file apart from one built into Boks.
+	Kit string `json:"kit,omitempty"`
 }
 
 // Policy compiles the resolution into the matchable form the engine takes.
@@ -142,6 +145,20 @@ type Request struct {
 	// to sandboxes that already exist.
 	Agent      string
 	AgentAllow []RuleSpec
+	// Kit names the kit applied to this sandbox, and KitAllow are the destinations its
+	// spec declares under permissions.network.allow. KitDeny are its deny rules.
+	//
+	// Separate from AgentAllow, though they are the same kind of fact, because the user
+	// has to be able to tell them apart: an agent's rules come from the Boks binary and a
+	// kit's come from a file — possibly one fetched from a URL — and `boks policy ls` has
+	// to name which, or a rule nobody recognises has no discoverable origin.
+	//
+	// A kit's rules are the only ones here that can arrive from outside the machine. That
+	// is why they get no more power than an agent's: they are added, never subtracted, and
+	// a deny in any scope still beats them. See the layer's placement in Resolve.
+	Kit      string
+	KitAllow []RuleSpec
+	KitDeny  []RuleSpec
 }
 
 // Resolve assembles the effective policy.
@@ -150,7 +167,7 @@ type Request struct {
 // preset, a rule that does not parse. None of them fall back to a default, because a caller
 // that received a policy it did not ask for would enforce the wrong one.
 func (req Request) Resolve() (Resolution, error) {
-	res := Resolution{Version: StoreVersion, Sandbox: req.Sandbox, Profile: req.Profile, Agent: req.Agent}
+	res := Resolution{Version: StoreVersion, Sandbox: req.Sandbox, Profile: req.Profile, Agent: req.Agent, Kit: req.Kit}
 
 	base, baseName, err := req.base()
 	if err != nil {
@@ -208,6 +225,45 @@ func (req Request) Resolve() (Resolution, error) {
 			})
 			if len(req.AgentAllow) > 0 {
 				names = append(names, "agent:"+req.Agent)
+			}
+		}
+	}
+
+	// The kit layer sits immediately after the agent layer and before global, because a
+	// kit's allows are the same kind of fact as an agent's: what this thing cannot work
+	// without, stated by its own definition. Position carries no decision weight — a deny
+	// in any layer beats an allow in any layer, which is the invariant this whole file
+	// rests on — so what the placement really buys is provenance: `boks policy ls` can say
+	// `kit vale` beside a destination, and the user knows which file to edit.
+	//
+	// What the position must NOT be is anywhere that lets a kit subtract. A kit is the one
+	// input here that can be fetched from a URL, and a kit that could remove a rule the
+	// user pinned would turn a downloaded file into a way to widen the sandbox's reach.
+	// Its denies are honoured because denies only ever narrow; its allows are honoured
+	// only as additions, exactly like an agent's.
+	if req.Kit != "" {
+		scope := "kit " + req.Kit
+		switch {
+		case base.Name == PresetLocked:
+			// Same rule as the agent layer, and for the same reason: locked means
+			// only what the user wrote. The layer is still listed, so that its
+			// absence is a statement rather than a gap.
+			res.Layers = append(res.Layers, Layer{
+				Source: scope,
+				Detail: "not applied: preset locked allows only what you write",
+			})
+		default:
+			// Denies first, so that a kit which both allows and denies a
+			// destination reads the way the engine evaluates it.
+			res.Rules = appendScoped(res.Rules, req.KitDeny, scope)
+			res.Rules = appendScoped(res.Rules, req.KitAllow, scope)
+			res.Layers = append(res.Layers, Layer{
+				Source: scope,
+				Detail: "what this kit declares it needs; a deny in any scope still wins",
+				Count:  len(req.KitAllow) + len(req.KitDeny),
+			})
+			if len(req.KitAllow)+len(req.KitDeny) > 0 {
+				names = append(names, "kit:"+req.Kit)
 			}
 		}
 	}

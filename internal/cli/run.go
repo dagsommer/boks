@@ -114,6 +114,12 @@ Agents:
 		if err := netFlags.checkPublish(); err != nil {
 			return err
 		}
+		// Before the daemon is touched and before anything is created: a kit that does
+		// not parse should cost nothing, and its rules decide the policy the sandbox is
+		// built with.
+		if err := netFlags.loadKit(env.Stderr); err != nil {
+			return err
+		}
 
 		ctx := cmd.Context()
 		// Before the first thing that talks to containerd, and after everything that can
