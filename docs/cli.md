@@ -1482,6 +1482,7 @@ echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
 | Flag | Default | Meaning |
 |---|---|---|
 | `--oauth` |  | acquire the credential by logging in (see 'boks secret set --help') |
+| `--sandbox string` |  | store this credential for one sandbox only, in preference to the machine-wide one |
 | `--store string` |  | encrypted store file |
 | `--value string` |  | the credential; omit to read it from stdin |
 

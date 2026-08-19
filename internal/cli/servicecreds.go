@@ -59,7 +59,7 @@ type credentialPlan struct {
 // stored credentials to attach", and failing `boks run` over a store the user was not asking
 // for would be the wrong trade. A run that *did* name a credential still fails, later and by
 // name, when the value it needs cannot be read.
-func (f *policyFlags) planCredentials(store *secret.FileStore) (credentialPlan, error) {
+func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error) {
 	plan := credentialPlan{
 		inject: slices.Clone(f.inject),
 		guest:  slices.Clone(f.guest),
@@ -203,7 +203,7 @@ func (p credentialPlan) describe(w io.Writer) {
 // The distinction matters for a command that did not ask for a credential: without a
 // passphrase there is nothing in the store that could be attached, so "no store" and "an
 // empty store" are the same thing, and only one of them is worth failing over.
-func openSecretStoreIfAvailable(path string) (*secret.FileStore, error) {
+func openSecretStoreIfAvailable(path string) (secret.Store, error) {
 	if os.Getenv(secret.PassphraseEnv) == "" {
 		return nil, nil
 	}
@@ -263,7 +263,7 @@ func (f *policyFlags) resolveCredentials(ctx context.Context, stderr io.Writer) 
 }
 
 // storePath is the store's path, or a placeholder when there is no store to name.
-func storePath(store *secret.FileStore) string {
+func storePath(store secret.Store) string {
 	if store == nil {
 		return "the credential store"
 	}

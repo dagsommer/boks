@@ -422,10 +422,17 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 		if err != nil {
 			return enforce.Spec{}, err
 		}
+		// Scoped to this sandbox: a credential stored with `boks secret set NAME
+		// --sandbox <name>` wins here, and the machine-wide one serves every sandbox
+		// that has no override. Without this wrapper the --sandbox flag would store
+		// something nothing ever reads.
+		provider := secret.ForSandbox(store, name)
 		for _, service := range services {
-			value, err := store.Lookup(ctx, service)
+			value, err := provider.Lookup(ctx, service)
 			if err != nil {
-				return enforce.Spec{}, fmt.Errorf("credential %q: %w\nStore it first: boks secret set %s", service, err, service)
+				return enforce.Spec{}, fmt.Errorf("credential %q: %w\nStore it first: boks secret set %s\n"+
+					"Or for this sandbox only: boks secret set %s --sandbox %s",
+					service, err, service, service, name)
 			}
 			secrets[service] = value.Reveal()
 		}
