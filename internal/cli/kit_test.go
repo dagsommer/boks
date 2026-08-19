@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+// The state directory is shortStateDir's and not t.TempDir()'s throughout this file, because
+// t.TempDir() embeds the TEST NAME in the path and the names here are long. A sandbox's link
+// socket lives under the state directory and must fit the 104-byte sun_path limit; on the
+// Windows runner `TestPolicyLsShowsTheKitLayer` alone pushed it to 105 and every test in this
+// file failed on a path length rather than on anything it was testing. See shortStateDir.
+
 // writeKit puts a kit on disk and returns the directory to point --kit at.
 func writeKit(t *testing.T, spec string) string {
 	t.Helper()
@@ -32,7 +38,7 @@ permissions:
 // as every other layer. Without that a kit is a file that grants network access and cannot be
 // audited without running it.
 func TestPolicyLsShowsTheKitLayer(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 	dir := writeKit(t, netKit)
 
 	out, _, err := runCLI(t, "", "policy", "ls", "--kit", dir)
@@ -50,7 +56,7 @@ func TestPolicyLsShowsTheKitLayer(t *testing.T) {
 // `policy check` is where a user asks whether one destination is reachable, so it is where a
 // kit either takes effect or silently does not.
 func TestPolicyCheckHonoursTheKit(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 	dir := writeKit(t, netKit)
 
 	// The control first: without the kit, the kit's destination is not reachable. If this
@@ -75,7 +81,7 @@ func TestPolicyCheckHonoursTheKit(t *testing.T) {
 // A kit cannot widen past a deny, end to end through the CLI. internal/policy asserts this on
 // the resolver; this asserts that nothing between the flag and the engine undoes it.
 func TestKitCannotOverrideAFlagDeny(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 	dir := writeKit(t, netKit)
 
 	out, _, err := runCLI(t, "", "policy", "check", "--kit", dir,
@@ -91,7 +97,7 @@ func TestKitCannotOverrideAFlagDeny(t *testing.T) {
 // A reference Boks cannot fetch must be refused where the user typed it, not deep inside a
 // sandbox creation. The message has to name the form and say the refusal is deliberate.
 func TestKitRemoteReferenceIsRefused(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 
 	_, _, err := runCLI(t, "", "policy", "ls", "--kit", "oci://ghcr.io/org/kit@sha256:abc")
 	if err == nil {
@@ -106,7 +112,7 @@ func TestKitRemoteReferenceIsRefused(t *testing.T) {
 
 // A kit that does not parse must fail before anything is built, naming the file.
 func TestKitInvalidSpecIsRefused(t *testing.T) {
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 	dir := writeKit(t, "schemaVersion: \"2\"\nkind: sandbox\nname: broken\nnetwork:\n  allowedDomains: [x]\n")
 
 	_, _, err := runCLI(t, "", "policy", "ls", "--kit", dir)
