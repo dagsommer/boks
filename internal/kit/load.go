@@ -13,7 +13,8 @@ import (
 //
 // Docker's kits are referenced in five forms: a built-in name, a local directory, a local ZIP,
 // a Git URL (`git+https://`, `git+ssh://`) and an OCI artifact. This function implements the
-// local directory and a direct path to a spec.yaml, and REFUSES the rest by name.
+// local directory, a direct path to a spec.yaml, and git — see fetch.go. ZIP and OCI are
+// REFUSED by name rather than mishandled.
 //
 // The refusal is deliberate and is not a stub that was never finished. A kit names an image,
 // declares network rules and runs commands as uid 0 (`setup.install`), so a fetched kit is
@@ -32,6 +33,9 @@ import (
 func Load(reference string) (*Spec, []string, error) {
 	if reference == "" {
 		return nil, nil, fmt.Errorf("no kit reference given")
+	}
+	if strings.HasPrefix(reference, "git+") {
+		return loadGit(reference)
 	}
 	if scheme, ok := remoteForm(reference); ok {
 		// "a"/"an" from the word itself: "a OCI reference" is the kind of wrongness that
@@ -84,12 +88,13 @@ func Load(reference string) (*Spec, []string, error) {
 // containerd uses to tell a registry host from a local name.
 func remoteForm(reference string) (string, bool) {
 	for prefix, name := range map[string]string{
-		"git+https://": "git",
-		"git+ssh://":   "git",
-		"git://":       "git",
-		"http://":      "HTTP",
-		"https://":     "HTTPS",
-		"oci://":       "OCI",
+		// git+https:// and git+ssh:// are handled by loadGit and never reach here.
+		// Bare git:// is refused: it is the unauthenticated, unencrypted protocol, and
+		// nothing should fetch something that sets network rules over it.
+		"git://":   "unencrypted git",
+		"http://":  "HTTP",
+		"https://": "HTTPS",
+		"oci://":   "OCI",
 	} {
 		if strings.HasPrefix(reference, prefix) {
 			return name, true
