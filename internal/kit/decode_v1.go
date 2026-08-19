@@ -148,6 +148,23 @@ type sandboxV1 struct {
 	// Persistence is the nested spelling of the removed persistence field; see
 	// specV1.Persistence. It lived both at the spec root and inside this block.
 	Persistence string `yaml:"persistence,omitempty"`
+
+	// Binary, RunOptions and InteractiveOptions are the OTHER v1 spelling of a command,
+	// and omitting them made every kit that uses them fail to load with "field binary not
+	// found" — a v1 kit refused by the v1 decoder.
+	//
+	// They come from `kind: agent`, where the executable and its arguments are three
+	// fields rather than an entrypoint mapping. The normative spec library says exactly
+	// how they map: "In v2 this is entrypoint[1:] plus sandbox.command.default", with
+	// InteractiveOptions becoming command.interactive and callers falling back to
+	// RunOptions when it is empty. So Binary is the entrypoint's head.
+	//
+	// Found by diffing this package's yaml tags against the field set in Docker's own
+	// spec library rather than by meeting a kit that used them, which is why the mapping
+	// is quoted rather than inferred.
+	Binary             string   `yaml:"binary,omitempty"`
+	RunOptions         []string `yaml:"runOptions,omitempty"`
+	InteractiveOptions []string `yaml:"interactiveOptions,omitempty"`
 }
 
 // entrypointV1 is the v1 entrypoint mapping. v2 flattens run into sandbox.entrypoint and
@@ -465,6 +482,27 @@ func translateV1Sandbox(sf *specV1, s *Spec, w *warnings) error {
 			w.drop("sandbox.entrypoint.pipeMode", "the field has no equivalent in the "+
 				"current grammar")
 		}
+	}
+
+	// The other v1 spelling of the same thing: `kind: agent` gives the executable and its
+	// arguments as three flat fields instead of an entrypoint mapping. The mapping is the
+	// normative spec library's own — "in v2 this is entrypoint[1:] plus
+	// sandbox.command.default" — so binary is the entrypoint's head.
+	//
+	// Only when the mapping form did not already set them. A kit carrying both spellings
+	// is not something either grammar defines, and preferring the one this decoder already
+	// documents beats picking by field order.
+	if block.Binary != "" && len(sb.Entrypoint) == 0 {
+		sb.Entrypoint = []string{block.Binary}
+		w.deprecate("agent.binary", "use 'sandbox.entrypoint' instead")
+	}
+	if len(block.RunOptions) > 0 && len(sb.Command.Default) == 0 {
+		sb.Command.Default = block.RunOptions
+		w.deprecate("agent.runOptions", "use 'sandbox.command.default' instead")
+	}
+	if len(block.InteractiveOptions) > 0 && len(sb.Command.Interactive) == 0 {
+		sb.Command.Interactive = block.InteractiveOptions
+		w.deprecate("agent.interactiveOptions", "use 'sandbox.command.interactive' instead")
 	}
 
 	if r := block.Resources; r != nil {
