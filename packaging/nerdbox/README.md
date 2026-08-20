@@ -136,6 +136,14 @@ a guest carrying it starts a container as the resolved uid.
 
 ## What applies this series
 
+**Changing anything in this directory means bumping `revision` in
+`packaging/homebrew/tap/Formula/nerdbox.rb.in`.** A formula's version comes from its `url` —
+a nerdbox tag this project pins deliberately — so adding or editing a patch changes what the
+formula builds while leaving what it claims to be identical. `brew upgrade` then sees nothing
+outdated and rebuilds nothing, and the shim on disk stays the one from before the patch: a new
+Boks, an unchanged shim, and a bug that was supposed to be fixed. `revision` exists for exactly
+this and costs one line.
+
 **`packaging/homebrew/render.sh` embeds every patch here into the rendered `nerdbox.rb`**, after
 an `__END__`, and the formula applies them with `patch :DATA` before it builds. That is the
 shim macOS installs, so a Mac runs a patched shim.
