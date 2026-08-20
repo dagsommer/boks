@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -252,6 +253,34 @@ func render(s Settings) (string, error) {
 		w("# image unpack fails and nothing before it says why. Install erofs-utils 1.8 or\n")
 		w("# later and run 'boks daemon start' again; this file is rewritten each time.\n")
 	}
+	// The writable layer's size, which is 64 MiB if nobody says otherwise.
+	//
+	// Off Linux the erofs snapshotter gives every active snapshot its own ext4 image and
+	// sizes it from defaultWritableSize — 64 MiB in erofs_other.go, chosen as a floor
+	// rather than as a working size. Every write a sandbox makes goes there: package
+	// installs, build output, an agent unpacking its own runtime. 64 MiB does not survive
+	// contact with any of that, and the failure lands inside the guest as ENOSPC from
+	// whatever was writing, naming a path in the container and nothing about Boks:
+	//
+	//	ENOSPC: no space left on device, write
+	//	  '/root/.cache/copilot/pkg/linux-arm64/.extracting-…/tree-sitter.wasm'
+	//
+	// The image is SPARSE — truncated to this size and then formatted — so a large number
+	// costs what is written to it and not what it says. There is one per active snapshot,
+	// so it is not free in aggregate, but it is nothing like its nominal size until used.
+	//
+	// This does not apply on Linux, where defaultWritableSize is 0 and the writable layer
+	// is a plain directory bounded by the real filesystem. Writing the key there would
+	// switch that to block mode, which is a behaviour change nobody asked for — so the
+	// value is only written where block mode is already on.
+	if blockWritableLayer(s.GOOS) {
+		w("[plugins.'io.containerd.snapshotter.v1.erofs']\n")
+		w("  # See BOKS_WRITABLE_LAYER_SIZE to change this. Sparse: it is a ceiling, not\n")
+		w("  # an allocation.\n")
+		w("  default_size = %q\n", writableLayerSize())
+		w("\n")
+	}
+
 	w("[plugins.'io.containerd.service.v1.diff-service']\n")
 	w("  default = [%s]\n", quoteList(order))
 	w("\n")
@@ -308,4 +337,27 @@ func settingsFor(dir string, erofs, ext4 bool) Settings {
 		s.UID, s.GID = &uid, &gid
 	}
 	return s
+}
+
+// WritableLayerSizeEnv overrides the size of a sandbox's writable layer.
+//
+// Any form containerd accepts — "32GiB", "512MiB" — since the value is passed through to it
+// and parsed by units.RAMInBytes there. A value containerd rejects fails the daemon at
+// startup with the key named, which is a better place to find out than mid-run.
+const WritableLayerSizeEnv = "BOKS_WRITABLE_LAYER_SIZE"
+
+// defaultWritableLayerSize is what a sandbox gets when nobody says otherwise.
+//
+// 16 GiB, sparse. Large enough that an agent installing its own toolchain, a package manager,
+// and a build tree does not hit it — which 64 MiB does immediately — and small enough to be
+// an obvious mistake if one ever actually filled. It is a ceiling rather than a reservation:
+// the image is created sparse and grows with what is written.
+const defaultWritableLayerSize = "16GiB"
+
+// writableLayerSize is the size to write into containerd's configuration.
+func writableLayerSize() string {
+	if v := os.Getenv(WritableLayerSizeEnv); v != "" {
+		return v
+	}
+	return defaultWritableLayerSize
 }
