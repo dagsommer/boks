@@ -208,3 +208,52 @@ func TestRenderSaysWhyEROFSIsMissing(t *testing.T) {
 		t.Error("a config written without mkfs.erofs still names the erofs differ")
 	}
 }
+
+// The writable layer must not be 64 MiB.
+//
+// Off Linux every active snapshot gets its own ext4 image, sized from containerd's
+// defaultWritableSize, which is 64 MiB — a floor, not a working size. A sandbox that installs
+// anything fills it, and the failure surfaces inside the guest as ENOSPC from whatever was
+// writing, naming a path in the container and nothing about Boks. Reported that way: an agent
+// unpacking its own runtime, out of space partway through a tar.
+func TestWritableLayerSizeIsUsable(t *testing.T) {
+	for _, goos := range []string{"darwin", "windows"} {
+		out, err := render(Settings{GOOS: goos, EROFS: true, Ext4: true})
+		if err != nil {
+			t.Fatalf("render(%s): %v", goos, err)
+		}
+		if !strings.Contains(out, "io.containerd.snapshotter.v1.erofs") {
+			t.Errorf("%s: no erofs snapshotter section, so the layer keeps the 64 MiB default:\n%s", goos, out)
+		}
+		if !strings.Contains(out, `default_size = "16GiB"`) {
+			t.Errorf("%s: default_size is not set to the usable value:\n%s", goos, out)
+		}
+	}
+}
+
+// On Linux the writable layer is a plain directory bounded by the real filesystem, because
+// defaultWritableSize is 0 there. Writing default_size would switch it into block mode — a
+// behaviour change nobody asked for, and one that would put every Linux sandbox behind an ext4
+// image it does not need.
+func TestWritableLayerSizeIsNotSetOnLinux(t *testing.T) {
+	out, err := render(Settings{GOOS: "linux", EROFS: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "default_size") {
+		t.Errorf("linux got a default_size, which turns on block mode:\n%s", out)
+	}
+}
+
+// The override, because 16 GiB is a guess about someone else's workload and the sandbox that
+// needs 200 GiB should not need a new Boks.
+func TestWritableLayerSizeCanBeOverridden(t *testing.T) {
+	t.Setenv(WritableLayerSizeEnv, "200GiB")
+	out, err := render(Settings{GOOS: "darwin", EROFS: true, Ext4: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `default_size = "200GiB"`) {
+		t.Errorf("%s was ignored:\n%s", WritableLayerSizeEnv, out)
+	}
+}
