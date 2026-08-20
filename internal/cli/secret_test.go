@@ -20,6 +20,10 @@ func secretStore(t *testing.T) *secret.FileStore {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("BOKS_STATE_DIR", dir)
+	// The encrypted file is selected explicitly: Boks prefers the OS keyring and never
+	// falls back on its own, so a test that wants the file has to say so — the same
+	// sentence a user on a headless host has to say.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv(secret.PassphraseEnv, "test-passphrase")
 	store, err := secret.OpenFile(secret.DefaultPath(policy.StateDir()), []byte("test-passphrase"))
 	if err != nil {
@@ -494,6 +498,10 @@ func TestAnUnreadableStoreDoesNotFailARunThatAskedForNothing(t *testing.T) {
 	if err := store.Set("anthropic", secret.NewValue(theKey)); err != nil {
 		t.Fatal(err)
 	}
+	// The encrypted file is selected explicitly: Boks prefers the OS keyring and never
+	// falls back on its own, so a test that wants the file has to say so — the same
+	// sentence a user on a headless host has to say.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv(secret.PassphraseEnv, "the-wrong-one")
 
 	var stderr strings.Builder

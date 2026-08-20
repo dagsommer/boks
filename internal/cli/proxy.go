@@ -237,24 +237,50 @@ func openSecretStore(path string) (secret.Store, error) {
 	if path != "" {
 		return openFileStore(path)
 	}
-	// The keyring first, because it is the one that needs nothing configured. A host
-	// without one — a container, an SSH session with no login keyring, a service account —
-	// falls back to the encrypted file, which is what BOKS_SECRETS_PASSPHRASE is for.
-	if os.Getenv(secret.PassphraseEnv) == "" {
-		ring, err := secret.OpenKeyring(context.Background())
-		if err == nil {
-			return secret.NewKeyringStore(ring, secret.DefaultIndexPath(policy.StateDir())), nil
-		}
-		if !errors.Is(err, secret.ErrNoKeyring) {
-			// The keyring exists and refused. Falling back here would answer a locked
-			// keychain by asking for a passphrase the user never set, which reads as
-			// "boks lost my credentials".
-			return nil, err
-		}
-		return nil, fmt.Errorf("no credential store is available: this host has no usable OS "+
-			"keyring (%w), and %s is not set for the encrypted file store", err, secret.PassphraseEnv)
+
+	// The keyring wins whenever there is one, and the presence of BOKS_SECRETS_PASSPHRASE
+	// does NOT change that.
+	//
+	// It used to. The rule was "passphrase set means use the file", which made the store a
+	// function of the environment — and two terminals on one machine then used two
+	// different stores. Reported exactly that way: a credential set in a shell that had
+	// the passphrase exported went into secrets.json, and `boks secret ls` in a fresh
+	// shell read the keyring and showed nothing. Both were behaving as designed, which is
+	// what made it baffling.
+	//
+	// A store must be a property of the machine, not of whichever variables a shell
+	// happens to carry. So: the keyring if the host has one, the file only when it does
+	// not — or when the user says so with BOKS_NO_KEYRING, which is a deliberate choice
+	// rather than a leftover export.
+	// Asked for the file explicitly. Checked before the keyring is probed, so that on a
+	// machine whose keychain prompts, saying "not the keyring" does not raise the prompt
+	// on the way to honouring that.
+	if os.Getenv(secret.DisableKeyringEnv) != "" {
+		return openFileStore(secret.DefaultPath(policy.StateDir()))
 	}
-	return openFileStore(secret.DefaultPath(policy.StateDir()))
+
+	ring, err := secret.OpenKeyring(context.Background())
+	if err == nil {
+		return secret.NewKeyringStore(ring, secret.DefaultIndexPath(policy.StateDir())), nil
+	}
+	if !errors.Is(err, secret.ErrNoKeyring) {
+		// The keyring exists and refused — a locked keychain, a denied prompt. Falling
+		// back here would answer that by reading a different store, and report the
+		// credentials it holds as the whole truth.
+		return nil, err
+	}
+	// No keyring, and no automatic fallback.
+	//
+	// The encrypted file still exists, and is still the only option on a host with no
+	// keyring at all — a container, a headless server, an SSH session with no session bus.
+	// But it is never selected implicitly: a fallback that happens on its own is how two
+	// machines, or two shells, end up using different stores without anyone choosing.
+	// BOKS_NO_KEYRING is how you choose it, and it has to be said out loud.
+	return nil, fmt.Errorf("%w.\n"+
+		"This host has no usable OS keyring: %v.\n"+
+		"Boks keeps credentials in the OS keyring and does not fall back on its own. To use "+
+		"the encrypted file instead, set %s=1 and %s.",
+		secret.ErrNoStore, err, secret.DisableKeyringEnv, secret.PassphraseEnv)
 }
 
 // openFileStore opens the passphrase-encrypted file, reporting clearly when the passphrase is
@@ -265,7 +291,10 @@ func openFileStore(path string) (secret.Store, error) {
 	}
 	pass := os.Getenv(secret.PassphraseEnv)
 	if pass == "" {
-		return nil, fmt.Errorf("credential rules need the secret store, but %s is not set", secret.PassphraseEnv)
+		// ErrNoStore, because this IS the no-store condition in its other shape: the
+		// file was chosen and cannot be opened, so there is nothing to read.
+		return nil, fmt.Errorf("%w: the encrypted file store needs %s",
+			secret.ErrNoStore, secret.PassphraseEnv)
 	}
 	return secret.OpenFile(path, []byte(pass))
 }
