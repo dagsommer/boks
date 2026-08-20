@@ -113,6 +113,27 @@ for template in "$here"/tap/Formula/*.rb.in; do
 		"$template" >"$outdir/Formula/$name"
 done
 
+# The nerdbox patches are EMBEDDED into the formula rather than fetched at build time.
+#
+# A Homebrew formula builds from the tarball it declares, and the patches this project carries
+# live in packaging/nerdbox/patches/ — not in the tap and not in that tarball. Homebrew's
+# `patch :DATA` reads a diff appended after `__END__` in the formula itself, which makes the
+# rendered formula self-contained: no second download, nothing to be unreachable at install
+# time, and `brew audit` sees the whole thing.
+#
+# Appended here rather than pasted into the template so there is ONE copy of each patch. A
+# formula carrying its own duplicate would drift from the series the rest of the project
+# applies, and the drift would show up as a shim that behaves differently from the one CI
+# built.
+if compgen -G "$root/packaging/nerdbox/patches/*.patch" >/dev/null; then
+	{
+		echo ""
+		echo "__END__"
+		cat "$root"/packaging/nerdbox/patches/*.patch
+	} >>"$outdir/Formula/nerdbox.rb"
+	echo "render.sh: embedded $(ls "$root"/packaging/nerdbox/patches/*.patch | wc -l | tr -d ' ') nerdbox patch(es)"
+fi
+
 # The tap's README is not templated — it describes the tap rather than a release — but it is
 # part of the tree the tap repository needs, so it is copied here rather than left to be
 # remembered.
