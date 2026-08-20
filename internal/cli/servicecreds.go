@@ -225,7 +225,7 @@ func openSecretStoreIfAvailable(path string) (secret.Store, error) {
 	// is a machine with no credentials rather than a failure, and a command that never
 	// asked for one must not be stopped by it. A store that EXISTS and refuses — a locked
 	// keychain, a file that will not decrypt — is a real error and is returned.
-	if errors.Is(err, secret.ErrNoKeyring) {
+	if errors.Is(err, secret.ErrNoStore) {
 		return nil, nil
 	}
 	return nil, err

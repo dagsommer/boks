@@ -53,6 +53,16 @@ type Keyring interface {
 // a container, an SSH session with no login keyring — is the common case and is not broken.
 var ErrNoKeyring = errors.New("no OS keyring available")
 
+// ErrNoStore reports that there is no credential store at all — no usable keyring, and no
+// encrypted file to fall back on.
+//
+// One sentinel for a condition with two shapes, because callers act on the CONDITION: a
+// command that did not ask for a credential treats "no store" as "no credentials" and carries
+// on, and it must do that whether the reason is a missing keyring or a file with no passphrase.
+// Before this they were different errors and only one was recognised, so the same situation
+// warned in one case and was silent in the other.
+var ErrNoStore = errors.New("no credential store is available")
+
 // keyringService is the service name every entry is filed under, so that Boks' secrets are
 // identifiable in Keychain Access, seahorse or the Credential Manager UI, and so that
 // uninstalling can find them.
