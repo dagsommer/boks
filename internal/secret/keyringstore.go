@@ -57,6 +57,11 @@ func DefaultIndexPath(stateDir string) string {
 	return filepath.Join(stateDir, "secrets-index.json")
 }
 
+// Describe names this store and where its index lives.
+func (s *KeyringStore) Describe() string {
+	return fmt.Sprintf("the %s (index: %s)", s.ring.Describe(), s.index)
+}
+
 // Path reports the index, which is the only file this store has. Named to match FileStore so
 // that a caller printing "where are my secrets" needs no type switch.
 func (s *KeyringStore) Path() string { return s.index }
@@ -263,6 +268,15 @@ type Store interface {
 	// FileStore, the name index for a KeyringStore. Callers print it when telling a user
 	// where their credentials live, so it must never be empty.
 	Path() string
+	// Describe names the store in a form a user can act on.
+	//
+	// It exists because there are now two stores and which one a command uses depends on
+	// the environment: a terminal with BOKS_SECRETS_PASSPHRASE set reads the encrypted
+	// file, and one without it reads the OS keyring. Two terminals can therefore disagree
+	// completely about what is stored, and with only a path in the output the disagreement
+	// looks like a lost secret rather than two different stores. Every command that prints
+	// where a credential went prints this.
+	Describe() string
 }
 
 // Both stores are the same shape to their callers, and the compiler is what keeps them that
