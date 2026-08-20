@@ -188,25 +188,6 @@ Agents:
 			return err
 		}
 
-		// Hand the agent a clean window. An agent's terminal interface draws itself over
-		// whatever the screen already held, so a full-screen UI came up underneath the
-		// user's shell history and had to be scrolled away from. Clearing here rather than
-		// after the lines below means the network summary is the first thing on the new
-		// screen and the agent starts under it, instead of the summary being wiped by the
-		// clear that was supposed to tidy up for it.
-		//
-		// Only for an interactive run, on stderr, and only when both streams really are a
-		// terminal — the same condition cfg.TTY uses below, and for the same reason. A
-		// piped or detached run must never receive escape codes.
-		if !detached && isTerminal(env.Stdin) && isTerminal(env.Stdout) &&
-			os.Getenv("BOKS_NO_CLEAR") == "" {
-			// Screen, then scrollback, then home. Scrollback is included deliberately: a
-			// clear that leaves the history one keypress above the agent has not given
-			// the window over to it. BOKS_NO_CLEAR is for anyone who disagrees, and for
-			// a terminal that renders any of this badly.
-			fmt.Fprint(env.Stderr, "\033[2J\033[3J\033[H")
-		}
-
 		// The network is decided, described and started before the sandbox: its
 		// annotations have to be on the container when it is created, and the host-side
 		// stack has to be holding the link socket before the VM boots and connects to it.
@@ -239,8 +220,12 @@ Agents:
 		cfg.Stdin = env.Stdin
 		cfg.Stdout = env.Stdout
 		cfg.Stderr = env.Stderr
+		// The image pull reports itself WITHOUT -v. It is the longest thing `boks run`
+		// does — hundreds of megabytes on a cold machine — and a silent wait is
+		// indistinguishable from a hang, which is how it was reported: a blank terminal
+		// with "nothing happening". Detail is optional; a several-minute pause is not.
+		cfg.Progress = env.Stderr
 		if verbose {
-			cfg.Progress = env.Stderr
 			// Before the image, because it is the fastest thing to establish and the
 			// order reads as a sequence: what will run, out of what, with which rules.
 			fmt.Fprintf(env.Stderr, "sandbox: %s (agent %s, %s)\n",
@@ -267,6 +252,21 @@ Agents:
 			}
 			fmt.Fprintln(env.Stdout, info.Name)
 			return nil
+		}
+
+		// Hand the agent a clean window, at the last possible moment.
+		//
+		// This used to happen before the network was even described, which was wrong in
+		// two ways at once. Everything printed afterwards — the image pull, a failure —
+		// landed on a screen the user had just watched go blank, so a long pull looked
+		// like a hang and an error looked like nothing at all. And it cleared the
+		// SCROLLBACK too, so whatever was in the terminal before `boks run` was gone.
+		//
+		// Now it clears the visible screen only, after everything Boks has to say and
+		// immediately before the agent's own interface starts drawing. Scrollback is left
+		// alone: taking the window is reasonable, taking the history is not.
+		if !detached && cfg.TTY && os.Getenv("BOKS_NO_CLEAR") == "" {
+			fmt.Fprint(env.Stderr, "\033[2J\033[H")
 		}
 
 		code, err := sandbox.Run(ctx, cfg)
