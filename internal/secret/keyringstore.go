@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 )
 
@@ -142,8 +143,31 @@ func (s *KeyringStore) put(name, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.ring.Set(context.Background(), name, value); err != nil {
+	ctx := context.Background()
+	if err := s.ring.Set(ctx, name, value); err != nil {
 		return err
+	}
+	// Read it back, and refuse to record a name whose value did not survive the write.
+	//
+	// This is not defensive programming for its own sake. Every backend here drives an
+	// external tool — `security`, `secret-tool`, CredWriteW — and the macOS one in
+	// particular depends on `security -i` executing the command it is fed and reporting
+	// that command's status. If that assumption is wrong the tool exits 0 having stored
+	// NOTHING, and without this check Boks records the name, reports success, and the
+	// credential is simply gone. The user finds out when `boks secret ls` does not list
+	// what they just stored, or worse when a sandbox cannot authenticate.
+	//
+	// A round trip is the only thing that can tell "the tool said yes" from "the value is
+	// there", and it costs one read on a path that already ran a subprocess.
+	switch got, err := s.ring.Get(ctx, name); {
+	case err != nil:
+		return fmt.Errorf("%s accepted %q and cannot return it (%w). The credential was NOT "+
+			"stored; nothing has been recorded", s.ring.Describe(), name, err)
+	case got != value:
+		// Never print either value: one of them is the secret.
+		return fmt.Errorf("%s returned a different value for %q than was written, so the "+
+			"credential was NOT stored correctly; nothing has been recorded",
+			s.ring.Describe(), name)
 	}
 	names, err := s.readIndex()
 	if err != nil {
@@ -183,6 +207,13 @@ func (s *KeyringStore) Names() ([]string, error) {
 	return s.readIndex()
 }
 
+// ErrIndexDrift reports names the index lists that the keyring cannot return.
+//
+// Returned ALONGSIDE the entries that were readable, so a caller can print the listing and the
+// problem: the entries are still correct, and refusing to show them would turn a partial
+// answer into none.
+var ErrIndexDrift = errors.New("the keyring no longer holds")
+
 // Entries lists the stored credentials with their kind.
 //
 // The kind is not in the index, because it would be a second thing to keep in step with the
@@ -196,15 +227,27 @@ func (s *KeyringStore) Entries() ([]Entry, error) {
 	}
 	ctx := context.Background()
 	entries := make([]Entry, 0, len(names))
+	var lost []string
 	for _, name := range names {
 		stored, err := s.ring.Get(ctx, name)
 		if errors.Is(err, ErrNotFound) {
+			// Recorded, not hidden. This used to `continue` silently, on the reasoning
+			// that the index is a cache and one stale entry should not fail a listing.
+			// That reasoning is right about the listing and wrong about the silence: a
+			// backend whose Set appears to succeed while storing nothing produces
+			// exactly this state, and the user sees a secret they just stored missing
+			// from `boks secret ls` with no indication that anything went wrong. Which
+			// is precisely how it was reported.
+			lost = append(lost, name)
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
 		entries = append(entries, Entry{Name: name, OAuth: IsOAuth(stored)})
+	}
+	if len(lost) > 0 {
+		return entries, fmt.Errorf("%w: %s", ErrIndexDrift, strings.Join(lost, ", "))
 	}
 	return entries, nil
 }
