@@ -254,19 +254,24 @@ Agents:
 			return nil
 		}
 
-		// Hand the agent a clean window, at the last possible moment.
+		// Hand the agent a clean window — but only once there IS an agent to hand it to.
 		//
-		// This used to happen before the network was even described, which was wrong in
-		// two ways at once. Everything printed afterwards — the image pull, a failure —
-		// landed on a screen the user had just watched go blank, so a long pull looked
-		// like a hang and an error looked like nothing at all. And it cleared the
-		// SCROLLBACK too, so whatever was in the terminal before `boks run` was gone.
+		// This has been wrong twice. Clearing before the network summary hid the image
+		// pull, so a long download looked like a hang. Clearing before sandbox.Run hid
+		// the task's own failure, so an image whose layers could not be mounted was
+		// reported as a terminal that went blank and said nothing. Both were the same
+		// mistake: clearing at a point where the run could still fail, and taking the
+		// evidence with it.
 		//
-		// Now it clears the visible screen only, after everything Boks has to say and
-		// immediately before the agent's own interface starts drawing. Scrollback is left
-		// alone: taking the window is reasonable, taking the history is not.
-		if !detached && cfg.TTY && os.Getenv("BOKS_NO_CLEAR") == "" {
-			fmt.Fprint(env.Stderr, "\033[2J\033[H")
+		// OnGuestReady fires after the guest's process has started and before its
+		// terminal is attached. Nothing can fail between there and the agent drawing, so
+		// nothing can be lost. A run that never gets that far never clears, and its error
+		// stays where the user can read it.
+		//
+		// The visible screen only, never the scrollback: taking the window is reasonable,
+		// taking the history is not.
+		if cfg.TTY && os.Getenv("BOKS_NO_CLEAR") == "" {
+			cfg.OnGuestReady = func() { fmt.Fprint(env.Stderr, "\033[2J\033[H") }
 		}
 
 		code, err := sandbox.Run(ctx, cfg)
