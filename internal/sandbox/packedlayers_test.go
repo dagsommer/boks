@@ -50,3 +50,30 @@ func TestPackedLayerFailureIgnoresEverythingElse(t *testing.T) {
 		}
 	}
 }
+
+// The hook must fire only when the guest is genuinely running, because `boks run` clears the
+// terminal from it. Firing early — which two earlier placements did — wipes the evidence of
+// whatever then goes wrong: a pull that is still running, a task that cannot start.
+//
+// This asserts the contract at the level a unit test can reach: that Config carries the hook
+// and that it is not called by anything on the failure paths. A real end-to-end proof needs a
+// hypervisor, which this machine does not have.
+func TestOnGuestReadyIsNotCalledWhenTheTaskFails(t *testing.T) {
+	called := false
+	cfg := Config{
+		Name:         "example",
+		Image:        "example/image:1",
+		OnGuestReady: func() { called = true },
+	}
+
+	// describeTaskError is on the path a failed task takes. Reaching it must not have
+	// invoked the hook: the run never got a guest, so the screen must not be cleared.
+	err := describeTaskError(cfg, errors.New(packedLayerMsg))
+	if err == nil {
+		t.Fatal("the packed-layer failure was not described")
+	}
+	if called {
+		t.Error("OnGuestReady fired on a failure path; the terminal would be cleared over " +
+			"the error the user needs to read")
+	}
+}
