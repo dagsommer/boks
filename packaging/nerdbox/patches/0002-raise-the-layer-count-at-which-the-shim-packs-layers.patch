@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Boks <boks@example.invalid>
+Date: Thu, 20 Aug 2026 12:00:00 +0200
+Subject: [PATCH] fix(shim): raise the layer count at which layers are packed
+ into one disk
+
+An image with more than eight erofs layers stops getting one virtio-block
+device per layer and is packed into a single GPT-partitioned VMDK instead.
+On libkrun that path fails at mount time:
+
+  mount source: "/dev/vdc4", target: "…/mounts/4", fstype: erofs,
+  flags: 1, data: "", err: invalid argument
+
+The message names neither layers nor a disk format, so nothing in it
+suggests that an image with eight layers works and the same image with
+nine does not.
+
+The threshold is far below what the device budget requires. Letters vda
+through vdz give 26 devices; the libkrun manager reserves exactly one
+(ReservedDisks() returns 1, for the guest rootfs), so containers have 25.
+A container spends one on its writable ext4 layer, leaving 24 for erofs
+layers and any volumes. Eight leaves 16 slots unused while sending every
+image past it down a path that does not work here.
+
+Raising it to 20 keeps a margin for volumes and for the reserved disk
+while letting ordinary images -- a .NET SDK image is commonly 10 to 15
+layers -- take the flat one-device-per-layer path, which is the path every
+working sandbox on this runtime already takes.
+
+This does not fix the packed path. An image with more than 20 layers still
+takes it and still fails; that is a separate defect, and this patch is
+deliberately the smaller change of using the code path that works for the
+images people actually have.
+---
+ internal/shim/task/mount.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/internal/shim/task/mount.go b/internal/shim/task/mount.go
+index 1111111..2222222 100644
+--- a/internal/shim/task/mount.go
++++ b/internal/shim/task/mount.go
+@@ -45,7 +45,7 @@
+ // devices total, some of which are reserved by the VM implementation) and
+ // lets the shim handle deep stacks of independent erofs mounts without
+ // coordinating layer offsets in the snapshotter.
+-const gptLayerThreshold = 8
++const gptLayerThreshold = 20
+ 
+ // diskAllocator assigns sequential virtio disk letters starting after any
+ // disks reserved by the VM implementation (see vm.Manager.ReservedDisks).

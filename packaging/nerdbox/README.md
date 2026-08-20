@@ -26,6 +26,32 @@ That is correct for the Windows series, whose three portable members fix things 
 hit at the revisions Linux pins. It is wrong for a patch whose entire point is that all three
 hosts need it.
 
+## `0002-raise-the-layer-count-at-which-the-shim-packs-layers.patch`
+
+The one that decides whether a sandbox starts.
+
+The shim gives each of an image's erofs layers its own virtio-block device, up to eight
+(`internal/shim/task/mount.go`, `gptLayerThreshold`). Past that it packs them all into one
+GPT-partitioned VMDK, and on libkrun that mount fails:
+
+```
+mount source: "/dev/vdc4", target: "…/mounts/4", fstype: erofs, flags: 1, err: invalid argument
+```
+
+Eight is far below the budget. `vda`–`vdz` is 26 letters, the libkrun manager reserves one
+(`ReservedDisks() == 1`), and a container spends one more on its writable ext4 layer — leaving
+24 for layers. Eight left sixteen unused while sending every larger image down a path that does
+not work here. A .NET SDK image is commonly 10–15 layers, so "larger" means ordinary.
+
+Raised to 20, which keeps four spare for volumes and puts ordinary images on the flat path that
+every working sandbox already uses. **It does not fix the packed path**: an image with more than
+20 layers still takes it and still fails. That is a separate defect, and this is deliberately
+the smaller change of using the code path that works.
+
+Verified against a real checkout of the pinned tag: the patch applies, nerdbox's own
+`internal/shim/task` tests pass with it, and the shim builds. Not verified: that a 9-layer image
+then boots, which needs a hypervisor this project's machines do not have.
+
 ## `0001-fix-vminitd-resolve-Process.User.Username-against-th.patch`
 
 ### The field nothing reads
@@ -108,7 +134,26 @@ The whole of `./internal/... ./pkg/...` still passes, and the tree builds for `l
 claim proven above is that the resolver produces the right spec; the claim *not* proven is that
 a guest carrying it starts a container as the resolved uid.
 
-## Nothing applies this series yet, and that is deliberate
+## What applies this series
+
+**`packaging/homebrew/render.sh` embeds every patch here into the rendered `nerdbox.rb`**, after
+an `__END__`, and the formula applies them with `patch :DATA` before it builds. That is the
+shim macOS installs, so a Mac runs a patched shim.
+
+Nothing else does. `linux-runtime.yml` still asserts a pristine tree and ships an unpatched
+shim, and `guest-image.yml` bakes an unpatched kernel and rootfs — so a Linux install and every
+guest image are unpatched. That split is not tidy and it is not permanent; it is where things
+stand, and it means a patch's effect depends on which platform you are on.
+
+**The formula builds only the shim** (`go build ./cmd/containerd-shim-nerdbox-v1`), so a patch
+touching `internal/vminit/` — 0001 does — compiles nothing there and changes no binary anyone
+runs. It is applied because applying the series as a series is simpler to reason about than
+maintaining a list of which patches count, and because it cannot do anything: the guest rootfs
+is built by a different workflow entirely. In particular it cannot make
+`ShimResolvesUsernames` answer differently, since that reads the nerdbox REVISION out of the
+shim and matches it against a list, not the source it was built from.
+
+## Why 0001 stays inert, and that is deliberate
 
 Neither `guest-image.yml` nor `linux-runtime.yml` has been changed to apply `patches/`. So as of
 this commit the capability exists in this directory and in **no artifact Boks builds, ships or
