@@ -270,8 +270,37 @@ jobs:
             done
             # The per-arch tags stay published: they are what the index points at, and
             # deleting them would break the multi-arch tag that references them.
-            docker buildx imagetools create \
-              --tag "${IMAGE_REPO}/${name}:${IMAGE_TAG}" \
-              "${IMAGE_REPO}/${name}:${IMAGE_TAG}-amd64" \
-              "${IMAGE_REPO}/${name}:${IMAGE_TAG}-arm64"
+            #
+            # Retried, because ghcr does not promise that a manifest is readable the instant
+            # the push that wrote it returns. On v0.1.8 this failed on the seventh of nine
+            # images with
+            #
+            #   httpReadSeeker: failed open: content at .../droid/manifests/sha256:dd389… not found
+            #
+            # and that exact digest served 200 when checked afterwards: skopeo had written
+            # it, imagetools asked before the registry would answer for it. Six images had
+            # already joined, two never got the chance, and the per-arch tags were all
+            # present the whole time — so nothing was wrong with what was built.
+            #
+            # A plain re-run fixes it, which is what makes it worth retrying here instead:
+            # the failure costs a whole release's image push for a delay measured in
+            # seconds. Five attempts with a widening gap, because eventual consistency is
+            # exactly the shape that a fixed short retry keeps losing to.
+            joined=""
+            for attempt in 1 2 3 4 5; do
+              if docker buildx imagetools create \
+                  --tag "${IMAGE_REPO}/${name}:${IMAGE_TAG}" \
+                  "${IMAGE_REPO}/${name}:${IMAGE_TAG}-amd64" \
+                  "${IMAGE_REPO}/${name}:${IMAGE_TAG}-arm64"; then
+                joined=yes
+                break
+              fi
+              echo "::warning::joining ${name}:${IMAGE_TAG} failed (attempt ${attempt}/5)" >&2
+              sleep $((attempt * 5))
+            done
+            if [ -z "$joined" ]; then
+              echo "could not join ${name}:${IMAGE_TAG} after five attempts." >&2
+              echo "The per-arch tags are published; only the multi-arch tag is missing." >&2
+              exit 1
+            fi
           done
