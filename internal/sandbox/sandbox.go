@@ -844,6 +844,9 @@ func describeCreateError(cfg Config, err error) error {
 // exist while the real cause sat in the line above.
 func describeTaskError(cfg Config, err error) error {
 	msg := err.Error()
+	if layered := describePackedLayerFailure(cfg, msg, err); layered != nil {
+		return layered
+	}
 	if !mentionsMissingExecutable(msg) {
 		return fmt.Errorf("creating sandbox process: %w", err)
 	}
