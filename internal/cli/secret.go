@@ -954,7 +954,16 @@ useful to somebody who cannot read the credentials themselves.`,
 			return err
 		}
 		entries, err := store.Entries()
-		if err != nil {
+		// Drift is reported and the listing still printed: the entries that came back are
+		// correct, and refusing to show them would turn a partial answer into none. It is
+		// on stderr so a piped `boks secret ls` is unaffected.
+		if errors.Is(err, secret.ErrIndexDrift) {
+			fmt.Fprintf(env.Stderr, "warning: %v.\n"+
+				"         Those names were stored but cannot be read back. Set them again;\n"+
+				"         if it keeps happening the keyring is accepting writes without\n"+
+				"         keeping them, and %s is the workaround.\n\n",
+				err, secret.DisableKeyringEnv)
+		} else if err != nil {
 			return explainSecretFailure(store.Path(), err)
 		}
 		if len(entries) == 0 {

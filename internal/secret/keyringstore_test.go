@@ -180,26 +180,10 @@ func TestKeyringStoreDelete(t *testing.T) {
 	}
 }
 
-// The index is a cache, so a name it lists that the keyring has lost must not break the whole
-// listing. One stale entry making `boks secret ls` fail would turn a cosmetic drift into an
-// unusable command.
-func TestKeyringStoreSkipsNamesTheKeyringLost(t *testing.T) {
-	s, ring := newTestKeyringStore(t)
-	for _, n := range []string{"kept", "lost"} {
-		if err := s.Set(n, NewValue("x")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	delete(ring.values, "lost")
-
-	entries, err := s.Entries()
-	if err != nil {
-		t.Fatalf("Entries: %v", err)
-	}
-	if len(entries) != 1 || entries[0].Name != "kept" {
-		t.Errorf("Entries = %+v, want only the name the keyring still has", entries)
-	}
-}
+// Superseded by TestKeyringStoreReportsIndexDrift. This asserted that a name the keyring had
+// lost was skipped SILENTLY, which was the behaviour that let a backend storing nothing look
+// like an empty store. The half of it worth keeping — that the readable entries still come
+// back — is asserted there.
 
 // Names that cannot survive the OS stores are refused at the door, so the failure names the
 // problem rather than surfacing as a keyring error three layers down.
@@ -209,5 +193,86 @@ func TestKeyringStoreRejectsImpossibleNames(t *testing.T) {
 		if err := s.Set(name, NewValue("x")); err == nil {
 			t.Errorf("Set accepted the name %q", name)
 		}
+	}
+}
+
+// silentKeyring accepts every write and stores nothing — the exact shape of a backend whose
+// external tool exits 0 without doing the work. It is not hypothetical: the macOS backend
+// drives `security -i` and depends on that mode executing the command it is fed, which is the
+// one assumption in this package that could not be verified without a Mac.
+type silentKeyring struct{ fakeKeyring }
+
+func (s *silentKeyring) Set(context.Context, string, string) error { return nil }
+
+// A write that did not happen must fail LOUDLY, and must record nothing.
+//
+// Without this, the store reports success, the index records the name, and the credential is
+// gone — discovered when `boks secret ls` does not list what was just stored, or worse when a
+// sandbox cannot authenticate. That is how it was reported.
+func TestKeyringStoreRefusesAWriteThatDidNotHappen(t *testing.T) {
+	ring := &silentKeyring{*newFakeKeyring()}
+	s := NewKeyringStore(ring, filepath.Join(t.TempDir(), "index.json"))
+
+	err := s.Set("github", NewValue("ghp_secret"))
+	if err == nil {
+		t.Fatal("a write that stored nothing was reported as success")
+	}
+	if !strings.Contains(err.Error(), "NOT") {
+		t.Errorf("error %q does not say the credential was not stored", err)
+	}
+	// Nothing recorded: a name in the index with no value behind it is the state that
+	// makes a listing lie.
+	names, nerr := s.Names()
+	if nerr != nil {
+		t.Fatalf("Names: %v", nerr)
+	}
+	if len(names) != 0 {
+		t.Errorf("the index recorded %v after a write that did not happen", names)
+	}
+}
+
+// wrongKeyring stores something other than what it was given — a mangled encoding, a truncated
+// value. The store must not accept that either.
+type wrongKeyring struct{ fakeKeyring }
+
+func (w *wrongKeyring) Set(ctx context.Context, name, value string) error {
+	return w.fakeKeyring.Set(ctx, name, value+"-mangled")
+}
+
+func TestKeyringStoreRefusesAValueThatChanged(t *testing.T) {
+	ring := &wrongKeyring{*newFakeKeyring()}
+	s := NewKeyringStore(ring, filepath.Join(t.TempDir(), "index.json"))
+
+	err := s.Set("github", NewValue("ghp_secret"))
+	if err == nil {
+		t.Fatal("a value that did not round trip was accepted")
+	}
+	// Neither value may appear in the message: one of them is the secret.
+	if strings.Contains(err.Error(), "ghp_secret") {
+		t.Errorf("the error leaks the secret: %v", err)
+	}
+}
+
+// A name the index lists that the keyring cannot return is REPORTED, not hidden — while the
+// entries that are readable are still returned, because a partial answer beats none.
+func TestKeyringStoreReportsIndexDrift(t *testing.T) {
+	s, ring := newTestKeyringStore(t)
+	for _, n := range []string{"kept", "lost"} {
+		if err := s.Set(n, NewValue("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delete(ring.values, "lost")
+
+	entries, err := s.Entries()
+	if !errors.Is(err, ErrIndexDrift) {
+		t.Errorf("Entries error = %v, want it to report the drift", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "lost") {
+		t.Errorf("error %q does not name the missing credential", err)
+	}
+	// The readable one still comes back.
+	if len(entries) != 1 || entries[0].Name != "kept" {
+		t.Errorf("Entries = %+v, want the readable entry despite the drift", entries)
 	}
 }
