@@ -297,6 +297,10 @@ func TestPolicyLogFilters(t *testing.T) {
 
 func TestSecretRoundTripThroughCLI(t *testing.T) {
 	dir := t.TempDir()
+	// The encrypted file is selected explicitly: Boks prefers the OS keyring and never
+	// falls back on its own, so a test that wants the file has to say so — the same
+	// sentence a user on a headless host has to say.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv(secret.PassphraseEnv, "test-passphrase")
 	t.Setenv("BOKS_STATE_DIR", dir)
 
@@ -345,11 +349,19 @@ func TestAForgottenPassphraseHasAWayOut(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("BOKS_STATE_DIR", dir)
 
+	// The encrypted file is selected explicitly: Boks prefers the OS keyring and never
+	// falls back on its own, so a test that wants the file has to say so — the same
+	// sentence a user on a headless host has to say.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv(secret.PassphraseEnv, "the-right-one")
 	if _, _, err := runCLI(t, "value\n", "secret", "set", "github"); err != nil {
 		t.Fatalf("secret set: %v", err)
 	}
 
+	// The encrypted file is selected explicitly: Boks prefers the OS keyring and never
+	// falls back on its own, so a test that wants the file has to say so — the same
+	// sentence a user on a headless host has to say.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv(secret.PassphraseEnv, "not-the-right-one")
 	for _, args := range [][]string{{"secret", "ls"}, {"secret", "rm", "github"}, {"secret", "set", "other"}} {
 		_, _, err := runCLI(t, "value\n", args...)
@@ -382,6 +394,10 @@ func TestAForgottenPassphraseHasAWayOut(t *testing.T) {
 	}
 
 	// And afterwards the store is usable again, with whatever passphrase you now have.
+	// The encrypted file is selected explicitly: Boks prefers the OS keyring and never
+	// falls back on its own, so a test that wants the file has to say so — the same
+	// sentence a user on a headless host has to say.
+	t.Setenv(secret.DisableKeyringEnv, "1")
 	t.Setenv(secret.PassphraseEnv, "a-new-one")
 	if _, _, err := runCLI(t, "value\n", "secret", "set", "github"); err != nil {
 		t.Fatalf("the store was not usable after a reset: %v", err)
