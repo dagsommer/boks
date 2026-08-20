@@ -278,3 +278,7 @@ func securityCommandLine(args ...string) (string, error) {
 	}
 	return b.String(), nil
 }
+
+// Describe names this platform's store, so that a user told where a credential went can
+// open the right application and look at it.
+func (k keychainKeyring) Describe() string { return "macOS Keychain" }

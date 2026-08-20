@@ -24,6 +24,8 @@ type fakeKeyring struct {
 
 func newFakeKeyring() *fakeKeyring { return &fakeKeyring{values: map[string]string{}} }
 
+func (f *fakeKeyring) Describe() string { return "fake keyring" }
+
 func (f *fakeKeyring) Get(_ context.Context, name string) (string, error) {
 	v, ok := f.values[name]
 	if !ok {

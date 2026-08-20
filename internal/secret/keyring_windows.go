@@ -358,3 +358,7 @@ func credmanError(e syscall.Errno) error {
 	}
 	return e
 }
+
+// Describe names this platform's store, so that a user told where a credential went can
+// open the right application and look at it.
+func (k credentialManager) Describe() string { return "Windows Credential Manager" }

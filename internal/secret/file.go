@@ -250,6 +250,9 @@ func (s *FileStore) Names() ([]string, error) {
 // Path reports where the store lives.
 func (s *FileStore) Path() string { return s.path }
 
+// Describe names this store. See Store.Describe for why the two stores say which they are.
+func (s *FileStore) Describe() string { return "the encrypted file " + s.path }
+
 func (s *FileStore) load() (map[string]string, error) {
 	raw, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
