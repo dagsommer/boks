@@ -249,7 +249,7 @@ const ImageRepo = "ghcr.io/dagsommer/boks"
 // built and pushed together from a single workflow, so a tag that differed between them
 // could only ever be a mistake. It is exported because the build tooling and the release
 // workflow need the same value, and deriving it from one place is what keeps them in step.
-const ImageTag = "0.1.7"
+const ImageTag = "0.1.8"
 
 // Image returns the published reference for one of the images in this repository. The name
 // is the agent's, except for the shell agent, which runs the base image itself.
