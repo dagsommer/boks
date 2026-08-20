@@ -231,9 +231,15 @@ One thing still speaks up unprompted: **interception getting wider**. A sandbox 
 one host yesterday and three today is a change to what is being read, and a kit, a profile or
 a new credential can make that change without the user doing it deliberately.
 
-Everything else — the policy table, the standing summary, which kit was applied, the image and
-its download progress, the command, the workspace mounts, the network stack's own progress —
-waits for `-v`.
+The image pull reports itself too, without `-v`: it is the longest thing a run does, and a
+silent multi-minute wait is indistinguishable from a hang.
+
+Everything else — the policy table, the standing summary, which kit was applied, the command,
+the workspace mounts, the network stack's own progress — waits for `-v`.
+
+An interactive run clears the visible screen immediately before the agent's interface starts,
+so it does not draw over your shell. Scrollback is left alone, so everything Boks printed is
+one scroll away. `BOKS_NO_CLEAR` turns that off.
 
 `-q`/`--quiet` still parses so that scripts written against 0.1.5 keep working. It does
 nothing: quiet is the default now.
