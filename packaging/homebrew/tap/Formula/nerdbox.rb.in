@@ -45,6 +45,17 @@ class Nerdbox < Formula
 
   depends_on :macos
 
+  # The patches this project carries against the pinned tag, appended to this file by
+  # packaging/homebrew/render.sh and applied before the build.
+  #
+  # 0002 is the one that matters for whether a sandbox starts at all: the shim gives each
+  # image layer its own virtio-block device only up to eight, and packs everything past that
+  # into a GPT-partitioned VMDK that fails to mount here. Twenty-five devices are available,
+  # so eight was leaving sixteen unused while sending ordinary images — a .NET SDK image is
+  # commonly ten to fifteen layers — down a path that does not work. See
+  # packaging/nerdbox/patches/ for the full reasoning.
+  patch :DATA
+
   def install
     # What nerdbox's own `task build:shim` does, minus the parts that need Docker. The
     # no_grpc tag is upstream's; the shim links no C and dlopens libkrun at runtime through
