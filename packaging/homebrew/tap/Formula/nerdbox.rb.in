@@ -21,6 +21,21 @@ class Nerdbox < Formula
   sha256 "8eb4c638d161701f93b01ec2c84fbc4891a0be98a10d1887473095c6c309cbc1"
   license "Apache-2.0"
 
+  # Bump this whenever packaging/nerdbox/patches/ changes, and ONLY then.
+  #
+  # A formula's version comes from its url, and that is a nerdbox tag this project pins
+  # deliberately. Adding or changing a patch therefore changes what the formula BUILDS while
+  # leaving what it CLAIMS TO BE identical — so `brew upgrade` sees nothing outdated, rebuilds
+  # nothing, and the shim on disk stays the one from before the patch. The user gets a new
+  # boks, an unchanged shim, and a bug that was supposed to be fixed.
+  #
+  # `revision` is Homebrew's answer to exactly that: it is part of the version for comparison
+  # (0.2.3_1) and nothing else, so bumping it forces the rebuild without pretending the
+  # upstream tag moved.
+  #
+  # 1: 0002 raised the layer count at which the shim packs layers into one disk.
+  revision 1
+
   # This formula is pinned to a nerdbox tag on purpose, and the pin is a Boks decision rather
   # than a packaging convenience: v0.2.3 is the release containing cd2c23f, the commit
   # docs/verification.md records the VM boundary being verified against. Moving it means the
