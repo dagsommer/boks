@@ -215,3 +215,7 @@ func runSecretTool(ctx context.Context, stdin io.Reader, args ...string) (secret
 	res.code = code
 	return res, nil
 }
+
+// Describe names this platform's store, so that a user told where a credential went can
+// open the right application and look at it.
+func (k secretServiceKeyring) Describe() string { return "Secret Service keyring" }

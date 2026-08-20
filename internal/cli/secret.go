@@ -586,9 +586,9 @@ rule says where it goes.`,
 			return explainSecretFailure(store.Path(), err)
 		}
 		if sandbox != "" {
-			fmt.Fprintf(env.Stdout, "stored %q for sandbox %s in %s\n", name, sandbox, store.Path())
+			fmt.Fprintf(env.Stdout, "stored %q for sandbox %s in %s\n", name, sandbox, store.Describe())
 		} else {
-			fmt.Fprintf(env.Stdout, "stored %q in %s\n", name, store.Path())
+			fmt.Fprintf(env.Stdout, "stored %q in %s\n", name, store.Describe())
 		}
 		describeStoredService(env.Stdout, name)
 		noteAnOverlappingLogin(cmd.Context(), env.Stdout, store, name)
@@ -958,12 +958,18 @@ useful to somebody who cannot read the credentials themselves.`,
 			return explainSecretFailure(store.Path(), err)
 		}
 		if len(entries) == 0 {
-			fmt.Fprintf(env.Stdout, "no secrets stored in %s\n", store.Path())
+			fmt.Fprintf(env.Stdout, "no secrets stored in %s\n", store.Describe())
 			return nil
 		}
 		// Names, kinds and destinations. There is no subcommand that prints a value,
 		// and there should not be. The kind is worth showing because the two are used
 		// differently, and because an OAuth login takes precedence over a key.
+		// Which store this came from, named on the listing itself. The empty case
+		// already said it; the non-empty one did not, so a terminal reading a different
+		// store from the one a secret was written to showed a list missing that secret
+		// with nothing to suggest why. Two stores exist and the environment picks
+		// between them — see Store.Describe.
+		fmt.Fprintf(env.Stdout, "%s\n\n", store.Describe())
 		w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(w, "NAME\tKIND\tATTACHED TO")
 		for _, e := range entries {

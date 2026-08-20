@@ -40,6 +40,10 @@ type Keyring interface {
 	// Delete removes name. Removing something absent is not an error, so that a delete
 	// after a partial write leaves nothing behind.
 	Delete(ctx context.Context, name string) error
+	// Describe names this keyring the way its own platform does — "macOS Keychain",
+	// "Secret Service", "Windows Credential Manager" — so that a user told where their
+	// credential went can go and look at it.
+	Describe() string
 }
 
 // ErrNoKeyring reports that this host has no usable OS secret store.
