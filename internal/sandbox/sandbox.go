@@ -137,6 +137,11 @@ type Config struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
+	// OnGuestReady is called once the guest's process is running and immediately before
+	// its terminal is attached — the last instant at which anything can still go wrong,
+	// and the first at which the screen belongs to the agent. Nil does nothing.
+	OnGuestReady func()
+
 	// Progress is where this package narrates what it is doing — pulling an image,
 	// unpacking it for the snapshotter. Nil means say nothing, which is the default and
 	// what an unattended caller wants.
@@ -693,6 +698,18 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 		return 1, fmt.Errorf("starting sandbox process: %w", err)
 	}
 	defer stdin.closeGuestStdin(ctx, task)()
+
+	// The guest process is running and the terminal is about to become its own. This is
+	// the only moment at which a caller can know that: everything before it can still
+	// fail — the image, the mounts, the task — and everything after belongs to the agent.
+	//
+	// It exists because `boks run` clears the screen here, and every earlier place it
+	// tried was wrong. Clearing before the pull hid the pull; clearing before the task
+	// hid the task's own failure, which is how an image that could not mount came to be
+	// reported as a terminal that just went blank.
+	if cfg.OnGuestReady != nil {
+		cfg.OnGuestReady()
+	}
 
 	restore := attachTerminal(ctx, task, cfg.TTY, cfg.Stdin)
 	interrupted := forwardSignals(ctx, task)
