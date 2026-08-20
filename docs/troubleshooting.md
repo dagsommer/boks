@@ -591,3 +591,25 @@ Set `BOKS_NO_KEYRING=1`. That is the switch for a shared account, a machine whos
 prompts more than you want, or a setup where the credentials have to travel with the state
 directory. It needs `BOKS_SECRETS_PASSPHRASE` set as well, since the file is what it falls
 back to.
+
+## Sandboxes
+
+**`mount source: "/dev/vdc4" … fstype: erofs … invalid argument`**
+
+The image has more than eight layers. Up to eight, the runtime gives each layer its own
+virtio-block device (`/dev/vdc`); past that it packs them all into one disk as a
+GPT-partitioned VMDK and the layers become partitions (`/dev/vdc4`). The digit on the end of
+the device name is the only part of the message that says which path was taken.
+
+The packed path needs VMDK support in libkrun — documented there as FLAT/ZERO extents without
+delta links — and fails this way when the guest cannot read a layer where the partition table
+says it is. Both the packing and the disk format belong to the runtime under Boks, so there is
+nothing to configure in Boks itself.
+
+What helps, in order of reliability:
+
+- **Squash the image to eight layers or fewer.** That avoids the packing entirely and uses the
+  path every working sandbox takes. If you build the image, a multi-stage final `COPY` or
+  `--squash` is usually enough.
+- **Update libkrun** (`brew upgrade libkrun`) if yours predates its VMDK support.
+- `boks doctor` reports which libkrun it found and where.
