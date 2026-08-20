@@ -613,3 +613,24 @@ What helps, in order of reliability:
   `--squash` is usually enough.
 - **Update libkrun** (`brew upgrade libkrun`) if yours predates its VMDK support.
 - `boks doctor` reports which libkrun it found and where.
+
+**`ENOSPC: no space left on device` inside a sandbox**
+
+The writable layer is full. Off Linux every sandbox gets its own ext4 image for everything it
+writes, and containerd's default size for it is 64 MiB — a floor rather than a working size.
+Anything that installs a toolchain, unpacks a runtime or builds something runs out partway
+through, and the error comes from whatever was writing, naming a path inside the container.
+
+Boks now asks containerd for **16 GiB**, sparse: it is a ceiling, not an allocation, and the
+image grows with what is actually written. Change it with
+
+```sh
+export BOKS_WRITABLE_LAYER_SIZE=64GiB
+boks daemon stop && boks daemon start     # the config is rewritten on start
+```
+
+Any size containerd accepts works (`32GiB`, `512MiB`). A sandbox created before the change
+keeps the layer it was created with — `boks rm` it and run again to get a new one.
+
+This does not apply on Linux, where the writable layer is a plain directory bounded by the
+real filesystem.
