@@ -20,6 +20,28 @@ followed on 2026-08-14 and 2026-08-15. Each section below says what was observed
 platform and what was not, and [verification.md](verification.md) is the record every one of
 those claims is taken from.
 
+
+## Windows, with winget, before the package is in winget-pkgs
+
+`winget install boks` needs the package to be accepted into `microsoft/winget-pkgs`, which
+needs a signed CLA and a review in a repository this project does not control. Until then
+winget can still do the install — it just has to be handed the manifests, and every release
+ships them:
+
+```powershell
+curl.exe -LO https://github.com/dagsommer/boks/releases/latest/download/boks-winget_<version>.zip
+Expand-Archive boks-winget_<version>.zip -DestinationPath boks-winget
+winget install --manifest boks-winget
+```
+
+The manifests name the release archive by URL and by SHA-256, so winget downloads it from
+GitHub and refuses it if the bytes differ. Nothing else is needed: the archive carries the CLI,
+the runtime and the guest, so the install boots without a second download.
+
+What this does not give you is `winget upgrade boks` — that resolves through a source, and the
+package is not in one. Repeat the three lines above for a new version.
+
+
 ## macOS on Apple silicon — Homebrew
 
 **The first platform Boks was shown to work on, and still the most measured.** The VM
