@@ -29,10 +29,16 @@ winget can still do the install — it just has to be handed the manifests, and 
 ships them:
 
 ```powershell
-curl.exe -LO https://github.com/dagsommer/boks/releases/latest/download/boks-winget_<version>.zip
+# --fail matters. Without it curl writes GitHub's "Not Found" body to the file on a 404 and
+# exits 0, and the first thing you see is Expand-Archive saying "Central Directory corrupt"
+# about a nine-byte file — which reads as a broken archive rather than a wrong version.
+curl.exe --fail -LO https://github.com/dagsommer/boks/releases/latest/download/boks-winget_<version>.zip
 Expand-Archive boks-winget_<version>.zip -DestinationPath boks-winget
 winget install --manifest boks-winget
 ```
+
+Substitute the real version — `latest/download` still needs the filename, and the filename
+carries the version. The asset is listed on the release page beside the archives.
 
 The manifests name the release archive by URL and by SHA-256, so winget downloads it from
 GitHub and refuses it if the bytes differ. Nothing else is needed: the archive carries the CLI,
