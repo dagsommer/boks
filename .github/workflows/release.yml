@@ -565,6 +565,31 @@ jobs:
             TZ=UTC zip -qrX "../dist/$d.zip" "$d"
           done
           cd ../dist
+
+          # The winget manifests, rendered against the zip that was just built and shipped
+          # as an asset of their own.
+          #
+          # Without this a Windows user cannot install with winget at all until the package
+          # is accepted into microsoft/winget-pkgs — a process that needs a signed CLA and a
+          # review in someone else's repository. `winget install --manifest` works today and
+          # needs only these three files, but until now the only way to obtain them was to
+          # clone this repository and run render.sh, which needs bash and python3 on a
+          # machine that has neither by default. Shipping them turns "wait for winget-pkgs"
+          # into a download.
+          #
+          # Rendered HERE rather than in winget.yml because only this job has the finished
+          # archive: the InstallerSha256 must be the digest of the file the manifest points
+          # at, and render.sh computes it from the zip itself rather than being told.
+          if [ -f "boks_${VERSION}_windows_amd64.zip" ]; then
+            "$GITHUB_WORKSPACE/packaging/winget/render.sh" "$VERSION" \
+              "boks_${VERSION}_windows_amd64.zip" winget-manifests
+            # Flattened into the archive root: `winget install --manifest <dir>` takes a
+            # directory of yaml, not winget-pkgs' d/dagsommer/boks/<version> tree.
+            manifest_dir="$(find winget-manifests -name '*.yaml' -exec dirname {} \; | head -1)"
+            TZ=UTC zip -qrXj "boks-winget_${VERSION}.zip" "$manifest_dir"
+            rm -rf winget-manifests
+          fi
+
           for f in *; do sha256sum "$f" >"$f.sha256"; done
           ls -l
           cat -- *.sha256
