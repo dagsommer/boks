@@ -70,7 +70,22 @@ RUN set -eux; \
     groupadd --gid 1000 agent; \
     useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash agent; \
     mkdir -p /home/agent/.local/bin /home/agent/.npm-global; \
-    chown -R agent:agent /home/agent
+    chown -R agent:agent /home/agent; \
+    # Writable by whatever uid the sandbox actually runs as, which is not always this one.
+    #
+    # A shared workspace forces the guest process to run as the uid that owns the host files
+    # — 501 on a Mac, not 1000 — because the guest kernel checks the real uid of a virtiofs
+    # file and libkrun has no id mapping to paper over it (see withHostUser in
+    # internal/sandbox). HOME is not on that share; it lives in this image. So without this
+    # the agent can write the user's repository and not its own configuration, which breaks
+    # every agent that keeps state — a login, a cache, a settings file.
+    #
+    # 0777 rather than a second user or an entrypoint that chowns as root. The guest is a
+    # disposable VM whose entire filesystem is the agent's to ruin, and docs/security-model.md
+    # says in as many words that in-guest permissions are not a boundary and nothing depends
+    # on them. Spending a root entrypoint to defend a directory inside that would buy nothing
+    # and cost the one thing worth keeping: no root in the chain at all.
+    chmod -R 0777 /home/agent
 
 # The CA entrypoint has to write to the trust store, and the container process is uid 1000.
 # Rather than grant the agent user root (or run the whole sandbox as root), hand it exactly
