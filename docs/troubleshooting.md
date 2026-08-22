@@ -634,3 +634,17 @@ keeps the layer it was created with — `boks rm` it and run again to get a new 
 
 This does not apply on Linux, where the writable layer is a plain directory bounded by the
 real filesystem.
+
+**A sandbox cannot write to the workspace**
+
+The guest runs as the uid that owns your files on the host, so this should not happen on a
+sandbox created by a current Boks. A sandbox created by an older one keeps the user it was
+created with — `boks rm` it and run again.
+
+Why it works that way: a workspace is a live share, and the guest sees your host's real
+ownership. libkrun's virtiofs offers no id mapping, so the only way for the guest to write your
+files is to run as the uid that owns them. `boks exec <name> -- id` shows what it is running as.
+
+Sandboxes from before this behaviour ran as root, and any file an agent created then is owned
+by root on your machine. Find them with `find . -user 0` and take them back with
+`sudo chown "$(id -u):$(id -g)"`.
