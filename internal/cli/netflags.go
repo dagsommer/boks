@@ -264,10 +264,11 @@ func (f *policyFlags) describeKit(w io.Writer) {
 
 	// Named individually rather than as "some fields are ignored", because the point is
 	// for the user to recognise the one they were relying on.
+	// The image, the entrypoint and the credentials ARE applied now — agentFromKit builds
+	// an agent from the first two and kitInjectSpecs turns the third into injection rules.
+	// Listing them here as ignored was wrong in the direction that makes a working feature
+	// look broken, which is the worse direction.
 	var ignored []string
-	if f.kitSpec.Sandbox != nil && f.kitSpec.Sandbox.Image != "" {
-		ignored = append(ignored, "image "+f.kitSpec.Sandbox.Image)
-	}
 	if f.kitSpec.Setup != nil {
 		if n := len(f.kitSpec.Setup.Install); n > 0 {
 			ignored = append(ignored, fmt.Sprintf("%d install command(s)", n))
@@ -279,15 +280,11 @@ func (f *policyFlags) describeKit(w io.Writer) {
 			ignored = append(ignored, fmt.Sprintf("%d file(s)", n))
 		}
 	}
-	if n := len(f.kitSpec.Credentials); n > 0 {
-		ignored = append(ignored, fmt.Sprintf("%d credential(s)", n))
-	}
 	if n := len(f.kitSpec.Ports); n > 0 {
 		ignored = append(ignored, fmt.Sprintf("%d port(s)", n))
 	}
 	if len(ignored) > 0 {
-		fmt.Fprintf(w, "kit: NOT applied — %s. Boks applies a kit's network rules only.\n",
-			strings.Join(ignored, ", "))
+		fmt.Fprintf(w, "kit: NOT applied — %s.\n", strings.Join(ignored, ", "))
 	}
 }
 

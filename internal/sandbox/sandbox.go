@@ -524,6 +524,12 @@ func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []o
 		// missing cwd (measured against runc), and the clone lands in it.
 		specOpts = append(specOpts, oci.WithProcessCwd(cfg.Workspaces[0].Root()))
 	}
+
+	// LAST, so it wins over the image's own user. The image config runs earlier and sets
+	// whatever USER the image declared; this is the deliberate override that makes a shared
+	// workspace writable, and an override that ran before the thing it overrides would do
+	// nothing at all.
+	specOpts = append(specOpts, withHostUser(cfg))
 	return specOpts
 }
 
