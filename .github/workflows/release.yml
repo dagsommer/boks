@@ -581,7 +581,12 @@ jobs:
           # archive: the InstallerSha256 must be the digest of the file the manifest points
           # at, and render.sh computes it from the zip itself rather than being told.
           if [ -f "boks_${VERSION}_windows_amd64.zip" ]; then
-            "$GITHUB_WORKSPACE/packaging/winget/render.sh" "$VERSION" \
+            # $GITHUB_WORKSPACE/boks, not $GITHUB_WORKSPACE: this job checks the
+            # repository out with `path: boks` so it does not collide with the artifact
+            # directories it downloads into the workspace root. Getting that wrong cost
+            # the v0.1.12 release, which failed here with "render.sh: No such file or
+            # directory" after every artifact had been built.
+            "$GITHUB_WORKSPACE/boks/packaging/winget/render.sh" "$VERSION" \
               "boks_${VERSION}_windows_amd64.zip" winget-manifests
             # Flattened into the archive root: `winget install --manifest <dir>` takes a
             # directory of yaml, not winget-pkgs' d/dagsommer/boks/<version> tree.
