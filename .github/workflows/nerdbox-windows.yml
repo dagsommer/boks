@@ -42,11 +42,13 @@ on:
     branches: [main]
     paths:
       - "packaging/nerdbox-windows/**"
+      - "packaging/nerdbox/patches/**"
       - "packaging/nerdbox/NERDBOX_REV"
       - ".github/workflows/nerdbox-windows.yml"
   pull_request:
     paths:
       - "packaging/nerdbox-windows/**"
+      - "packaging/nerdbox/patches/**"
       - "packaging/nerdbox/NERDBOX_REV"
       - ".github/workflows/nerdbox-windows.yml"
   workflow_dispatch:
@@ -102,18 +104,43 @@ jobs:
       # No `--3way` and no fuzz. The revision is pinned, so the patches either apply exactly or
       # the pin and the series have drifted apart, and a fuzzy application would hide precisely
       # the breakage this job exists to find.
-      - name: Apply the Boks Windows patches
+      # BOTH series, shared first.
+      #
+      # This applied only packaging/nerdbox-windows/patches/, which was right while that was
+      # the only series. packaging/nerdbox/patches/ is the platform-INDEPENDENT one — its
+      # README says so in its first line — and leaving it out gave Windows a shim missing a
+      # fix every other platform ships. Measured on Windows 2026-08-24, a 17-layer image:
+      #
+      #   failed to create shim task: mount source: "/dev/vdc4", target: "…/mounts/4",
+      #   fstype: erofs, flags: 1, data: "", err: invalid argument
+      #
+      # A partition, not a disk: past gptLayerThreshold the shim stops giving each layer its
+      # own virtio-blk device and packs them all into one GPT-partitioned VMDK, and that path
+      # does not mount. 0002 raises the threshold to 20 so an image of this size takes the
+      # path that works. Homebrew has carried it since it was written; Windows never did, and
+      # the same image runs on macOS and fails here for exactly that reason.
+      #
+      # Shared first because the Windows series was generated against that base, which is the
+      # order packaging/nerdbox/README.md gives for applying both to one tree. Verified rather
+      # than assumed: both series apply clean to a real cd2c23f checkout in that order, and
+      # the result builds with GOOS=windows.
+      - name: Apply the Boks patches
         working-directory: nerdbox
         run: |
           set -euo pipefail
           shopt -s nullglob
-          patches=(../boks/packaging/nerdbox-windows/patches/*.patch)
-          if [ ${#patches[@]} -eq 0 ]; then
+          shared=(../boks/packaging/nerdbox/patches/*.patch)
+          windows=(../boks/packaging/nerdbox-windows/patches/*.patch)
+          if [ ${#windows[@]} -eq 0 ]; then
             echo "no patches found — packaging/nerdbox-windows/patches/ is empty" >&2
             exit 1
           fi
-          echo "Applying ${#patches[@]} patch(es) onto ${{ steps.pin.outputs.rev }}"
-          git apply --verbose "${patches[@]}"
+          if [ ${#shared[@]} -eq 0 ]; then
+            echo "no patches found — packaging/nerdbox/patches/ is empty" >&2
+            exit 1
+          fi
+          echo "Applying ${#shared[@]} shared and ${#windows[@]} Windows patch(es) onto ${{ steps.pin.outputs.rev }}"
+          git apply --verbose "${shared[@]}" "${windows[@]}"
 
       # Read nerdbox's own go directive rather than pinning a version here. A shim built with a
       # different Go than nerdbox expects is a variable we do not need, and `go-version-file`
@@ -259,7 +286,7 @@ jobs:
           {
             echo "## nerdbox shim for Windows"
             echo
-            echo "nerdbox \`${{ steps.pin.outputs.rev }}\` + \`packaging/nerdbox-windows/patches/\`."
+            echo "nerdbox \`${{ steps.pin.outputs.rev }}\` + \`packaging/nerdbox/patches/\` + \`packaging/nerdbox-windows/patches/\`."
             echo
             echo "The series applies and builds a PE executable for windows/amd64 and windows/arm64,"
             echo "and its Windows-only test files type-check."

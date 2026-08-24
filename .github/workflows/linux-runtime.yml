@@ -18,11 +18,12 @@
 #
 # WHAT IT BUILDS, AND FROM WHERE.
 #
-#   containerd-shim-nerdbox-v1   containerd/nerdbox @ packaging/nerdbox/NERDBOX_REV, UNPATCHED
+#   containerd-shim-nerdbox-v1   containerd/nerdbox @ packaging/nerdbox/NERDBOX_REV,
+#                                + packaging/nerdbox/patches/ (the platform-independent series)
 #   libkrun.so                   containers/libkrun @ packaging/linux/LIBKRUN_REV, UNPATCHED,
 #                                --features blk,net
 #
-# NEITHER PATCH SERIES IS APPLIED, and both omissions were checked rather than assumed:
+# NEITHER *WINDOWS* SERIES IS APPLIED, and both omissions were checked rather than assumed:
 #
 #   * packaging/nerdbox-windows/patches/ — three of the five (0003, 0004, and the io.go half
 #     of 0005) touch files with no build constraint and DO change Linux behaviour. They are
@@ -125,19 +126,48 @@ jobs:
           path: nerdbox
           fetch-depth: 0
 
-      # Assert the tree really is unpatched before building it. Without this, someone adding a
-      # patch step later — or a stray file from a cached checkout — would ship a binary whose
-      # provenance line in the summary was a lie. `git status` is cheap and unambiguous.
-      - name: Assert the nerdbox tree is pristine
+      # Assert the checkout is what the pin says before anything touches it. Without this, a
+      # stray file from a cached checkout would ship a binary whose provenance line in the
+      # summary was a lie. It runs BEFORE the patch step below, so what it proves is "this is
+      # cd2c23f and nothing else", not "nothing is applied".
+      - name: Assert the nerdbox checkout is pristine
         working-directory: nerdbox
         run: |
           set -euo pipefail
           if [ -n "$(git status --porcelain)" ]; then
-            echo "the nerdbox checkout is not pristine — this workflow ships UNPATCHED binaries" >&2
+            echo "the nerdbox checkout is not pristine before patching" >&2
             git status --porcelain >&2
             exit 1
           fi
           echo "  nerdbox @ $(git rev-parse HEAD): clean"
+
+      # The platform-independent series, which Linux needs for the same reason macOS and
+      # Windows do.
+      #
+      # This workflow shipped an unpatched shim, and packaging/nerdbox/README.md — the file
+      # that argued this directory into existence — gave that as the reason a patch all three
+      # hosts need could not live in the Windows one. The directory was then created and this
+      # workflow was not taught to read it, so 0002 reached macOS through Homebrew and reached
+      # neither of the other two. Windows found it the hard way on 2026-08-24: a 17-layer image
+      # failing on `mount source: "/dev/vdc4" … err: invalid argument`, which is exactly the
+      # packed-layer path 0002 exists to avoid, on an image that runs on a patched macOS.
+      #
+      # Only the shim is built here, so 0001 (which fixes vminitd, in the guest rootfs) changes
+      # nothing in these binaries. It is applied anyway rather than cherry-picked, because "the
+      # series that is not about a platform" is a rule a human can keep and "the members of it
+      # that affect this artifact" is one that rots.
+      - name: Apply the platform-independent nerdbox patches
+        working-directory: nerdbox
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(../boks/packaging/nerdbox/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "no patches found — packaging/nerdbox/patches/ is empty" >&2
+            exit 1
+          fi
+          echo "Applying ${#patches[@]} patch(es) onto $(git rev-parse HEAD)"
+          git apply --verbose "${patches[@]}"
 
       - uses: actions/setup-go@v6
         with:
@@ -369,7 +399,8 @@ jobs:
       #
       # NINETEEN, not the twenty the Windows workflow checks. That workflow builds a nerdbox
       # PATCHED by packaging/nerdbox-windows/patches/, whose patch 0003 adds a krun_add_vsock
-      # binding. This one builds nerdbox unpatched, so that binding does not exist. Regenerate
+      # binding. This one applies only packaging/nerdbox/patches/, which touches neither
+      # krun.go nor any other symbol site, so that binding does not exist. Regenerate
       # the list from the tree this workflow actually checks out, rather than editing by hand:
       #
       #   grep -oE 'C:"krun_[a-z0-9_]+"' internal/vm/libkrun/krun.go \
@@ -583,7 +614,8 @@ jobs:
             (cd staging && cat SHA256SUMS) 2>/dev/null || echo "(build failed)"
             echo '```'
             echo
-            echo "All three are UNPATCHED upstream: nerdbox at \`packaging/nerdbox/NERDBOX_REV\`,"
+            echo "nerdbox is \`packaging/nerdbox/NERDBOX_REV\` plus the platform-independent"
+            echo "series in \`packaging/nerdbox/patches/\`; the other two are UNPATCHED upstream:"
             echo "libkrun at \`packaging/linux/LIBKRUN_REV\` (the 1.x line — 2.x drops four of"
             echo "the nineteen symbols nerdbox resolves at load), containerd at the release"
             echo "\`packaging/containerd-linux/CONTAINERD_VERSION\` pins."
