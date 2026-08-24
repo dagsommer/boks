@@ -299,3 +299,22 @@ func TestPolicyFlagsSpecified(t *testing.T) {
 		t.Error("-allow was not detected")
 	}
 }
+
+// The original failure must survive the diagnosis. A user chasing `ttrpc: closed` through a
+// search engine has to still find it in the output.
+func TestLinkDiagnosisIsAddedToAFailureWithoutReplacingIt(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BOKS_STATE_DIR", dir)
+	underlying := errors.New("failed to create shim task: ttrpc: closed")
+
+	got := withLinkDiagnosis("never-existed", underlying)
+	if !errors.Is(got, underlying) {
+		t.Error("the original error no longer unwraps out of the wrapped one")
+	}
+	if !strings.Contains(got.Error(), "ttrpc: closed") {
+		t.Errorf("the original text was lost: %v", got)
+	}
+	if !strings.Contains(got.Error(), "network supervisor") {
+		t.Errorf("no diagnosis was added: %v", got)
+	}
+}
