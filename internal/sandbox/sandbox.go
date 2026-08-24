@@ -688,6 +688,19 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
+		// An interrupted start can leave the runtime's bundle directory behind, and every
+		// later attempt then fails before it does anything. `boks rm` does not clear it —
+		// it removes the sandbox, and the directory belongs to containerd — so without
+		// this the sandbox is permanently unstartable under that name. Measured on
+		// Windows: Ctrl-C during the first run's image pull, then every run after it
+		// failing on mkdir.
+		if cleared, clearErr := clearStaleBundle(ctx, container, err); cleared {
+			task, err = container.NewTask(ctx, creator)
+		} else if clearErr != nil {
+			return 1, clearErr
+		}
+	}
+	if err != nil {
 		return 1, describeTaskError(cfg, err)
 	}
 
@@ -869,6 +882,9 @@ func describeTaskError(cfg Config, err error) error {
 	msg := err.Error()
 	if layered := describePackedLayerFailure(cfg, msg, err); layered != nil {
 		return layered
+	}
+	if stale := describeStaleBundle(cfg, msg, err); stale != nil {
+		return stale
 	}
 	if !mentionsMissingExecutable(msg) {
 		return fmt.Errorf("creating sandbox process: %w", err)

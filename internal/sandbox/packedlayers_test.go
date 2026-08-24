@@ -77,3 +77,36 @@ func TestOnGuestReadyIsNotCalledWhenTheTaskFails(t *testing.T) {
 			"the error the user needs to read")
 	}
 }
+
+// Both spellings of the operating system's complaint, because the message is not containerd's.
+// A regex that matched only Unix would leave Windows — where this was reported — unrepaired.
+func TestStaleBundleIsRecognisedOnBothPlatforms(t *testing.T) {
+	for _, msg := range []string{
+		`mkdir C:\Users\E194604\AppData\Local\boks\containerd\state\io.containerd.runtime.v2.task\boks\x: Cannot create a file when that file already exists.`,
+		`mkdir /home/u/.local/state/boks/containerd/state/io.containerd.runtime.v2.task/boks/x: file exists`,
+	} {
+		m := staleBundleDir.FindStringSubmatch(msg)
+		if m == nil {
+			t.Errorf("not recognised: %s", msg)
+			continue
+		}
+		if !strings.Contains(m[1], "io.containerd.runtime.v2.task") {
+			t.Errorf("captured %q, which is not the bundle directory", m[1])
+		}
+	}
+}
+
+// And nothing else. This function removes a directory, so a loose match would delete state
+// belonging to a failure it does not understand.
+func TestStaleBundleIgnoresOtherFailures(t *testing.T) {
+	for _, msg := range []string{
+		`mkdir /tmp/other: file exists`,
+		"failed to create shim task: executable file not found",
+		`mkdir /var/lib/io.containerd.runtime.v2.task/x: permission denied`,
+		"",
+	} {
+		if m := staleBundleDir.FindStringSubmatch(msg); m != nil {
+			t.Errorf("claimed %q, capturing %q", msg, m[1])
+		}
+	}
+}
