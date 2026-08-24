@@ -560,8 +560,11 @@ sudo install -m0644 nerdbox-kernel-* nerdbox-rootfs.erofs /usr/local/lib/
 sudo install -m0755 containerd /usr/local/libexec/boks/
 ```
 
-All three binaries are **unpatched upstream**, built for amd64 and arm64 from the revisions
-pinned in [`packaging/nerdbox/NERDBOX_REV`](../packaging/nerdbox/NERDBOX_REV),
+libkrun and containerd are **unpatched upstream**; the shim carries the platform-independent
+series in [`packaging/nerdbox/patches/`](../packaging/nerdbox/patches/), which every platform
+gets — without it, an image of more than eight layers fails to mount. All three are built for
+amd64 and arm64 from the revisions pinned in
+[`packaging/nerdbox/NERDBOX_REV`](../packaging/nerdbox/NERDBOX_REV),
 [`packaging/linux/LIBKRUN_REV`](../packaging/linux/LIBKRUN_REV) and
 [`packaging/containerd-linux/CONTAINERD_VERSION`](../packaging/containerd-linux/CONTAINERD_VERSION).
 [`packaging/linux/README.md`](../packaging/linux/README.md) covers where each file has to go

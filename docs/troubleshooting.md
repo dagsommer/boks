@@ -596,10 +596,18 @@ back to.
 
 **`mount source: "/dev/vdc4" … fstype: erofs … invalid argument`**
 
-The image has more than eight layers. Up to eight, the runtime gives each layer its own
-virtio-block device (`/dev/vdc`); past that it packs them all into one disk as a
-GPT-partitioned VMDK and the layers become partitions (`/dev/vdc4`). The digit on the end of
-the device name is the only part of the message that says which path was taken.
+The image has more layers than the shim will give a disk each. Up to its threshold, the runtime
+gives every layer its own virtio-block device (`/dev/vdc`); past that it packs them all into one
+disk as a GPT-partitioned VMDK and the layers become partitions (`/dev/vdc4`). The digit on the
+end of the device name is the only part of the message that says which path was taken.
+
+**The threshold is 20 in the shim Boks ships, and 8 in an unpatched nerdbox**
+(`internal/shim/task/mount.go`, `gptLayerThreshold`; raised by
+`packaging/nerdbox/patches/0002-…`). That difference is the first thing to check, because it
+decides which of the two answers below is yours — an image of 9 to 20 layers that fails here and
+runs on another machine is a shim that predates the patch, not an image that needs changing. It
+reached macOS through Homebrew months before it reached Windows or Linux, and a 17-layer image
+failing on Windows on 2026-08-24 is what found the gap.
 
 The packed path needs VMDK support in libkrun — documented there as FLAT/ZERO extents without
 delta links — and fails this way when the guest cannot read a layer where the partition table
@@ -608,11 +616,13 @@ nothing to configure in Boks itself.
 
 What helps, in order of reliability:
 
-- **Squash the image to eight layers or fewer.** That avoids the packing entirely and uses the
-  path every working sandbox takes. If you build the image, a multi-stage final `COPY` or
-  `--squash` is usually enough.
+- **Update Boks and its runtime**, and check the shim you actually have. This is the answer for
+  any image of 20 layers or fewer, and it needs no change to the image.
+- **Squash the image below 20 layers**, if it really has more. That avoids the packing entirely
+  and uses the path every working sandbox takes; a multi-stage final `COPY` or `--squash` is
+  usually enough. Nothing repairs the packed path itself today.
 - **Update libkrun** (`brew upgrade libkrun`) if yours predates its VMDK support.
-- `boks doctor` reports which libkrun it found and where.
+- `boks doctor` reports which shim and libkrun it found, and where.
 
 **`ENOSPC: no space left on device` inside a sandbox**
 

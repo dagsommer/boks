@@ -343,9 +343,11 @@ This whole step was **measured** on 2026-08-14; if it fails now, something in th
 regressed rather than something new being discovered. `packaging/containerd-windows/README.md`
 steps 4–7 diagnose it.
 
-Alpine is chosen because it is **one layer**. Layer count matters later: nerdbox packs more than
-eight EROFS layers into a single GPT-partitioned VMDK instead of one disk each
-(`internal/shim/task/mount.go:48`, `gptLayerThreshold = 8`), and there is a hard cap of 26 disks
+Alpine is chosen because it is **one layer**. Layer count matters later: nerdbox packs EROFS
+layers past `gptLayerThreshold` into a single GPT-partitioned VMDK instead of one disk each
+(`internal/shim/task/mount.go`) — 8 upstream, raised to 20 by
+`packaging/nerdbox/patches/0002-…`, which `nerdbox-windows.yml` did not apply until
+2026-08-24 — and there is a hard cap of 26 disks
 including the guest's own rootfs (`internal/shim/task/service.go:375-377`). One layer keeps both
 paths out of the first test.
 

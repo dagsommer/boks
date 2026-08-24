@@ -20,7 +20,11 @@ func TestPackedLayerFailureIsRecognised(t *testing.T) {
 	if err == nil {
 		t.Fatal("the packed-layer failure was not recognised")
 	}
-	for _, want := range []string{"/dev/vdc4", "eight layers", "example/big:1", "libkrun"} {
+	// "20 layers" rather than "eight": the shim Boks ships packs at 20, and the advice used
+	// to say eight — which told a user with a 17-layer image to squash it when the real
+	// answer was that their shim predated the threshold. Reported from Windows on
+	// 2026-08-24, where that shim was still being built without the shared patch series.
+	for _, want := range []string{"/dev/vdc4", "20 layers", "example/big:1", "boks doctor"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the explanation is missing %q:\n%v", want, err)
 		}
