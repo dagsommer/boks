@@ -668,3 +668,24 @@ func forgetNetworkQuietly(name string, stderr io.Writer) {
 		fmt.Fprintf(stderr, "warning: %v\n", err)
 	}
 }
+
+// withLinkDiagnosis adds what the host knows about a sandbox's network supervisor to a start
+// failure that does not mention it.
+//
+// The failure this was written for arrived as `failed to create shim task: ttrpc: closed`, and
+// every layer that knew more than that was either inside containerd's log or already deleted.
+// The supervisor is asked while the failing run is still on the stack, because releaseStack is
+// about to remove exactly the evidence being read.
+//
+// The original error stays first and stays whole. A wrapper that replaced it would trade a
+// vague true statement for a specific one that can be wrong: LinkDiagnosis reports the state
+// of the network, not the cause of the failure, and those coincide often enough to be worth
+// printing and not always enough to be worth asserting. So the wording says what is true —
+// this is what the network looked like — and leaves the inference to the reader.
+func withLinkDiagnosis(name string, err error) error {
+	note := enforce.LinkDiagnosis(policy.StateDir(), name)
+	if note == "" {
+		return err
+	}
+	return fmt.Errorf("%w\n\n%s", err, note)
+}

@@ -668,3 +668,59 @@ func ReadSpec(r io.Reader) (Spec, error) {
 	}
 	return spec, nil
 }
+
+// LinkDiagnosis explains a sandbox that failed to start in terms of its network supervisor,
+// or returns "" when the supervisor is not the story.
+//
+// It exists because of what the failure looks like without it. On Windows on 2026-08-24 a run
+// ended with:
+//
+//	boks: creating sandbox process: failed to create shim task: ttrpc: closed
+//
+// which says only that the shim died. containerd's log had the reason four layers down: the
+// guest's virtio-net device could not reach the link socket ("No connection could be made
+// because the target machine actively refused it"), and libkrun panics rather than returns
+// when a device will not activate, so the shim aborted and the surviving evidence was a closed
+// connection. Nothing in that chain names the supervisor, and nothing in it survives: the
+// supervisor removes its own directory on the way out, so by the time a human looks, the
+// socket, the state file and the log are gone.
+//
+// So the question is asked at the only moment it can be answered — while the failing run is
+// still on the stack, before its own cleanup — and it is asked of the host rather than of the
+// error text, because the error text is the one thing that does not know.
+//
+// Three answers are worth a sentence and the fourth is worth silence:
+//
+//   - No state directory: the supervisor started (the CLI waited for it to say so), then
+//     exited and cleaned up before the VM attached. Nothing else removes that directory
+//     while a run is in flight.
+//   - State but no lock: it died without cleaning up, which is the case where its log
+//     survives — so the log is quoted.
+//   - Alive, but the link socket is not on disk: something removed it underneath a
+//     supervisor still holding it. The guest connects to a path, not to a process.
+//   - Alive with its socket bound: this failure is not about the network. Say nothing.
+//
+// It never returns an error. A diagnosis that fails to diagnose must not replace the failure
+// it was called to explain.
+func LinkDiagnosis(stateDir, sandbox string) string {
+	dir := dirFor(stateDir, sandbox)
+	st, alive := Lookup(stateDir, sandbox)
+
+	if _, err := os.Stat(filepath.Join(dir, stateFile)); errors.Is(err, os.ErrNotExist) {
+		return fmt.Sprintf("The network supervisor for %q is gone: it reported the link socket bound, "+
+			"then exited\nand removed %s before the guest attached. A guest whose virtio-net "+
+			"backend cannot\nreach that socket does not boot without it.", sandbox, dir)
+	}
+	if !alive {
+		return fmt.Sprintf("The network supervisor for %q is no longer running, so nothing was holding "+
+			"the link\nsocket when the guest tried to attach%s", sandbox, logTail(filepath.Join(dir, logFile)))
+	}
+	if st.Socket != "" {
+		if _, err := os.Stat(st.Socket); errors.Is(err, os.ErrNotExist) {
+			return fmt.Sprintf("The network supervisor for %q is running (pid %d) but its link socket "+
+				"%s\nis not there. The guest connects to that path, not to that process, so its "+
+				"NIC had\nnowhere to attach.", sandbox, st.PID, st.Socket)
+		}
+	}
+	return ""
+}

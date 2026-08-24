@@ -276,7 +276,11 @@ Agents:
 
 		code, err := sandbox.Run(ctx, cfg)
 		if err != nil {
-			return err
+			// Asked here, before this command's own cleanup removes the answer. See
+			// enforce.LinkDiagnosis: a supervisor that leaves takes its socket, its
+			// state and its log with it, and the failure the user is left holding
+			// names none of them.
+			return withLinkDiagnosis(inv.name, err)
 		}
 		if code != 0 {
 			return &ExitError{Code: code}
