@@ -72,7 +72,7 @@ func TestOnGuestReadyIsNotCalledWhenTheTaskFails(t *testing.T) {
 
 	// describeTaskError is on the path a failed task takes. Reaching it must not have
 	// invoked the hook: the run never got a guest, so the screen must not be cleared.
-	err := describeTaskError(cfg, errors.New(packedLayerMsg))
+	err := describeTaskError(cfg, 0, errors.New(packedLayerMsg))
 	if err == nil {
 		t.Fatal("the packed-layer failure was not described")
 	}
@@ -111,6 +111,55 @@ func TestStaleBundleIgnoresOtherFailures(t *testing.T) {
 	} {
 		if m := staleBundleDir.FindStringSubmatch(msg); m != nil {
 			t.Errorf("claimed %q, capturing %q", msg, m[1])
+		}
+	}
+}
+
+// The real message, from Windows on 2026-08-25, on a 17-layer image with a shim that had just
+// stopped packing it.
+const krunEINVALMsg = "failed to create shim task: failure running vm: krun_start_enter failed: -22"
+
+// The explanation has to carry the arithmetic, because the arithmetic is the only part a user
+// can act on: their layer count against this platform's line count.
+func TestDeviceBudgetFailureCountsTheLayers(t *testing.T) {
+	cfg := Config{Name: "s", Image: "example/deep:1"}
+	err := describeDeviceBudgetFailure(cfg, 17, "amd64", krunEINVALMsg, errors.New(krunEINVALMsg))
+	if err == nil {
+		t.Fatal("a 17-layer image over a 19-device budget was not recognised")
+	}
+	for _, want := range []string{"17 layers", "24 devices", "19", "12 layers", "example/deep:1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the explanation is missing %q:\n%v", want, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "-22") {
+		t.Errorf("the underlying error was dropped:\n%v", err)
+	}
+}
+
+// Quiet unless the arithmetic actually supports the story. EINVAL from a VMM has many causes,
+// and an image that fits the budget failing to start is one of them — explaining that one with
+// interrupt lines would send someone rebuilding an image for no reason.
+func TestDeviceBudgetFailureStaysQuietWhenItCannotKnow(t *testing.T) {
+	cfg := Config{Name: "s", Image: "example/small:1"}
+	cases := []struct {
+		why    string
+		layers int
+		goarch string
+		msg    string
+	}{
+		{"the image fits the budget", 6, "amd64", krunEINVALMsg},
+		{"the layer count is unknown", 0, "amd64", krunEINVALMsg},
+		{"a different failure entirely", 17, "amd64", "failed to create shim task: ttrpc: closed"},
+		{"a different krun error", 17, "amd64", "failure running vm: krun_start_enter failed: -1"},
+		// The same 17-layer image on arm64, where the interrupt controller has no such
+		// ceiling. This is the case that must stay silent for a reason other than
+		// arithmetic, and it is the one the reporter can reach by switching machines.
+		{"arm64, where this ceiling does not exist", 17, "arm64", krunEINVALMsg},
+	}
+	for _, c := range cases {
+		if err := describeDeviceBudgetFailure(cfg, c.layers, c.goarch, c.msg, errors.New(c.msg)); err != nil {
+			t.Errorf("explained a failure it should have left alone (%s):\n%v", c.why, err)
 		}
 	}
 }

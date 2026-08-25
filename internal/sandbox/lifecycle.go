@@ -532,7 +532,7 @@ func describeStartError(ctx context.Context, container client.Container, err err
 		Image:   info.Image,
 		Runtime: info.Runtime.Name,
 		Command: keeperCommand,
-	}, err)
+	}, imageLayerCount(ctx, container), err)
 }
 
 // describe reads one container back into an Info.
