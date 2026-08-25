@@ -31,13 +31,18 @@
     .\probe-gpt-descriptor.ps1
 
 .NOTES
-    If no descriptor is found, the bundle was cleaned up. Re-run the failing sandbox WITHOUT
-    --rm and run this again; a bundle whose task never started is normally left behind.
+    The descriptor exists for about a second. The shim writes it into the runtime bundle before
+    the VM starts, and its own cleanup removes the bundle when task creation fails -- which is
+    every run that reproduces this. Keeping the sandbox does not help: the bundle belongs to
+    containerd, not to the sandbox. probe-packed-layers.ps1 -Reproduce copies it out while it
+    is there and then calls this script with -Descriptor and -FallbackDir, so running that is
+    the way to get here.
 #>
 [CmdletBinding()]
 param(
     [string] $StateDir = "$env:LOCALAPPDATA\boks",
     [string] $Descriptor,
+    [string] $FallbackDir,
     [string] $OutFile = "$env:TEMP\boks-gpt-descriptor.txt"
 )
 
@@ -55,6 +60,21 @@ function Section {
     Say ("=" * 78)
     Say $Title
     Say ("=" * 78)
+}
+
+# A captured descriptor names its header blob by a bundle path that the shim's cleanup has
+# already removed. The copy sits in the capture directory under the same name, so a missing
+# file is looked for there before being called missing. Layer files are unaffected: they live
+# in the snapshotter's root and outlive the bundle.
+function Resolve-File {
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if (Test-Path -LiteralPath $Path) { return $Path }
+    if (-not [string]::IsNullOrWhiteSpace($FallbackDir)) {
+        $alt = Join-Path $FallbackDir (Split-Path $Path -Leaf)
+        if (Test-Path -LiteralPath $alt) { return $alt }
+    }
+    return $Path
 }
 
 Section "FINDING THE DESCRIPTOR"
@@ -103,7 +123,7 @@ foreach ($line in (Get-Content -LiteralPath $Descriptor)) {
         StartLBA   = $cursor
         Sectors    = $count
         Kind       = $kind
-        File       = $file
+        File       = (Resolve-File $file)
         FileOffLBA = $off
     }
     $cursor += $count
