@@ -54,6 +54,7 @@ param(
     [string] $Shim,
     [string] $BackupDir = "C:\scratch-gpt\backup",
     [string] $Workspace = "C:\scratch-gpt\probe",
+    [string] $StateDir  = "$env:LOCALAPPDATA\boks",
     [string] $OutFile   = "$env:TEMP\boks-packed-probe.txt"
 )
 
@@ -83,7 +84,7 @@ if ($null -eq $boks) {
 }
 $boksDir  = Split-Path $boks.Source
 $shimPath = Join-Path $boksDir "containerd-shim-nerdbox-v1.exe"
-$logPath  = Join-Path $env:LOCALAPPDATA "boks\containerd\containerd.log"
+$logPath  = Join-Path $StateDir "containerd\containerd.log"
 
 Say "boks.exe   : $($boks.Source)"
 Say "boks version: $((& boks --version 2>&1 | Out-String).Trim())"
@@ -180,7 +181,11 @@ try {
 
     Say ""
     Say "--- boks run (the failure is expected)"
-    $runOut = (& boks run --rm shell $Workspace -- uname -a 2>&1 | Out-String)
+    # Deliberately NOT --rm. The packed disk's descriptor lives in the runtime bundle, and
+    # removing the sandbox removes the bundle with it -- which is how the first run of this
+    # script destroyed the evidence probe-gpt-descriptor.ps1 needs. A bundle whose task never
+    # started is left behind, so the descriptor survives for inspection.
+    $runOut = (& boks run shell $Workspace -- uname -a 2>&1 | Out-String)
     Say $runOut.Trim()
 
     Start-Sleep -Seconds 2
@@ -220,6 +225,23 @@ finally {
         Say "MISMATCH - restore this by hand from $saved before using boks."
     }
     Say ((& boks daemon start 2>&1 | Out-String).Trim())
+
+    # Did the descriptor survive? It is the whole point of the run, and finding out now beats
+    # finding out after the next cleanup.
+    $bundles = Join-Path $StateDir "containerd\state\io.containerd.runtime.v2.task"
+    $desc = Get-ChildItem -LiteralPath $bundles -Recurse -Filter "merged_fs_gpt.vmdk" -ErrorAction SilentlyContinue
+    Say ""
+    if ($null -eq $desc) {
+        Say "No merged_fs_gpt.vmdk was left behind. The bundle was cleaned up anyway --"
+        Say "say so and I will get at the descriptor another way."
+    } else {
+        foreach ($d in $desc) { Say "descriptor kept: $($d.FullName)" }
+        Say ""
+        Say "Now run:  .\probe-gpt-descriptor.ps1"
+    }
+    Say ""
+    Say "The sandbox 'shell-probe' was left in place on purpose. Remove it when done:"
+    Say "  boks rm shell-probe"
     Say ""
     Say "Output saved to $OutFile"
 }
