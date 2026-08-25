@@ -55,6 +55,7 @@ param(
     [string] $BackupDir = "C:\scratch-gpt\backup",
     [string] $Workspace = "C:\scratch-gpt\probe",
     [string] $StateDir  = "$env:LOCALAPPDATA\boks",
+    [string] $CaptureDir = "C:\scratch-gpt\captured",
     [string] $OutFile   = "$env:TEMP\boks-packed-probe.txt"
 )
 
@@ -167,6 +168,7 @@ $savedHash = (Get-FileHash -LiteralPath $saved -Algorithm SHA256).Hash
 Say "working shim saved to $saved"
 Say "  sha256: $savedHash"
 
+$capture = $null
 try {
     Say ""
     Say "--- stopping the daemon and installing $Shim"
@@ -178,6 +180,31 @@ try {
     Say ((& boks daemon start 2>&1 | Out-String).Trim())
 
     New-Item -ItemType Directory -Force -Path $Workspace | Out-Null
+
+    # The descriptor exists for about a second. The shim writes merged_fs_gpt.vmdk into the
+    # runtime bundle before the VM starts, and its own cleanup removes the bundle when task
+    # creation fails -- which is every run that reproduces this. Keeping the sandbox does not
+    # help: the bundle belongs to containerd, not to the sandbox. So it is copied out while it
+    # is there, by a job that polls faster than the window is short.
+    New-Item -ItemType Directory -Force -Path $CaptureDir | Out-Null
+    Get-ChildItem -LiteralPath $CaptureDir -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    $bundlesDir = Join-Path $StateDir "containerd\state\io.containerd.runtime.v2.task"
+    $capture = Start-Job -ArgumentList $bundlesDir, $CaptureDir -ScriptBlock {
+        param($bundles, $dest)
+        $deadline = (Get-Date).AddMinutes(5)
+        while ((Get-Date) -lt $deadline) {
+            $found = Get-ChildItem -LiteralPath $bundles -Recurse -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -like "merged_fs_gpt*" }
+            foreach ($f in $found) {
+                # Copied on every tick rather than once: an early tick can catch the file
+                # half-written, and the last complete copy is the one that survives.
+                Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $dest $f.Name) `
+                          -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    Say "capturing the descriptor into $CaptureDir (job $($capture.Id))"
 
     Say ""
     Say "--- boks run (the failure is expected)"
@@ -226,18 +253,30 @@ finally {
     }
     Say ((& boks daemon start 2>&1 | Out-String).Trim())
 
-    # Did the descriptor survive? It is the whole point of the run, and finding out now beats
-    # finding out after the next cleanup.
-    $bundles = Join-Path $StateDir "containerd\state\io.containerd.runtime.v2.task"
-    $desc = Get-ChildItem -LiteralPath $bundles -Recurse -Filter "merged_fs_gpt.vmdk" -ErrorAction SilentlyContinue
+    if ($null -ne $capture) {
+        Stop-Job   -Job $capture -ErrorAction SilentlyContinue
+        Remove-Job -Job $capture -Force -ErrorAction SilentlyContinue
+    }
     Say ""
-    if ($null -eq $desc) {
-        Say "No merged_fs_gpt.vmdk was left behind. The bundle was cleaned up anyway --"
-        Say "say so and I will get at the descriptor another way."
+    $caught = Get-ChildItem -LiteralPath $CaptureDir -File -ErrorAction SilentlyContinue
+    if ($null -eq $caught) {
+        Say "Nothing was captured. Either the run failed before the shim wrote the descriptor"
+        Say "(check above for 'ttrpc: closed' with no /dev/vdc4 - that is the virtio-net flake,"
+        Say "just run this again), or the window was shorter than the poll."
     } else {
-        foreach ($d in $desc) { Say "descriptor kept: $($d.FullName)" }
-        Say ""
-        Say "Now run:  .\probe-gpt-descriptor.ps1"
+        foreach ($c in $caught) { Say "captured: $($c.FullName)  ($($c.Length) bytes)" }
+        $desc = Join-Path $CaptureDir "merged_fs_gpt.vmdk"
+        $analyzer = Join-Path $PSScriptRoot "probe-gpt-descriptor.ps1"
+        if ((Test-Path -LiteralPath $desc) -and (Test-Path -LiteralPath $analyzer)) {
+            Say ""
+            Say "--- analysing the captured descriptor"
+            # The descriptor names its header blob by a bundle path that no longer exists, so
+            # the analyser is told where the copies went.
+            & $analyzer -Descriptor $desc -FallbackDir $CaptureDir
+        } else {
+            Say ""
+            Say "Now run:  .\probe-gpt-descriptor.ps1 -Descriptor `"$desc`" -FallbackDir `"$CaptureDir`""
+        }
     }
     Say ""
     Say "The sandbox 'shell-probe' was left in place on purpose. Remove it when done:"
