@@ -144,3 +144,77 @@ func clearStaleBundle(ctx context.Context, container client.Container, cause err
 	}
 	return true, nil
 }
+
+// krunStartEINVAL matches libkrun refusing to start the VM at all.
+//
+// -22 is EINVAL, which libkrun returns for anything it will not accept, so this match alone
+// proves nothing about the cause. What narrows it is the layer count, which is why the
+// explanation below is only offered when there are enough layers for the interrupt budget to
+// be the plausible reason.
+var krunStartEINVAL = regexp.MustCompile(`krun_start_enter failed: -22\b`)
+
+// x86DeviceBudget is how many virtio-MMIO devices a guest can have on x86_64.
+//
+// The VMM raises interrupts through the IOAPIC, which has 24 pins. Pins 0-4 are taken by real
+// hardware the guest expects to find — the PIT, the i8042, the 8259 cascade and the 16550s —
+// so virtio gets 5 through 23. That is not a tunable: it is how many inputs the interrupt
+// controller has. aarch64 is not affected, which is why the same image runs on an Apple Silicon
+// Mac and stops here.
+//
+// packaging/libkrun-windows/patches/0036 raised this from 11 by declaring MP-table sources for
+// pins 16-23, and its closing paragraph predicted this exact failure: "It does not make the
+// per-layer device count scale — a 20-layer image would still exhaust 19 lines."
+const x86DeviceBudget = 19
+
+// x86NonLayerDevices is what a sandbox spends before its first image layer: the console, the
+// RNG, the balloon, the NIC and virtiofs, plus two block devices — the runtime's config disk
+// and the sandbox's writable ext4 layer. Counted from a boot log rather than from the source,
+// where they appear as virtio0 through virtio6.
+const x86NonLayerDevices = 7
+
+// describeDeviceBudgetFailure explains a VM that will not start because the image has more
+// layers than the guest has interrupt lines.
+//
+// It is deliberately quiet when the layer count is unknown or small. EINVAL from a VMM has
+// many causes, and attaching a confident story about interrupt controllers to an unrelated
+// configuration error would send someone rebuilding an image for no reason.
+// goarch is taken as an argument rather than read, so that the x86 explanation can be
+// rendered and asserted on the arm64 machines this project is developed on. A test that skips
+// where the bug lives is not a test of it.
+func describeDeviceBudgetFailure(cfg Config, layers int, goarch, msg string, err error) error {
+	if !krunStartEINVAL.MatchString(msg) || layers <= 0 {
+		return nil
+	}
+	if goarch != "amd64" || layers+x86NonLayerDevices <= x86DeviceBudget {
+		return nil
+	}
+	max := x86DeviceBudget - x86NonLayerDevices
+	return fmt.Errorf("the VM for %s could not be started.\n\n%w\n\n"+
+		"Image %s has %d layers, and the runtime gives each one its own virtio device. With\n"+
+		"the %d a sandbox always needs, that is %d devices against the %d this architecture has\n"+
+		"interrupt lines for — an x86 IOAPIC has 24 pins and the first five belong to hardware\n"+
+		"the guest expects to find. The practical ceiling is about %d layers.\n\n"+
+		"This is not a setting. What can change:\n"+
+		"  - Fewer layers in the image. At %d or fewer this starts.\n"+
+		"  - Run it on arm64 (an Apple Silicon Mac), whose interrupt controller has no such\n"+
+		"    limit. The same image can run there and not here.\n\n"+
+		"Packing the layers onto one disk is what the runtime does past its threshold, and that\n"+
+		"path does not mount under libkrun today — so it is not an escape from this.",
+		cfg.Name, err, cfg.Image, layers, x86NonLayerDevices,
+		layers+x86NonLayerDevices, x86DeviceBudget, max, max)
+}
+
+// imageLayerCount reports how many layers a container's image has, or 0 when that cannot be
+// answered. It is asked only on a failure path, so the cost does not matter and the answer
+// never being available must not turn into an error of its own.
+func imageLayerCount(ctx context.Context, container client.Container) int {
+	image, err := container.Image(ctx)
+	if err != nil {
+		return 0
+	}
+	diffs, err := image.RootFS(ctx)
+	if err != nil {
+		return 0
+	}
+	return len(diffs)
+}

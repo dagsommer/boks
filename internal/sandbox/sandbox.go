@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -701,7 +702,7 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 		}
 	}
 	if err != nil {
-		return 1, describeTaskError(cfg, err)
+		return 1, describeTaskError(cfg, imageLayerCount(ctx, container), err)
 	}
 
 	// Establish the exit channel before starting, so a fast-exiting process cannot
@@ -878,10 +879,13 @@ func describeCreateError(cfg Config, err error) error {
 // is not the PATH containerd uses: every unrelated failure, a malformed annotation among
 // them, was then reported as a missing shim, sending the user after a problem that did not
 // exist while the real cause sat in the line above.
-func describeTaskError(cfg Config, err error) error {
+func describeTaskError(cfg Config, layers int, err error) error {
 	msg := err.Error()
 	if layered := describePackedLayerFailure(cfg, msg, err); layered != nil {
 		return layered
+	}
+	if budget := describeDeviceBudgetFailure(cfg, layers, runtime.GOARCH, msg, err); budget != nil {
+		return budget
 	}
 	if stale := describeStaleBundle(cfg, msg, err); stale != nil {
 		return stale

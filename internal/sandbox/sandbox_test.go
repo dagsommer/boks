@@ -139,7 +139,7 @@ func TestDescribeTaskErrorKeepsUnrelatedFailuresIntact(t *testing.T) {
 	}
 	underlying := errors.New("failed to create shim task: failed to parse network annotation: invalid port mapping \"8080\"")
 
-	got := describeTaskError(cfg, underlying).Error()
+	got := describeTaskError(cfg, 0, underlying).Error()
 	if strings.Contains(got, "boks doctor") || strings.Contains(got, "daemon's PATH") {
 		t.Errorf("unrelated failure was reported as a missing shim:\n%s", got)
 	}
@@ -152,7 +152,7 @@ func TestDescribeTaskErrorNamesTheMissingShim(t *testing.T) {
 	cfg := Config{Runtime: "io.containerd.nerdbox.v1", Command: []string{"sh"}}
 	underlying := errors.New(`failed to start shim: exec: "containerd-shim-nerdbox-v1": executable file not found in $PATH`)
 
-	got := describeTaskError(cfg, underlying).Error()
+	got := describeTaskError(cfg, 0, underlying).Error()
 	if !strings.Contains(got, "containerd-shim-nerdbox-v1") || !strings.Contains(got, "boks doctor") {
 		t.Errorf("a missing shim was not explained:\n%s", got)
 	}
@@ -170,7 +170,7 @@ func TestDescribeTaskErrorNamesTheMissingGuestCommand(t *testing.T) {
 	cfg := Config{Image: "docker.io/library/alpine:latest", Runtime: "io.containerd.runc.v2", Command: []string{"nosuchcommand"}}
 	underlying := errors.New(`failed to create containerd task: exec: "nosuchcommand": executable file not found in $PATH`)
 
-	got := describeTaskError(cfg, underlying).Error()
+	got := describeTaskError(cfg, 0, underlying).Error()
 	if !strings.Contains(got, "nosuchcommand") || !strings.Contains(got, "docker.io/library/alpine:latest") {
 		t.Errorf("a missing guest command was not explained:\n%s", got)
 	}
