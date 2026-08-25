@@ -52,6 +52,48 @@ Verified against a real checkout of the pinned tag: the patch applies, nerdbox's
 `internal/shim/task` tests pass with it, and the shim builds. Not verified: that a 9-layer image
 then boots, which needs a hypervisor this project's machines do not have.
 
+### What is known about the packed path it avoids
+
+Investigated on Windows on 2026-08-25, on the 17-layer image that found this. Recorded here so
+the ruled-out ground is not walked again — every item below is a measurement, not a reading of
+the source:
+
+**Ruled out.** The synthetic disk is laid out correctly and libkrun's VMDK reader parses it
+correctly. `ComputeLayout` rejects nothing (all 17 layers are 512-multiples); the descriptor's
+36 extents (18 FLAT, 18 ZERO) sum exactly to `TotalSectors`; no extent approaches the 2 GiB
+split limit and no partition spans more than one. Resolving every partition's `FirstLBA`
+through the extent map lands on its layer's EROFS superblock — magic `e0f5e1e2` on all 17. A
+harness linking imago 0.2.3, the crate libkrun delegates all VMDK parsing to, reproduced that
+on Windows through the same entry point `block/device.rs` uses: 17 of 17 correct.
+
+**Where the evidence points instead.** The mount that fails is partition 4, and partition 4 is
+the first whose superblock lives above 2^31 bytes:
+
+| partition | superblock offset | |
+| --- | --- | --- |
+| 1 | 1,049,600 | mounts |
+| 2 | 106,955,776 | mounts |
+| 3 | 2,138,047,488 | mounts — 9 MB *under* the boundary |
+| 4 | 2,315,256,832 | **EINVAL** — first one over |
+
+2^31 is 2,147,483,648. Partition 2 *extends* past it and still mounts, because mounting reads
+the superblock at the partition's start and nothing further. So every read known to have
+succeeded is below the boundary and the first known to have failed is above it. That is the
+signature of a signed-32-bit truncation, and one layer per device — where every offset is
+small — is exactly the configuration that does not hit it.
+
+**Not yet examined**, and the reason the finding above is a lead rather than a cause: the guest
+does not reach imago the way that harness did. Its path is
+`block/worker.rs` (`request_header.sector * 512`) → `Writer::write_from_at`
+(`descriptor_utils.rs`) → `DiskProperties::read_vectored_at_volatile` (`file_traits.rs`) →
+imago's **`readv`** with a vector of guest buffers. Every offset in libkrun's own code along
+that path is `u64` — read at the pinned revision, 07fd40d. The untested step is imago's
+vectored read on Windows, which the harness's plain `read()` did not exercise.
+
+One latent defect found on the way, not this bug: imago `src/vmdk/mod.rs:641` adds the
+descriptor's fourth field — defined by the VMDK spec in *sectors* — to a byte offset. It is
+inert only because nerdbox writes 0 for every FLAT offset.
+
 ## `0001-fix-vminitd-resolve-Process.User.Username-against-th.patch`
 
 ### The field nothing reads
