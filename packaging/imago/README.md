@@ -88,31 +88,59 @@ offset handling on Windows, and imago's own `read()` on the same descriptor. See
 
 ## Reproducing it
 
+Two programs, because they prove different things.
+
 `reproduce/main.rs` builds the two disks' real extent tables and runs both comparators through
-the real `slice::binary_search_by`. No VM, no Windows, no imago:
+the real `slice::binary_search_by`. No VM, no Windows, no imago, no network:
 
 ```
 rustc -O -o repro reproduce/main.rs && ./repro
 ```
 
-It is the evidence for everything above, and it is the thing to re-run against any proposed
-fix.
+It shows *why* the failure lands where it does, including the part no count-based theory
+predicts: in the 17-layer disk, partitions 9 through 12 work again.
+
+`verify/` proves the same thing end to end through imago itself. It writes a real packed VMDK
+of the shape nerdbox produces and reads the first block of every partition, with each layer
+carrying its own index beside the magic so that landing on the *wrong* layer is as detectable
+as landing on zeros:
+
+```
+cd verify && cargo run --release -- /tmp/disk
+```
+
+Against a stock imago 0.2.3: `3 of 8 partitions read their own superblock`, with 4 through 8
+reporting ZEROS — the reported failure, reproduced without a hypervisor. Against a patched
+one: `8 of 8`. It exits non-zero unless every partition reads correctly.
+
+One thing that version of the test got wrong first, kept here because it is the trap: reading
+at `partition_start + 1024` passes against the *unpatched* crate. That offset is inside the
+extent, where `contains()` matches and the comparator is never consulted about a boundary. The
+guest reads a block starting at the partition's first byte, and only that reproduces it.
 
 ## The fix, and where it has to go
 
 `patches/0001-…` changes `<` to `<=`. It is one character; the comment explaining why is
 longer than the change, deliberately.
 
-imago is a crates.io dependency of libkrun, not a vendored source, so the patch cannot simply
-be applied to a checkout the way `packaging/libkrun-windows/patches/` are. Options, in the
-order they should be preferred:
+imago is a crates.io dependency of libkrun, not a vendored source, so the patch cannot be
+applied to a checkout the way `packaging/libkrun-windows/patches/` are.
 
-1. **Upstream.** This is a plain bug in a released crate and affects every VMDK with more than
-   a couple of extents. It should be reported and fixed there, and libkrun should take the
-   bumped version. Everything needed for a report is in this directory.
-2. **A `[patch.crates-io]` override in libkrun's build**, pointing at a copy of the crate with
-   this patch applied. That is what a Boks build would carry until the above lands.
+`.github/workflows/libkrun-windows.yml` copies the crate out of the registry, patches the copy,
+and points the workspace at it with `[patch.crates-io]`. The version stays 0.2.3, so a
+`cargo update` cannot quietly walk off it, and the registry's own copy is left untouched so the
+runner's cache is not poisoned for anything else. The step then greps for the fixed comparison,
+because a patch that applies somewhere unintended must not pass as success.
 
-**Not yet done, and not claimed:** no Boks build applies this today. The analysis is confirmed
-by execution, and the fix follows from it directly, but a `krun.dll` built with the patch has
-not been produced or booted.
+The `verify/` run is a gate in that same workflow, before anything is built with the patched
+crate — checked in both directions: it exits 1 against a stock imago and 0 against the patched
+one.
+
+**This should still go upstream.** It is a plain bug in a released crate and affects any VMDK
+with more than a couple of extents, whoever is reading it. Everything needed for a report is in
+this directory; the override is what Boks carries until a fixed release exists.
+
+**What is not claimed:** the whole recipe was rehearsed on Linux — patch applies to the
+pristine crate, the fixed crate builds, the verifier passes through `[patch.crates-io]` and
+fails without it. A `krun.dll` built with the patch has not yet been produced, and no guest has
+booted from a packed disk.

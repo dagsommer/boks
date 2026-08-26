@@ -35,19 +35,16 @@ successful read. Reproduced against this comparator and the real
 
 --- a/src/vmdk/mod.rs
 +++ b/src/vmdk/mod.rs
-@@ -509,7 +509,10 @@
-     /// Return the extent covering `offset`, if any.
-     fn get_extent_at(&self, offset: u64) -> Option<&VmdkExtent<S>> {
-         self.extents
+@@ -514,7 +514,11 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
              .binary_search_by(|extent| {
                  if extent.disk_range.contains(&offset) {
                      cmp::Ordering::Equal
 -                } else if extent.disk_range.end < offset {
 +                } else if extent.disk_range.end <= offset {
-+                    // `disk_range` is half-open, so an extent whose end EQUALS `offset`
-+                    // does not contain it and lies below it. Reporting `Greater` here
-+                    // sends the search the wrong way and it returns `Err`, which becomes
-+                    // a zero-filled read reported as success.
++                    // `disk_range` is half-open, so an extent whose end EQUALS `offset` does
++                    // not contain it and lies below it. Reporting `Greater` here sends the
++                    // search the wrong way, it returns `Err`, and that becomes a zero-filled
++                    // read reported as success.
                      cmp::Ordering::Less
                  } else {
                      cmp::Ordering::Greater
