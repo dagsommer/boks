@@ -1,0 +1,65 @@
+From: Dag Sommer <dagaleks@gmail.com>
+Subject: [PATCH] windows: pack layers before the guest runs out of interrupt lines
+
+The platform-independent series raises gptLayerThreshold from 8 to 20, to keep
+ordinary images off the packed path while that path did not work. On x86-64
+that number is above what the guest's interrupt controller can carry.
+
+An IOAPIC has 24 pins and the first five belong to hardware the guest expects
+to find, so virtio gets nineteen. A sandbox spends six or seven of those before
+its first image layer. A 17-layer image therefore asks for 24 devices, and
+libkrun refuses to build the VM at all:
+
+    Building the microVM failed: RegisterBlockDevice(IrqsExhausted)
+
+which reaches the caller as `krun_start_enter failed: -22`. Measured on Windows
+on 2026-08-25, on an image that runs on an Apple Silicon Mac, whose interrupt
+controller has no such ceiling. This is the exact failure the note at the end
+of packaging/libkrun-windows/patches/0036 predicted.
+
+Ten rather than twelve: the non-layer device count was six in one boot and
+seven in another, the difference being one more share, so the budget is not a
+constant to compute against exactly. Ten leaves the flat path to images that
+fit comfortably and packs the rest.
+
+This is only viable together with packaging/imago/. Until that fix, the packed
+path answered every partition past the third with zeros reported as a
+successful read, so lowering the threshold alone would trade one failure for
+another.
+
+Applies on top of packaging/nerdbox/patches/0002, which is where the 20 comes
+from; the Windows series is applied second, as packaging/nerdbox/README.md
+describes.
+---
+diff --git a/internal/shim/task/mount.go b/internal/shim/task/mount.go
+index c2ca2fa..8957843 100644
+--- a/internal/shim/task/mount.go
++++ b/internal/shim/task/mount.go
+@@ -45,7 +45,26 @@ import (
+ // devices total, some of which are reserved by the VM implementation) and
+ // lets the shim handle deep stacks of independent erofs mounts without
+ // coordinating layer offsets in the snapshotter.
+-const gptLayerThreshold = 20
++// Windows runs on x86-64, where the guest's interrupt controller is an IOAPIC with 24 pins.
++// Pins 0-4 belong to hardware the guest expects to find -- the PIT, the i8042, the 8259
++// cascade and the 16550s -- so virtio gets 5 through 23: nineteen devices, and that is a
++// property of the interrupt controller rather than a tunable
++// (packaging/libkrun-windows/patches/0036).
++//
++// A sandbox spends six or seven of those before its first image layer: console, RNG, balloon,
++// NIC, virtiofs, the runtime's config disk and its writable ext4 layer. Measured at six in one
++// boot and seven in another, the difference being an extra share. Ten leaves the flat path --
++// the one with all the mileage -- to images that fit comfortably, and packs the rest, with
++// slack for a sandbox that mounts another volume.
++//
++// Above this the shim packs, and past 19 devices the VM does not start at all: libkrun reports
++// RegisterBlockDevice(IrqsExhausted), which surfaces through the C API as krun_start_enter
++// failed: -22. Measured on Windows on 2026-08-25 with a 17-layer image at threshold 20.
++//
++// Packing is only viable because of packaging/imago/: libkrun's VMDK reader answered every
++// partition past the third with zeros-reported-as-success until that fix. A Windows shim
++// carrying this threshold and a krun.dll without that fix is the worst of both worlds.
++const gptLayerThreshold = 10
+ 
+ // diskAllocator assigns sequential virtio disk letters starting after any
+ // disks reserved by the VM implementation (see vm.Manager.ReservedDisks).

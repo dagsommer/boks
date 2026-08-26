@@ -124,6 +124,11 @@ jobs:
       # order packaging/nerdbox/README.md gives for applying both to one tree. Verified rather
       # than assumed: both series apply clean to a real cd2c23f checkout in that order, and
       # the result builds with GOOS=windows.
+      #
+      # The order is load-bearing now rather than merely conventional: the Windows series' 0006
+      # lowers the layer threshold that the shared series' 0002 raises, because x86-64 gives
+      # virtio nineteen interrupt lines and 0002's value of 20 is above what fits. Applied the
+      # other way round, the shim would ship the wrong number and fail to start a VM.
       - name: Apply the Boks patches
         working-directory: nerdbox
         run: |
