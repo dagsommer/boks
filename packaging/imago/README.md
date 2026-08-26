@@ -1,5 +1,20 @@
 # The imago VMDK extent-lookup bug
 
+**Status: fixed upstream, and Boks takes the released fix.** imago
+[`f7e1406`](https://gitlab.com/hreitz/imago) — "vmdk: fix get_extent_at binary search at
+extent boundaries", Derek McGowan, 2026-06-06 — landed the same one-character change with the
+same reasoning, and it shipped in **0.2.4** on 2026-07-17. libkrun's manifest asks for
+`imago = "0.2.3"`, which semver-permits 0.2.4; it is the `Cargo.lock` at the revision Boks
+pins that holds it back, so `.github/workflows/libkrun-windows.yml` moves the lock and nothing
+else. Boks carries no patch.
+
+This file is kept because the analysis below was done independently, from the guest inwards,
+and the trail is worth having: it says what was ruled out, in what order, and which of the
+obvious explanations were wrong. If a packed disk ever misbehaves again, start here.
+
+---
+
+
 Boks does not depend on [imago](https://crates.io/crates/imago) directly. libkrun does, for
 every disk format that is not raw, and on Windows that is how a Boks sandbox reads a
 GPT-partitioned VMDK — the single disk nerdbox packs an image's EROFS layers into when there
@@ -109,38 +124,33 @@ as landing on zeros:
 cd verify && cargo run --release -- /tmp/disk
 ```
 
-Against a stock imago 0.2.3: `3 of 8 partitions read their own superblock`, with 4 through 8
-reporting ZEROS — the reported failure, reproduced without a hypervisor. Against a patched
-one: `8 of 8`. It exits non-zero unless every partition reads correctly.
+Against imago 0.2.3: `3 of 8 partitions read their own superblock`, with 4 through 8 reporting
+ZEROS — the reported failure, reproduced without a hypervisor. Against 0.2.4: `8 of 8`. It
+exits non-zero unless every partition reads correctly, and it is a gate in the Windows libkrun
+workflow, run before anything is built against the resolved crate.
 
 One thing that version of the test got wrong first, kept here because it is the trap: reading
 at `partition_start + 1024` passes against the *unpatched* crate. That offset is inside the
 extent, where `contains()` matches and the comparator is never consulted about a boundary. The
 guest reads a block starting at the partition's first byte, and only that reproduces it.
 
-## The fix, and where it has to go
+## The fix, and how Boks gets it
 
-`patches/0001-…` changes `<` to `<=`. It is one character; the comment explaining why is
-longer than the change, deliberately.
+The change is one character — `<` becomes `<=` — and it is already released, so Boks does not
+carry it as a patch. The Windows libkrun workflow runs `cargo update -p imago --precise 0.2.4`
+against the pinned libkrun revision, asserts the resolved version is **at least** 0.2.4 rather
+than exactly it, and skips entirely when the pin already resolves to something newer, so a
+later libkrun revision cannot be silently downgraded by this step.
 
-imago is a crates.io dependency of libkrun, not a vendored source, so the patch cannot be
-applied to a checkout the way `packaging/libkrun-windows/patches/` are.
+Verified on Linux against the real crates and the real pin:
 
-`.github/workflows/libkrun-windows.yml` copies the crate out of the registry, patches the copy,
-and points the workspace at it with `[patch.crates-io]`. The version stays 0.2.3, so a
-`cargo update` cannot quietly walk off it, and the registry's own copy is left untouched so the
-runner's cache is not poisoned for anything else. The step then greps for the fixed comparison,
-because a patch that applies somewhere unintended must not pass as success.
+- imago 0.2.4 from crates.io: `verify/` reports **8 of 8** partitions, and 0.2.3 reports 3 of 8
+  and exits 1.
+- `cargo update -p imago` on libkrun at `07fd40d` moves 0.2.3 → 0.2.4 with no manifest change,
+  since `"0.2.3"` is a caret requirement.
+- 0.2.4 keeps the `sync-wrappers` and `vm-memory` features libkrun asks for, despite the
+  `maybe-async` refactor between the two releases, and `krun-devices` type-checks against it
+  for `x86_64-pc-windows-msvc` with the Windows patch series applied.
 
-The `verify/` run is a gate in that same workflow, before anything is built with the patched
-crate — checked in both directions: it exits 1 against a stock imago and 0 against the patched
-one.
-
-**This should still go upstream.** It is a plain bug in a released crate and affects any VMDK
-with more than a couple of extents, whoever is reading it. Everything needed for a report is in
-this directory; the override is what Boks carries until a fixed release exists.
-
-**What is not claimed:** the whole recipe was rehearsed on Linux — patch applies to the
-pristine crate, the fixed crate builds, the verifier passes through `[patch.crates-io]` and
-fails without it. A `krun.dll` built with the patch has not yet been produced, and no guest has
-booted from a packed disk.
+**What is not claimed:** no `krun.dll` has been built against 0.2.4, and no guest has booted
+from a packed disk.

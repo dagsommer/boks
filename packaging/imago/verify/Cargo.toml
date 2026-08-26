@@ -1,8 +1,8 @@
 # Verifies that the imago in effect maps a nerdbox-shaped packed disk correctly.
 #
-# The dependency is the ordinary crates.io one, so this fails against a stock imago and passes
-# against a patched one. Whichever imago the build has arranged -- via [patch.crates-io] or a
-# future upstream release -- is the one this tests.
+# 0.2.4 is the first release with the extent-boundary fix. The requirement is written as the
+# ordinary caret one, so this tracks whatever libkrun ends up resolving; point it at "=0.2.3"
+# to watch it fail, which is the only way to know it can.
 [package]
 name = "imago-vmdk-verify"
 version = "0.0.0"
@@ -10,7 +10,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-imago = { version = "0.2.3", features = ["sync-wrappers"] }
+imago = { version = "0.2.4", features = ["sync-wrappers"] }
 
 [[bin]]
 name = "imago-vmdk-verify"
