@@ -115,6 +115,71 @@ jobs:
           echo "Applying ${#patches[@]} patch(es) onto ${{ steps.pin.outputs.rev }}"
           git apply --verbose "${patches[@]}"
 
+      # ---------------------------------------------------------------------------------
+      # The imago fix, which is not a libkrun patch because imago is not libkrun's source.
+      #
+      # libkrun delegates every non-raw disk format to the imago crate (src/devices/Cargo.toml
+      # pins 0.2.3). Its VMDK extent lookup compares a HALF-OPEN range's end with `<`, so an
+      # extent whose end equals the sought offset reports "search left" instead of "search
+      # right"; the binary search then walks away from the correct extent and returns Err,
+      # which becomes ShallowMapping::Eof, which readv answers with zeros AND SUCCESS.
+      #
+      # Every partition of a GPT-partitioned flat VMDK starts exactly on an extent boundary,
+      # so every one of them is exposed. Measured on Windows: a guest mounted partitions 1, 2
+      # and 3 of a packed image and then said "cannot find valid erofs superblock" for the
+      # 4th, with no I/O error anywhere, because the zeros arrived as a successful read.
+      #
+      # packaging/imago/ has the analysis, a standalone reproduction, and an end-to-end
+      # verifier. The patch is one character.
+      #
+      # It is applied by copying the crate out of the registry, patching the copy, and
+      # pointing the workspace at it with [patch.crates-io] -- the version stays 0.2.3, so
+      # `cargo update` cannot quietly walk off it. The registry copy itself is left alone:
+      # editing it would poison the runner's cache for anything else built here.
+      # ---------------------------------------------------------------------------------
+      - name: Apply the imago VMDK fix
+        working-directory: libkrun
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -oE 'imago = \{ version = "[0-9.]+"' src/devices/Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "libkrun asks for imago $version"
+          # Populate the registry so the extracted source exists to copy.
+          cargo fetch --target x86_64-pc-windows-msvc >/dev/null
+          src=$(find ~/.cargo/registry/src -maxdepth 2 -type d -name "imago-$version" | head -1)
+          test -n "$src" || { echo "imago-$version is not in the registry after cargo fetch" >&2; exit 1; }
+          rm -rf ../imago-patched
+          cp -r "$src" ../imago-patched
+          chmod -R u+w ../imago-patched
+          patches=(../boks/packaging/imago/patches/*.patch)
+          test ${#patches[@]} -gt 0 || { echo "packaging/imago/patches/ is empty" >&2; exit 1; }
+          for p in "${patches[@]}"; do
+            echo "applying $(basename "$p")"
+            # `patch` rather than `git apply`: the copy is not a git tree.
+            patch -p1 -d ../imago-patched --no-backup-if-mismatch < "$p"
+          done
+          # Assert the fix is in, so a patch that applied to the wrong place cannot pass.
+          grep -q 'disk_range.end <= offset' ../imago-patched/src/vmdk/mod.rs || {
+            echo "the patch applied but the fixed comparison is not there" >&2; exit 1; }
+          # printf rather than a heredoc: a heredoc body has to start at column 0, and a
+          # line at column 0 ends the YAML block scalar this step is written in.
+          printf '\n[patch.crates-io]\nimago = { path = "../imago-patched" }\n' >> Cargo.toml
+          echo "--- [patch.crates-io] now in the workspace root:"
+          tail -4 Cargo.toml
+
+      # Prove the fix before building anything with it. This runs on the RUNNER's own target,
+      # not the Windows one, because the defect is in portable Rust and needs no hypervisor:
+      # it builds a real packed VMDK of the shape nerdbox writes and reads every partition
+      # through imago. Against a stock imago it reports partitions 1-3 ok and the rest ZEROS;
+      # it must report all of them ok here, and exits non-zero otherwise.
+      - name: Verify the packed VMDK maps correctly
+        working-directory: boks/packaging/imago/verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '\n[patch.crates-io]\nimago = { path = "../../../../imago-patched" }\n' >> Cargo.toml
+          cargo run --release -- "${RUNNER_TEMP:-/tmp}/imago-verify-disk"
+
       # windows-latest ships rustup and a host toolchain, so the target is already installed
       # and there is no third-party toolchain action to add. `rustup show` is here to put the
       # exact compiler version in the log: when this job starts failing without a patch
