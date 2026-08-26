@@ -52,13 +52,16 @@ func describePackedLayerFailure(cfg Config, msg string, err error) error {
 		"GPT-partitioned VMDK. Reading that disk needs a libkrun carrying the fix in\n"+
 		"packaging/imago/: without it, every partition past the third reads as zeros and is\n"+
 		"reported as a successful read, which is what an unmountable EROFS looks like.\n\n"+
-		"So this is one of two things:\n"+
-		"  - The image really has more layers than the threshold. Squashing it below that is\n"+
-		"    the only fix today for a shim that packs correctly.\n"+
-		"  - Your shim predates the threshold, in which case an image of 9 to 20 layers fails\n"+
-		"    here and the same image runs elsewhere. Update Boks and its runtime, then run\n"+
-		"    'boks doctor', which reports which shim and libkrun were found and where.",
-		cfg.Image, err, m[1])
+		"The threshold is deliberately different per platform — on x86-64 the guest has only\n"+
+		"nineteen interrupt lines for virtio devices, so a large image has to be packed rather\n"+
+		"than given a device per layer — which is why an image can pack here and not elsewhere.\n\n"+
+		"What to do:\n"+
+		"  - Update Boks and its runtime together. A libkrun without the imago fix, or a shim\n"+
+		"    from a different release, is the common cause. 'boks doctor' reports which shim\n"+
+		"    and libkrun were found and where.\n"+
+		"  - If they are already current, this is a bug worth reporting, with the layer count\n"+
+		"    of %s and the device name above.",
+		cfg.Image, err, m[1], cfg.Image)
 }
 
 // staleBundleDir matches containerd failing to create a task's bundle directory because one is
