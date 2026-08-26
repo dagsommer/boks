@@ -49,11 +49,12 @@ func describePackedLayerFailure(cfg Config, msg string, err error) error {
 	return fmt.Errorf("the guest could not mount a layer of image %s.\n\n%w\n\n"+
 		"The device in that message (%s) is a PARTITION, not a disk. Past a threshold the shim\n"+
 		"stops giving each layer its own virtio-blk device and packs them all into one\n"+
-		"GPT-partitioned VMDK, and that packed path does not mount here. Boks ships a shim whose\n"+
-		"threshold is 20 layers, which keeps ordinary images off it entirely.\n\n"+
+		"GPT-partitioned VMDK. Reading that disk needs a libkrun carrying the fix in\n"+
+		"packaging/imago/: without it, every partition past the third reads as zeros and is\n"+
+		"reported as a successful read, which is what an unmountable EROFS looks like.\n\n"+
 		"So this is one of two things:\n"+
-		"  - The image really has more than 20 layers. Squashing it below that is the only fix\n"+
-		"    today; the packed path is a separate defect and is not repaired by any version.\n"+
+		"  - The image really has more layers than the threshold. Squashing it below that is\n"+
+		"    the only fix today for a shim that packs correctly.\n"+
 		"  - Your shim predates the threshold, in which case an image of 9 to 20 layers fails\n"+
 		"    here and the same image runs elsewhere. Update Boks and its runtime, then run\n"+
 		"    'boks doctor', which reports which shim and libkrun were found and where.",
