@@ -20,11 +20,12 @@ func TestPackedLayerFailureIsRecognised(t *testing.T) {
 	if err == nil {
 		t.Fatal("the packed-layer failure was not recognised")
 	}
-	// "20 layers" rather than "eight": the shim Boks ships packs at 20, and the advice used
-	// to say eight — which told a user with a 17-layer image to squash it when the real
-	// answer was that their shim predated the threshold. Reported from Windows on
-	// 2026-08-24, where that shim was still being built without the shared patch series.
-	for _, want := range []string{"/dev/vdc4", "20 layers", "example/big:1", "boks doctor"} {
+	// No layer count is asserted, because the message no longer states one: the threshold is
+	// 20 where the interrupt map is not the constraint and 10 on x86-64 where it is, so any
+	// single number in this text would be wrong on some platform. The advice used to say
+	// "eight", which told a user with a 17-layer image to squash it when the real answer was
+	// that their shim predated the threshold entirely.
+	for _, want := range []string{"/dev/vdc4", "interrupt lines", "example/big:1", "boks doctor"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the explanation is missing %q:\n%v", want, err)
 		}
