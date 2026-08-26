@@ -1,0 +1,53 @@
+From: Dag Sommer <dagaleks@gmail.com>
+Subject: [PATCH] vmdk: an extent ending at the sought offset is below it, not above
+
+`VmdkExtent::disk_range` is a half-open `Range`, so an extent covers
+`[start, end)`. `get_extent_at` searches for the extent covering `offset`
+with a comparator that reports `Less` only when `end < offset`. When
+`offset == end`, the extent lies entirely BELOW the target -- but the
+comparator reports `Greater`, telling the search to look further left.
+
+That breaks `binary_search_by`'s contract, and the search can then walk
+away from the correct extent and return `Err`. `get_extent_at` maps that
+to `None`, `get_mapping` turns it into `ShallowMapping::Eof`, and
+`FormatAccess::readv` fills the buffer with zeros and returns SUCCESS.
+The caller is handed zeroed data with no error of any kind.
+
+Any offset that coincides with an extent boundary is exposed, which for
+a partitioned flat VMDK is every partition start. Whether a given one
+survives depends on which extents the search happens to probe first, so
+the failure looks arbitrary: with an 18-extent disk, partitions 1-3 are
+found and 4 onwards are not.
+
+Measured through libkrun on Windows: a GPT-partitioned flat VMDK with
+one EROFS partition per container image layer, where the guest mounted
+partitions 1, 2 and 3 and then reported
+
+    erofs: (device vdc4): erofs_read_superblock: cannot find valid erofs
+    superblock
+
+with no I/O error anywhere, because the zeros were delivered as a
+successful read. Reproduced against this comparator and the real
+`binary_search_by` for two unrelated images, at 4 MiB and at 2.3 GB.
+---
+ src/vmdk/mod.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/src/vmdk/mod.rs
++++ b/src/vmdk/mod.rs
+@@ -509,7 +509,10 @@
+     /// Return the extent covering `offset`, if any.
+     fn get_extent_at(&self, offset: u64) -> Option<&VmdkExtent<S>> {
+         self.extents
+             .binary_search_by(|extent| {
+                 if extent.disk_range.contains(&offset) {
+                     cmp::Ordering::Equal
+-                } else if extent.disk_range.end < offset {
++                } else if extent.disk_range.end <= offset {
++                    // `disk_range` is half-open, so an extent whose end EQUALS `offset`
++                    // does not contain it and lies below it. Reporting `Greater` here
++                    // sends the search the wrong way and it returns `Err`, which becomes
++                    // a zero-filled read reported as success.
+                     cmp::Ordering::Less
+                 } else {
+                     cmp::Ordering::Greater
