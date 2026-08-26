@@ -22,20 +22,20 @@ seven in another, the difference being one more share, so the budget is not a
 constant to compute against exactly. Ten leaves the flat path to images that
 fit comfortably and packs the rest.
 
-This is only viable together with packaging/imago/. Until that fix, the packed
-path answered every partition past the third with zeros reported as a
-successful read, so lowering the threshold alone would trade one failure for
-another.
+This is only viable against a libkrun built with imago >= 0.2.4. Up to 0.2.3
+the packed path answered every partition past the third with zeros reported as
+a successful read (imago f7e1406; see packaging/imago/), so lowering the
+threshold alone would trade one failure for another.
 
 Applies on top of packaging/nerdbox/patches/0002, which is where the 20 comes
 from; the Windows series is applied second, as packaging/nerdbox/README.md
 describes.
 ---
 diff --git a/internal/shim/task/mount.go b/internal/shim/task/mount.go
-index c2ca2fa..8957843 100644
+index c2ca2fa..99106fe 100644
 --- a/internal/shim/task/mount.go
 +++ b/internal/shim/task/mount.go
-@@ -45,7 +45,26 @@ import (
+@@ -45,7 +45,27 @@ import (
  // devices total, some of which are reserved by the VM implementation) and
  // lets the shim handle deep stacks of independent erofs mounts without
  // coordinating layer offsets in the snapshotter.
@@ -56,9 +56,10 @@ index c2ca2fa..8957843 100644
 +// RegisterBlockDevice(IrqsExhausted), which surfaces through the C API as krun_start_enter
 +// failed: -22. Measured on Windows on 2026-08-25 with a 17-layer image at threshold 20.
 +//
-+// Packing is only viable because of packaging/imago/: libkrun's VMDK reader answered every
-+// partition past the third with zeros-reported-as-success until that fix. A Windows shim
-+// carrying this threshold and a krun.dll without that fix is the worst of both worlds.
++// Packing is only viable against a libkrun built with imago >= 0.2.4: up to 0.2.3 its VMDK
++// reader answered every partition past the third with zeros-reported-as-success
++// (packaging/imago/). A shim carrying this threshold beside an older krun.dll is the worst of
++// both worlds.
 +const gptLayerThreshold = 10
  
  // diskAllocator assigns sequential virtio disk letters starting after any
