@@ -82,7 +82,47 @@ succeeded is below the boundary and the first known to have failed is above it. 
 signature of a signed-32-bit truncation, and one layer per device — where every offset is
 small — is exactly the configuration that does not hit it.
 
-**Not yet examined**, and the reason the finding above is a lead rather than a cause: the guest
+**The 2^31 reading was wrong**, and the experiment that killed it is worth keeping: with the
+threshold lowered to 2, Boks' own 8-layer `shell` image fails identically — `/dev/vdc4`, at
+4 MiB rather than 2.3 GB. The failure is positional. It is always the **fourth partition**,
+whatever the sizes or offsets.
+
+**What the guest says**, which nobody had read until 2026-08-25 — containerd's log carries the
+guest's kmsg:
+
+```
+erofs: (device vdc1): mounted with root inode @ nid 36.
+erofs: (device vdc2): mounted with root inode @ nid 36.
+erofs: (device vdc3): mounted with root inode @ nid 36.
+erofs: (device vdc4): erofs_read_superblock: cannot find valid erofs superblock
+```
+
+Not a rejected filesystem, not a failed read: **wrong bytes reported as good**. The guest gets
+no I/O error at all. That matches one behaviour in imago's `readv` — reaching the end of a
+mapping fills the rest of the buffer with zeros and returns success:
+
+```rust
+if chunk_length == 0 { assert!(mapping.is_eof()); bufv.fill(0); break; }
+```
+
+**The descriptor from the failing run is correct.** Captured in flight (the shim's cleanup
+deletes the bundle on the failure, so it exists for about a second) and resolved by hand: 18
+extents summing exactly to the disk's 1,345,536 sectors, every FLAT extent's declared size
+matching its backing file byte for byte, the GPT header's `PartitionEntryLBA`, entry count and
+entry size all correct, and all 8 partitions landing on their own layer's `e2e1f5e0`.
+
+**The open lead** is how libkrun opens it (`block/device.rs:312`):
+
+```rust
+Vmdk::builder(file).open_sync(PermissiveImplicitOpenGate::default())
+```
+
+Every extent file is an implicit dependency opened through that gate. In the failing disk the
+opens are, in order: the header blob, then partitions 1, 2 and 3 — and partition 4's layer is
+the **fifth**. A gate that stops opening dependencies after a few would explain the ordinal
+exactly, in both images, and would surface as zeros rather than as an error.
+
+**Not yet examined**, and the reason this is a lead rather than a cause: the guest
 does not reach imago the way that harness did. Its path is
 `block/worker.rs` (`request_header.sector * 512`) → `Writer::write_from_at`
 (`descriptor_utils.rs`) → `DiskProperties::read_vectored_at_volatile` (`file_traits.rs`) →
