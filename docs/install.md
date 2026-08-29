@@ -40,6 +40,20 @@ winget install --manifest boks-winget
 Substitute the real version — `latest/download` still needs the filename, and the filename
 carries the version. The asset is listed on the release page beside the archives.
 
+> [!IMPORTANT]
+> **Stop the daemon before installing over an existing version.** winget removes the old
+> package directory, and the boks-managed containerd runs from inside it. Windows will not
+> delete a running binary, so the install gets most of the way and then fails:
+>
+> ```
+> An unexpected error occurred while executing the command:
+> remove_all: Access is denied.: "…\WinGet\Packages\dagsommer.boks__DefaultSource\boks_<old>_windows_amd64"
+> Portable install failed; Cleaning up...
+> ```
+>
+> `boks daemon stop` first. If a sandbox is running, its shim holds files there too, so stop
+> that as well — `boks ls` shows what is up.
+
 The manifests name the release archive by URL and by SHA-256, so winget downloads it from
 GitHub and refuses it if the bytes differ. Nothing else is needed: the archive carries the CLI,
 the runtime and the guest, so the install boots without a second download.
