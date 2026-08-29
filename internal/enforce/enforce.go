@@ -718,19 +718,13 @@ func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer)
 	var provider secret.Provider
 	if len(credentials) > 0 {
 		// A store for this sandbox and nothing else, built from what arrived on the pipe.
-		// A refresh it performs is durable for the life of this process only — the
-		// supervisor has no passphrase and so cannot write to the encrypted store — and
-		// that is said in the decision log at the moment it happens rather than left for
-		// a user to deduce from a failed login tomorrow.
+		// A refresh it performs is written back to the keyring when the host has one, so
+		// that a rotation does not retire the copy the next sandbox will use; see
+		// rotation.go for why that is not optional with providers that rotate, and for
+		// what is said in the decision log when it cannot be done.
 		store := secret.NewMemoryStore(spec.Secrets, spec.OAuth)
-		store.OnRotate = func(service string) {
-			target, terr := policy.NewTarget(spec.OAuth[service].TokenHost, 443)
-			if terr != nil {
-				return
-			}
-			engine.Note(policy.StageRequest, target, policy.ModeForward,
-				"the oauth credential "+service+" was refreshed for this sandbox only; the copy on the host is now stale, so re-run 'boks secret import' when this sandbox ends")
-		}
+		store.OnRotate = rotationHandler(spec, store, openRotationStore(spec.StateDir), engine,
+			func(format string, args ...any) { fmt.Fprintf(logger, format+"\n", args...) })
 		provider = store
 	}
 	injector, err := secret.NewInjector(provider, credentials...)

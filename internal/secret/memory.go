@@ -14,23 +14,28 @@ import (
 // decrypt every credential you own would be a much worse thing to have running — and it has
 // a consequence for OAuth that is stated here rather than discovered later.
 //
-// **A rotation inside a sandbox is not durable.** When the proxy refreshes an OAuth
+// **A rotation inside a sandbox is not durable on its own.** When the proxy refreshes an OAuth
 // credential, the new pair is kept here, used for the rest of the sandbox's life, and lost
 // when the sandbox stops. For a provider that rotates refresh tokens on every exchange — most
-// of them, including Anthropic — the pair left in the encrypted store is then stale, and the
-// next sandbox that uses it will fail its first refresh and have to be re-imported. OnRotate
-// exists so the caller can say so where the user is looking, at the moment it happens.
+// of them, including Anthropic — that does not merely fail to help the next sandbox: the
+// exchange RETIRES the old token, so the copy on the host is left broken.
 //
-// The fix is not to give this process the passphrase. It is either a writeback channel to the
-// process that has it, or refreshing in the CLI before the supervisor is spawned; neither is
-// built.
+// OnRotate is how that is answered. It used to exist only so the caller could say so where
+// the user was looking; internal/enforce now uses it to write the new pair back to the OS
+// keyring, which needs no passphrase and so is reachable from a process that must never be
+// able to read every credential the user owns. See internal/enforce/rotation.go, including
+// what is said when there is no keyring to write to.
+//
+// This comment previously ended "neither is built", listing a writeback channel as one of two
+// possible fixes. One of them is built now.
 type MemoryStore struct {
 	mu     sync.Mutex
 	values map[string]string
 	oauth  map[string]OAuthRecord
 
-	// OnRotate is called after a refresh that could not be persisted. It receives the
-	// service name and never a value.
+	// OnRotate is called after a refresh. It receives the service name and never a value;
+	// a caller that needs the new pair reads it back with Records(), which is what makes a
+	// racing rotation persist the newer one rather than whichever call arrived second.
 	OnRotate func(service string)
 }
 
