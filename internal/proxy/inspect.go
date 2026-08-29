@@ -241,6 +241,21 @@ func (s *Server) answerTokenRequest(ctx context.Context, target policy.Target, c
 	if err != nil {
 		// Errors here name the service and never a token; see internal/secret.
 		s.logf("oauth token request for %s on %s: %v", credential.Service, target, err)
+
+		// And in the decision log, because the 502 below is written to an agent, and an
+		// agent does not show it. Claude Code renders exactly "Failed to connect to
+		// api.anthropic.com: Status 502" and suggests checking the proxy — sending its
+		// user to look at network rules for a credential problem. Reported 2026-08-29,
+		// where every rule was in fact allowing the traffic and `boks policy log` showed
+		// nothing but successful forwards.
+		//
+		// NoteRefused rather than Note: nothing was carried, and a failure recorded as
+		// allowed would claim otherwise.
+		s.cfg.Engine.NoteRefused(policy.StageRequest, target, policy.ModeForward,
+			"the oauth credential "+credential.Service+" could not be refreshed on the host ("+
+				err.Error()+"). If a previous sandbox refreshed it, the rotation invalidated "+
+				"the stored copy: re-run 'boks secret adopt' (or 'boks secret import') to store "+
+				"a current one")
 		writeStatus(client, http.StatusBadGateway, "boks: "+err.Error()+"\n")
 		return false
 	}
