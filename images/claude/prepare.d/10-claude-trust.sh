@@ -20,6 +20,19 @@
 # well.
 set -eu
 
+# A HOME of "/" means the process is running as a uid this image's passwd does not know, and
+# crun had nothing to set it from. Writing dotfiles into / would fail anyway; saying so beats
+# a Python traceback about a path with a doubled slash, which is what this produced before
+# images/base/Dockerfile set HOME explicitly.
+case "${HOME:-}" in
+"" | "/")
+	echo "boks: HOME is ${HOME:-unset}, so there is nowhere to write Claude Code's config." >&2
+	echo "      Its first-run prompts will be asked. An image run as a uid it does not know" >&2
+	echo "      needs HOME in its own environment; see images/base/Dockerfile." >&2
+	exit 0
+	;;
+esac
+
 config="${HOME}/.claude.json"
 workspace="$(pwd)"
 

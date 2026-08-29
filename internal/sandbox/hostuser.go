@@ -27,6 +27,25 @@ import (
 // problem in its own virtiofs, which is not libkrun's. So the only lever available here is
 // which uid the guest process runs as, and this is that lever.
 //
+// # What this breaks in an image, and what an image owes in return
+//
+// The uid it picks is a HOST uid, and no image's /etc/passwd knows it. That has consequences
+// an image has to be built for, and Boks' own images were not until they were measured:
+//
+//   - **HOME.** crun derives it from the container uid's passwd entry, finds nothing, and
+//     leaves "/". The first dotfile write then fails on a doubled-slash path
+//     ("Permission denied: '//.claude.json.boks-tmp'"). An image must declare HOME in its own
+//     environment, where no lookup is needed; images/base/Dockerfile does.
+//   - **Anything the image chowned to its own user.** Ownership cannot help a uid that is not
+//     knowable at build time, so those paths need a MODE instead. images/base does that for
+//     /home/agent and for the three paths update-ca-certificates writes.
+//
+// Neither is fixable from here for an image Boks did not build, and both fail in ways that
+// look like the sandbox is broken rather than the image being unprepared. Where Boks can, it
+// degrades rather than aborting: boks-install-ca warns and continues when the trust store is
+// unwritable, since the mounted CA bundle still reaches every runtime that reads an
+// environment variable.
+//
 // # Why it was not needed before, and why that was worse
 //
 // Until the images were given numeric users, `USER agent` silently became uid 0 off Linux and
