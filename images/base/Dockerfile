@@ -109,6 +109,34 @@ RUN set -eux; \
     chmod 0777 /usr/local/share/ca-certificates /etc/ssl/certs; \
     chmod 0666 /etc/ssl/certs/ca-certificates.crt /etc/ca-certificates.conf
 
+# /etc/passwd, for the same reason and with a sharper consequence.
+#
+# The uid a sandbox runs as is the one that owns the workspace on the host, so it has no entry
+# here and getpwuid() fails for it. A surprising amount of software treats that as fatal rather
+# than as missing metadata — OpenSSH refuses to start at all ("No user exists for uid 502"),
+# taking ssh, scp, git-over-ssh and any deploy with it. prepare.d/05-host-uid.sh adds the entry
+# at start-up, once the number is knowable, and it needs somewhere to write it.
+#
+# Writable rather than owned, since the uid is not known at build time.
+#
+# What that does and does not cost, stated rather than waved at. Debian ships /bin/su setuid
+# root, and su trusts /etc/passwd: an agent that can write this file can give itself a
+# password-less root entry and become root INSIDE THE GUEST. That is worth knowing and it is
+# not an escape — the boundary is the VM, docs/security-model.md says in-guest permissions are
+# not one, and the filesystem is already entirely the agent's to ruin. The one practical
+# consequence is on the workspace share: a file created as root lands on the host owned by
+# uid 0, which the person who opens it afterwards cannot delete.
+#
+# The alternative to accepting that is to drop the setuid bits in this image
+# (`find / -perm /4000 -type f -exec chmod u-s {} +`), which a sandbox has no use for — there
+# is no root login to su to. Not done here, because it is a separate decision from making ssh
+# work and it deserves to be taken on its own.
+RUN chmod 0666 /etc/passwd /etc/group
+
+# The base image's own start-up scripts. Derived images add theirs to the same directory;
+# boks-prepare runs whatever is there in name order, which is why these are numbered.
+COPY --chmod=0755 prepare.d/ /etc/boks/prepare.d/
+
 COPY --chmod=0755 boks-install-ca boks-entrypoint boks-open boks-prepare /usr/local/bin/
 
 # The names a program reaches for when it wants a browser, all pointing at the one that says
