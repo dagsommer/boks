@@ -34,6 +34,7 @@ RUN apt-get update \
       python3-pip \
       python3-venv \
       ripgrep \
+      sudo \
       tini \
       unzip \
       xz-utils \
@@ -132,6 +133,33 @@ RUN set -eux; \
 # is no root login to su to. Not done here, because it is a separate decision from making ssh
 # work and it deserves to be taken on its own.
 RUN chmod 0666 /etc/passwd /etc/group
+
+# Passwordless root, deliberately.
+#
+# The agent runs as an unprivileged uid so that files it creates in the workspace belong to the
+# person who will open them. That is the right default and it is not a boundary: root was
+# already reachable in this image the moment /etc/passwd became writable, since Debian ships
+# /bin/su setuid and su trusts that file. The choice is therefore not "root or no root" but
+# "root by trick or root by rule", and a rule is better: it is visible, it is documented, and
+# it does not depend on a trick continuing to work.
+#
+# What it buys is concrete, from an agent that hit all three inside a sandbox: apt-get for the
+# libraries a project needs (an ICU-less image crashes the .NET CLI), a daemon that wants root
+# (dockerd), and any tool that assumes it can write outside $HOME.
+#
+# The boundary is the VM. docs/security-model.md says in-guest permissions are not one, and
+# every guarantee Boks makes — the network policy, the credential sentinels, the read-only
+# mounts of the CA and credentials — is enforced OUTSIDE the guest, where a root shell inside
+# it cannot reach. What root does change is the workspace share: a file created as root lands
+# on the host owned by uid 0, which the user cannot delete. That is the reason the default uid
+# stays unprivileged and this is opt-in per command rather than the identity the agent runs as.
+#
+# ALL rather than a user, because the uid is not known when this image is built — it is the
+# host's, and it varies per machine. In a single-tenant disposable VM those are the same set.
+RUN set -eux; \
+    printf 'ALL ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/boks; \
+    chmod 0440 /etc/sudoers.d/boks; \
+    visudo -c -f /etc/sudoers.d/boks
 
 # The base image's own start-up scripts. Derived images add theirs to the same directory;
 # boks-prepare runs whatever is there in name order, which is why these are numbered.
