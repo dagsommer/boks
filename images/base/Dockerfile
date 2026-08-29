@@ -87,17 +87,27 @@ RUN set -eux; \
     # and cost the one thing worth keeping: no root in the chain at all.
     chmod -R 0777 /home/agent
 
-# The CA entrypoint has to write to the trust store, and the container process is uid 1000.
-# Rather than grant the agent user root (or run the whole sandbox as root), hand it exactly
-# the three paths update-ca-certificates writes: the drop-in directory, the generated bundle
-# directory, and the index it rewrites. Nothing else in / changes owner.
+# The CA entrypoint has to write to the trust store, and MODE rather than OWNER is what makes
+# that possible, because the uid is not knowable when this image is built.
 #
-# In the threat model this costs nothing — the guest is a disposable VM whose entire
-# filesystem is already the agent's to ruin — and it keeps the process uid honest.
+# This used to chown these paths to agent, on the stated grounds that "the container process
+# is uid 1000". That stopped being true: a sandbox with a workspace runs as the uid that owns
+# the workspace on the host, so that files the agent creates belong to the person who will
+# open them afterwards (internal/sandbox/hostuser.go). On a Mac that is typically 502, which
+# owns nothing here, and boks-install-ca failed with
+#
+#   cannot create /usr/local/share/ca-certificates/boks-local-ca.crt.tmp.5: Permission denied
+#
+# So: the same three paths update-ca-certificates writes — the drop-in directory, the
+# directory it regenerates the bundle in, and the files it rewrites — made writable by whoever
+# the process turns out to be. Same reasoning as `chmod -R 0777 /home/agent` above, and the
+# same threat model: the guest is a disposable VM whose entire filesystem is already the
+# agent's to ruin, and docs/security-model.md says in as many words that in-guest permissions
+# are not a boundary.
 RUN set -eux; \
     mkdir -p /usr/local/share/ca-certificates; \
-    chown agent:agent /usr/local/share/ca-certificates /etc/ssl/certs /etc/ca-certificates.conf; \
-    chown agent:agent /etc/ssl/certs/ca-certificates.crt
+    chmod 0777 /usr/local/share/ca-certificates /etc/ssl/certs; \
+    chmod 0666 /etc/ssl/certs/ca-certificates.crt /etc/ca-certificates.conf
 
 COPY --chmod=0755 boks-install-ca boks-entrypoint boks-open boks-prepare /usr/local/bin/
 
