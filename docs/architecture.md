@@ -290,7 +290,7 @@ the host: no other process, no other sandbox and nothing on the LAN can reach it
 sandboxes cannot collide on a port. A host port would have failed all three.
 
 **The guest environment is a convenience, not the control.** `HTTP_PROXY`, `HTTPS_PROXY`,
-`NO_PROXY`, the CA (as `BOKS_CA_CERT_B64`, as a read-only mount at `/etc/boks`, and through
+`NO_PROXY`, the CA (as `BOKS_CA_CERT_B64`, as a read-only mount at `/etc/boks/ca`, and through
 `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` for the
 runtimes that ignore the system trust store) let a cooperating client get hostname rules,
 credential injection and readable refusals. A guest that ignores all of it loses those and

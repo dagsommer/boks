@@ -76,11 +76,29 @@ const (
 	// GuestCADir is where a sandbox's copy of the CA certificate is mounted. It holds
 	// the public half only; the signing key never leaves the host.
 	//
+	// A SUBDIRECTORY of /etc/boks rather than /etc/boks itself, and that distinction cost
+	// two bugs before it was made. /etc/boks is the guest's Boks namespace: the images
+	// create /etc/boks/prepare.d in it and boks-prepare runs what is there before the
+	// agent starts, and internal/secret mounts credential files at /etc/boks/credentials.
+	// Mounting the CA over the whole directory:
+	//
+	//   - HID the image's prepare.d, because a mount replaces the directory's contents
+	//     rather than merging with them. Silently: nothing failed, the scripts just never
+	//     ran.
+	//   - Made the credential mount impossible. Its mount point has to be created inside
+	//     the CA's read-only mount, which the runtime cannot do:
+	//     "OCI runtime create failed: mkdir `/etc/boks/credentials`: Read-only file
+	//     system". Reported 2026-08-29, the first time a credential and interception were
+	//     used together.
+	//
+	// Anything Boks shares into the guest under /etc/boks must therefore be its own
+	// subdirectory. TestGuestPathsDoNotNest holds that line.
+	//
 	// Paths under it are joined with path.Join, never filepath.Join: these name files
 	// inside a Linux guest, and filepath follows the *host's* separator, which on a
 	// Windows host would put backslashes into an environment variable a guest runtime has
 	// to open.
-	GuestCADir = "/etc/boks"
+	GuestCADir = "/etc/boks/ca"
 
 	certFile   = "ca.pem"
 	bundleFile = "ca-bundle.pem"
