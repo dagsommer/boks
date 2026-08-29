@@ -194,6 +194,26 @@ func terminate(pid int) error {
 		return fmt.Errorf("opening process %d: %w", pid, err)
 	}
 	defer windows.CloseHandle(h)
+
+	// A process that has ALREADY exited can still be opened — the object outlives the
+	// process while any handle to it exists — and TerminateProcess on it fails with
+	// ERROR_ACCESS_DENIED. That reads like a permissions problem and is not one: there is
+	// nothing left to terminate, which is exactly the outcome the caller asked for.
+	//
+	// This is why SYNCHRONIZE is requested alongside PROCESS_TERMINATE above. A process
+	// object is signalled when the process exits, so a zero-timeout wait answers "is it
+	// still running" without ambiguity. GetExitCodeProcess would also answer it, but
+	// through STILL_ACTIVE (259), which a live process may legitimately return as its own
+	// exit code.
+	//
+	// Found by CI on 2026-08-29, where TestTerminateToleratesAProcessThatIsGone failed with
+	// "terminating process 5136: Access is denied" — and had passed on the run before,
+	// because whether the object is still openable after the child is reaped is a matter of
+	// timing.
+	if event, err := windows.WaitForSingleObject(h, 0); err == nil && event == windows.WAIT_OBJECT_0 {
+		return nil
+	}
+
 	if err := windows.TerminateProcess(h, 1); err != nil {
 		return fmt.Errorf("terminating process %d: %w", pid, err)
 	}
