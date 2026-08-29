@@ -807,6 +807,32 @@ Residual exposure worth knowing, none of it hypothetical:
    worth a MITM against anything that was told to trust it; that is why it is owner-only, why
    Boks refuses to use a key others can read, and why `boks ca regenerate` exists.
 
+## Root inside the guest
+
+**The agent can become root in its own VM, and this is not treated as a failure.** Boks' own
+images ship `sudo` with a passwordless rule, and `/etc/passwd` is writable so that the uid a
+sandbox runs as — the host's, so that files it creates in the workspace belong to the person
+who opens them — can be given an entry that `getpwuid()` finds.
+
+Stated plainly because the alternative is a claim that would not survive contact: root was
+reachable in these images the moment `/etc/passwd` became writable, since Debian ships
+`/bin/su` setuid and `su` trusts that file. Shipping `sudo` makes deliberate what was already
+available by trick.
+
+Nothing Boks enforces depends on the agent staying unprivileged. The network policy, the
+credential sentinels, the TLS interception and the read-only mounts of the CA and credential
+files are all enforced **outside** the guest — in the supervisor, the proxy and the runtime —
+where a root shell inside the VM cannot reach them. The boundary is the VM.
+
+What root does change, and the reason the default identity is still unprivileged:
+
+- **The workspace share.** A file created as root lands on the host owned by uid 0, which the
+  user who opens the directory afterwards cannot delete. That is a real cost of `sudo cp`
+  into a workspace, and it is the whole reason the agent runs as the host's uid rather than
+  as root.
+- **Nothing else that Boks measures.** In-guest file permissions were never a control here;
+  see the trust boundaries above.
+
 ## What Boks does not claim
 
 - It has **not** been security-reviewed or audited.
