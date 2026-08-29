@@ -147,14 +147,33 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
 # `--dangerously-skip-permissions` as root, which is the symptom that found this.
 #
 # Numbers need no filesystem, so every host honours them — see applyImageUser in
-# internal/sandbox/imageconfig.go. Nothing is lost by spelling it this way: uid/gid 1000 is
-# the `agent` created above, HOME still comes from this image's own /etc/passwd (crun calls
-# set_home_env with the container uid, which finds /home/agent), and on Linux containerd
-# still reads /etc/group for supplementary groups afterwards, of which this image has none.
+# internal/sandbox/imageconfig.go. uid/gid 1000 is the `agent` created above, and on Linux
+# containerd still reads /etc/group for supplementary groups afterwards, of which this image
+# has none.
 #
 # Keep it numeric. `USER agent` reads better and silently means root off Linux.
 USER 1000:1000
 WORKDIR /home/agent
+
+# HOME, explicitly, because nothing else can supply it any more.
+#
+# This comment used to say HOME "still comes from this image's own /etc/passwd (crun calls
+# set_home_env with the container uid, which finds /home/agent)". That was true while the
+# container ran as 1000. A sandbox with a workspace now runs as the uid that owns that
+# workspace on the host — 502 on a typical Mac — and no such user exists in this image's
+# passwd, so crun finds nothing and leaves HOME as "/". The first thing to write a dotfile
+# then fails on a path with a doubled slash:
+#
+#   PermissionError: [Errno 13] Permission denied: '//.claude.json.boks-tmp'
+#
+# An environment variable needs no passwd lookup, so it survives any uid. It has to be set
+# after USER: an ENV before it would be inherited by the intervening RUN steps, which is
+# harmless but misleading about where it takes effect.
+#
+# Images Boks does not build have the same exposure and no equivalent fix from here: an image
+# that declares no HOME and is run as a foreign uid gets "/". internal/sandbox/hostuser.go
+# says so where someone would look for it.
+ENV HOME=/home/agent
 
 # tini first so it reaps; the entrypoint installs the CA and then execs, so it does not
 # linger as a process of its own.
