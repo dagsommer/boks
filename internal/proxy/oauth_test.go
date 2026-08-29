@@ -425,3 +425,72 @@ func assertNoOAuthCanary(t *testing.T, p *testProxy, record secret.OAuthRecord) 
 		}
 	}
 }
+
+// A refresh the token endpoint rejects has to reach the DECISION LOG, not just the 502.
+//
+// The 502's body says what happened, and the thing reading it is an agent that does not show
+// it. Claude Code renders exactly "Failed to connect to api.anthropic.com: Status 502" and
+// then suggests checking the proxy configuration — pointing its user at network rules for a
+// credential problem. Reported on 2026-08-29 from a sandbox where every rule was allowing the
+// traffic and `boks policy log` showed nothing but successful forwards, so the log the user
+// was told to consult contradicted the failure they were looking at.
+//
+// The recovery matters as much as the reason: a refresh performed for an earlier sandbox
+// rotates the token upstream, which invalidates the copy on the host, so the fix is to store a
+// current one rather than to change any rule.
+func TestARejectedRefreshIsRecordedWithItsRemedy(t *testing.T) {
+	webCA := newAuthority(t)
+	tokenLeaf, err := webCA.LeafFor("console.creds.test")
+	if err != nil {
+		t.Fatalf("LeafFor: %v", err)
+	}
+	// The token endpoint refusing the refresh token, which is what an already-rotated one
+	// gets: OAuth's invalid_grant.
+	tokenSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":"invalid_grant"}`)
+	}))
+	tokenSrv.EnableHTTP2 = false
+	tokenSrv.TLS = &tls.Config{Certificates: []tls.Certificate{*tokenLeaf}}
+	tokenSrv.StartTLS()
+	defer tokenSrv.Close()
+
+	record := oauthRecord(time.Now().Add(-time.Hour)) // expired, so a refresh is attempted
+	inj, _ := oauthInjector(t, record)
+	boksCA := newAuthority(t)
+	p := newTestProxy(t, mustPolicy(t, policy.Deny, "allow console.creds.test"), inj, func(c *Config) {
+		c.CA = boksCA
+		c.UpstreamRootCAs = pool(webCA)
+	})
+
+	url := hostPort(t, tokenSrv.URL, "console.creds.test") + "/v1/oauth/token"
+	payload := fmt.Sprintf(`{"grant_type":"refresh_token","refresh_token":%q}`, record.RefreshSentinel)
+	resp, err := p.client(pool(boksCA)).Post(url, "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("POST to the token endpoint: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body = %s", resp.StatusCode, body)
+	}
+
+	var found string
+	for _, d := range p.Engine().Log().Recent(0) {
+		if strings.Contains(d.Reason, "could not be refreshed") {
+			found = d.Reason
+			if d.Allowed {
+				t.Error("a refusal was recorded as allowed; the log would claim traffic was carried")
+			}
+		}
+	}
+	if found == "" {
+		t.Fatal("the decision log does not mention the failed refresh, so `boks policy log` " +
+			"shows a working sandbox while the agent cannot reach anything")
+	}
+	if !strings.Contains(found, "boks secret") {
+		t.Errorf("the note says what failed but not how to recover:\n%s", found)
+	}
+	// The same rule as everywhere else in this file: a token never reaches a log.
+	assertNoOAuthCanary(t, p, record)
+}
