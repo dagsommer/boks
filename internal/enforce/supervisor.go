@@ -117,6 +117,11 @@ type State struct {
 	Started   time.Time `json:"started"`
 	LogPath   string    `json:"log_path"`
 	Intercept bool      `json:"intercept"`
+	// Services names the credentials this stack was built with, so that a later run can
+	// tell whether the supervisor it is about to reuse serves the ones it asked for. Names
+	// only — they are already in `boks secret ls`, and nothing about a value belongs in a
+	// file on disk. See reusedStackNote.
+	Services []string `json:"services,omitempty"`
 	// Ports is what this sandbox currently publishes, rewritten by the supervisor after
 	// every change.
 	//
@@ -198,6 +203,14 @@ func Ensure(ctx context.Context, spec Spec, progress io.Writer) (State, error) {
 		return State{}, errors.New("enforce: no sandbox name")
 	}
 	if st, ok := Lookup(spec.StateDir, spec.Sandbox); ok {
+		// Reused as it stands — including the credentials it was started with, which is
+		// not obvious and was not said until a user watched GitHub traffic go
+		// uninspected after adding a rule for it. See reusedStackNote.
+		if progress != nil {
+			if note := reusedStackNote(st, spec); note != "" {
+				fmt.Fprint(progress, note)
+			}
+		}
 		return st, nil
 	}
 	// A dead supervisor leaves a socket and a state file behind. Removing them here,
@@ -489,6 +502,7 @@ func Serve(ctx context.Context, spec Spec, ready io.Writer, watch Watch) error {
 		Started:   time.Now(),
 		LogPath:   filepath.Join(dir, logFile),
 		Intercept: spec.intercepts(),
+		Services:  credentialSummary(spec),
 		Ports:     session.Ports(),
 	}
 	if err := writeState(dir, st); err != nil {
