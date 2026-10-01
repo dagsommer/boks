@@ -118,6 +118,23 @@ var guestResolvesUsernames = sync.OnceValue(func() bool {
 	)
 })
 
+// guestSupportsIdmappedMounts reports whether containerd will accept an idmapped workspace
+// mount from the shim on this host, which is what lets Boks idmap a shared workspace instead of
+// running the guest process as the host's own uid. See internal/sandbox/hostuser.go for what
+// this gates.
+//
+// Unlike guestResolvesUsernames it does not look the shim's revision up in a list: it runs the
+// shim with -info and reads the answer containerd itself would read. See
+// internal/daemon/compat.go's ShimSupportsIdmappedMounts for why.
+//
+// Computed once: it runs a binary, the answer cannot change while the process runs, and this
+// sits on the container-creation path.
+var guestSupportsIdmappedMounts = sync.OnceValue(func() bool {
+	return daemon.ShimSupportsIdmappedMounts(
+		daemon.FindShim(runtimecfg.Runtime, daemon.ContainerdPath(os.Getenv("PATH"))),
+	)
+})
+
 // containerdReadsGuestRootfs reports whether containerd's own oci.WithImageConfig actually
 // opens the image's root filesystem on this host — which is the only thing that makes it
 // better than the reimplementation below.
@@ -142,8 +159,8 @@ var guestResolvesUsernames = sync.OnceValue(func() bool {
 // too, so nothing was resolved there either, and appendOSMounts is a no-op off FreeBSD.
 //
 // applyImageUser below does parse numeric ids, so moving macOS to the metadata path loses
-// nothing containerd was doing and gains every image that numbers its user. Names remain
-// unresolvable on both hosts, which is a guest problem — see packaging/nerdbox/patches/.
+// nothing containerd was doing and gains every image that numbers its user. Names are resolved
+// from the image's own layers instead of a mount — see imageuser.go.
 //
 // Linux is decided by inclusion rather than by excluding Windows, because that is the claim
 // being made: this host mounts the image. A host that does not belongs on the metadata path.
@@ -161,7 +178,15 @@ func withImageConfigFromMetadata(image client.Image) oci.SpecOpts {
 		if err != nil {
 			return fmt.Errorf("reading the configuration of image %s: %w", image.Name(), err)
 		}
-		return applyImageConfig(s, config.Config)
+		if err := applyImageConfig(s, config.Config); err != nil {
+			return err
+		}
+		// Fails open by design: an error leaves the spec as applyImageConfig wrote it,
+		// which is what every host got before names could be resolved here at all.
+		if needsImageUserFiles(config.Config.User) {
+			_ = resolveImageUserFromLayers(ctx, image, s, config.Config.User)
+		}
+		return nil
 	}
 }
 
@@ -233,11 +258,10 @@ func applyImageConfig(s *specs.Spec, config ocispec.ImageConfig) error {
 // containerd's own WithUserID settles on when /etc/passwd has no entry for that uid — and
 // a guest that later reads Username refines the gid to the passwd one.
 //
-// What is left is the genuinely irreducible case: a *name*, which no amount of host-side
-// parsing can turn into a number. Those still run as uid 0 on Windows and macOS. That is
-// unchanged rather than newly introduced, it is the reason for the guest patch in
-// packaging/nerdbox/patches/, and it is recorded in docs/verification.md as an open defect
-// rather than left for someone to discover.
+// What is left is a *name*, which no parsing of the string can turn into a number. That needs
+// the image's /etc/passwd, and withImageConfigFromMetadata reads it out of the image's layers
+// right after this runs (imageuser.go). Only if that fails does a name still run as uid 0 on
+// Windows and macOS, which is the behaviour from before it existed.
 func applyImageUser(s *specs.Spec, userstr string) {
 	s.Process.User.AdditionalGids = nil
 	// Kept even when the numbers below are known, so that a capable guest can supply the

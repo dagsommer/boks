@@ -526,10 +526,11 @@ func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []o
 		specOpts = append(specOpts, oci.WithProcessCwd(cfg.Workspaces[0].Root()))
 	}
 
-	// LAST, so it wins over the image's own user. The image config runs earlier and sets
-	// whatever USER the image declared; this is the deliberate override that makes a shared
-	// workspace writable, and an override that ran before the thing it overrides would do
-	// nothing at all.
+	// LAST, so it can see both the image's own user (set by imageConfig, above) and the
+	// mounts just added. withHostUser either idmaps those mounts to the image's user — the
+	// image's own USER keeps running, unchanged — or, where the guest can't do that yet (or
+	// the image resolved to root), overrides the process to the host's uid the way it always
+	// has. Either way it has to run after both inputs exist, which is why it is last.
 	specOpts = append(specOpts, withHostUser(cfg))
 	return specOpts
 }

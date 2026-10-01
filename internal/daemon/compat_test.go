@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	apitypes "github.com/containerd/containerd/api/types"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 func TestParseVersionAcceptsEverySpellingInPlay(t *testing.T) {
@@ -169,6 +173,78 @@ func TestShimResolvesUsernamesIsFalseWithoutEvidence(t *testing.T) {
 	}
 }
 
+// ShimSupportsIdmappedMounts decides whether Boks may idmap a shared workspace's mount instead
+// of running the guest process as the host's own uid. Answering true when the shim does not
+// report support makes containerd refuse to create the task — a hard failure, not a graceful
+// degrade — so every case this cannot answer must come back false.
+func TestShimSupportsIdmappedMountsIsFalseWithoutEvidence(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "containerd-shim-nerdbox-v1")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec true\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"no shim found at all", ""},
+		{"a missing file", filepath.Join(dir, "absent")},
+		{"a file that is not a Go binary", script},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if ShimSupportsIdmappedMounts(tc.path) {
+				t.Error("ShimSupportsIdmappedMounts = true; an unknown shim must never " +
+					"be treated as one whose guest can idmap a workspace mount")
+			}
+		})
+	}
+}
+
+// The -info output is decoded exactly as containerd decodes it. The positive case is the
+// literal JSON the patched shim printed on 2026-10-01; each negative one is a way a shim can
+// fail to claim support, and must not be read as claiming it.
+func TestRuntimeInfoSupportsIdmap(t *testing.T) {
+	info := func(typeURL, value string) []byte {
+		out, err := proto.Marshal(&apitypes.RuntimeInfo{
+			Name:     "io.containerd.nerdbox.v1",
+			Features: &anypb.Any{TypeUrl: typeURL, Value: []byte(value)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name string
+		out  []byte
+		want bool
+	}{
+		{"the patched shim's answer", info(runtimeFeaturesTypeURL, `{"linux":{"mountExtensions":{"idmap":{"enabled":true}}}}`), true},
+		{"idmap explicitly disabled", info(runtimeFeaturesTypeURL, `{"linux":{"mountExtensions":{"idmap":{"enabled":false}}}}`), false},
+		{"idmap present without enabled", info(runtimeFeaturesTypeURL, `{"linux":{"mountExtensions":{"idmap":{}}}}`), false},
+		{"no linux features", info(runtimeFeaturesTypeURL, `{}`), false},
+		{"another type under the same JSON", info("example.com/Other", `{"linux":{"mountExtensions":{"idmap":{"enabled":true}}}}`), false},
+		{"no features at all, as the unpatched shim prints", mustMarshal(t, &apitypes.RuntimeInfo{Name: "io.containerd.nerdbox.v1"}), false},
+		{"not protobuf", []byte("usage: containerd-shim-nerdbox-v1 [flags]\n"), false},
+		{"empty output", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runtimeInfoSupportsIdmap(tc.out); got != tc.want {
+				t.Errorf("runtimeInfoSupportsIdmap = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func mustMarshal(t *testing.T, m proto.Message) []byte {
+	t.Helper()
+	out, err := proto.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 // A Go binary that is not nerdbox must not be mistaken for one. Boks' own binary is the
 // convenient example: it is a real, VCS-stamped Go program of the right shape whose main
 // module is something else entirely.
@@ -187,5 +263,8 @@ func TestShimNerdboxRejectsAnotherModulesBinary(t *testing.T) {
 	}
 	if ShimResolvesUsernames(probe) {
 		t.Error("ShimResolvesUsernames(the boks binary) = true")
+	}
+	if ShimSupportsIdmappedMounts(probe) {
+		t.Error("ShimSupportsIdmappedMounts(the boks binary) = true")
 	}
 }

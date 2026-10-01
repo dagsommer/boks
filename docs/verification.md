@@ -2338,3 +2338,17 @@ test above is the thing that should have caught it.
 Only a sandbox created *after* this change has the field: it is written into the OCI spec once,
 when the sandbox is created, and containerd never revisits it. An existing sandbox keeps
 `(none)` until it is recreated.
+
+### Image `USER` names resolve on macOS, and workspaces are idmapped, 2026-10-01
+
+This closes the 2026-08-16 defect above for macOS and Windows hosts. It works from the host
+side rather than through `vminitd`: `internal/sandbox/imageuser.go` reads `/etc/passwd` and
+`/etc/group` out of the image's layers in the content store. Measured on macOS against
+`registry.example.test/copilot-sandbox:latest` (`USER agent`), the spec went from
+`{"uid":0,...,"username":"agent"}` to `uid=1000(agent) gid=1000(agent)
+groups=1000(agent),27(sudo),1001(docker)` inside the guest.
+
+With a shim carrying `packaging/nerdbox/patches/0003`, the same sandbox's workspace was mounted
+`idmapped`: files read as `1000` inside the guest and the agent's writes landed as `502:20` on
+the host. With the unpatched Homebrew shim, the same build fell back to the host-uid override
+and the workspace stayed writable. Details are in `packaging/nerdbox/README.md`, "0003".

@@ -1,10 +1,19 @@
 package daemon
 
 import (
+	"bytes"
+	"context"
 	"debug/buildinfo"
+	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
+
+	apitypes "github.com/containerd/containerd/api/types"
+	"github.com/opencontainers/runtime-spec/specs-go/features"
+	"google.golang.org/protobuf/proto"
 )
 
 // Whether the pieces Boks found are compatible with each other, not merely present.
@@ -134,6 +143,79 @@ func ShimResolvesUsernames(path string) bool {
 	}
 	revision := ShimNerdbox(path)
 	return revision != "" && nerdboxRevisionsResolvingUsernames[revision]
+}
+
+// ShimSupportsIdmappedMounts reports whether the shim at path tells containerd that its runtime
+// supports idmapped mounts — which decides whether Boks can idmap a shared workspace instead of
+// running the guest process as the host's own uid (see internal/sandbox/hostuser.go).
+//
+// # Why it asks the shim rather than looking up its revision
+//
+// It is the exact question containerd asks before it creates a task whose spec carries an
+// idmapped mount (validateRuntimeFeatures, core/runtime/v2/task_manager.go at v2.2.6): run the
+// shim with -info, read the runtime-spec Features out of the RuntimeInfo it prints, and require
+// linux.mountExtensions.idmap.enabled. So this answers true exactly when containerd would accept
+// the task, which no proxy can promise. The guest side needs nothing beyond what every guest
+// already has: crun 1.24 idmaps a mount with a throwaway user namespace of its own.
+//
+// A revision allowlist, the way ShimResolvesUsernames works, was tried first and cannot work
+// here. The shim Homebrew builds carries no vcs stamp at all — built from a release tarball, so
+// ShimNerdbox reads "" from it — and the patch that makes the shim answer this (0003 in
+// packaging/nerdbox/patches/) does not change the upstream revision it applies on top of.
+//
+// # What it executes, and when it answers false
+//
+// Only a file that debug/buildinfo confirms is a nerdbox build is run, with an empty stdin
+// (which is what containerd passes when there are no runtime options) and a short deadline.
+// Anything that is not that, fails to run, or prints something unreadable answers false, and
+// Boks keeps the host-uid override. Answering true wrongly would fail container creation
+// outright; answering false wrongly only forgoes the better mechanism.
+func ShimSupportsIdmappedMounts(path string) bool {
+	if path == "" || !isNerdboxBuild(path) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "-info")
+	cmd.Stdin = bytes.NewReader(nil)
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return runtimeInfoSupportsIdmap(out)
+}
+
+// isNerdboxBuild reports whether path is a Go binary whose main module is nerdbox. Unlike
+// ShimNerdbox it does not require a vcs stamp, which a Homebrew build lacks.
+func isNerdboxBuild(path string) bool {
+	info, err := buildinfo.ReadFile(path)
+	return err == nil && info.Main.Path == nerdboxModule
+}
+
+// runtimeFeaturesTypeURL is the type URL containerd's typeurl registers for runtime-spec
+// Features, and the only one this reads.
+const runtimeFeaturesTypeURL = "types.containerd.io/opencontainers/runtime-spec/1/features/Features"
+
+// runtimeInfoSupportsIdmap reads a shim's -info output, a protobuf RuntimeInfo, and reports
+// whether its Features claim idmapped mount support. Split out so the decoding can be tested
+// from bytes, with no shim.
+func runtimeInfoSupportsIdmap(out []byte) bool {
+	var info apitypes.RuntimeInfo
+	if err := proto.Unmarshal(out, &info); err != nil {
+		return false
+	}
+	if info.Features == nil || info.Features.GetTypeUrl() != runtimeFeaturesTypeURL {
+		return false
+	}
+	var feat features.Features
+	if err := json.Unmarshal(info.Features.GetValue(), &feat); err != nil {
+		return false
+	}
+	if feat.Linux == nil || feat.Linux.MountExtensions == nil || feat.Linux.MountExtensions.IDMap == nil {
+		return false
+	}
+	enabled := feat.Linux.MountExtensions.IDMap.Enabled
+	return enabled != nil && *enabled
 }
 
 // ShimContainerd returns the containerd version the binary at path was built against, or ""

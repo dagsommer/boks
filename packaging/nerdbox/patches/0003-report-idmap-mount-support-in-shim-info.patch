@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Boks <boks@example.invalid>
+Date: Thu, 1 Oct 2026 14:00:00 +0200
+Subject: [PATCH] fix(shim): report idmap mount support from Info
+
+containerd refuses to create any task whose spec carries a
+Mount.UIDMappings/GIDMappings -- which is how Boks asks for a workspace's
+bind mount to be idmapped, see internal/sandbox/hostuser.go -- unless the
+runtime says first that it can honour one:
+
+  core/runtime/v2/task_manager.go, validateRuntimeFeatures():
+    // runc ignores silently features it doesn't know about, so for things
+    // that this is problematic let's check if this runc version supports
+    // them.
+    if err := m.validateRuntimeFeatures(ctx, opts); err != nil {
+        return nil, fmt.Errorf("failed to validate OCI runtime features: %w", err)
+    }
+
+That check calls the shim's Info RPC and tries to unmarshal its Features
+field into an *features.Features. manager.Info() here never sets that
+field, so every task creation that asks for an idmapped mount -- not only
+ones the runtime would actually refuse -- fails before a task is even
+attempted, with an error that names neither idmapping nor this method:
+
+  failed to create shim task: failed to validate OCI runtime features:
+  unmarshal runtime features: type with url : not found
+
+"type with url : not found" is typeurl trying to resolve an empty
+TypeUrl, which is what a never-populated *anypb.Any looks like. This is
+not a graceful "unsupported" signal reaching the check's own fallback
+path (the one guarding non-runc-compatible runtimes that report nothing)
+-- that path only runs once typeurl.UnmarshalAny has succeeded, and an
+empty Any fails there first.
+
+containerd-shim-runc-v2 answers this by running `runc features` and
+reporting whatever comes back (cmd/containerd-shim-runc-v2/manager/
+manager_linux.go). That is not available here: crun runs inside the
+guest, which is not started yet at the point containerd asks Info --
+there is nothing to exec `crun features` against. What this project
+already knows, at the point this file is built, is which crun release it
+pins (1.24, this Dockerfile) and that it supports idmapped mounts --
+confirmed by reading src/libcrun/linux.c at that tag, which creates a
+throwaway user namespace per mount rather than requiring one on the
+container (see packaging/nerdbox/README.md in Boks for that reading). So
+this states that fact rather than discovering it at runtime.
+
+The commented-out TODO this sits beside ("Get features list from
+run_vminitd") is a different, larger thing -- forwarding whatever a live
+guest reports -- and is left alone. This only answers the one question
+containerd is actually asking before it will accept an idmapped mount at
+all.
+---
+ pkg/shim/manager/manager.go | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/pkg/shim/manager/manager.go b/pkg/shim/manager/manager.go
+index 6003566..cf48047 100644
+--- a/pkg/shim/manager/manager.go
++++ b/pkg/shim/manager/manager.go
+@@ -19,11 +19,14 @@ package manager
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"io"
+ 	"os"
+
+ 	"github.com/containerd/containerd/api/types"
+ 	"github.com/containerd/containerd/v2/pkg/shim"
++	"github.com/containerd/typeurl/v2"
++	"github.com/opencontainers/runtime-spec/specs-go/features"
+ )
+
+ // New returns a shim manager implementation that launches the nerdbox shim
+@@ -102,5 +105,26 @@ func (m manager) Info(ctx context.Context, optionsR io.Reader) (*types.RuntimeIn
+
+ 		}
+ 	*/
++
++	// containerd refuses to create a task whose spec carries Mount.UIDMappings/GIDMappings
++	// unless the runtime reports idmap support here first (core/runtime/v2/task_manager.go,
++	// validateRuntimeFeatures) -- an empty Features leaves it unable to unmarshal this field
++	// at all, which fails every task creation that asks for an idmapped mount, not only ones
++	// the runtime would actually refuse. crun itself runs inside the guest, which is not
++	// started yet at the point containerd asks this, so this can't shell out to `crun
++	// features` the way containerd-shim-runc-v2 does; it states what the crun build this
++	// project pins (1.24, see Dockerfile) is known to support instead.
++	idmapEnabled := true
++	marshaled, err := typeurl.MarshalAnyToProto(&features.Features{
++		Linux: &features.Linux{
++			MountExtensions: &features.MountExtensions{
++				IDMap: &features.IDMap{Enabled: &idmapEnabled},
++			},
++		},
++	})
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal runtime features: %w", err)
++	}
++	info.Features = marshaled
+ 	return info, nil
+ }
+--
+2.43.0
