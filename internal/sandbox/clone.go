@@ -223,6 +223,17 @@ func ensureClone(ctx context.Context, container client.Container, task client.Ta
 
 // sandboxOwner is the "uid:gid" the sandbox's own processes run as, read from its spec. It is
 // who the clone has to belong to for the agent to be able to write in it.
+//
+// This stays correct under either of withHostUser's two mechanisms, and does not need to know
+// which one applied. The clone lives in the guest's own filesystem — a plain directory, not
+// the shared, possibly-idmapped workspace mount — so "what uid does the process run as" is
+// still the only question that matters: the override mechanism sets spec.Process.User to the
+// host's uid, and the idmap mechanism deliberately leaves it as the image's own uid (see
+// idmapWorkspaceMounts), and both are exactly the uid this function reads back. Verified by
+// hostuser_test.go's reconcileWorkspaceIdentity cases, which assert what each mechanism leaves
+// in Process.User; not independently tested here because exercising it end to end needs a
+// client.Container this package has no fake for — see the clone-mode entry in the idmap
+// implementation plan's manual-verification list.
 func sandboxOwner(ctx context.Context, container client.Container) (string, error) {
 	spec, err := container.Spec(ctx)
 	if err != nil {

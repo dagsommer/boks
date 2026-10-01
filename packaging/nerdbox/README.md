@@ -134,6 +134,194 @@ One latent defect found on the way, not this bug: imago `src/vmdk/mod.rs:641` ad
 descriptor's fourth field — defined by the VMDK spec in *sectors* — to a byte offset. It is
 inert only because nerdbox writes 0 for every FLAT offset.
 
+## A patch that was tried and withdrawn: mounting virtiofs shares with `default_permissions`
+
+Boks wants to idmap a shared workspace's bind mount (see `internal/sandbox/hostuser.go`), and
+the guest kernel only allows an idmapped mount on top of one made with `default_permissions`
+(`fs/fuse/inode.c:fuse_fill_super_common`). A patch was written adding
+`Options: []string{"default_permissions"}` to `bindMounter.VmMounts()`'s
+`mount.Mount{Type: "virtiofs", ...}` literal (`internal/shim/task/mount.go`) on the reasoning
+that nothing currently sets it.
+
+**Booted and found wrong, 2026-10-01.** The mount itself failed:
+
+```
+failed to mount bind-eb5a2bb732f4b795 at /run/mnt/bind-eb5a2bb732f4b795: mount source:
+"bind-eb5a2bb732f4b795", target: "/run/mnt/bind-eb5a2bb732f4b795", fstype: virtiofs, flags: 0,
+data: "default_permissions", err: invalid argument
+```
+
+Reading `fs/fuse/virtio_fs.c` at the pinned guest kernel (6.12.44) explains why:
+`default_permissions` is a generic-FUSE mount option, and `virtiofs` is a *different*,
+narrower filesystem type with its own parameter table —
+
+```c
+static const struct fs_parameter_spec virtio_fs_parameters[] = {
+	fsparam_flag("dax", OPT_DAX),
+	fsparam_enum("dax", OPT_DAX_ENUM, dax_param_enums),
+	{}
+};
+```
+
+— which only knows `dax`. Passing anything else makes `fs_parse()` reject the mount outright,
+which is the EINVAL above. But `virtio_fs_fill_super()` calls `virtio_fs_ctx_set_defaults()`
+unconditionally before that parsing even matters:
+
+```c
+static inline void virtio_fs_ctx_set_defaults(struct fuse_fs_context *ctx)
+{
+	ctx->rootmode = S_IFDIR;
+	ctx->default_permissions = 1;
+	...
+}
+```
+
+Every virtiofs mount already has `default_permissions` on, for every Boks sandbox, today, with
+no option to turn it off and nothing elsewhere in the file that does. The patch was not just
+unneeded, it broke the one thing it touched. It has been reverted. The actual blocker, found by
+continuing to boot against a plain unpatched shim once this one was pulled, is `0003` below.
+
+## `0003-report-idmap-mount-support-in-shim-info.patch`
+
+The one that actually gates whether containerd will accept an idmapped mount at all.
+
+With the withdrawn patch above reverted, booting again against a plain pinned shim reached
+container creation and failed differently:
+
+```
+failed to create shim task: failed to validate OCI runtime features: unmarshal runtime
+features: type with url : not found
+```
+
+This is containerd's own safety net, not nerdbox's or Boks' — `core/runtime/v2/task_manager.go`
+(containerd 2.2.6), `validateRuntimeFeatures`: whenever a spec's mounts carry `UIDMappings` or
+`GIDMappings` (`usesIDMapMounts`), containerd asks the runtime, via the shim's `Info` RPC,
+whether it actually supports idmapped mounts before creating the task — because a runc-family
+low-level runtime silently ignores spec fields it does not recognise, and a silently-dropped
+idmap is a real permissions regression, not a no-op. `manager.Info()`
+(`pkg/shim/manager/manager.go`) never sets the `Features` field at all, so containerd cannot
+even unmarshal it — not "unsupported," just empty — which fails every task creation that asks
+for an idmapped mount, including ones the runtime would gladly have honoured.
+
+`containerd-shim-runc-v2` answers this by shelling out to `runc features` and forwarding
+whatever it prints. That path does not exist here: crun runs inside the guest, and the guest is
+not started yet at the point containerd asks `Info`. What this project already knows at build
+time is which crun it pins — 1.24, this project's own Dockerfile — and that it supports
+idmapped mounts: reading `src/libcrun/linux.c` at that tag shows
+`maybe_create_userns_for_idmapped_mount` creating a throwaway user namespace per mount, with no
+dependence on the container having one of its own. The patch states that fact rather than
+discovering it at runtime.
+
+**Verified:** applies cleanly together with `0001` and `0002` against the pinned commit, and
+the resulting shim builds clean for `darwin/arm64` (`go build -tags no_grpc`) with `go vet
+./...` passing across the whole tree.
+
+### What happened once containerd actually accepted the task, 2026-10-01
+
+It did — `mount_setattr(MOUNT_ATTR_IDMAP)` succeeded, `mount` inside the guest reported the
+workspace share as `idmapped`, and the container's process ran as the image's own uid (`101`,
+not root, not the host's uid). The Go-side mechanism this patch exists to unblock
+(`internal/sandbox/hostuser.go`'s `idmapWorkspaceMounts`) is doing exactly what it was
+designed to do.
+
+What doesn't work yet: every uid/gid read through the idmapped mount — `ls`, `stat`, a fresh
+`touch` — returns the kernel's overflow sentinel (`65534`), and every write fails with
+`EOVERFLOW`, as if the mapping table were empty. It is not empty. The bundle's `config.json`,
+read directly off disk, carries exactly the right values:
+
+```json
+"uidMappings":[{"containerID":101,"hostID":502,"size":1}],
+"gidMappings":[{"containerID":0,"hostID":20,"size":1}]
+```
+
+— matching `id -u`/`id -g` (502/20) and the real on-disk owner of the shared directory
+(`stat -f '%u %g'` on the host, also 502/20), confirmed independently on the macOS side. So
+this is not a Boks bug, not a value lost somewhere in the containerd/shim pipeline — the
+correct mapping reaches crun and crun's own `mount_setattr` call reports success.
+
+**Ruled out by direct testing** (not by reading source and reasoning it away):
+
+| Hypothesis | Test | Result |
+| --- | --- | --- |
+| Stale cwd reference, since source and destination are the same path | Fresh absolute-path access from a different cwd | Same failure |
+| Missing the literal `"idmap"`/`"ridmap"` mount-option string (crun's own passing test, `test_idmapped_mounts_without_userns`, always sets it alongside `UIDMappings`) | Added `"ridmap"` to `Options` | Same failure |
+| `rw` specifically clobbers the mapping via crun's second, option-driven `mount_setattr` call (crun's own passing test uses `"ro"`) | Idmapped a read-only mount instead | Same failure |
+| General crun+idmap+no-container-userns mechanism is broken | Same crun, same kernel, idmapped a plain ext4 write (`/tmp` inside the guest, no mount involved) | **Works** — correct uid, no error |
+
+That last row is the one worth sitting with: the exact same crun code path, same kernel, same
+"no container user namespace" shape, works correctly against ext4 and fails identically against
+virtiofs regardless of direction (read or write) or mode (ro or rw). crun's own test coverage
+for "idmap without a container userns" exercises a plain directory, never FUSE — this
+combination may simply never have been exercised before.
+
+Traced through `fs/fuse/dir.c`'s `fuse_fillattr`/`fuse_getattr` and the kernel's
+`make_vfsuid`/`i_uid_into_vfsuid` machinery at the pinned kernel tag (6.12.44): structurally
+correct, properly idmap-aware, nothing found. That doesn't mean nothing is there — it means
+finding it needs live syscall tracing (`strace`/`bpftrace` against the actual `mount_setattr`
+call and the FUSE requests that follow it), which is a different kind of tool than source
+reading, and nobody has run it yet.
+
+### Found, 2026-10-01: the mapping was written backwards
+
+Nothing was wrong in crun, the kernel or the pipeline. The **mapping Boks wrote was inverted**,
+and the decisive evidence was in the first reproduction all along. The test file's gid on disk
+was `0` (macOS `wheel`, under `/private/tmp`), and the guest listed it as **`20`**:
+
+```
+uid=101(nginx) gid=0(root) groups=0(root)
+-rw-r--r-- 1 65534 20 3 Oct  1 15:31 f
+touch: cannot touch 'g': Value too large for defined data type
+```
+
+The gid entry was `{containerID: 0, hostID: 20}`, and it had turned on-disk `0` into a
+visible `20`. So `containerID` is the id **on disk** and `hostID` is the id the **caller
+sees**. crun writes each entry into the throwaway namespace's `uid_map` as `inside outside
+size`, and an idmapped mount maps an on-disk id as an *inside* id of that namespace
+(`make_vfsuid` → `make_kuid(idmap_userns, ...)`). The uid entry `{101 → 502}` therefore had
+`101` on the disk side, so the real on-disk `502` was unmapped, which gives `65534` on read.
+On write, the caller's `101` had no on-disk counterpart, so FUSE's request setup failed with
+`EOVERFLOW`. The field names only read naturally when the container has a user namespace of
+its own, where a mount's mapping is normally a copy of the container's.
+
+That also explains the ext4 row in the table above: nothing on that path compared against a
+host-owned file, so it never put a real on-disk id through the reversed entry.
+
+**Fixed in `idmapWorkspaceMounts`** (`internal/sandbox/hostuser.go`), which now writes
+`{containerID: hostUID, hostID: containerUID}` (and the same for gids). The unit test asserts
+that direction. Booted against the patched shim, same image:
+
+| Inside the guest (uid 101) | On the host |
+| --- | --- |
+| existing `f` lists as `101` | `502 20` |
+| `echo >> f` succeeds | `502 20`, 12 bytes |
+| `touch g`, `mkdir d`, `touch d/h` succeed, all list as `101` | all `502 20` |
+
+**Not caused by idmap:** files created through the share land on the host as `0600`/`0700`
+even though the guest reports `0644`/`0755`. The host-uid override path does the same
+(checked on the same day, same shim), so it is libkrun's passthrough behaviour and predates
+this feature.
+
+**Where this leaves things:** the mechanism works end to end against a shim built with
+`0001`+`0002`+`0003`. Boks decides whether to use it by running the shim with `-info` and
+reading the same `linux.mountExtensions.idmap.enabled` that containerd requires
+(`ShimSupportsIdmappedMounts`, `internal/daemon/compat.go`). It does not use a revision
+allowlist, because the Homebrew-built shim carries no vcs stamp, and a patch does not change
+the revision it applies on top of anyway. So a Mac picks it up as soon as `brew upgrade`
+installs the `revision 2` formula. Until then, the shim prints no features and Boks keeps the
+host-uid override.
+
+### Named `USER`: resolved on the host, 2026-10-01
+
+The idmap needs the container's uid when the spec is built, so `USER agent` (most agent
+images, including most kit-defined ones) had to be resolved before the guest exists. On macOS it used
+to reach the spec as uid 0 and take the override. `internal/sandbox/imageuser.go` now reads
+`/etc/passwd` and `/etc/group` out of the image's layers in the content store, top layer
+first and honouring whiteouts, and resolves the name the way containerd does on Linux.
+Verified on 2026-10-01 against `registry.example.test/copilot-sandbox:latest`
+through the `team-copilot-default` kit: the agent ran as `uid=1000(agent)` with groups `sudo`
+and `docker`, and `HOME=/home/agent` was writable. Its workspace writes landed as `502:20` on
+the host.
+
 ## `0001-fix-vminitd-resolve-Process.User.Username-against-th.patch`
 
 ### The field nothing reads

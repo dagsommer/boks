@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"os"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -71,5 +72,105 @@ func TestHostUserNeverAsksForRoot(t *testing.T) {
 	got := applyHostUser(t, cfg, specs.User{UID: 1000, GID: 1000})
 	if got.UID == 0 {
 		t.Errorf("the guest was told to run as root (host uid is %d)", os.Getuid())
+	}
+}
+
+// reconcileWorkspaceIdentity is withHostUser's decision, taking the guest's ability to idmap
+// as a parameter so both branches can be exercised without a real shim on disk — the same
+// idiom usesMetadataImageConfigOn uses in imageconfig.go. These tests build the *.Spec that
+// withHostUser would already have (a Process with the image's resolved user, Mounts already
+// populated by workspaceMounts) and call the decision directly.
+
+// The point of the idmap mechanism: the image's own user keeps running unchanged, and only
+// the mount gains a mapping translating the host's uid to it.
+func TestReconcileWorkspaceIdentityIdmapsANonRootImageWhenTheGuestCan(t *testing.T) {
+	ws := workspace.Workspace{HostPath: "/tmp/x", GuestPath: "/tmp/x"}
+	s := &specs.Spec{
+		Process: &specs.Process{User: specs.User{UID: 1000, GID: 1000, AdditionalGids: []uint32{1000, 27}}},
+		Mounts:  []specs.Mount{{Type: "bind", Source: ws.HostPath, Destination: ws.GuestPath}},
+	}
+
+	reconcileWorkspaceIdentity(s, []workspace.Workspace{ws}, 501, 20, true)
+
+	if s.Process.User.UID != 1000 || s.Process.User.GID != 1000 {
+		t.Errorf("Process.User = %d:%d, want the image's 1000:1000 untouched", s.Process.User.UID, s.Process.User.GID)
+	}
+	if len(s.Process.User.AdditionalGids) != 2 {
+		t.Errorf("AdditionalGids = %v, want the image's untouched", s.Process.User.AdditionalGids)
+	}
+	// ContainerID is the on-disk id and HostID the id the container sees: the kernel's
+	// idmap userns direction, the reverse of what the field names suggest. Inverting
+	// these made every file read as 65534 in a real guest; see idmapWorkspaceMounts.
+	wantUID := []specs.LinuxIDMapping{{ContainerID: 501, HostID: 1000, Size: 1}}
+	if !reflect.DeepEqual(s.Mounts[0].UIDMappings, wantUID) {
+		t.Errorf("Mounts[0].UIDMappings = %+v, want %+v", s.Mounts[0].UIDMappings, wantUID)
+	}
+	wantGID := []specs.LinuxIDMapping{{ContainerID: 20, HostID: 1000, Size: 1}}
+	if !reflect.DeepEqual(s.Mounts[0].GIDMappings, wantGID) {
+		t.Errorf("Mounts[0].GIDMappings = %+v, want %+v", s.Mounts[0].GIDMappings, wantGID)
+	}
+}
+
+// Without a guest that can idmap, the mechanism must fall back to exactly today's behavior —
+// losing the benefit, never losing correctness.
+func TestReconcileWorkspaceIdentityFallsBackWhenTheGuestCannotIdmap(t *testing.T) {
+	ws := workspace.Workspace{HostPath: "/tmp/x", GuestPath: "/tmp/x"}
+	s := &specs.Spec{
+		Process: &specs.Process{User: specs.User{UID: 1000, GID: 1000}},
+		Mounts:  []specs.Mount{{Type: "bind", Source: ws.HostPath, Destination: ws.GuestPath}},
+	}
+
+	reconcileWorkspaceIdentity(s, []workspace.Workspace{ws}, 501, 20, false)
+
+	if s.Process.User.UID != 501 || s.Process.User.GID != 20 {
+		t.Errorf("Process.User = %d:%d, want the host's 501:20", s.Process.User.UID, s.Process.User.GID)
+	}
+	if s.Mounts[0].UIDMappings != nil || s.Mounts[0].GIDMappings != nil {
+		t.Errorf("Mounts[0] carries an idmap (%+v/%+v); the fallback must leave mounts untouched",
+			s.Mounts[0].UIDMappings, s.Mounts[0].GIDMappings)
+	}
+}
+
+// A root-resolved image has no non-root container-side id to idmap to, so it must take the
+// override even when the guest could otherwise idmap — asserted with guestCanIdmap: true so a
+// mutation that dropped the UID != 0 guard would be caught here, not masked by the guest
+// simply never being able to idmap in this test's environment.
+func TestReconcileWorkspaceIdentityNeverIdmapsARootImage(t *testing.T) {
+	ws := workspace.Workspace{HostPath: "/tmp/x", GuestPath: "/tmp/x"}
+	s := &specs.Spec{
+		Process: &specs.Process{User: specs.User{UID: 0, GID: 0}},
+		Mounts:  []specs.Mount{{Type: "bind", Source: ws.HostPath, Destination: ws.GuestPath}},
+	}
+
+	reconcileWorkspaceIdentity(s, []workspace.Workspace{ws}, 501, 20, true)
+
+	if s.Process.User.UID == 0 {
+		t.Error("the guest was told to run as root")
+	}
+	if s.Mounts[0].UIDMappings != nil {
+		t.Errorf("a root-resolved image got an idmap instead of the override: %+v", s.Mounts[0].UIDMappings)
+	}
+}
+
+// A read-only mount has no EACCES-on-write problem to begin with; only the writable one should
+// change.
+func TestReconcileWorkspaceIdentityOnlyIdmapsWritableMounts(t *testing.T) {
+	rw := workspace.Workspace{HostPath: "/tmp/rw", GuestPath: "/tmp/rw", Mode: workspace.ModeReadWrite}
+	ro := workspace.Workspace{HostPath: "/tmp/ro", GuestPath: "/tmp/ro", Mode: workspace.ModeReadOnly}
+	s := &specs.Spec{
+		Process: &specs.Process{User: specs.User{UID: 1000, GID: 1000}},
+		Mounts: []specs.Mount{
+			{Type: "bind", Source: rw.HostPath, Destination: rw.GuestPath},
+			{Type: "bind", Source: ro.HostPath, Destination: ro.GuestPath},
+		},
+	}
+
+	reconcileWorkspaceIdentity(s, []workspace.Workspace{rw, ro}, 501, 20, true)
+
+	if s.Mounts[0].UIDMappings == nil {
+		t.Error("the read-write mount got no idmap")
+	}
+	if s.Mounts[1].UIDMappings != nil {
+		t.Errorf("the read-only mount got an idmap it has no use for: %+v", s.Mounts[1].UIDMappings)
 	}
 }

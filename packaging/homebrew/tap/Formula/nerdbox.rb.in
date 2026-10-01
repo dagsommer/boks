@@ -34,7 +34,8 @@ class Nerdbox < Formula
   # upstream tag moved.
   #
   # 1: 0002 raised the layer count at which the shim packs layers into one disk.
-  revision 1
+  # 2: 0003 reports idmap mount support from Info, so Boks can idmap workspace shares.
+  revision 2
 
   # This formula is pinned to a nerdbox tag on purpose, and the pin is a Boks decision rather
   # than a packaging convenience: v0.2.3 is the release containing cd2c23f, the commit
