@@ -13,7 +13,9 @@ import (
 // developer's real policy and nothing the developer has written can reach the test.
 func policyState(t *testing.T) {
 	t.Helper()
-	t.Setenv("BOKS_STATE_DIR", t.TempDir())
+	// shortStateDir, not t.TempDir(): the test names here are long enough to push a
+	// sandbox's link socket past the 104-byte sun_path limit under macOS's temp root.
+	t.Setenv("BOKS_STATE_DIR", shortStateDir(t))
 }
 
 // mustPolicy runs a policy subcommand and fails the test if it does not succeed.

@@ -38,11 +38,22 @@ import (
 // error the tests asserting that behaviour are written against. daemonStart panics rather than
 // returning an error, because a test reaching it is a defect in the test rather than a
 // condition to handle, and an error could be swallowed by a test that expects one.
+//
+// BOKS_STATE_DIR is pointed at a throwaway directory for the same reason: without it, a test
+// that never set its own read the policy store of whoever ran the tests, and asserted on rules
+// it had not written. A test that wants a state directory of its own still sets one.
 func TestMain(m *testing.M) {
+	state, err := os.MkdirTemp("", "bkt")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("BOKS_STATE_DIR", state)
 	daemonServing = func(context.Context, string) bool { return true }
 	daemonStart = func(context.Context, string, io.Writer) (daemon.State, error) {
 		panic("a test reached daemon.Start, which re-execs the test binary as a detached " +
 			"process: override daemonStart/daemonServing in the test, as autostart_test.go does")
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	_ = os.RemoveAll(state)
+	os.Exit(code)
 }
