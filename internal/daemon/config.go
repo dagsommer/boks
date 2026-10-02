@@ -136,10 +136,32 @@ func diffOrder(goos string, erofs bool) []string {
 	return append([]string{runtimecfg.Snapshotter}, rest...)
 }
 
+// disabledGroup is a set of plugins turned off together, with the comment rendered above them.
+type disabledGroup struct {
+	why []string
+	ids []string
+}
+
 // disabledPlugins is what must not load for the daemon to come up at all.
-func disabledPlugins(goos string) []string {
+func disabledPlugins(goos string) []disabledGroup {
+	// NRI, on every host. Its default socket is the machine-wide /var/run/nri/nri.sock, which
+	// is not this daemon's to hold: unprivileged it cannot be created at all, and privileged
+	// it collides with the system containerd's. Since GitHub's ubuntu-latest runner moved to a
+	// containerd that treats that as fatal — "failed to set up NRI for CRI service: failed to
+	// start NRI interface: failed to create socket /var/run/nri/nri.sock: mkdir /var/run/nri:
+	// permission denied", first seen on 2026-10-01 — the daemon exited at startup. Boks uses
+	// no NRI plugins, and CRI treats a missing NRI as "NRI support disabled" and carries on
+	// (plugins/cri/cri.go, getNRIAPI).
+	groups := []disabledGroup{{
+		why: []string{
+			"NRI's socket is the machine-wide /var/run/nri/nri.sock, which this daemon must not",
+			"hold: unprivileged it cannot create it, and privileged it collides with the",
+			"system containerd's. Boks uses no NRI plugins.",
+		},
+		ids: []string{"io.containerd.nri.v1.nri"},
+	}}
 	if goos != "windows" {
-		return nil
+		return groups
 	}
 	// Unelevated, the cimfs snapshotter dies at init on "A required privilege is not held
 	// by the client". That would be survivable alone, except the bolt metadata plugin
@@ -147,10 +169,17 @@ func disabledPlugins(goos string) []string {
 	// plugins with it — including the erofs differ, which then reads as an erofs problem.
 	// Both entries are needed: the differ is a separate plugin and is useless without its
 	// snapshotter.
-	return []string{
-		"io.containerd.snapshotter.v1.cimfs",
-		"io.containerd.differ.v1.cimfs",
-	}
+	return append(groups, disabledGroup{
+		why: []string{
+			"Unelevated, the cimfs snapshotter fails at init, and the bolt metadata plugin",
+			"requires every snapshotter — so one failing snapshotter takes about forty plugins",
+			"with it, including the erofs differ. Turning cimfs off is the whole fix.",
+		},
+		ids: []string{
+			"io.containerd.snapshotter.v1.cimfs",
+			"io.containerd.differ.v1.cimfs",
+		},
+	})
 }
 
 // render writes the configuration file.
@@ -188,13 +217,15 @@ func render(s Settings) (string, error) {
 	w("state = '%s'\n", s.State)
 	w("\n")
 
-	if plugins := disabledPlugins(s.GOOS); len(plugins) > 0 {
-		w("# Unelevated, the cimfs snapshotter fails at init, and the bolt metadata plugin\n")
-		w("# requires every snapshotter — so one failing snapshotter takes about forty plugins\n")
-		w("# with it, including the erofs differ. Turning cimfs off is the whole fix.\n")
+	if groups := disabledPlugins(s.GOOS); len(groups) > 0 {
 		w("disabled_plugins = [\n")
-		for _, p := range plugins {
-			w("  '%s',\n", p)
+		for _, g := range groups {
+			for _, line := range g.why {
+				w("  # %s\n", line)
+			}
+			for _, id := range g.ids {
+				w("  '%s',\n", id)
+			}
 		}
 		w("]\n\n")
 	}
