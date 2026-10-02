@@ -345,9 +345,16 @@ Windows 11 on 2026-10-02, with v0.1.22 installed through winget:
 hold sparse files (FAT, exFAT) refuses the call; that is logged as a warning and the file
 stays dense, which is the behaviour from before. Off Windows the helper is a no-op.
 
+**Measured, on the same Windows 11 machine, 2026-10-02:** the `mkfs.ext4.exe` that ships in
+the v0.1.22 archive, run on a 16 GiB file flagged sparse by hand (`fsutil sparse setflag`,
+then `fsutil file seteof`), finished in **3.1 s** and consumed **0.26 GiB** of the volume —
+against 106 s and the full 16 GiB unflagged. The file still reported `set as sparse`
+afterwards, so mkfs does not undo the flag.
+
 **Verified:** applies on top of `0001`–`0006` against v2.3.3, `GOOS=windows go build
 ./cmd/containerd` and `go vet ./core/mount/manager/` are clean, and that package's tests pass.
-**Not yet run on Windows.**
+What is not yet run is this containerd build itself on Windows: the measurement above sets the
+flag by hand, where the patch sets it with the same FSCTL from inside the mount manager.
 
 ## What actually works on Windows, and what does not
 
