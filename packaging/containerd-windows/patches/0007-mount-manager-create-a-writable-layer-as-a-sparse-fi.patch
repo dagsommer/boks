@@ -1,0 +1,119 @@
+From 2f4f91bcdea5270f44d0dbc5f66fdfd680d06f38 Mon Sep 17 00:00:00 2001
+From: Dag Sommer <dagaleks@me.com>
+Date: Fri, 2 Oct 2026 14:15:04 +0200
+Subject: [PATCH] mount/manager: create a writable layer as a sparse file on
+ Windows
+
+On NTFS a file is sparse only when flagged so. Unflagged, the truncate
+that sizes a writable layer reserves every cluster, and mkfs.ext4's
+writes near the end make the host zero-fill everything before them. A
+16 GiB layer needed 16 GiB of free space to exist ("There is not enough
+space on the disk" at truncate) and about 110 s of disk writes before the
+VM could boot.
+
+Flag the file with FSCTL_SET_SPARSE before extending it. A volume that
+cannot hold sparse files refuses it; that is logged and the file stays
+dense, as before.
+---
+ core/mount/manager/mkfs.go           |  5 ++++
+ core/mount/manager/sparse_other.go   | 24 +++++++++++++++++
+ core/mount/manager/sparse_windows.go | 40 ++++++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+)
+ create mode 100644 core/mount/manager/sparse_other.go
+ create mode 100644 core/mount/manager/sparse_windows.go
+
+diff --git a/core/mount/manager/mkfs.go b/core/mount/manager/mkfs.go
+index 767e4ea..fbeffbc 100644
+--- a/core/mount/manager/mkfs.go
++++ b/core/mount/manager/mkfs.go
+@@ -231,6 +231,11 @@ func (t *mkfs) Transform(ctx context.Context, m mount.Mount, a []mount.ActiveMou
+ 
+ 		createArgs = append(createArgs, f.Name())
+ 
++		// Sparse before the truncate, or the truncate is an allocation. See sparse_windows.go.
++		if err := makeSparse(f); err != nil {
++			log.G(ctx).WithError(err).WithField("path", m.Source).Warn("writable layer is not sparse; it will occupy its full size on disk")
++		}
++
+ 		err = f.Truncate(size)
+ 		f.Close()
+ 		if err != nil {
+diff --git a/core/mount/manager/sparse_other.go b/core/mount/manager/sparse_other.go
+new file mode 100644
+index 0000000..d610a8c
+--- /dev/null
++++ b/core/mount/manager/sparse_other.go
+@@ -0,0 +1,24 @@
++//go:build !windows
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package manager
++
++import "os"
++
++// makeSparse does nothing off Windows: a truncated file is already sparse there.
++func makeSparse(*os.File) error { return nil }
+diff --git a/core/mount/manager/sparse_windows.go b/core/mount/manager/sparse_windows.go
+new file mode 100644
+index 0000000..4c7df91
+--- /dev/null
++++ b/core/mount/manager/sparse_windows.go
+@@ -0,0 +1,40 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package manager
++
++import (
++	"os"
++
++	"golang.org/x/sys/windows"
++)
++
++// makeSparse marks f as an NTFS sparse file.
++//
++// On Linux and macOS, truncating a new file to its size leaves a hole: the file costs what is
++// written to it. NTFS does that only for a file flagged sparse. Unflagged, SetEndOfFile
++// reserves every cluster up front, and the first write near the end zero-fills everything
++// before it — so a 16 GiB writable layer needed 16 GiB of free space to be created, and
++// mkfs.ext4, whose backup superblocks reach the last block groups, made the host write all
++// 16 GiB before the VM could boot (measured at about 110 s on Windows 11).
++//
++// It must be called before the file is extended. A volume that cannot hold sparse files (FAT,
++// exFAT) refuses it; the caller logs that and carries on with a dense file, which is the
++// behaviour from before this existed.
++func makeSparse(f *os.File) error {
++	var returned uint32
++	return windows.DeviceIoControl(windows.Handle(f.Fd()), windows.FSCTL_SET_SPARSE, nil, 0, nil, 0, &returned, nil)
++}
+-- 
+2.56.0
+

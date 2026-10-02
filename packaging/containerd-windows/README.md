@@ -326,6 +326,29 @@ either, it is every unelevated Windows containerd's problem, and the earlier cla
 page that it was "upstream's design call, not something to fork here" was a way of not
 choosing.
 
+### `0007` — create a writable layer as a sparse file
+
+Off Linux every sandbox gets its own ext4 image, `rwlayer.img`, which the mount manager
+creates, truncates to `default_size` (16 GiB since Boks v0.1.11) and formats with
+`mkfs.ext4`. On Linux and macOS that truncate leaves a hole and the file costs what is written
+to it. **NTFS does that only for a file flagged sparse**, and nothing flagged it. Measured on
+Windows 11 on 2026-10-02, with v0.1.22 installed through winget:
+
+- every `rwlayer.img` reported `This file is NOT set as sparse` (`fsutil sparse queryflag`);
+- the first start of a sandbox took **106 s**, all of it `mkfs.ext4` — its backup superblocks
+  reach the last block groups, and each write past the valid data length makes NTFS zero-fill
+  everything before it, so the host wrote the full 16 GiB before the VM could boot;
+- with 16 GiB of free space no longer available, creation failed outright at the truncate:
+  `There is not enough space on the disk`.
+
+`0007` issues `FSCTL_SET_SPARSE` on the new file before it is extended. A volume that cannot
+hold sparse files (FAT, exFAT) refuses the call; that is logged as a warning and the file
+stays dense, which is the behaviour from before. Off Windows the helper is a no-op.
+
+**Verified:** applies on top of `0001`–`0006` against v2.3.3, `GOOS=windows go build
+./cmd/containerd` and `go vet ./core/mount/manager/` are clean, and that package's tests pass.
+**Not yet run on Windows.**
+
 ## What actually works on Windows, and what does not
 
 Registering a plugin is not the same as it functioning. Reading the code:
@@ -884,7 +907,7 @@ Where a claim below was checked by running something, it says so.
 
 | Check | How | Result |
 | --- | --- | --- |
-| all six patches apply to pristine v2.3.3, in order | `git apply --check`, then `git apply`, on a fresh v2.3.3 clone | clean |
+| all seven patches apply to pristine v2.3.3, in order | `git apply --check`, then `git apply`, on a fresh v2.3.3 clone | clean |
 | PE32+ x86-64 | `objdump -f` | `pei-x86-64` for `containerd.exe` and `ctr.exe` |
 | erofs plugins linked in | `strings` | `plugins/diff/erofs/plugin`, `plugins/snapshots/erofs/plugin` present, both arches |
 | existing plugins kept | `strings` | `plugins/snapshots/windows` still present |
