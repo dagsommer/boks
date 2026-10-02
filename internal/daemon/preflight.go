@@ -1,21 +1,26 @@
 package daemon
 
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-
-	"github.com/containerd/containerd/v2/defaults"
-)
-
 // The things Boks cannot fix by writing a configuration file, checked before they fail later.
 //
 // Everything in config.go is a setting, and a setting can simply be written correctly. What is
-// left over is the residue: one directory whose location is compiled into containerd and
-// cannot be moved, and two host tools whose absence is invisible until much later — one of
-// which quietly changes what the configuration is allowed to say. The directory and one of the
-// tools fail at task start, the other at image unpack, and none of the three at `boks daemon
-// start`, which is when somebody is looking. So each is worth a sentence up front.
+// left over is the residue: host tools whose absence is invisible until much later — one of
+// which quietly changes what the configuration is allowed to say. They fail at task start or at
+// image unpack, and not at `boks daemon start`, which is when somebody is looking. So each is
+// worth a sentence up front.
+//
+// # The shim socket directory is no longer one of them
+//
+// Until 2026-10-02 this also warned that /var/run/containerd (/run/containerd on Linux) was not
+// writable, and told the user to create it with sudo — "the one step that needs root". It was
+// right for containerd 2.2, which compiled the shim socket directory in (containerd#12444). It
+// is wrong for 2.3 and later, which is every daemon Boks can run with: the shim links 2.3.3 and
+// CheckSkew refuses an older daemon. From 2.3 an unprivileged containerd picks a directory it
+// can use itself ($XDG_RUNTIME_DIR/containerd/s, /run/<uid>/containerd/s, then
+// /tmp/containerd-s-<uid>, created 0700 and checked to be the caller's —
+// core/runtime/v2/shim_unix.go, defaultSocketDir) and hands it to the shim in the bootstrap
+// parameters, which nerdbox honours (pkg/shim/manager, bparams.GetSocketDir). On macOS the old
+// advice was worse than unnecessary: /var/run is emptied at every boot, so the sudo had to be
+// repeated after each restart.
 
 // Note is something the user should know about the daemon that is starting. It is never fatal:
 // a daemon that comes up and can pull images is useful even if it cannot yet start a task, and
@@ -29,9 +34,6 @@ type Note struct {
 // Preflight returns what is wrong with the host that the configuration cannot express.
 func Preflight(settings Settings) []Note {
 	var notes []Note
-	if n := shimSocketRootNote(settings.GOOS); n != nil {
-		notes = append(notes, *n)
-	}
 	if !settings.EROFS {
 		notes = append(notes, Note{
 			Name:   "mkfs.erofs",
@@ -100,94 +102,3 @@ func writableLayerNote(settings Settings) *Note {
 		Remedy: remedy,
 	}
 }
-
-// shimSocketRootNote reports whether containerd will be able to create the shim's socket.
-//
-// containerd derives that path from a compile-time constant — pkg/shim/util_unix.go's
-// `socketRoot`, which is `filepath.Join(defaults.DefaultStateDir, "s")` — so no configuration
-// setting moves it (containerd#12444), and this is the one part of the daemon's layout Boks
-// cannot choose. On Linux it is /run/containerd and on macOS /var/run/containerd, both of which
-// a normal user cannot create.
-//
-// The failure without this note arrives much later and reads as a Boks failure:
-//
-//	creating sandbox process: mkdir /var/run/containerd: permission denied
-//
-// docs/install.md calls the fix "the only step that needs root", and it still is — Boks does
-// not elevate to do it. What Boks can do is try the harmless half first: if the directory can
-// simply be created, it is created and there is nothing to report.
-//
-// # Why it says nothing on Windows
-//
-// It used to, and it was wrong. `boks daemon start` on Windows 11 warned about
-// `C:\ProgramData\containerd\state` on 2026-08-16, on a machine where that path did not exist
-// and where sandboxes then started, ran, enforced policy and stopped without it. The check was
-// asking a question with no meaning on that host: a shim on Windows is reached over a **named
-// pipe**, which lives in the kernel's object namespace and not on any filesystem. containerd's
-// own pkg/shim/util_windows.go has no socketRoot, no SocketAddress and no writeSocketDir, and
-// its RemoveSocket is a no-op — the whole mechanism this note is about is Unix-only. The only
-// Windows use of DefaultStateDir is a *default* for `--state`, which Boks overrides anyway
-// (see config.go).
-//
-// It was also the wrong remedy in the wrong direction: it told an unelevated user to give
-// themselves write access to a machine directory or "run the daemon elevated", on the one
-// platform where Boks has been verified end to end with no elevation at all. A warning that
-// fires on a working host teaches its reader to ignore the ones that mean something, which is
-// the argument internal/cli/notice.go already makes about volume.
-//
-// The platform is a parameter rather than a read of runtime.GOOS so that the Windows case can
-// be constructed by a test on a machine that is not Windows — which is the only kind of machine
-// this repository's tests have ever run on.
-func shimSocketRootNote(goos string) *Note {
-	if goos == "windows" {
-		return nil
-	}
-	root := defaults.DefaultStateDir
-	if writableDir(root) {
-		return nil
-	}
-	if err := os.MkdirAll(root, 0o700); err == nil && writableDir(root) {
-		return nil
-	}
-	return &Note{
-		Name:   "shim socket directory",
-		Detail: root + " is not writable by you",
-		Remedy: shimSocketRemedy(root),
-	}
-}
-
-func shimSocketRemedy(root string) string {
-	return fmt.Sprintf(
-		"containerd puts each shim's socket under %s, and that path is a compile-time\n"+
-			"constant: no configuration moves it, so it cannot live under your state\n"+
-			"directory with everything else. The daemon will start and can pull images;\n"+
-			"starting a sandbox will fail with\n\n"+
-			"    creating sandbox process: mkdir %s: permission denied\n\n"+
-			"This is the one step that needs root, and it is needed once:\n\n"+
-			"    sudo mkdir -p %s\n"+
-			"    sudo chown \"$(id -u):$(id -g)\" %s", root, root, root, root)
-}
-
-// writableDir reports whether path is a directory this process can create a file in.
-//
-// Permission bits are not consulted, and that is deliberate: they answer the wrong question
-// under a group membership, an ACL, or a read-only mount. Creating a file and removing it
-// answers the question that will actually be asked later.
-func writableDir(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil || !info.IsDir() {
-		return false
-	}
-	probe, err := os.CreateTemp(path, ".boks-writable-")
-	if err != nil {
-		return false
-	}
-	name := probe.Name()
-	probe.Close()
-	_ = os.Remove(name)
-	return true
-}
-
-// ShimSocketRoot is where containerd will put shim sockets, exported so that `boks doctor` can
-// name the same directory rather than repeating the constant.
-func ShimSocketRoot() string { return filepath.Clean(defaults.DefaultStateDir) }

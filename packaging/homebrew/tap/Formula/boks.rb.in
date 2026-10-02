@@ -110,18 +110,8 @@ class Boks < Formula
   def caveats
     <<~EOS
       Run `boks doctor` now. It checks every prerequisite and prints what to do about each
-      gap. One of them is not this formula's to fix:
-
-        containerd must be running, and its state directory must be yours.
-
-        containerd derives the shim's socket path from a compile-time constant, so no
-        config setting moves it (containerd#12444). Once, as root:
-
-          sudo mkdir -p /var/run/containerd
-          sudo chown "$(id -u):$(id -g)" /var/run/containerd
-
-        This is the only step that needs root. `boks daemon start` does the rest: it starts
-        containerd itself and writes the rootless configuration by hand.
+      gap. Nothing needs root: `boks daemon start` starts containerd itself, rootless, and
+      writes its configuration by hand.
 
       containerd resolves the nerdbox shim through the daemon's PATH, not your shell's. A
       containerd `boks daemon start` launched inherits your shell's PATH, which already has

@@ -11,8 +11,16 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// applyHostUser runs withHostUser as the override path, whatever this machine's shim can do.
+// The probe behind guestSupportsIdmappedMounts runs the real installed shim, so without
+// pinning it these tests asserted the override on hosts with an unpatched shim and failed on
+// hosts with a patched one. The idmap branch has its own tests, which call
+// reconcileWorkspaceIdentity with the capability as a parameter.
 func applyHostUser(t *testing.T, cfg Config, start specs.User) specs.User {
 	t.Helper()
+	probe := guestSupportsIdmappedMounts
+	guestSupportsIdmappedMounts = func() bool { return false }
+	t.Cleanup(func() { guestSupportsIdmappedMounts = probe })
 	s := &specs.Spec{Process: &specs.Process{User: start}}
 	if err := withHostUser(cfg)(context.Background(), nil, nil, s); err != nil {
 		t.Fatalf("withHostUser: %v", err)

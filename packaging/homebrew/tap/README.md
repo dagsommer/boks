@@ -35,17 +35,13 @@ brew trust libkrun/krun
 brew install boks
 ```
 
-Then, once, as root — and this is the only step that needs root:
+Then:
 
 ```sh
-sudo mkdir -p /var/run/containerd
-sudo chown "$(id -u):$(id -g)" /var/run/containerd
 boks doctor
 ```
 
-containerd derives each shim's socket path from a compile-time constant, so no configuration
-setting moves it ([containerd#12444](https://github.com/containerd/containerd/issues/12444)).
-`boks daemon start` does everything else: it runs containerd rootless with the right `PATH`,
+Nothing needs root. `boks daemon start` does everything else: it runs containerd rootless with the right `PATH`,
 which is the daemon's and not your shell's.
 
 ## Why three commands before `install`, and why whole-tap trust
