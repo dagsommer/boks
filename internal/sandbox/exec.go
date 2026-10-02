@@ -147,6 +147,21 @@ func execProcess(ctx context.Context, container client.Container, task client.Ta
 
 	status := <-statusC
 	restore()
+	// Close this side's IO now the process is gone, before the deferred Delete. containerd's
+	// Process.Delete asks the shim to delete the exec first and only closes the client's IO
+	// afterwards, and nerdbox's shim does not finish deleting an exec while the stdin stream
+	// from the client is still open. A terminal — or any input that has not reached EOF —
+	// never closes it on its own, so every interactive exit waited out stopTimeout (10s) in
+	// Delete and then failed anyway, leaking the exec record Delete exists to remove.
+	// Measured 2026-10-02: Delete took 10.0s with stdin open and 2ms after this.
+	//
+	// Wait first: it returns once stdout and stderr are fully copied, so nothing the process
+	// wrote last is cut off — 200,000 lines written just before exit all arrived. Closing the
+	// guest's stdin over the API (CloseIO) instead was tried and does not unblock Delete.
+	if stdin != nil {
+		proc.IO().Wait()
+		proc.IO().Close()
+	}
 	code, _, statusErr := status.Result()
 
 	// An interrupted command reports 128+signal and prints nothing; the status error in
