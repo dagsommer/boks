@@ -612,3 +612,40 @@ func TestParseMode(t *testing.T) {
 		t.Error("ParseMode accepted an unknown mode")
 	}
 }
+
+// A name too long for the socket path is shortened rather than refused, and the shortened
+// name still fits, stays recognisable, and is unique per sandbox.
+func TestSandboxDirNameShortensOnlyWhenItMust(t *testing.T) {
+	runtimeDir := "/Users/someone.with.a.long.name/Library/Application Support/boks/net"
+
+	if got := SandboxDirName(runtimeDir, "shell-boks"); got != "shell-boks" {
+		t.Errorf("a short name was changed to %q", got)
+	}
+
+	long := "team-copilot-default-Dokumentproduksjon"
+	got := SandboxDirName(runtimeDir, long)
+	if got == long {
+		t.Fatalf("a name too long for the socket path was kept: %q", got)
+	}
+	if socket := filepath.Join(runtimeDir, got, "net.sock"); len(socket) >= unixPathMaxDarwin {
+		t.Errorf("shortened socket path is %d bytes, still over the limit: %s", len(socket), socket)
+	}
+	if !strings.HasPrefix(got, "team-copilot") {
+		t.Errorf("shortened name %q no longer reads as the sandbox", got)
+	}
+	if again := SandboxDirName(runtimeDir, long); again != got {
+		t.Errorf("not deterministic: %q then %q", got, again)
+	}
+	if other := SandboxDirName(runtimeDir, long+"2"); other == got {
+		t.Errorf("two sandboxes sharing a long prefix got the same directory %q", got)
+	}
+
+	// NewPlan uses it, so the case that used to be refused now plans.
+	plan, err := NewPlan(Config{Mode: ModeNAT, Sandbox: long, RuntimeDir: runtimeDir})
+	if err != nil {
+		t.Fatalf("NewPlan refused a long sandbox name: %v", err)
+	}
+	if filepath.Base(filepath.Dir(plan.Socket)) != got {
+		t.Errorf("plan socket %s is not in the directory SandboxDirName names (%s)", plan.Socket, got)
+	}
+}

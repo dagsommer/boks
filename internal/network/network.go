@@ -80,6 +80,8 @@ package network
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/netip"
@@ -253,7 +255,7 @@ func NewPlan(cfg Config) (Plan, error) {
 		return Plan{}, err
 	}
 
-	socket := filepath.Join(cfg.RuntimeDir, sanitize(cfg.Sandbox), "net.sock")
+	socket := filepath.Join(cfg.RuntimeDir, SandboxDirName(cfg.RuntimeDir, cfg.Sandbox), "net.sock")
 	if err := checkSocketPath(socket); err != nil {
 		return Plan{}, err
 	}
@@ -352,6 +354,38 @@ func checkSocketPath(path string) error {
 			len(path), unixPathMaxDarwin, path)
 	}
 	return nil
+}
+
+// SandboxDirName is the name of a sandbox's directory under runtimeDir: the directory that
+// holds its link socket, and the one internal/enforce keeps the rest of its network state in.
+// Both packages call this, so they agree on it.
+//
+// It is the sandbox's name, sanitised, whenever that fits — which is every sandbox that worked
+// before this existed, so their directories do not move. When the name would push the link
+// socket past the 104-byte sun_path limit, the name is cut short and a digest of the whole name
+// appended, so it stays unique and still reads as the sandbox it belongs to. That case used to
+// be a refusal: a kit agent's name plus the workspace directory's
+// ("team-copilot-default-Dokumentproduksjon") under ~/Library/Application Support on macOS
+// came to 112 bytes, and `boks run` stopped before creating anything, telling the user to pick
+// a shorter name for a sandbox whose name they had not picked.
+func SandboxDirName(runtimeDir, sandbox string) string {
+	name := sanitize(sandbox)
+	// The longest path this directory has to hold: the socket the link listens on.
+	// internal/enforce's control socket is named to be exactly as long.
+	budget := unixPathMaxDarwin - 1 - len(filepath.Join(runtimeDir, "x", "net.sock")) + 1
+	if len(name) <= budget {
+		return name
+	}
+	sum := sha256.Sum256([]byte(sandbox))
+	digest := hex.EncodeToString(sum[:])[:12]
+	keep := budget - len(digest) - 1
+	if keep <= 0 {
+		// The runtime directory alone leaves no room for a readable prefix. The digest
+		// is the best that can be done, and checkSocketPath reports it if even that
+		// does not fit.
+		return digest
+	}
+	return strings.TrimRight(name[:keep], "-_") + "-" + digest
 }
 
 // sanitize keeps a sandbox name usable as a directory component.

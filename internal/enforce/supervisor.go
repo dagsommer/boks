@@ -134,8 +134,12 @@ type State struct {
 
 // dirFor is where one sandbox's network state lives. It is the directory that holds the
 // link socket, so that everything belonging to a sandbox's network is removed together.
+//
+// The directory name comes from network.SandboxDirName, which is also what places the socket,
+// so a name too long to fit the socket path is shortened identically on both sides.
 func dirFor(stateDir, sandbox string) string {
-	return filepath.Join(stateDir, "net", sanitize(sandbox))
+	netDir := filepath.Join(stateDir, "net")
+	return filepath.Join(netDir, network.SandboxDirName(netDir, sandbox))
 }
 
 // StateDir is exported for the CLI, which builds the plan and so must place the socket in
