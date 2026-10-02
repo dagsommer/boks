@@ -251,15 +251,12 @@ same spirit as the network supervisor's.
 
 ### What `boks daemon` cannot fix
 
-`/run/containerd` on Linux, `/var/run/containerd` on macOS. containerd derives each shim's
-socket path from a compile-time constant (`pkg/shim/util_unix.go`, `socketRoot =
-defaults.DefaultStateDir`), so no configuration setting moves it —
-[containerd#12444](https://github.com/containerd/containerd/issues/12444).
-
-Boks tries the harmless half — if the directory can simply be created, it creates it — and
-otherwise prints the one `sudo` line up front rather than letting the first sandbox fail on
-`mkdir`. It does not refuse to start: a daemon that can pull images is useful to somebody
-debugging, and refusing would remove the machine they are debugging with.
+Not the shim socket directory, any more. containerd 2.2 derived each shim's socket path from
+a compile-time constant ([containerd#12444](https://github.com/containerd/containerd/issues/12444)),
+so `/var/run/containerd` had to be created with `sudo` — and on macOS, where `/var/run` is
+emptied at boot, re-created after every restart. containerd 2.3, which Boks requires, picks a
+directory an unprivileged daemon can use and passes it to the shim, so Boks stopped asking on
+2026-10-02. See `internal/daemon/preflight.go`.
 
 ### What it also fixes, almost for free
 
@@ -850,8 +847,9 @@ work end to end, and the guest resource is now in `boks.rb`, so `brew install bo
 produce a machine where `boks doctor` passes and a sandbox boots. That would be the first
 install that is *true* — and "should" is doing real work in that sentence.
 
-It still requires the one `sudo` line for `/var/run/containerd` and the `brew trust` lines.
-Neither is avoidable and both are documented.
+It still requires the `brew trust` lines, which are not avoidable and are documented. The
+`sudo` line for `/var/run/containerd` it used to need is gone: containerd 2.3 made it
+unnecessary.
 
 The tap has never been run, and there is no macOS machine on CI. **Treat the first `brew
 install` as the test**, and expect it to fail the first time.

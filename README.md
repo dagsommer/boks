@@ -44,8 +44,8 @@ the way it will be measured rather than the way it would sell, is in
 
 - Hardware virtualisation: Linux with `/dev/kvm` (and membership of the `kvm` group), or
   macOS on Apple silicon (Hypervisor.framework). macOS additionally needs the nerdbox shim
-  codesigned with the `com.apple.security.hypervisor` entitlement and a user-writable
-  `/var/run/containerd` — see [docs/verification.md](docs/verification.md#macos-setup-notes).
+  codesigned with the `com.apple.security.hypervisor` entitlement — see
+  [docs/verification.md](docs/verification.md#macos-setup-notes).
 - [containerd](https://containerd.io/) 2.3 or later, running — not 2.2, which cannot decode
   the shim's bootstrap parameters
 - [nerdbox](https://github.com/containerd/nerdbox) — the VM runtime shim

@@ -40,13 +40,14 @@ not. This is the single most common macOS setup failure.
 
 ### `mkdir /var/run/containerd: permission denied`
 
-```bash
-sudo mkdir -p /var/run/containerd && sudo chown "$(id -u):$(id -g)" /var/run/containerd
-```
-
-The only step that needs root. Full macOS setup notes, including the rootless containerd
-configuration where startup dies on `chown …containerd.sock.ttrpc: operation not permitted`,
-are in [Verification](verification.md#macos-setup-notes).
+Your containerd is older than 2.3. containerd 2.2 compiled the shim socket directory in
+([containerd#12444](https://github.com/containerd/containerd/issues/12444)); 2.3 and later
+choose one an unprivileged daemon can use, and Boks requires 2.3 anyway (`boks doctor` reports
+the skew). Upgrade containerd rather than creating the directory with `sudo` — on macOS
+`/var/run` is emptied at every boot, so that workaround has to be repeated after each restart.
+Full macOS setup notes, including the rootless containerd configuration where startup dies on
+`chown …containerd.sock.ttrpc: operation not permitted`, are in
+[Verification](verification.md#macos-setup-notes).
 
 ### `containerd` is unreachable
 

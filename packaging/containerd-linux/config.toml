@@ -36,14 +36,10 @@ version = 3
 # containerd just needs somewhere it can write. Create these yourself, or let containerd
 # create them; either works as long as the parent is yours.
 #
-# `/var/run/containerd` is a SEPARATE problem and this file cannot fix it: containerd
-# derives the shim's socket path from a compile-time constant, so no setting moves it
-# (containerd#12444). You still need, once, as root:
-#
-#     sudo mkdir -p /var/run/containerd
-#     sudo chown "$(id -u):$(id -g)" /var/run/containerd
-#
-# See docs/install.md, "Then three things Homebrew cannot do for you".
+# Shim sockets need nothing from you either. containerd 2.2 compiled their directory in
+# (containerd#12444) and needed `sudo mkdir /var/run/containerd`; 2.3 and later, which is
+# what Boks requires, pick a directory an unprivileged daemon can use ($XDG_RUNTIME_DIR,
+# /run/<uid>, then /tmp/containerd-s-<uid>) and hand it to the shim.
 # ---------------------------------------------------------------------------------------
 root = '/home/YOU/.local/share/boks/containerd/root'
 state = '/home/YOU/.local/state/boks/containerd/state'
@@ -188,7 +184,6 @@ state = '/home/YOU/.local/state/boks/containerd/state'
 # What still needs privilege after all of the above, and what does not.
 #
 # Needs it, once, as root, and this file cannot help:
-#   * `sudo mkdir -p /var/run/containerd && sudo chown …` (compile-time shim socket path).
 #   * `/dev/kvm` readable and writable by you — usually `sudo usermod -aG kvm $USER`. On
 #     WSL2 also a udev-less chown; `boks doctor`'s virtualization check already says so.
 #

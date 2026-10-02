@@ -46,10 +46,10 @@ does and does not establish.
 
 Docker Desktop is not required. There is no account to create and nothing to sign in to.
 
-On macOS there are two further steps that are easy to miss and fail opaquely when skipped —
-the shim has to be codesigned with the `com.apple.security.hypervisor` entitlement, and
-`/var/run/containerd` has to be writable by you. Both are in
-[Verification](verification.md#macos-setup-notes), and `boks doctor` checks the first.
+On macOS there is one further step that is easy to miss and fails opaquely when skipped —
+the shim has to be codesigned with the `com.apple.security.hypervisor` entitlement. It is in
+[Verification](verification.md#macos-setup-notes), and `boks doctor` checks it. Nothing needs
+`sudo`.
 
 ## Install
 

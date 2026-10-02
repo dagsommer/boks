@@ -113,24 +113,18 @@ Two shortcuts look like they should work and do not, both verified against Homeb
   install stops at *"Refusing to load formula libkrun/krun/libkrunfw"*. Trust the tap, or
   name all three formulae.
 
-### Then two things Homebrew cannot do for you
+### Then one thing Homebrew cannot do for you
 
-**1. Give yourself `/var/run/containerd`.** containerd derives the shim's socket path from a
-compile-time constant, so no configuration setting moves it
-([containerd#12444](https://github.com/containerd/containerd/issues/12444)). Without this
-you get `creating sandbox process: mkdir /var/run/containerd: permission denied`.
+Nothing here needs root. Earlier versions of these instructions began with
+`sudo mkdir -p /var/run/containerd`, because containerd 2.2 compiled the shim socket
+directory in ([containerd#12444](https://github.com/containerd/containerd/issues/12444)).
+containerd 2.3, which Boks requires, picks a directory an unprivileged daemon can use and
+hands it to the shim, so that step is gone. containerd runs rootless — it works, despite
+nerdbox's README note, provided you set `[ttrpc] address` alongside `[grpc] address` and give
+both a `uid`/`gid`, or startup dies on `chown …containerd.sock.ttrpc: operation not
+permitted`. `boks daemon start` writes exactly that.
 
-```sh
-sudo mkdir -p /var/run/containerd
-sudo chown "$(id -u):$(id -g)" /var/run/containerd
-```
-
-This is the only step that needs root. Run containerd rootless afterwards — it works,
-despite nerdbox's README note, provided you set `[ttrpc] address` alongside `[grpc]
-address` and give both a `uid`/`gid`, or startup dies on
-`chown …containerd.sock.ttrpc: operation not permitted`.
-
-**2. Start containerd with the shim on *its* PATH.** containerd resolves a runtime handler
+**Start containerd with the shim on *its* PATH.** containerd resolves a runtime handler
 to an executable using the daemon's `PATH`, not your shell's. If you start it from a
 launchd job or a `brew services` plist, that `PATH` is probably minimal and will not include
 `$(brew --prefix)/bin`.
