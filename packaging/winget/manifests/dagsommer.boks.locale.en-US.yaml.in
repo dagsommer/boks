@@ -59,7 +59,13 @@ Author: Dag Sommer
 PackageName: Boks
 PackageUrl: https://github.com/dagsommer/boks
 License: Apache-2.0
-LicenseUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/LICENSE
+#| Every URL here is fetched by winget-pkgs' validation bot, and on 2026-10-02 github.com
+#| answered that bot — and curl — with 503 for every /blob/ page, its own and other
+#| repositories' alike, while raw files, release pages and the docs site returned 200. The
+#| first submission (microsoft/winget-pkgs#445618) failed "URLs Validation" on exactly
+#| those four links. So: the license as a raw file, still pinned to the tag, and the
+#| documentation on the published site rather than as rendered blobs.
+LicenseUrl: https://raw.githubusercontent.com/dagsommer/boks/v{{VERSION}}/LICENSE
 ShortDescription: Run coding agents and other untrusted developer tooling in local microVMs
 Description: >-
   Boks runs coding agents and other untrusted developer tooling inside isolated microVMs on
@@ -96,10 +102,10 @@ InstallationNotes: |-
   Boks needs the Windows Hypervisor Platform. It is not code-signed; see docs/install.md.
 Documentations:
 - DocumentLabel: Installing Boks
-  DocumentUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/docs/install.md
-- DocumentLabel: What has actually been verified
-  DocumentUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/docs/verification.md
-- DocumentLabel: Boks on Windows
-  DocumentUrl: https://github.com/dagsommer/boks/blob/v{{VERSION}}/docs/windows.md
+  DocumentUrl: https://dagsommer.github.io/boks/install/
+- DocumentLabel: Security model
+  DocumentUrl: https://dagsommer.github.io/boks/security-model/
+- DocumentLabel: Troubleshooting
+  DocumentUrl: https://dagsommer.github.io/boks/troubleshooting/
 ManifestType: defaultLocale
 ManifestVersion: 1.12.0
