@@ -112,6 +112,27 @@ func TestRenderLeavesUnpackConfigAlone(t *testing.T) {
 	}
 }
 
+// NRI is off everywhere: its socket is machine-wide, and a containerd that cannot create it
+// exits at startup ("failed to set up NRI for CRI service"), which is how the v0.1.20
+// release's checks failed on GitHub's runner.
+func TestRenderDisablesNRIEverywhere(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin", "windows"} {
+		settings := unixSettings()
+		settings.GOOS = goos
+		if goos == "windows" {
+			settings.UID, settings.GID, settings.TTRPCAddress = nil, nil, ""
+			settings.Address = `\\.\pipe\boks-containerd`
+		}
+		out, err := render(settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out, "  'io.containerd.nri.v1.nri',\n") {
+			t.Errorf("%s config does not disable NRI:\n%s", goos, out)
+		}
+	}
+}
+
 // Windows needs cimfs off, or one snapshotter failing at init takes about forty plugins with
 // it — and none of the resulting errors mention cimfs.
 func TestRenderDisablesCimfsOnWindowsOnly(t *testing.T) {
