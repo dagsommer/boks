@@ -235,6 +235,11 @@ covering the same hosts.`,
 		if err != nil {
 			return err
 		}
+		if from == "" && account == "" && profile.DefaultSource != nil {
+			// Read from where the agent keeps its own login, so sandboxes may follow that
+			// login when this copy goes stale. See secret.OAuthRecord.HostProfile.
+			record.HostProfile = profile.Name
+		}
 		store, err := openSecretStore(storePath)
 		if err != nil {
 			return err

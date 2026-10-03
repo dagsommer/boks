@@ -535,7 +535,15 @@ func (h HTTPRefresher) Refresh(ctx context.Context, o *OAuth, refresh Value) (OA
 	if resp.StatusCode != http.StatusOK {
 		// Deliberately not the body: a token endpoint's error body is not guaranteed to
 		// be free of the credential it was sent.
-		return OAuthTokens{}, fmt.Errorf("%s refused the refresh with status %d", o.TokenEndpoint, resp.StatusCode)
+		err := fmt.Errorf("%s refused the refresh with status %d", o.TokenEndpoint, resp.StatusCode)
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized {
+			// RFC 6749 §5.2: invalid_grant and invalid_client come back as 400 or 401.
+			// That is the endpoint saying this refresh token is dead — rotated by another
+			// client, revoked, or expired — not that it could not answer, so it is told
+			// apart from a 5xx or a 429, which a retry may get past.
+			err = fmt.Errorf("%w: %w", err, ErrRefreshRejected)
+		}
+		return OAuthTokens{}, err
 	}
 	return ParseTokenResponse(body, o.ResponseFields, time.Now())
 }

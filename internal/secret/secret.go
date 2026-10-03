@@ -483,8 +483,12 @@ type Injector struct {
 	oauth     OAuthProvider
 	saver     OAuthSaver
 	refresher Refresher
-	skew      time.Duration
-	now       func() time.Time
+	// hostSource, when set, reads the login the agent itself keeps on the host — Claude
+	// Code's Keychain item — which is where a stored copy goes stale from. See
+	// SetHostSource.
+	hostSource HostSource
+	skew       time.Duration
+	now        func() time.Time
 
 	// mu guards tokens and serialises refreshes. It is held across the exchange on
 	// purpose: several concurrent requests to a resource host must produce one refresh,
@@ -533,6 +537,77 @@ func (i *Injector) SetRefresher(r Refresher) {
 		return
 	}
 	i.refresher = r
+}
+
+// HostSource reads the current token pair for service from wherever the agent keeps its own
+// login on the host, the place 'boks secret adopt' copies from. It returns ErrNotFound when
+// there is no such place for service.
+type HostSource func(ctx context.Context, service string) (OAuthTokens, error)
+
+// SetHostSource lets the injector follow the host's own login instead of holding a copy that
+// dies whenever the host's agent refreshes it.
+//
+// # Why a stored copy dies
+//
+// 'boks secret adopt' copies Claude Code's login out of the Keychain. Claude Code on the host
+// goes on using that same login, and its provider rotates refresh tokens: each refresh, by
+// either party, retires the other's copy. Reported 2026-10-03 on v0.1.23 — every time the
+// host's Claude refreshed, the sandbox failed until the user stopped it, adopted again and
+// restarted it. And Boks refreshing first does the same to the host's Claude.
+//
+// So before refreshing, Boks looks at the host's login and takes it if it is newer and still
+// valid, which refreshes nothing and retires nobody's copy. And when a refresh is rejected,
+// Boks looks again, because the host has usually just rotated it.
+func (i *Injector) SetHostSource(s HostSource) {
+	if i == nil {
+		return
+	}
+	i.hostSource = s
+}
+
+// ReadHostLogin reads the login kept at an OAuth profile's default location — for
+// claude-code, the Keychain item "Claude Code-credentials" on macOS and
+// ~/.claude/.credentials.json elsewhere. A profile with no default location is ErrNotFound.
+func ReadHostLogin(ctx context.Context, profileName string) (OAuthTokens, error) {
+	profile, err := Profile(profileName)
+	if err != nil || profile.DefaultSource == nil || profile.Parse == nil {
+		return OAuthTokens{}, ErrNotFound
+	}
+	raw, err := profile.DefaultSource().Read(ctx)
+	if err != nil {
+		return OAuthTokens{}, err
+	}
+	t, err := profile.Parse(raw)
+	if err != nil {
+		return OAuthTokens{}, err
+	}
+	return OAuthTokens{Access: NewValue(t.Access), Refresh: NewValue(t.Refresh), Expiry: t.Expiry()}, nil
+}
+
+// fromHost returns the host's login for c when it is a different one from current, and false
+// otherwise. The caller holds mu. A failure to read is not reported: the host source is an
+// improvement on the stored copy, never a requirement.
+func (i *Injector) fromHost(ctx context.Context, c Credential, current OAuthTokens) (OAuthTokens, bool) {
+	if i.hostSource == nil {
+		return OAuthTokens{}, false
+	}
+	host, err := i.hostSource(ctx, c.Service)
+	if err != nil || host.IsZero() || host.Access.Reveal() == current.Access.Reveal() {
+		return OAuthTokens{}, false
+	}
+	return host, true
+}
+
+// adopt makes tokens the credential's current pair, in memory and in the store. The caller
+// holds mu.
+func (i *Injector) adopt(ctx context.Context, c Credential, tokens OAuthTokens) (OAuthTokens, error) {
+	i.tokens[c.Service] = tokens
+	if i.saver != nil {
+		if err := i.saver.SaveOAuth(ctx, c.Service, tokens); err != nil {
+			return tokens, fmt.Errorf("the oauth credential %q was taken from the host's login but could not be saved: %w", c.Service, err)
+		}
+	}
+	return tokens, nil
 }
 
 // SetClock replaces the clock, so that expiry can be tested without waiting.
@@ -670,6 +745,7 @@ func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header, fl
 		return nil, nil
 	}
 	var used []string
+	var stale error
 	for _, c := range i.credentials {
 		matched := false
 		for _, r := range c.Inject {
@@ -699,11 +775,17 @@ func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header, fl
 		// request that carries no sentinel is left exactly as the guest wrote it.
 		if c.OAuth.MatchesResource(t) && flow == FlowTLS {
 			tokens, err := i.accessToken(ctx, c)
-			if err != nil {
+			switch {
+			case errors.Is(err, ErrCredentialStale):
+				// Left as the guest wrote it: the sentinel goes out, the origin says 401,
+				// and the agent's own login flow takes over. See ErrCredentialStale.
+				stale = errors.Join(stale, err)
+			case err != nil:
 				return nil, err
-			}
-			if c.OAuth.substitute(h, tokens.Access) {
-				matched = true
+			default:
+				if c.OAuth.substitute(h, tokens.Access) {
+					matched = true
+				}
 			}
 		}
 
@@ -711,7 +793,7 @@ func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header, fl
 			used = append(used, c.Service)
 		}
 	}
-	return used, nil
+	return used, stale
 }
 
 // accessToken returns a usable access token for an OAuth credential, refreshing on the host
@@ -741,19 +823,41 @@ func (i *Injector) accessToken(ctx context.Context, c Credential) (OAuthTokens, 
 		i.tokens[c.Service] = tokens
 	}
 	if tokens.IsZero() {
-		return OAuthTokens{}, fmt.Errorf("oauth credential %q has no access token", c.Service)
+		return OAuthTokens{}, fmt.Errorf("oauth credential %q has no access token: %w", c.Service, ErrCredentialStale)
 	}
 	if !tokens.Expired(i.now(), i.skew) {
 		return tokens, nil
 	}
+	// Take the host's login if it is newer and still good: nothing is refreshed, so neither
+	// side's copy is retired. See SetHostSource.
+	if host, ok := i.fromHost(ctx, c, tokens); ok && !host.Expired(i.now(), i.skew) {
+		return i.adopt(ctx, c, host)
+	}
 	return i.refresh(ctx, c, tokens)
 }
 
+// ErrRefreshRejected is a token endpoint refusing a refresh token outright (400 or 401), as
+// opposed to failing to answer. See HTTPRefresher.Refresh.
+var ErrRefreshRejected = errors.New("the token endpoint rejected the refresh token")
+
+// ErrCredentialStale reports an OAuth credential that has no usable token: its refresh was
+// rejected, or it has never had one. Apply treats it as non-fatal — the request goes out with
+// the guest's own sentinel and the origin answers 401 — and NeedsAcquisition then reports the
+// credential as wanting a login, so the agent's own re-login is captured on the host.
+//
+// This replaced a hard failure (a 502 from the proxy) on 2026-10-03. The reasoning then was
+// that a 401 inside the guest would be "an authentication problem the user cannot act on".
+// Once logins inside a sandbox were captured by the host, that stopped being true, and the 502
+// was the one thing the user could not act on: Claude Code renders it as "Unable to connect
+// to Anthropic services … check your proxy", for a credential problem.
+var ErrCredentialStale = errors.New("oauth credential has no usable token")
+
 // refresh exchanges the refresh token for a new pair and persists it. The caller holds mu.
 //
-// An expired token with no way to renew it is a hard failure, not a request sent with a dead
-// credential: the origin's 401 would surface inside the guest as an authentication problem
-// the user cannot act on, when the real answer is "log in again on the host".
+// A refresh the endpoint rejects drops the in-memory tokens, so the credential reads as
+// awaiting a login (NeedsAcquisition) and the next login inside a sandbox is captured. The
+// stored copy is left as it is; it is just as dead, and the next sandbox reaches the same
+// conclusion the same way.
 func (i *Injector) refresh(ctx context.Context, c Credential, current OAuthTokens) (OAuthTokens, error) {
 	if current.Refresh.IsZero() {
 		return OAuthTokens{}, fmt.Errorf("the oauth credential %q expired at %s and carries no refresh token; re-import it with 'boks secret import %s'",
@@ -765,6 +869,25 @@ func (i *Injector) refresh(ctx context.Context, c Credential, current OAuthToken
 	fresh, err := i.refresher.Refresh(ctx, c.OAuth, current.Refresh)
 	if err != nil {
 		// The refresher's errors are written not to contain a token; see HTTPRefresher.
+		if errors.Is(err, ErrRefreshRejected) {
+			// Most often the host's own agent has just rotated it. Its login is the
+			// current one: use it, refreshing it once if it has expired too.
+			if host, ok := i.fromHost(ctx, c, current); ok {
+				if !host.Expired(i.now(), i.skew) {
+					return i.adopt(ctx, c, host)
+				}
+				if !host.Refresh.IsZero() && host.Refresh.Reveal() != current.Refresh.Reveal() {
+					if fresh, herr := i.refresher.Refresh(ctx, c.OAuth, host.Refresh); herr == nil && !fresh.IsZero() {
+						if fresh.Refresh.IsZero() {
+							fresh.Refresh = host.Refresh
+						}
+						return i.adopt(ctx, c, fresh)
+					}
+				}
+			}
+			i.tokens[c.Service] = OAuthTokens{}
+			return OAuthTokens{}, fmt.Errorf("refreshing the oauth credential %q: %w (%w)", c.Service, err, ErrCredentialStale)
+		}
 		return OAuthTokens{}, fmt.Errorf("refreshing the oauth credential %q: %w", c.Service, err)
 	}
 	if fresh.IsZero() {

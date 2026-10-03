@@ -731,6 +731,15 @@ func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer)
 	if err != nil {
 		return err
 	}
+	// Follow the host's own login for credentials adopted from it, so a refresh by the
+	// host's agent no longer strands the sandbox. See secret.Injector.SetHostSource.
+	injector.SetHostSource(func(ctx context.Context, service string) (secret.OAuthTokens, error) {
+		record, ok := spec.OAuth[service]
+		if !ok || record.HostProfile == "" {
+			return secret.OAuthTokens{}, secret.ErrNotFound
+		}
+		return secret.ReadHostLogin(ctx, record.HostProfile)
+	})
 
 	// The authority is opened only when a credential rule justifies it. A sandbox with no
 	// injection configured never terminates anything and has no reason to touch a signing

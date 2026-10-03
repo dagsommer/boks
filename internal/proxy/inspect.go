@@ -171,10 +171,22 @@ func (s *Server) serveInspected(ctx context.Context, target policy.Target, clien
 		}
 
 		used, err := s.cfg.Injector.Apply(ctx, target, req.Header, secret.FlowTLS)
-		if err != nil {
+		if err != nil && !errors.Is(err, secret.ErrCredentialStale) {
 			// The error names secrets, never values; see internal/secret.
 			writeStatus(client, http.StatusBadGateway, "boks: credential injection failed: "+err.Error()+"\n")
 			return
+		}
+		if err != nil {
+			// A login that is dead, not a fault: the request goes out as the guest wrote it,
+			// the origin answers 401, and the agent asks for a login — which is captured on
+			// the host. Recorded so 'boks policy log' says why the agent was logged out,
+			// which nothing did before (2026-10-03: Claude Code showed "Status 502 … check
+			// your proxy" while every rule allowed the traffic).
+			s.logf("forwarding to %s without a credential: %v", target, err)
+			s.cfg.Engine.Note(policy.StageRequest, target, policy.ModeForward,
+				"forwarded without a credential: "+err.Error()+". The agent will be asked to log in "+
+					"again, and that login is stored on the host; or run 'boks secret adopt' to "+
+					"store a current one")
 		}
 		if len(used) > 0 {
 			s.logf("injected credential %s for %s (inspected flow)", strings.Join(used, ", "), target)
