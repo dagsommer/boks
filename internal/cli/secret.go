@@ -236,9 +236,13 @@ covering the same hosts.`,
 			return err
 		}
 		if from == "" && account == "" && profile.DefaultSource != nil {
-			// Read from where the agent keeps its own login, so sandboxes may follow that
-			// login when this copy goes stale. See secret.OAuthRecord.HostProfile.
+			// Read from where the agent keeps its own login, so sandboxes follow that login
+			// when this copy goes stale. See secret.OAuthRecord.HostProfile.
 			record.HostProfile = profile.Name
+		} else {
+			// Read from somewhere else, possibly for a different account: never swapped for
+			// the host's.
+			record.HostProfile = secret.NoHostProfile
 		}
 		store, err := openSecretStore(storePath)
 		if err != nil {

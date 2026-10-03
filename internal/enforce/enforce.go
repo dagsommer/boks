@@ -735,10 +735,14 @@ func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer)
 	// host's agent no longer strands the sandbox. See secret.Injector.SetHostSource.
 	injector.SetHostSource(func(ctx context.Context, service string) (secret.OAuthTokens, error) {
 		record, ok := spec.OAuth[service]
-		if !ok || record.HostProfile == "" {
+		if !ok {
 			return secret.OAuthTokens{}, secret.ErrNotFound
 		}
-		return secret.ReadHostLogin(ctx, record.HostProfile)
+		profile := secret.HostProfileFor(record)
+		if profile == "" {
+			return secret.OAuthTokens{}, secret.ErrNotFound
+		}
+		return secret.ReadHostLogin(ctx, profile)
 	})
 
 	// The authority is opened only when a credential rule justifies it. A sandbox with no
