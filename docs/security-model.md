@@ -730,6 +730,23 @@ proxy is the only way out.
   agent is authenticated, and the credential is gone when the sandbox stops. The fix is the
   writeback channel `internal/secret/memory.go` already names as missing, and it is not built.
 
+- **A login adopted from the host follows the host.** A plain `boks secret adopt` reads the
+  agent's own login (the Keychain item `Claude Code-credentials` on macOS,
+  `~/.claude/.credentials.json` elsewhere), and the agent on the host goes on refreshing it —
+  each refresh retiring the other party's copy. So when the stored token expires, the
+  supervisor first re-reads that location and, if the host's login is newer and still valid,
+  uses it without refreshing anything; and when Anthropic rejects a refresh, it re-reads it
+  again. Only a login adopted from there is followed: one read with `--from`, from standard
+  input or from another Keychain account is not, so a deliberately different account is never
+  swapped for the host's.
+- **A login that is dead is forwarded, not refused.** If no current token can be had, the
+  request goes out with the guest's own sentinel, the origin answers 401, and the agent asks for
+  a login — which is captured on the host like a first one. This replaced a 502 on 2026-10-03,
+  which Claude Code shows as "Unable to connect to Anthropic services … check your proxy". The
+  sentinel is not a secret, so forwarding it discloses nothing. A token endpoint that fails to
+  answer (a 5xx, a timeout) is still a 502: that is not a dead login, and asking for a new one
+  over it would be wrong.
+
 Residual exposure worth knowing, none of it hypothetical:
 
 - **An origin that echoes `Authorization` back would hand the guest the real token.** That is

@@ -46,6 +46,14 @@ type OAuthRecord struct {
 	// inferred.
 	Pending bool `json:"pending,omitempty"`
 
+	// HostProfile names the OAuth profile whose default location this login was adopted
+	// from — "claude-code" for a plain 'boks secret adopt'. When set, a sandbox follows that
+	// location instead of trusting only this copy: see Injector.SetHostSource. It is empty
+	// for a login read from anywhere else (--from, stdin, another Keychain account) or
+	// acquired inside a sandbox, so a deliberately different account is never swapped for
+	// whichever one the host's own agent happens to be logged in as.
+	HostProfile string `json:"host_profile,omitempty"`
+
 	TokenHost string   `json:"token_host"`
 	TokenPath string   `json:"token_path"`
 	ClientID  string   `json:"client_id,omitempty"`
