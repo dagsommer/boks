@@ -490,6 +490,10 @@ type Injector struct {
 	skew       time.Duration
 	now        func() time.Time
 
+	// hostChecked is when a credential with no usable token last looked at the host's
+	// login; see hostRecheckInterval.
+	hostChecked map[string]time.Time
+
 	// mu guards tokens and serialises refreshes. It is held across the exchange on
 	// purpose: several concurrent requests to a resource host must produce one refresh,
 	// not one each, because a provider that rotates refresh tokens invalidates the loser.
@@ -519,6 +523,7 @@ func NewInjector(p Provider, credentials ...Credential) (*Injector, error) {
 		skew:        DefaultRefreshSkew,
 		now:         time.Now,
 		tokens:      map[string]OAuthTokens{},
+		hostChecked: map[string]time.Time{},
 	}
 	i.oauth, _ = p.(OAuthProvider)
 	i.saver, _ = p.(OAuthSaver)
@@ -565,6 +570,23 @@ func (i *Injector) SetHostSource(s HostSource) {
 	i.hostSource = s
 }
 
+// NoHostProfile is the OAuthRecord.HostProfile value that stops a credential following the
+// host's login.
+const NoHostProfile = "-"
+
+// HostProfileFor reports which profile's host login a stored credential follows, or "" when
+// it follows none. See OAuthRecord.HostProfile.
+func HostProfileFor(r OAuthRecord) string {
+	switch r.HostProfile {
+	case NoHostProfile:
+		return ""
+	case "":
+		return r.Service
+	default:
+		return r.HostProfile
+	}
+}
+
 // ReadHostLogin reads the login kept at an OAuth profile's default location — for
 // claude-code, the Keychain item "Claude Code-credentials" on macOS and
 // ~/.claude/.credentials.json elsewhere. A profile with no default location is ErrNotFound.
@@ -591,11 +613,51 @@ func (i *Injector) fromHost(ctx context.Context, c Credential, current OAuthToke
 	if i.hostSource == nil {
 		return OAuthTokens{}, false
 	}
+	// Every read is a check, whichever path made it, so recoverFromHost's interval counts
+	// from the last time anything looked.
+	i.hostChecked[c.Service] = i.now()
 	host, err := i.hostSource(ctx, c.Service)
 	if err != nil || host.IsZero() || host.Access.Reveal() == current.Access.Reveal() {
 		return OAuthTokens{}, false
 	}
 	return host, true
+}
+
+// hostRecheckInterval bounds how often a credential with no usable token reads the host's
+// login. Every request to a resource host lands here while the login is dead, and an agent
+// retries in bursts; reading the Keychain per request would be a subprocess per request.
+const hostRecheckInterval = 30 * time.Second
+
+// recoverFromHost takes the host's login for a credential that has none usable, at most once
+// per hostRecheckInterval. The caller holds mu.
+func (i *Injector) recoverFromHost(ctx context.Context, c Credential) (OAuthTokens, bool) {
+	if i.hostSource == nil {
+		return OAuthTokens{}, false
+	}
+	now := i.now()
+	if last, ok := i.hostChecked[c.Service]; ok && now.Sub(last) < hostRecheckInterval {
+		return OAuthTokens{}, false
+	}
+	host, ok := i.fromHost(ctx, c, OAuthTokens{})
+	if !ok {
+		return OAuthTokens{}, false
+	}
+	if !host.Expired(now, i.skew) {
+		adopted, _ := i.adopt(ctx, c, host)
+		return adopted, true
+	}
+	if host.Refresh.IsZero() || i.refresher == nil {
+		return OAuthTokens{}, false
+	}
+	fresh, err := i.refresher.Refresh(ctx, c.OAuth, host.Refresh)
+	if err != nil || fresh.IsZero() {
+		return OAuthTokens{}, false
+	}
+	if fresh.Refresh.IsZero() {
+		fresh.Refresh = host.Refresh
+	}
+	adopted, _ := i.adopt(ctx, c, fresh)
+	return adopted, true
 }
 
 // adopt makes tokens the credential's current pair, in memory and in the store. The caller
@@ -826,6 +888,11 @@ func (i *Injector) accessToken(ctx context.Context, c Credential) (OAuthTokens, 
 		i.tokens[c.Service] = tokens
 	}
 	if tokens.IsZero() {
+		// A dead login stays dead only until the host has a live one: look again, so a sandbox
+		// recovers without a restart once the host's agent is logged in or has refreshed.
+		if recovered, ok := i.recoverFromHost(ctx, c); ok {
+			return recovered, nil
+		}
 		return OAuthTokens{}, fmt.Errorf("oauth credential %q has no access token: %w", c.Service, ErrCredentialStale)
 	}
 	if !tokens.Expired(i.now(), i.skew) {

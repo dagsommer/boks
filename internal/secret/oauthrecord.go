@@ -46,12 +46,17 @@ type OAuthRecord struct {
 	// inferred.
 	Pending bool `json:"pending,omitempty"`
 
-	// HostProfile names the OAuth profile whose default location this login was adopted
-	// from — "claude-code" for a plain 'boks secret adopt'. When set, a sandbox follows that
-	// location instead of trusting only this copy: see Injector.SetHostSource. It is empty
-	// for a login read from anywhere else (--from, stdin, another Keychain account) or
-	// acquired inside a sandbox, so a deliberately different account is never swapped for
-	// whichever one the host's own agent happens to be logged in as.
+	// HostProfile says whose login on the host this credential follows: see
+	// Injector.SetHostSource and HostProfileFor. Empty means the profile named like the
+	// service ("claude-code"), which is what a plain 'boks secret adopt' reads — and what every
+	// record stored before this field existed was, almost without exception, adopted from.
+	// NoHostProfile opts out, and is what an adoption from anywhere else (--from, stdin,
+	// another Keychain account) records, so a deliberately different account is never swapped
+	// for whichever one the host's own agent happens to be logged in as.
+	//
+	// It was briefly the other way round (v0.1.24): follow only when set. That left every
+	// login adopted before the field existed unfollowed, which is exactly the population the
+	// feature was for, and they went on failing until re-adopted.
 	HostProfile string `json:"host_profile,omitempty"`
 
 	TokenHost string   `json:"token_host"`

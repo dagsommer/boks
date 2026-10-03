@@ -175,3 +175,80 @@ func TestAgentsOwnTokenIsLeftAlone(t *testing.T) {
 		t.Errorf("the agent's own token was touched: used %v, Authorization %q", used, h.Get("Authorization"))
 	}
 }
+
+// Which host login a stored credential follows. Unmarked follows — that is every record
+// stored before the marker existed, nearly all of them plain adoptions — and only the explicit
+// opt-out does not.
+func TestHostProfileFor(t *testing.T) {
+	for _, tc := range []struct {
+		record OAuthRecord
+		want   string
+	}{
+		{OAuthRecord{Service: "claude-code"}, "claude-code"},
+		{OAuthRecord{Service: "claude-code", HostProfile: "claude-code"}, "claude-code"},
+		{OAuthRecord{Service: "work-claude", HostProfile: "claude-code"}, "claude-code"},
+		{OAuthRecord{Service: "claude-code", HostProfile: NoHostProfile}, ""},
+	} {
+		if got := HostProfileFor(tc.record); got != tc.want {
+			t.Errorf("HostProfileFor(%+v) = %q, want %q", tc.record, got, tc.want)
+		}
+	}
+}
+
+// A sandbox whose login died recovers without a restart once the host has a live one — and
+// does not read the host's login on every request in between.
+func TestDeadLoginRecoversFromTheHostWithoutARestart(t *testing.T) {
+	record := testRecord(t, time.Now().Add(-time.Hour))
+	inj, _, c := testInjector(t, record)
+	inj.SetRefresher(&stubRefresher{err: fmt.Errorf("status 400: %w", ErrRefreshRejected)})
+	now := time.Now()
+	inj.SetClock(func() time.Time { return now })
+
+	hostLoggedIn := false
+	reads := 0
+	inj.SetHostSource(func(context.Context, string) (OAuthTokens, error) {
+		reads++
+		if !hostLoggedIn {
+			return OAuthTokens{}, ErrNotFound
+		}
+		return OAuthTokens{Access: NewValue(hostAccess), Refresh: NewValue("sk-ant-ort01-HOST"), Expiry: now.Add(time.Hour)}, nil
+	})
+	apply := func() (string, error) {
+		h := http.Header{}
+		h.Set("Authorization", "Bearer "+record.AccessSentinel)
+		_, err := inj.Apply(context.Background(), mustTarget(t, "api.creds.test:443"), h, FlowTLS)
+		return h.Get("Authorization"), err
+	}
+
+	// The refresh is rejected and the host has nothing: the login is dead.
+	if _, err := apply(); !errors.Is(err, ErrCredentialStale) {
+		t.Fatalf("first request: %v, want ErrCredentialStale", err)
+	}
+	if !inj.NeedsAcquisition(context.Background(), c) {
+		t.Fatal("the dead login does not read as awaiting one")
+	}
+
+	// The host logs in. Within the recheck interval nothing reads it again.
+	hostLoggedIn = true
+	readsBefore := reads
+	now = now.Add(10 * time.Second)
+	if _, err := apply(); !errors.Is(err, ErrCredentialStale) {
+		t.Fatalf("within the interval: %v, want still stale", err)
+	}
+	if reads != readsBefore {
+		t.Errorf("the host login was read %d times within the recheck interval", reads-readsBefore)
+	}
+
+	// Past it, the next request finds the host's login and uses it.
+	now = now.Add(hostRecheckInterval)
+	got, err := apply()
+	if err != nil {
+		t.Fatalf("after the interval: %v", err)
+	}
+	if got != "Bearer "+hostAccess {
+		t.Errorf("Authorization = %q, want the host's login", got)
+	}
+	if inj.NeedsAcquisition(context.Background(), c) {
+		t.Error("recovered, but still reads as awaiting a login")
+	}
+}

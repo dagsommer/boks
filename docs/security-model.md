@@ -736,9 +736,11 @@ proxy is the only way out.
   each refresh retiring the other party's copy. So when the stored token expires, the
   supervisor first re-reads that location and, if the host's login is newer and still valid,
   uses it without refreshing anything; and when Anthropic rejects a refresh, it re-reads it
-  again. Only a login adopted from there is followed: one read with `--from`, from standard
-  input or from another Keychain account is not, so a deliberately different account is never
-  swapped for the host's.
+  again. A sandbox whose login has died keeps looking — at most every 30 seconds, on the
+  requests that find no token — so it recovers without a restart as soon as the host's agent
+  is logged in again. Every adopted login follows, including ones stored before this existed;
+  only one read with `--from`, from standard input or from another Keychain account is marked
+  not to, so a deliberately different account is never swapped for the host's.
 - **A login that is dead is forwarded, not refused.** If no current token can be had, the
   request goes out with the guest's own sentinel, the origin answers 401, and the agent asks for
   a login — which is captured on the host like a first one. This replaced a 502 on 2026-10-03,
