@@ -152,3 +152,26 @@ func TestHTTPRefresherClassifiesRejections(t *testing.T) {
 		assertNoCanary(t, err.Error())
 	}
 }
+
+// A request that carries the agent's own token rather than the sentinel is not Boks'
+// business: it is not rewritten, and it does not wait on — or fail over — a refresh of the
+// stored credential it is not using.
+func TestAgentsOwnTokenIsLeftAlone(t *testing.T) {
+	record := testRecord(t, time.Now().Add(-time.Hour))
+	inj, _, _ := testInjector(t, record)
+	stub := &stubRefresher{err: errors.New("endpoint refused the refresh with status 503")}
+	inj.SetRefresher(stub)
+
+	h := http.Header{}
+	h.Set("Authorization", "Bearer sk-ant-oat01-the-agents-own-login")
+	used, err := inj.Apply(context.Background(), mustTarget(t, "api.creds.test:443"), h, FlowTLS)
+	if err != nil {
+		t.Fatalf("Apply failed a request that needed nothing from Boks: %v", err)
+	}
+	if stub.calls != 0 {
+		t.Errorf("refreshed %d times for a request that does not carry the sentinel", stub.calls)
+	}
+	if len(used) != 0 || h.Get("Authorization") != "Bearer sk-ant-oat01-the-agents-own-login" {
+		t.Errorf("the agent's own token was touched: used %v, Authorization %q", used, h.Get("Authorization"))
+	}
+}

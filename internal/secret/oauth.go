@@ -384,6 +384,18 @@ func (o *OAuth) Domains() []string {
 // Substitution, not assignment: a header the guest did not put a sentinel in is left alone.
 // That keeps the guest's own request shape intact and makes the mechanism auditable — a
 // token appears exactly where a sentinel was, and nowhere else.
+// carriesSentinel reports whether any permitted header holds the access sentinel.
+func (o *OAuth) carriesSentinel(h http.Header) bool {
+	for _, name := range o.headers() {
+		for _, v := range h.Values(name) {
+			if strings.Contains(v, o.Sentinels.Access) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (o *OAuth) substitute(h http.Header, access Value) bool {
 	replaced := false
 	for _, name := range o.headers() {
