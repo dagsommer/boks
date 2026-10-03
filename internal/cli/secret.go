@@ -1002,10 +1002,18 @@ useful to somebody who cannot read the credentials themselves.`,
 						"  (awaiting a login: 'boks run claude -- auth login')"
 				}
 			default:
-				if service, ok := knownServices.Lookup(e.Name); ok && service.Configured() {
+				// A sandbox-scoped credential is looked up by its service name, which is
+				// how the proxy resolves it too (secret.ForSandbox). Looking up the stored
+				// name instead listed `sandbox:web/github` as attached to nothing while it
+				// was in fact replacing the machine's github key for that sandbox.
+				sandbox, name := secret.SplitScopedName(e.Name)
+				if service, ok := knownServices.Lookup(name); ok && service.Configured() {
 					where = strings.Join(service.Hosts(), ", ")
 					if service.EnvName != "" {
 						where += "  ($" + service.EnvName + " in the guest)"
+					}
+					if sandbox != "" {
+						where += "  for sandbox " + sandbox + " only, instead of the machine-wide one"
 					}
 				}
 			}
