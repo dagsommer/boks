@@ -47,3 +47,13 @@ if ! cat "$src" 2>/dev/null >"$tmp"; then
 fi
 chmod 0600 "$tmp" 2>/dev/null || true
 mv "$tmp" "$dest"
+
+# With the full login installed, CLAUDE_CODE_OAUTH_TOKEN has to go. Claude Code reads that
+# variable first and takes it for a `claude setup-token` long-lived token, and a long-lived
+# token cannot use remote control ("only works with a normal login") — although the file just
+# installed is a normal login, scopes and all. The variable stays for an image that installs
+# no file, where it is the only way in; here it is redundant, and it costs a feature.
+# Reported 2026-10-03.
+if [ -n "${BOKS_UNSET_ENV_FILE:-}" ]; then
+	echo CLAUDE_CODE_OAUTH_TOKEN >>"$BOKS_UNSET_ENV_FILE"
+fi

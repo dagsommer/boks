@@ -6,7 +6,26 @@
 set -eu
 
 boks-install-ca
+
+# A prepare script runs as a child, so it cannot take a variable out of the agent's
+# environment itself. It names it in this file instead, and it is dropped here, before the
+# agent is exec'd. One name per line; anything that is not a plain variable name is ignored.
+# See images/claude/prepare.d/20-claude-credentials.sh for the one user.
+BOKS_UNSET_ENV_FILE=$(mktemp 2>/dev/null || echo "")
+export BOKS_UNSET_ENV_FILE
+
 boks-prepare
+
+if [ -n "$BOKS_UNSET_ENV_FILE" ] && [ -r "$BOKS_UNSET_ENV_FILE" ]; then
+	while IFS= read -r name; do
+		case "$name" in
+		"" | [0-9]* | *[!A-Za-z0-9_]*) ;;
+		*) unset "$name" ;;
+		esac
+	done <"$BOKS_UNSET_ENV_FILE"
+	rm -f "$BOKS_UNSET_ENV_FILE"
+fi
+unset BOKS_UNSET_ENV_FILE
 
 if [ "$#" -eq 0 ]; then
 	set -- /bin/bash
