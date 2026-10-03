@@ -88,6 +88,10 @@ func execProcess(ctx context.Context, container client.Container, task client.Ta
 	process := *spec.Process
 	process.Args = cfg.Command
 	process.Terminal = cfg.TTY
+	// Also here, not only at creation: a sandbox created before withPrivilegeEscalation
+	// existed carries no_new_privileges in its stored spec, and every command run in it —
+	// the agent included — is built from that spec.
+	process.NoNewPrivileges = false
 	// Build the process env in three layers, each able to override the previous:
 	//   1. spec env (image ENV + whatever was set at create time)
 	//   2. live terminal vars — appended as overrides so the *current* terminal wins
