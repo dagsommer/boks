@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
@@ -463,6 +464,27 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 // can be asserted on without a hypervisor: no VM boots in a test, but every field written here
 // is inspectable, and two of the bugs this file carries repairs for were fields that were
 // written and never looked at again.
+// withPrivilegeEscalation turns off no_new_privileges, which containerd's default spec turns
+// on, so that sudo inside the guest works.
+//
+// Boks' images ship passwordless sudo on purpose (docs/security-model.md, "Root inside the
+// guest"): the VM is the boundary, and everything Boks enforces — the network policy, the
+// credential sentinels, the interception — lives outside it. no_new_privileges stops setuid
+// binaries from raising privilege, so with it on that sudo could never run:
+//
+//	sudo: The "no new privileges" flag is set, which prevents sudo from running as root.
+//
+// Seen 2026-10-03 when an agent could not install the tooling its task needed; the image's
+// sudo rule had shipped in v0.1.19 and had never worked in a sandbox.
+func withPrivilegeEscalation() oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Process != nil {
+			s.Process.NoNewPrivileges = false
+		}
+		return nil
+	}
+}
+
 func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []oci.SpecOpts {
 	specOpts := []oci.SpecOpts{
 		// Must come first: it resets the spec to the platform default, discarding
@@ -475,6 +497,7 @@ func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []o
 		// spec and nothing else.
 		withPOSIXCgroupsPath(),
 		withoutWindowsSection(),
+		withPrivilegeEscalation(),
 		imageConfig,
 		oci.WithAnnotations(resourceAnnotations(cfg)),
 		// The guest reported `(none)`, the kernel's default nodename, until this was
