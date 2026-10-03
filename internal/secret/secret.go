@@ -773,7 +773,10 @@ func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header, fl
 		// The OAuth half: on a resource host, and nowhere else, a sentinel in a permitted
 		// header becomes the real access token. Substitution rather than assignment — a
 		// request that carries no sentinel is left exactly as the guest wrote it.
-		if c.OAuth.MatchesResource(t) && flow == FlowTLS {
+		// Only a request carrying the sentinel is Boks' business. One that carries anything
+		// else — a token the agent obtained for itself — goes out untouched, and is not made
+		// to wait on, or fail over, a refresh of a credential it is not using.
+		if c.OAuth.MatchesResource(t) && flow == FlowTLS && c.OAuth.carriesSentinel(h) {
 			tokens, err := i.accessToken(ctx, c)
 			switch {
 			case errors.Is(err, ErrCredentialStale):
