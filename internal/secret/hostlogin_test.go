@@ -252,3 +252,31 @@ func TestDeadLoginRecoversFromTheHostWithoutARestart(t *testing.T) {
 		t.Error("recovered, but still reads as awaiting a login")
 	}
 }
+
+// Only the credential's own refresh and its own client's login are taken; anything else at
+// the shared token endpoint is someone else's.
+func TestClassifyTokenRequest(t *testing.T) {
+	record := testRecord(t, time.Now().Add(time.Hour))
+	c, err := record.Credential()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const json = "application/json"
+	const form = "application/x-www-form-urlencoded"
+	for _, tc := range []struct {
+		name, ct, body string
+		want           TokenRequestKind
+	}{
+		{"refresh with the sentinel", json, `{"grant_type":"refresh_token","refresh_token":"` + record.RefreshSentinel + `"}`, TokenRequestRefresh},
+		{"refresh with the sentinel, form", form, "grant_type=refresh_token&refresh_token=" + record.RefreshSentinel, TokenRequestRefresh},
+		{"refresh with another client's token", json, `{"grant_type":"refresh_token","refresh_token":"sk-ant-ort01-someone-else"}`, TokenRequestForeign},
+		{"login by the credential's client", json, `{"grant_type":"authorization_code","code":"c","client_id":"client-id-is-public"}`, TokenRequestLogin},
+		{"login by another client", json, `{"grant_type":"authorization_code","code":"c","client_id":"claude-design"}`, TokenRequestForeign},
+		{"login with no client id", json, `{"grant_type":"authorization_code","code":"c"}`, TokenRequestForeign},
+		{"not a token request at all", json, `not json`, TokenRequestForeign},
+	} {
+		if got := c.ClassifyTokenRequest(tc.ct, []byte(tc.body)); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
