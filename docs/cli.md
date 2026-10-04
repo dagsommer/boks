@@ -339,6 +339,7 @@ boks create shell .
 | Flag | Default | Meaning |
 |---|---|---|
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
+| `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--annotation stringArray` |  | extra OCI annotation KEY=VALUE passed to the runtime (repeatable) |
 | `--clone` |  | keep guest writes off your disk: work on a git clone made inside the guest, with the host repository shared read-only at /run/sandbox/source |
 | `--cpus int` | `0` | vCPUs for the guest (0: all host CPUs) |
@@ -710,6 +711,7 @@ boks policy check github.com:443
 |---|---|---|
 | `--agent string` |  | include the allowlist this agent's definition carries (shell, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
+| `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
@@ -865,6 +867,7 @@ Presets:
 |---|---|---|
 | `--agent string` |  | include the allowlist this agent's definition carries (shell, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
+| `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
@@ -1068,6 +1071,7 @@ boks proxy --policy standard
 | Flag | Default | Meaning |
 |---|---|---|
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
+| `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--ca string` |  | certificate authority directory (default: the one 'boks ca' uses) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
@@ -1206,6 +1210,7 @@ boks run                              # a shell in the current directory
 | Flag | Default | Meaning |
 |---|---|---|
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
+| `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--annotation stringArray` |  | extra OCI annotation KEY=VALUE passed to the runtime (repeatable) |
 | `--clone` |  | keep guest writes off your disk: work on a git clone made inside the guest, with the host repository shared read-only at /run/sandbox/source |
 | `--cpus int` | `0` | vCPUs for the guest (0: all host CPUs) |

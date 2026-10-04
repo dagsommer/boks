@@ -565,6 +565,28 @@ credential is attached. Port
 forwarding, when implemented, is explicit and host-initiated. The guest cannot ask for a
 port to be published, cannot enumerate host state, and cannot request secrets.
 
+**The one exception is opt-in, per port, and HTTP only: `--allow-host-port`.** A sandbox run
+with `--allow-host-port 8080` can reach `http://host.boks.internal:8080`, which the proxy
+forwards to `127.0.0.1:8080` on the host — the case it exists for is a model served locally
+(llama-server, Ollama, LM Studio) to an agent in the sandbox. What bounds it:
+
+- **No policy opens it.** Every preset denies the host's loopback and a deny cannot be
+  overridden; host access is a separate list of ports, checked before the policy, so even
+  `--policy open` reaches no port on the host that was not named.
+- **Only through the proxy.** The sandbox's resolver does not know `host.boks.internal` and no
+  address in the virtual network reaches the host, so a client that ignores `HTTP_PROXY`
+  fails to resolve the name; there is no raw path to the host. A `CONNECT` to it is accepted
+  only to be read as plain HTTP, request by request — Node's proxy support tunnels even
+  `http://`, so refusing tunnels outright locked out every Node client — and TLS inside such a
+  tunnel closes it, since an unreadable flow to the host is what this is built to rule out.
+- **Recorded and injectable like any proxied request.** Each request is a decision in
+  `boks policy log`, and an `--inject` rule for `host.boks.internal` attaches an API key the
+  sandbox never sees.
+
+What it does not bound is the service itself: the sandbox can send it anything it accepts.
+Open a port only for a service you would let the agent use, and give that service an API key
+the sandbox does not hold.
+
 Local MCP servers are worth a specific warning: in Docker's model they run *outside* the VM
 with host privileges. Any such bridge is a hole through the boundary. Boks does not
 implement one, and if it ever does, it will be an explicit, per-server opt-in.

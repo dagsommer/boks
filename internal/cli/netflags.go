@@ -28,6 +28,9 @@ type policyFlags struct {
 	guest   []string
 	publish []string
 	oauth   []string
+	// hostPorts are --allow-host-port: ports on the host's loopback the sandbox may reach,
+	// through the proxy only, as http://host.boks.internal:PORT.
+	hostPorts []int
 	// noSecrets leaves the credential store out of this run entirely. A credential
 	// stored under a service's name applies without being named again — see
 	// credentialPlan — and this is how a sandbox is run without one.
@@ -70,6 +73,8 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 		string(network.DefaultMode)+")")
 	fs.StringArrayVar(&f.allow, "allow", nil, "allow a destination, host[:ports] (repeatable)")
 	fs.StringArrayVar(&f.deny, "deny", nil, "deny a destination, host[:ports] (repeatable); deny always wins")
+	fs.IntSliceVar(&f.hostPorts, "allow-host-port", nil,
+		"let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable)")
 	fs.StringArrayVar(&f.inject, "inject", nil,
 		"attach a credential: service@host[,host]=bearer|basic[:user]|header[:format] (repeatable)")
 	fs.StringArrayVar(&f.guest, "guest-credential", nil,
