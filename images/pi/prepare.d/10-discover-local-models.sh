@@ -73,10 +73,12 @@ for port in ports_str.split(","):
         if not model_ids:
             continue
 
+        # Convert the list of model IDs into the expected array of objects
+        model_objs = [{"id": m} for m in model_ids]
         provider = {
             "api": "openai-completions",
             "baseUrl": base_url,
-            "models": model_ids,
+            "models": model_objs,
         }
 
         if api_key:
