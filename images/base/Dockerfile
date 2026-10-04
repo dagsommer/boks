@@ -156,8 +156,18 @@ RUN chmod 0666 /etc/passwd /etc/group
 #
 # ALL rather than a user, because the uid is not known when this image is built — it is the
 # host's, and it varies per machine. In a single-tenant disposable VM those are the same set.
+#
+# env_keep, because sudo's env_reset drops everything else — and that includes the proxy and
+# the CA the sandbox's network runs through. Without it `sudo npm install` or `sudo apt-get`
+# had no proxy, so it dialled out raw, where a hostname-only policy denies it ("If you are
+# behind a proxy, please make sure that the 'proxy' config is set properly"), and a root
+# process that did get through did not trust the interception CA. Found 2026-10-04.
 RUN set -eux; \
-    printf 'ALL ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/boks; \
+    { \
+      printf 'Defaults env_keep += "HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy"\n'; \
+      printf 'Defaults env_keep += "SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE BOKS_CA_CERT"\n'; \
+      printf 'ALL ALL=(ALL) NOPASSWD: ALL\n'; \
+    } > /etc/sudoers.d/boks; \
     chmod 0440 /etc/sudoers.d/boks; \
     visudo -c -f /etc/sudoers.d/boks
 
