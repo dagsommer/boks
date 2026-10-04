@@ -55,7 +55,8 @@ for port in ports_str.split(","):
     if not port:
         continue
 
-    base_url = f"http://host.boks.internal:{port}/v1"
+    host = os.environ.get("BOKS_MODEL_HOST", "host.boks.internal")
+    base_url = f"http://{host}:{port}/v1"
     models_url = f"{base_url}/models"
 
     try:
