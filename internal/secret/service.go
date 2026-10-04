@@ -627,6 +627,23 @@ var builtinServices = []Service{
 		Source:        "ai.google.dev/gemini-api/docs/api-key, docs.cloud.google.com api-keys, developers.google.com/identity/protocols/oauth2",
 	},
 	{
+		// A model served on this machine (llama-server --api-key, Ollama behind a key,
+		// LM Studio), reached from a sandbox as http://host.boks.internal:PORT with
+		// --allow-host-port. Stored once, attached to every request to it, never seen by
+		// the sandbox.
+		Name:    "local-model",
+		Summary: "a model server on this machine, reached as host.boks.internal",
+		Inject: []ServiceInject{{
+			Hosts:  []string{"host.boks.internal"},
+			Scheme: SchemeBearer,
+			Why:    "the API key of a model server on this machine (llama-server --api-key and the like)",
+		}},
+		// No published shape: a local server accepts whatever key it was started with.
+		KeyPrefix: "sk-local-",
+		KeyLength: 48,
+		Source:    "llama-server --help (--api-key); the OpenAI-compatible Authorization: Bearer convention",
+	},
+	{
 		Name:    "groq",
 		Summary: "GroqCloud",
 		Inject: []ServiceInject{{

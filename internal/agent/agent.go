@@ -80,6 +80,14 @@ type Agent struct {
 	// any scope still beats them, so an agent's definition can never widen access past
 	// what a user has forbidden. See internal/policy/resolve.go.
 	Allow []Destination
+	// Deny are destinations this agent must never reach, whatever the policy or the user's
+	// own allows say. A deny in any scope wins, so these hold even under `--policy open`, and
+	// they apply under `--policy locked` too, where the agent's allows do not.
+	//
+	// It exists for an agent whose point is what it does not talk to — pi-local, a coding
+	// agent for models served on this machine, which must not quietly fall back to a cloud
+	// provider it also knows how to use.
+	Deny []Destination
 }
 
 // Destination is one network destination an agent needs, with the reason it is here.
@@ -103,6 +111,15 @@ func (a Agent) AllowRules() []policy.RuleSpec {
 	out := make([]policy.RuleSpec, 0, len(a.Allow))
 	for _, d := range a.Allow {
 		out = append(out, policy.RuleSpec{Action: policy.Allow, Spec: d.Spec, Note: d.Why})
+	}
+	return out
+}
+
+// Rules renders the agent's allow and deny lists in the form the policy resolver takes.
+func (a Agent) Rules() []policy.RuleSpec {
+	out := a.AllowRules()
+	for _, d := range a.Deny {
+		out = append(out, policy.RuleSpec{Action: policy.Deny, Spec: d.Spec, Note: d.Why})
 	}
 	return out
 }
@@ -319,6 +336,14 @@ func Builtin() *Registry {
 			Args:    ArgsCommand,
 		},
 		{
+			Name: "pi-local", Summary: "pi, with models served on this machine only (llama-server, Ollama, LM Studio)",
+			Image: Image("pi"),
+			// pi's own config is written at start from what the opened host ports serve:
+			// images/pi/prepare.d. Run with --allow-host-port PORT for the model server.
+			Command: []string{"pi"},
+			Deny:    piCloudProviders,
+		},
+		{
 			Name: "claude", Summary: "Claude Code", Image: Image("claude"),
 			// --dangerously-skip-permissions suppresses Claude Code's per-action
 			// permission prompts. The VM boundary is the containment layer here;
@@ -443,3 +468,33 @@ func Builtin() *Registry {
 	}
 	return r
 }
+
+// piCloudProviders are the model APIs pi knows how to use, which pi-local must not reach: its
+// point is that the code it works on goes to a model on this machine and nowhere else. Taken
+// from the endpoints in @mariozechner/pi-ai 0.73.1, the package pi's providers live in, on
+// 2026-10-04. A deny wins in every scope, so neither a stored credential for one of these nor
+// `--policy open` reopens it.
+//
+// Bedrock's endpoints are per region and the pattern language has no mid-name wildcard, so the
+// regions pi names are listed rather than all of *.amazonaws.com, which would also take every
+// S3 download a build makes.
+var piCloudProviders = func() []Destination {
+	hosts := []string{
+		"api.anthropic.com", "platform.claude.com", "claude.ai",
+		"api.openai.com", "auth.openai.com", "chatgpt.com", "*.openai.azure.com", "*.cognitiveservices.azure.com",
+		"generativelanguage.googleapis.com", "aiplatform.googleapis.com", "*.aiplatform.googleapis.com",
+		"openrouter.ai", "ai-gateway.vercel.sh", "opencode.ai",
+		"api.mistral.ai", "api.x.ai", "api.groq.com", "api.cerebras.ai", "api.fireworks.ai",
+		"api.deepseek.com", "api.moonshot.ai", "api.moonshot.cn", "api.kimi.com", "api.z.ai",
+		"api.minimax.io", "api.minimaxi.com", "api.xiaomimimo.com", "*.xiaomimimo.com",
+		"router.huggingface.co", "gateway.ai.cloudflare.com", "api.cloudflare.com",
+		"api.individual.githubcopilot.com", "*.githubcopilot.com", "api.together.xyz",
+		"bedrock-runtime.us-east-1.amazonaws.com", "bedrock-runtime.us-west-2.amazonaws.com",
+		"bedrock-runtime.eu-central-1.amazonaws.com", "bedrock-runtime.eu-west-1.amazonaws.com",
+	}
+	out := make([]Destination, len(hosts))
+	for i, h := range hosts {
+		out[i] = Destination{Spec: h, Why: "a cloud model API; pi-local uses models on this machine only"}
+	}
+	return out
+}()

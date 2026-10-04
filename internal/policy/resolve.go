@@ -211,10 +211,24 @@ func (req Request) Resolve() (Resolution, error) {
 		switch {
 		case base.Name == PresetLocked:
 			// Locked means locked. See the package comment above: the layer is
-			// still shown, so that its absence is a statement rather than a gap.
+			// still shown, so that its absence is a statement rather than a gap. The
+			// agent's denies still apply — a deny only narrows, and locked is not a
+			// reason to let a user's own allow reach what the agent must never.
+			var denies []RuleSpec
+			for _, r := range req.AgentAllow {
+				if r.Action == Deny {
+					denies = append(denies, r)
+				}
+			}
+			res.Rules = appendScoped(res.Rules, denies, scope)
+			detail := "not applied: preset locked allows only what you write"
+			if len(denies) > 0 {
+				detail = "allows not applied under preset locked; its denies are"
+			}
 			res.Layers = append(res.Layers, Layer{
 				Source: scope,
-				Detail: "not applied: preset locked allows only what you write",
+				Detail: detail,
+				Count:  len(denies),
 			})
 		default:
 			res.Rules = appendScoped(res.Rules, req.AgentAllow, scope)

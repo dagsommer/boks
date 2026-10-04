@@ -320,6 +320,7 @@ fixed when the sandbox is created and cannot be changed afterwards.
 ```
 Agents:
   shell          a plain shell in the Boks base image
+  pi-local       pi, with models served on this machine only (llama-server, Ollama, LM Studio)
   claude         Claude Code
   codex          OpenAI Codex
   copilot        GitHub Copilot CLI
@@ -709,7 +710,7 @@ boks policy check github.com:443
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--agent string` |  | include the allowlist this agent's definition carries (shell, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
+| `--agent string` |  | include the allowlist this agent's definition carries (shell, pi-local, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
 | `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
@@ -865,7 +866,7 @@ Presets:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--agent string` |  | include the allowlist this agent's definition carries (shell, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
+| `--agent string` |  | include the allowlist this agent's definition carries (shell, pi-local, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
 | `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
@@ -1188,6 +1189,7 @@ rather than drawing over your shell history. Set BOKS_NO_CLEAR to keep the scree
 ```
 Agents:
   shell          a plain shell in the Boks base image
+  pi-local       pi, with models served on this machine only (llama-server, Ollama, LM Studio)
   claude         Claude Code
   codex          OpenAI Codex
   copilot        GitHub Copilot CLI
@@ -1244,7 +1246,7 @@ Credentials live in an encrypted file on this machine and are never written into
 sandbox. The host proxy attaches them to requests for the hosts the credential names; the
 guest holds a placeholder shaped like the real thing.
 
-A credential stored under a service boks knows — anthropic, cursor, droid, github, google, groq, mistral, nebius, openai, openrouter, xai —
+A credential stored under a service boks knows — anthropic, cursor, droid, github, google, local-model, groq, mistral, nebius, openai, openrouter, xai —
 needs no further configuration: boks already has that vendor's hosts, header, environment
 variable and key shape, and every sandbox you run attaches it. 'boks secret services'
 prints the list. Anything else is stored under a name of your own and attached by a

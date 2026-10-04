@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -179,6 +180,15 @@ Agents:
 		}
 
 		cfg, err := flags.config(inv, agentArgs)
+		if err == nil && len(netFlags.hostPorts) > 0 {
+			// What the agent's own start-up scripts read to find a service on the host —
+			// pi-local's, to list the models a local server offers. See proxy.HostName.
+			ports := make([]string, len(netFlags.hostPorts))
+			for i, p := range netFlags.hostPorts {
+				ports[i] = strconv.Itoa(p)
+			}
+			cfg.RunEnv = append(cfg.RunEnv, "BOKS_HOST_PORTS="+strings.Join(ports, ","))
+		}
 		if err != nil {
 			return err
 		}

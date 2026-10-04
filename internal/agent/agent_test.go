@@ -10,7 +10,7 @@ import (
 
 // The built-in set is sbx's, so that a habit formed there works here.
 func TestBuiltinNames(t *testing.T) {
-	want := []string{"claude", "codex", "copilot", "cursor", "docker-agent", "droid", "gemini", "kiro", "opencode", "shell"}
+	want := []string{"claude", "codex", "copilot", "cursor", "docker-agent", "droid", "gemini", "kiro", "opencode", "pi-local", "shell"}
 	got := Builtin().Names()
 	slices.Sort(got)
 	if !slices.Equal(got, want) {

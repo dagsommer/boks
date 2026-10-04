@@ -109,6 +109,10 @@ type Config struct {
 	Mounts []workspace.Workspace
 	// Env are additional environment variables, in KEY=VALUE form.
 	Env []string
+	// RunEnv are variables for this run's agent process only, never stored in the sandbox:
+	// facts about this run, like the host ports it opened, that a sandbox created on an
+	// earlier run must not keep.
+	RunEnv []string
 	// CPUs is the number of vCPUs for the guest.
 	CPUs int
 	// MemoryMiB is guest memory in MiB.
@@ -208,7 +212,9 @@ func Run(ctx context.Context, cfg Config) (int, error) {
 		Address: cfg.Address,
 		Name:    cfg.Name,
 		Command: command,
-		// No Env: create already put cfg.Env in the spec, and execProcess inherits it.
+		// create already put cfg.Env in the spec, and execProcess inherits it. RunEnv is
+		// this run's own, and goes on top.
+		Env:    cfg.RunEnv,
 		TTY:    cfg.TTY,
 		Stdin:  cfg.Stdin,
 		Stdout: cfg.Stdout,
