@@ -179,7 +179,7 @@ func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (
 	// The agent's own allowlist is re-derived from the registry rather than read back
 	// from the sandbox, so that it is always this build's definition of what that agent
 	// needs — including when an entry is removed.
-	req.Agent, req.AgentAllow = f.agent.Name, f.agent.AllowRules()
+	req.Agent, req.AgentAllow = f.agent.Name, f.agent.Rules()
 	// A kit's network rules enter as their own layer, labelled with the kit's name so that
 	// `boks policy ls` can point at the file a destination came from. They are added, never
 	// subtracted: a deny in any scope still beats a kit's allow, which is the engine's

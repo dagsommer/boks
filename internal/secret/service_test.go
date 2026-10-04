@@ -19,7 +19,7 @@ func TestBuiltinServicesAreValidAndSourced(t *testing.T) {
 
 	// sbx's list, verbatim from its own help, in its own order. A name missing here is a
 	// name a user's habit will not find.
-	want := []string{"anthropic", "cursor", "droid", "github", "google", "groq",
+	want := []string{"anthropic", "cursor", "droid", "github", "google", "local-model", "groq",
 		"mistral", "nebius", "openai", "openrouter", "xai"}
 	got := r.Names()
 	if len(got) != len(want) {
