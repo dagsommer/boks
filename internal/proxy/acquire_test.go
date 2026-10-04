@@ -204,7 +204,7 @@ func TestAcquisitionHappensOnceAndThenTheEndpointIsAnswered(t *testing.T) {
 	url := hostPort(t, tokenSrv.URL, "console.creds.test") + "/v1/oauth/token"
 
 	first, err := client.Post(url, "application/json",
-		strings.NewReader(`{"grant_type":"authorization_code","code":"c","code_verifier":"v"}`))
+		strings.NewReader(`{"grant_type":"authorization_code","code":"c","code_verifier":"v","client_id":"public-client-id"}`))
 	if err != nil {
 		t.Fatalf("the login exchange failed: %v", err)
 	}
@@ -252,9 +252,10 @@ func TestAcquisitionIsRefusedForACredentialThatAlreadyHasAToken(t *testing.T) {
 	})
 
 	url := hostPort(t, tokenSrv.URL, "console.creds.test") + "/v1/oauth/token"
-	// A guest trying to talk boks into the relay path by sending an acquisition-shaped body.
+	// A guest trying to talk boks into the relay path by sending an acquisition-shaped body,
+	// as the credential's own client.
 	resp, err := p.client(pool(boksCA)).Post(url, "application/json",
-		strings.NewReader(`{"grant_type":"authorization_code","code":"c","code_verifier":"v"}`))
+		strings.NewReader(`{"grant_type":"authorization_code","code":"c","code_verifier":"v","client_id":"public-client-id"}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
@@ -340,4 +341,50 @@ func assertNoAcquisitionCanary(t *testing.T, p *testProxy, record secret.OAuthRe
 			t.Errorf("%s is in the decision log:\n%s", name, decisions.String())
 		}
 	}
+}
+
+// TestAnotherClientsLoginGetsItsOwnToken: the token endpoint is shared, and a different OAuth
+// client exchanging its own code must reach it and get its own answer — not the managed
+// credential's. On 2026-10-04 Claude Design's MCP server got Claude Code's token back and
+// reported its scopes as never granted.
+func TestAnotherClientsLoginGetsItsOwnToken(t *testing.T) {
+	webCA := newAuthority(t)
+	var (
+		sentToOrigin atomic.Value
+		exchanges    atomic.Int32
+	)
+	tokenSrv := loginOrigin(t, webCA, &sentToOrigin, &exchanges)
+
+	record := oauthRecord(time.Now().Add(time.Hour)) // healthy: Boks would answer its own
+	inj, _ := oauthInjector(t, record)
+	boksCA := newAuthority(t)
+	p := newTestProxy(t, mustPolicy(t, policy.Deny, "allow console.creds.test"), inj, func(c *Config) {
+		c.CA = boksCA
+		c.UpstreamRootCAs = pool(webCA)
+	})
+
+	const designBody = `{"grant_type":"authorization_code","code":"design-code",` +
+		`"client_id":"some-other-client","code_verifier":"v"}`
+	url := hostPort(t, tokenSrv.URL, "console.creds.test") + "/v1/oauth/token"
+	resp, err := p.client(pool(boksCA)).Post(url, "application/json", strings.NewReader(designBody))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if exchanges.Load() != 1 {
+		t.Fatalf("the token endpoint saw %d exchanges; another client's login must reach it", exchanges.Load())
+	}
+	// The recorder appends the request's Accept-Encoding after a newline.
+	if got, _ := sentToOrigin.Load().(string); !strings.HasPrefix(got, designBody+"\n") {
+		t.Errorf("the origin received %q, want the guest's request body unchanged", got)
+	}
+	if !strings.Contains(string(body), mintedAccess) {
+		t.Errorf("the other client did not get its own token back:\n%s", body)
+	}
+	if strings.Contains(string(body), record.AccessSentinel) {
+		t.Error("the other client was answered with the managed credential's sentinel")
+	}
+	assertNoAcquisitionCanary(t, p, record)
 }

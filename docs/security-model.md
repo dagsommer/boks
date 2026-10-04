@@ -761,6 +761,15 @@ Residual exposure worth knowing, none of it hypothetical:
   second reason as well: a request has to be answered, which cannot be done through a tunnel.
 - **Other paths on the token endpoint's host are ordinary traffic.** Only the configured path
   is answered; everything else on that host is forwarded with no credential attached.
+- **Other OAuth clients' requests on that path are ordinary traffic too.** The endpoint is
+  shared by every client of the same authorisation server, so Boks reads a request there only
+  to classify it, and takes just two shapes: a refresh carrying its own refresh-token sentinel,
+  and a login exchange from the credential's own client ID. Anything else — another client
+  exchanging its own code, such as Claude Design's MCP server — is forwarded as written and
+  gets its own answer. That cannot disclose anything of Boks': a request without the sentinel
+  carries nothing Boks holds, and the token that comes back belongs to the client that asked.
+  Until 2026-10-04 every request on the path was answered from the managed login, which handed
+  Claude Design Claude Code's token and made it report its scopes as never granted.
 - **An OAuth token is never written onto a plaintext flow.** The guest chooses the scheme, and
   `http://` to a resource host would otherwise be a downgrade the guest controls. Such a
   request goes out carrying the sentinel and fails at the origin.

@@ -157,17 +157,39 @@ func (s *Server) serveInspected(ctx context.Context, target policy.Target, clien
 		// other one is a refresh: the request is answered here and never forwarded. See
 		// relayTokenRequest and answerTokenRequest, and internal/secret/acquire.go for why
 		// they are opposites.
+		//
+		// Only a request that concerns the credential is taken at all: the endpoint is shared
+		// with every other client of the same authorisation server, and one of those
+		// exchanging its own code must get its own token. See ClassifyTokenRequest.
 		if credential, ok := s.cfg.Injector.TokenEndpointFor(target, req.URL.Path); ok && req.Method == http.MethodPost {
-			if s.cfg.Injector.NeedsAcquisition(ctx, credential) {
+			body, err := io.ReadAll(io.LimitReader(req.Body, maxTokenRequestBody+1))
+			req.Body.Close()
+			if err != nil {
+				writeStatus(client, http.StatusBadGateway, "boks: the token request could not be read\n")
+				return
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+
+			kind := secret.TokenRequestForeign
+			if len(body) <= maxTokenRequestBody {
+				kind = credential.ClassifyTokenRequest(req.Header.Get("Content-Type"), body)
+			}
+			switch {
+			case kind == secret.TokenRequestForeign:
+				s.cfg.Engine.Note(policy.StageRequest, target, policy.ModeForward,
+					"token request for another oauth client than "+credential.Service+"; forwarded as the guest wrote it")
+			case s.cfg.Injector.NeedsAcquisition(ctx, credential):
 				if !s.relayTokenRequest(ctx, target, credential, req, client, upstream, upstreamReader) {
 					return
 				}
 				continue
+			default:
+				if !s.answerTokenRequest(ctx, target, credential, req, client) {
+					return
+				}
+				continue
 			}
-			if !s.answerTokenRequest(ctx, target, credential, req, client) {
-				return
-			}
-			continue
 		}
 
 		used, err := s.cfg.Injector.Apply(ctx, target, req.Header, secret.FlowTLS)
