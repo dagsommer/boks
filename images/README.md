@@ -119,6 +119,7 @@ So:
 | `droid` | `downloads.factory.ai` binary | 0.193.0 | vendor-published `.sha256`, recorded here | none |
 | `gemini` | GitHub release, self-contained JS bundle | 0.54.4 | SHA-256 recorded here | none |
 | `opencode` | GitHub release tarball | 1.18.16 | SHA-256 recorded here | none |
+| `pi` | npm tarball, extracted (bundled) | 0.74.0 | SHA-256 from npm registry metadata | none |
 
 Where a vendor publishes its own checksum (Claude Code, Droid) that is what is recorded.
 Where one does not (Cursor, and the GitHub release assets), the digest attests "the same
