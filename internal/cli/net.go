@@ -398,6 +398,11 @@ func orphanedStackWarning(name string) string {
 func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mode network.Mode,
 	record *policy.SandboxPolicy, publish []string, stderr io.Writer) (enforce.Spec, error) {
 
+	for _, port := range f.hostPorts {
+		if port < 1 || port > 65535 {
+			return enforce.Spec{}, fmt.Errorf("--allow-host-port %d: not a TCP port", port)
+		}
+	}
 	plan, err := f.planFor(name, mode)
 	if err != nil {
 		return enforce.Spec{}, err
@@ -447,6 +452,7 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 		Secrets:          secrets,
 		OAuth:            oauth,
 		Publish:          publish,
+		HostPorts:        f.hostPorts,
 		Intercept:        true,
 		CADir:            caDir(""),
 		StateDir:         policy.StateDir(),

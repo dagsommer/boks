@@ -130,6 +130,10 @@ type Config struct {
 
 	// DialTimeout bounds a single upstream connection attempt. Zero means the default.
 	DialTimeout time.Duration
+
+	// HostPorts are the ports on the host's loopback this sandbox may reach as
+	// http://host.boks.internal:PORT. Empty means none. See HostName.
+	HostPorts []int
 }
 
 const (
@@ -242,7 +246,12 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Plaintext HTTP is readable by everything on the path, Boks included. Recording it
 	// as a distinct flow keeps "we read this" true in the log without implying that a TLS
 	// session was broken to do it.
-	decision := s.cfg.Engine.CheckMode(policy.StageHTTP, target, policy.ModeForward)
+	var decision policy.Decision
+	if isHost(target) {
+		decision = s.hostDecision(policy.StageHTTP, target)
+	} else {
+		decision = s.cfg.Engine.CheckMode(policy.StageHTTP, target, policy.ModeForward)
+	}
 	if !decision.Allowed {
 		writeDenied(w, decision)
 		return
@@ -299,6 +308,11 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	target, err := policy.ParseTarget(r.Host, 443)
 	if err != nil {
 		http.Error(w, "boks: cannot parse CONNECT target: "+err.Error()+"\n", http.StatusBadRequest)
+		return
+	}
+
+	if isHost(target) {
+		s.handleHostTunnel(w, r, target)
 		return
 	}
 
@@ -467,6 +481,9 @@ func (e *deniedError) Error() string { return e.decision.Reason }
 // whatever is listening on the host's loopback. Deny rules apply to the address that will
 // actually be contacted, not to the name that was asked for.
 func (s *Server) dial(ctx context.Context, t policy.Target, mode policy.Mode) (net.Conn, error) {
+	if isHost(t) {
+		return s.dialHost(ctx, t)
+	}
 	var candidates []netip.Addr
 	if t.IsIP() {
 		candidates = []netip.Addr{t.Addr}

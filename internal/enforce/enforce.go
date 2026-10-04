@@ -161,6 +161,10 @@ type Spec struct {
 	// without the port the user asked for would be found out by a browser, later.
 	Publish []string `json:"publish,omitempty"`
 
+	// HostPorts are the ports on the host's loopback the sandbox may reach through the
+	// proxy as http://host.boks.internal:PORT. See proxy.HostName.
+	HostPorts []int `json:"host_ports,omitempty"`
+
 	CADir    string `json:"ca_dir,omitempty"`
 	StateDir string `json:"state_dir,omitempty"`
 	LogPath  string `json:"log_path,omitempty"`
@@ -756,10 +760,11 @@ func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer)
 	}
 
 	srv, err := proxy.New(proxy.Config{
-		Engine:   engine,
-		Injector: injector,
-		CA:       authority,
-		ErrorLog: log.New(orDiscard(logger), "boks net "+spec.Sandbox+": ", log.LstdFlags),
+		Engine:    engine,
+		Injector:  injector,
+		CA:        authority,
+		ErrorLog:  log.New(orDiscard(logger), "boks net "+spec.Sandbox+": ", log.LstdFlags),
+		HostPorts: spec.HostPorts,
 	})
 	if err != nil {
 		return err
