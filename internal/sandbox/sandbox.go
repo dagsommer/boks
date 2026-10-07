@@ -491,6 +491,94 @@ func withPrivilegeEscalation() oci.SpecOpts {
 	}
 }
 
+// allCapabilities is every Linux capability, which is what a privileged container holds.
+// Listed rather than derived: containerd's own helper reads the capabilities of the process
+// it runs in, and on macOS that is not a Linux process at all.
+var allCapabilities = []string{
+	"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL",
+	"CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP", "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE",
+	"CAP_NET_BROADCAST", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK", "CAP_IPC_OWNER",
+	"CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE", "CAP_SYS_PACCT",
+	"CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE", "CAP_SYS_RESOURCE", "CAP_SYS_TIME",
+	"CAP_SYS_TTY_CONFIG", "CAP_MKNOD", "CAP_LEASE", "CAP_AUDIT_WRITE", "CAP_AUDIT_CONTROL",
+	"CAP_SETFCAP", "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG", "CAP_WAKE_ALARM",
+	"CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF", "CAP_CHECKPOINT_RESTORE",
+}
+
+// withPrivileged makes the sandbox's container privileged inside its VM — what `docker run
+// --privileged` gives a container — so that a Docker engine runs in it. Measured 2026-10-07:
+// with this, dockerd started, `docker build` and `docker run` worked, and containers reached
+// the network through Boks' enforcement; without it dockerd stopped at "Devices cgroup isn't
+// mounted".
+//
+// # Why this is the default and not a weakening
+//
+// The VM is the boundary (docs/security-model.md, "Root inside the guest"), and everything Boks
+// enforces — the network policy, the credentials, the interception — is outside it. Privilege
+// inside the container reaches the rest of the VM and no further. The one thing it could have
+// reached is a read-only share remounted read-write, and that was tested rather than assumed: a
+// fully privileged root could not write a `:ro` share by plain write, by remount or by a fresh
+// mount of its virtiofs tag, because nerdbox creates the device read-only
+// (krun_add_virtiofs3(…, readonly)) and libkrun refuses the write on the host.
+//
+// What it adds over a plain container is the rest of what Docker needs and the default spec
+// lacks: a cgroup namespace with cgroup v2 mounted read-write at /sys/fs/cgroup (nothing mounted
+// one at all), /dev/fuse (for fuse-overlayfs, since overlay2 cannot stack on the sandbox's own
+// overlay root), every device allowed, and no masked or read-only kernel paths.
+func withPrivileged() oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Process == nil {
+			s.Process = &specs.Process{}
+		}
+		// Bounding, permitted and effective, as `docker run --privileged` sets them — not
+		// ambient or inheritable. Those would hand every capability to every program the
+		// unprivileged agent runs, without sudo; this way a non-root process loses them at
+		// its first exec, and root (sudo) has them all.
+		caps := slices.Clone(allCapabilities)
+		s.Process.Capabilities = &specs.LinuxCapabilities{
+			Bounding: caps, Effective: caps, Permitted: caps,
+		}
+		if s.Linux == nil {
+			s.Linux = &specs.Linux{}
+		}
+		s.Linux.Seccomp = nil
+		s.Linux.MaskedPaths = nil
+		s.Linux.ReadonlyPaths = nil
+		if s.Linux.Resources == nil {
+			s.Linux.Resources = &specs.LinuxResources{}
+		}
+		s.Linux.Resources.Devices = []specs.LinuxDeviceCgroup{{Allow: true, Access: "rwm"}}
+
+		fileMode := os.FileMode(0o666)
+		uid, gid := uint32(0), uint32(0)
+		s.Linux.Devices = append(s.Linux.Devices, specs.LinuxDevice{
+			Path: "/dev/fuse", Type: "c", Major: 10, Minor: 229, FileMode: &fileMode, UID: &uid, GID: &gid,
+		})
+
+		hasCgroupNS := false
+		for _, ns := range s.Linux.Namespaces {
+			if ns.Type == specs.CgroupNamespace {
+				hasCgroupNS = true
+			}
+		}
+		if !hasCgroupNS {
+			s.Linux.Namespaces = append(s.Linux.Namespaces, specs.LinuxNamespace{Type: specs.CgroupNamespace})
+		}
+
+		for i := range s.Mounts {
+			if s.Mounts[i].Destination == "/sys" {
+				s.Mounts[i].Options = slices.DeleteFunc(slices.Clone(s.Mounts[i].Options), func(o string) bool { return o == "ro" })
+			}
+		}
+		s.Mounts = slices.DeleteFunc(s.Mounts, func(m specs.Mount) bool { return m.Destination == "/sys/fs/cgroup" })
+		s.Mounts = append(s.Mounts, specs.Mount{
+			Destination: "/sys/fs/cgroup", Type: "cgroup2", Source: "cgroup2",
+			Options: []string{"nosuid", "noexec", "nodev", "rw"},
+		})
+		return nil
+	}
+}
+
 func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []oci.SpecOpts {
 	specOpts := []oci.SpecOpts{
 		// Must come first: it resets the spec to the platform default, discarding
@@ -504,6 +592,7 @@ func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []o
 		withPOSIXCgroupsPath(),
 		withoutWindowsSection(),
 		withPrivilegeEscalation(),
+		withPrivileged(),
 		imageConfig,
 		oci.WithAnnotations(resourceAnnotations(cfg)),
 		// The guest reported `(none)`, the kernel's default nodename, until this was

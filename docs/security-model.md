@@ -883,6 +883,27 @@ What root does change, and the reason the default identity is still unprivileged
 - **Nothing else that Boks measures.** In-guest file permissions were never a control here;
   see the trust boundaries above.
 
+### The sandbox's container is privileged inside its VM
+
+Since v0.1.32 every sandbox's container is what `docker run --privileged` makes a container:
+all capabilities in the bounding set (root, through `sudo`, holds them; the unprivileged agent
+does not), no seccomp filter, no masked kernel paths, every device allowed, `/dev/fuse`, and its
+own cgroup namespace with cgroup v2 mounted read-write. That is what a Docker engine needs, and
+the base image runs one (`images/base/prepare.d/30-docker.sh`), so `docker build`, `docker run`
+and `docker compose` work inside a sandbox; their traffic goes through the same proxy and the
+same policy as the sandbox's own.
+
+It reaches the rest of the VM — its kernel, its init, every mount in it — and no further, which
+is the same claim as the rest of this section. The one thing it could have reached that matters
+is a read-only share, and that was tested on 2026-10-07 rather than reasoned about: a fully
+privileged root could not write a `:ro` share by plain write, by `mount -o remount,rw`, or by
+mounting the share's virtiofs tag afresh. nerdbox creates the share read-only
+(`krun_add_virtiofs3(…, readonly)`), so libkrun refuses the write on the host, below anything
+the guest can change. `--clone` mode's read-only source share is the same kind of share.
+
+What privilege does widen is the guest kernel's attack surface — mounts, BPF, raw devices — so a
+kernel bug is easier to reach. That is defence in depth inside the VM, not the boundary.
+
 ## What Boks does not claim
 
 - It has **not** been security-reviewed or audited.
