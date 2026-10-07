@@ -1,0 +1,24 @@
+#!/bin/sh
+# Start pi pointed at a llama.cpp router on the host, when one was found.
+#
+# pi has llama.cpp router support built in — `/llama` loads, unloads and downloads models on
+# the router, and `/model` lists what is loaded — configured by LLAMA_BASE_URL. A prepare
+# script cannot set the agent's environment (it is a child process), so
+# prepare.d/10-discover-local-models.sh records the router it found and this launcher, which
+# becomes pi, exports it.
+#
+# LLAMA_API_KEY is left to pi's default. If the server needs a key, it stays on the host as
+# the local-model secret and the proxy puts it on every request to host.boks.internal; the
+# sandbox never holds it.
+set -eu
+
+router_file="${HOME}/.pi/agent/.boks-llama-router"
+if [ -z "${LLAMA_BASE_URL:-}" ] && [ -r "$router_file" ]; then
+	url=$(head -n 1 "$router_file")
+	if [ -n "$url" ]; then
+		LLAMA_BASE_URL="$url"
+		export LLAMA_BASE_URL
+	fi
+fi
+
+exec pi "$@"

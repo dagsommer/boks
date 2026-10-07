@@ -43,14 +43,17 @@ models_json="$agent_dir/models.json"
 # Written as a Python helper so we can parse JSON reliably without jq (which is on the
 # base image but we want this to be a self-contained shell script).
 
-python3 - "$ports" "$models_json" "$agent_dir/settings.json" <<'PYEOF'
+python3 - "$ports" "$models_json" "$agent_dir/settings.json" "$agent_dir/.boks-llama-router" <<'PYEOF'
 import json, subprocess, sys, os
 
 ports_str = sys.argv[1]
 models_json_path = sys.argv[2]
 settings_path = sys.argv[3]
+router_path = sys.argv[4]
 
 providers = {}
+router_url = None       # the first llama.cpp router found; see boks-pi-local
+router_default = None   # a model loaded on it, if any
 
 for port in ports_str.split(","):
     port = port.strip()
@@ -94,6 +97,16 @@ for port in ports_str.split(","):
                         return int(args[i + 1])
             return None
 
+        # A llama.cpp router is left to pi's built-in llama.cpp provider, which loads and
+        # unloads models on it through /llama: listing it here too would show every model
+        # twice, and as fixed names that answer "model is not loaded" until something loads
+        # them. Its status field is how a router identifies itself.
+        if any(isinstance(m.get("status"), dict) for m in entries):
+            if router_url is None:
+                router_url = f"http://{host}:{port}"
+                router_default = next((m["id"] for m in entries if loaded(m)), None)
+            continue
+
         entries.sort(key=lambda m: not loaded(m))
         model_objs = []
         for m in entries:
@@ -131,20 +144,38 @@ def write(path, data):
 
 write(models_json_path, output)
 
-# Start on the first discovered model unless the user has chosen one: without a default,
-# pi starts on a cloud provider pi-local cannot reach.
-if providers:
-    try:
-        with open(settings_path) as f:
-            settings = json.load(f)
-    except Exception:
-        settings = {}
-    if not settings.get("defaultProvider"):
-        first = next(iter(providers))
-        settings["defaultProvider"] = first
-        settings["defaultModel"] = providers[first]["models"][0]["id"]
-        write(settings_path, settings)
+# Recorded for boks-pi-local, which exports it as LLAMA_BASE_URL. Removed when no router
+# was found this time, so a stale one is never used.
+if router_url:
+    with open(router_path, "w") as f:
+        f.write(router_url + "\n")
+elif os.path.exists(router_path):
+    os.remove(router_path)
+
+# Start on a model that answers unless the user has chosen one: without a default, pi starts
+# on a cloud provider pi-local cannot reach. A router's loaded model comes first; a router
+# with nothing loaded gets no default, and /llama is where one is loaded.
+try:
+    with open(settings_path) as f:
+        settings = json.load(f)
+except Exception:
+    settings = {}
+chosen = settings.get("defaultProvider")
+# A "local-PORT" default is one this script wrote; once that provider is gone (the port is a
+# router now, or closed) it is stale, not the user's choice, and is replaced.
+if chosen and chosen.startswith("local-") and chosen not in providers:
+    chosen = None
+if not chosen and router_default:
+    settings["defaultProvider"] = "llama.cpp"
+    settings["defaultModel"] = router_default
+    write(settings_path, settings)
+elif not chosen and providers:
+    first = next(iter(providers))
+    settings["defaultProvider"] = first
+    settings["defaultModel"] = providers[first]["models"][0]["id"]
+    write(settings_path, settings)
 PYEOF
 
-echo "pi-local: wrote models.json with discovered providers" >&2
-cat "$models_json" >&2
+if [ -r "$agent_dir/.boks-llama-router" ]; then
+	echo "pi-local: llama.cpp router at $(head -n 1 "$agent_dir/.boks-llama-router"); /llama loads models, /model picks one" >&2
+fi

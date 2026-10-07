@@ -338,9 +338,11 @@ func Builtin() *Registry {
 		{
 			Name: "pi-local", Summary: "pi, with models served on this machine only (llama-server, Ollama, LM Studio)",
 			Image: Image("pi"),
-			// pi's own config is written at start from what the opened host ports serve:
-			// images/pi/prepare.d. Run with --allow-host-port PORT for the model server.
-			Command: []string{"pi"},
+			// pi's own config is written at start from what the opened host ports serve
+			// (images/pi/prepare.d), and boks-pi-local points pi's built-in llama.cpp
+			// provider at a router when one was found. Run with --allow-host-port PORT for
+			// the model server.
+			Command: []string{"boks-pi-local"},
 			Deny:    piCloudProviders,
 		},
 		{

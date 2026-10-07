@@ -13,21 +13,20 @@
 # lifecycle hooks entirely. This is the same approach the other images use:
 # vendor artifact, pinned version, verified checksum, zero build-time scripts.
 #
-# This version (0.74.0) is unbundled and carries ~25 runtime dependencies,
-# so we keep node_modules. The next minor version bundles everything, and
-# when we bump to that we can strip node_modules and go back to a single-file
-# copy approach.
+# 1.0.4, not the 0.74.0 this image first shipped: 0.74.0 has no llama.cpp support, and the
+# built-in llama.cpp provider (/llama to load, unload and download models on a router, /model
+# for what is loaded) is what pi-local is for. See boks-pi-local.
 
 ARG BASE_IMAGE=ghcr.io/dagsommer/boks/base:0.1.0
 FROM ${BASE_IMAGE}
 
 USER root
 
-ARG PI_VERSION=0.74.0
+ARG PI_VERSION=1.0.4
 # From https://registry.npmjs.org/@earendil-works/pi-coding-agent/${PI_VERSION}
 # The npm registry provides a SHA-1 shasum (called "shasum"); we verify with sha512
 # from the SRI integrity field instead.
-ARG PI_INTEGRITY=sha512-Q5GikbB5vRBrsrrf/uvet53rPSQ1sn5I5mO+l7sIobdXYpS04/X2oOc2UHFm90fNdkl3yU+ANTZL0zOtHbnqRw==
+ARG PI_INTEGRITY=sha512-+956nfMFHr5lDUVY/2Q4k+YzojzBuCaBXFgj0eSlXVGr7QVliVddKdc1Pz6yVg1dOlJQmb67doOVrlMsIcIdaw==
 
 RUN set -eux; \
     # Download the npm tarball.
@@ -41,11 +40,17 @@ RUN set -eux; \
     # --omit=dev ensures devDependencies are not installed.
     npm install -g --ignore-scripts --omit=dev /tmp/pi.tgz; \
     rm -f /tmp/pi.tgz; \
+    # Installed as root into the agent's own npm prefix, which left root-owned directories
+    # in it and a root-owned ~/.npm cache: the agent could not update pi or install any
+    # global package ("The operation was rejected by your operating system"). Hand both back.
+    chown -R 1000:1000 "$(npm config get prefix)" /home/agent/.npm 2>/dev/null || true; \
     pi --version
 
 # Prepare.d scripts run at sandbox start-up via boks-prepare.
 # This one discovers model servers on opened host ports and writes models.json.
 COPY --chmod=0755 prepare.d/ /etc/boks/prepare.d/
+# Exports the llama.cpp router the prepare script found, then becomes pi. See the file.
+COPY --chmod=0755 boks-pi-local /usr/local/bin/boks-pi-local
 
 USER 1000:1000
 WORKDIR /home/agent
