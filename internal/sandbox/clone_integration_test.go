@@ -43,7 +43,13 @@ func hostRepo(t *testing.T) workspace.Workspace {
 
 	git := func(args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		// No automatic maintenance: newer git runs it in the background after a commit,
+		// creating and removing .git/objects/maintenance.lock while treeDigest walks the
+		// repository. The v0.1.30 release's checks failed on exactly that ("lstat
+		// …/maintenance.lock: no such file or directory"), and a repository that changes
+		// on its own would also make the digests this file compares meaningless.
+		cmd := exec.Command("git", append([]string{"-C", dir,
+			"-c", "maintenance.auto=false", "-c", "gc.auto=0"}, args...)...)
 		// A pristine configuration, so the developer's own git settings — hooks
 		// directories, signing, default branch — cannot change what the fixture is.
 		cmd.Env = append(os.Environ(),
