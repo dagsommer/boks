@@ -6,8 +6,13 @@
 # as a comma-separated list (e.g. "8080,11434").
 #
 # For each port, probe /v1/models (OpenAI-compatible API) to find the model, then
-# write a models.json entry with the correct baseUrl and apiKey (if the port
-# carries a BOKS_LOCAL_MODEL_API_KEY env var).
+# write a models.json entry with the correct baseUrl and a placeholder apiKey.
+#
+# The apiKey is ALWAYS a placeholder. pi refuses a custom provider without one ("apiKey is
+# required when defining custom models" — the v0.1.29 failure), and the real key must never
+# be in the sandbox: store it on the host with `boks secret set local-model` and the proxy
+# replaces the Authorization header on every request to host.boks.internal. A server started
+# without --api-key ignores the placeholder.
 #
 # The file is written to ~/.pi/agent/models.json, which is where pi reads custom
 # model definitions from (see model-registry.ts, getAgentDir).
@@ -28,9 +33,6 @@ mkdir -p "$agent_dir"
 
 models_json="$agent_dir/models.json"
 
-# API key from the local-model secret, if configured.
-# pi reads apiKey from models.json; the proxy swaps the placeholder for the real key.
-api_key="${BOKS_LOCAL_MODEL_API_KEY:-}"
 
 # Discover models across all opened host ports, writing a single models.json.
 #
@@ -41,12 +43,12 @@ api_key="${BOKS_LOCAL_MODEL_API_KEY:-}"
 # Written as a Python helper so we can parse JSON reliably without jq (which is on the
 # base image but we want this to be a self-contained shell script).
 
-python3 - "$ports" "$models_json" "$api_key" <<'PYEOF'
+python3 - "$ports" "$models_json" "$agent_dir/settings.json" <<'PYEOF'
 import json, subprocess, sys, os
 
 ports_str = sys.argv[1]
 models_json_path = sys.argv[2]
-api_key = sys.argv[3] if len(sys.argv) > 3 else ""
+settings_path = sys.argv[3]
 
 providers = {}
 
@@ -68,23 +70,52 @@ for port in ports_str.split(","):
             continue
 
         data = json.loads(result.stdout)
-        model_ids = [m["id"] for m in data.get("data", []) if "id" in m]
-
-        if not model_ids:
+        entries = [m for m in data.get("data", []) if "id" in m]
+        if not entries:
             continue
 
-        # Convert the list of model IDs into the expected array of objects
-        model_objs = [{"id": m} for m in model_ids]
+        # llama-server in router mode lists every model it can serve, with
+        # status.value "loaded" or "unloaded" and the arguments it starts each with. A
+        # loaded one goes first, so the default below is a model that answers rather than
+        # "400 model is not loaded"; and --ctx-size becomes pi's context window, so pi does
+        # not plan for more context than the server gives. Servers without these fields
+        # (Ollama, LM Studio, a single-model llama-server) keep their order and pi's defaults.
+        def loaded(m):
+            status = m.get("status")
+            return isinstance(status, dict) and status.get("value") == "loaded"
+
+        def ctx_size(m):
+            status = m.get("status")
+            args = status.get("args", []) if isinstance(status, dict) else []
+            for flag in ("--ctx-size", "-c"):
+                if flag in args:
+                    i = args.index(flag)
+                    if i + 1 < len(args) and args[i + 1].isdigit():
+                        return int(args[i + 1])
+            return None
+
+        entries.sort(key=lambda m: not loaded(m))
+        model_objs = []
+        for m in entries:
+            obj = {"id": m["id"]}
+            ctx = ctx_size(m)
+            if ctx:
+                obj["contextWindow"] = ctx
+            model_objs.append(obj)
         provider = {
             "api": "openai-completions",
             "baseUrl": base_url,
+            # A placeholder: see the comment at the top of this file.
+            "apiKey": "boks-managed",
+            # llama-server and most local servers do not know the developer role or
+            # reasoning_effort; pi's own docs say to turn both off for them.
+            "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
             "models": model_objs,
         }
 
-        if api_key:
-            provider["apiKey"] = api_key
-
-        providers[f"host:{port}"] = provider
+        # Not "host:PORT": pi reads ":<thinking>" off the end of a model reference, and
+        # local model IDs already carry colons (":Q4_K_M").
+        providers[f"local-{port}"] = provider
 
     except Exception:
         # Port unreachable or malformed response — skip it.
@@ -92,10 +123,27 @@ for port in ports_str.split(","):
 
 output = {"providers": providers}
 
-with open(models_json_path + ".tmp", "w") as f:
-    json.dump(output, f, indent=2)
-    f.write("\n")
-os.replace(models_json_path + ".tmp", models_json_path)
+def write(path, data):
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(path + ".tmp", path)
+
+write(models_json_path, output)
+
+# Start on the first discovered model unless the user has chosen one: without a default,
+# pi starts on a cloud provider pi-local cannot reach.
+if providers:
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except Exception:
+        settings = {}
+    if not settings.get("defaultProvider"):
+        first = next(iter(providers))
+        settings["defaultProvider"] = first
+        settings["defaultModel"] = providers[first]["models"][0]["id"]
+        write(settings_path, settings)
 PYEOF
 
 echo "pi-local: wrote models.json with discovered providers" >&2
