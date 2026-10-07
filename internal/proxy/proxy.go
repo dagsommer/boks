@@ -139,6 +139,11 @@ type Config struct {
 const (
 	defaultClientHelloTimeout = 5 * time.Second
 	defaultDialTimeout        = 15 * time.Second
+
+	// plainHTTPTimeout bounds one plain-HTTP request forwarded through the proxy, now that
+	// its client's half-close no longer cancels it. Generous: a model server streaming a
+	// long answer over plain HTTP is a real use (host.boks.internal).
+	plainHTTPTimeout = 30 * time.Minute
 )
 
 // Server is the forward proxy. It is an http.Handler, so it can be served on any
@@ -257,7 +262,15 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outbound := r.Clone(r.Context())
+	// Not r.Context(): Go cancels that when the client half-closes its connection, and a
+	// client may do exactly that after sending its request — BusyBox wget does, and nc. The
+	// request was then cancelled under it ("boks: upstream request failed: context
+	// canceled"), which broke plain-HTTP proxying from every Alpine container in a sandbox
+	// (2026-10-07). A client that really goes away still ends the exchange: copying the
+	// response to it fails. plainHTTPTimeout bounds the rest.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), plainHTTPTimeout)
+	defer cancel()
+	outbound := r.Clone(ctx)
 	outbound.RequestURI = ""
 	stripHopByHop(outbound.Header)
 	// The guest's own proxy credentials are not ours to forward, and they are exactly
