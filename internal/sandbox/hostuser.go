@@ -135,6 +135,17 @@ func overrideWithHostUser(s *specs.Spec, hostUID, hostGID uint32) {
 // guest first, on 2026-10-01: every file read back as 65534 and every write failed with
 // EOVERFLOW, because the host's 502 was on the side the kernel never looks up.
 //
+// # Every id is mapped, not just the host's
+//
+// The mapping covers the whole id range, swapping the host's id with the container's and
+// leaving every other id as itself (see swapIDMapping). A one-entry mapping was shipped first,
+// and it made any file whose owner or group was some other id unwritable: the kernel refuses a
+// write, and answers chmod with EOVERFLOW, on an idmapped inode whose uid *or* gid has no
+// mapping — even when its owner is the agent. That is every file in a workspace under /tmp on
+// a Mac, where files take the directory's group (wheel, 0) rather than the user's own. Mapped
+// to themselves, those ids reach the agent as what they are on disk, and ordinary permission
+// bits decide, as they would on the host.
+//
 // Only writable mounts get one: a read-only mount has no EACCES-on-write problem to begin
 // with, and an idmap on a mount nothing writes through changes nothing observable.
 func idmapWorkspaceMounts(s *specs.Spec, shares []workspace.Workspace, hostUID, hostGID uint32) {
@@ -149,8 +160,8 @@ func idmapWorkspaceMounts(s *specs.Spec, shares []workspace.Workspace, hostUID, 
 		if !writable[s.Mounts[i].Destination] {
 			continue
 		}
-		s.Mounts[i].UIDMappings = []specs.LinuxIDMapping{{ContainerID: hostUID, HostID: containerUID, Size: 1}}
-		s.Mounts[i].GIDMappings = []specs.LinuxIDMapping{{ContainerID: hostGID, HostID: containerGID, Size: 1}}
+		s.Mounts[i].UIDMappings = swapIDMapping(hostUID, containerUID)
+		s.Mounts[i].GIDMappings = swapIDMapping(hostGID, containerGID)
 		// crun's own idmap-without-container-userns test (test_mounts.py,
 		// test_idmapped_mounts_without_userns) always pairs UIDMappings/GIDMappings with
 		// a literal "idmap"/"ridmap" entry in Options; nothing in crun's own source makes
@@ -160,4 +171,32 @@ func idmapWorkspaceMounts(s *specs.Spec, shares []workspace.Workspace, hostUID, 
 		// that with "ridmap" rather than relying on an untested bare-UIDMappings path.
 		s.Mounts[i].Options = append(s.Mounts[i].Options, "ridmap")
 	}
+}
+
+// idSpace is how many ids a mapping covers: 0 through 4294967294. 4294967295 is (uid_t)-1,
+// which is not an id but "no change" to chown, and no uid_map may include it.
+const idSpace = 1<<32 - 1
+
+// swapIDMapping maps the whole id space so that onDisk and seen trade places and every other
+// id maps to itself, in the field order idmapWorkspaceMounts documents (ContainerID on disk,
+// HostID seen). A swap rather than a plain onDisk→seen entry because a mapping must be
+// one-to-one: seen's own on-disk id has to go somewhere, and onDisk is the id left free.
+func swapIDMapping(onDisk, seen uint32) []specs.LinuxIDMapping {
+	if onDisk == seen {
+		return []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: idSpace}}
+	}
+	lo, hi := min(onDisk, seen), max(onDisk, seen)
+	var m []specs.LinuxIDMapping
+	if lo > 0 {
+		m = append(m, specs.LinuxIDMapping{ContainerID: 0, HostID: 0, Size: lo})
+	}
+	m = append(m, specs.LinuxIDMapping{ContainerID: lo, HostID: hi, Size: 1})
+	if hi-lo > 1 {
+		m = append(m, specs.LinuxIDMapping{ContainerID: lo + 1, HostID: lo + 1, Size: hi - lo - 1})
+	}
+	m = append(m, specs.LinuxIDMapping{ContainerID: hi, HostID: lo, Size: 1})
+	if hi < idSpace-1 {
+		m = append(m, specs.LinuxIDMapping{ContainerID: hi + 1, HostID: hi + 1, Size: idSpace - hi - 1})
+	}
+	return m
 }

@@ -109,14 +109,59 @@ func TestReconcileWorkspaceIdentityIdmapsANonRootImageWhenTheGuestCan(t *testing
 	// ContainerID is the on-disk id and HostID the id the container sees: the kernel's
 	// idmap userns direction, the reverse of what the field names suggest. Inverting
 	// these made every file read as 65534 in a real guest; see idmapWorkspaceMounts.
-	wantUID := []specs.LinuxIDMapping{{ContainerID: 501, HostID: 1000, Size: 1}}
+	wantUID := []specs.LinuxIDMapping{
+		{ContainerID: 0, HostID: 0, Size: 501},
+		{ContainerID: 501, HostID: 1000, Size: 1},
+		{ContainerID: 502, HostID: 502, Size: 498},
+		{ContainerID: 1000, HostID: 501, Size: 1},
+		{ContainerID: 1001, HostID: 1001, Size: idSpace - 1001},
+	}
 	if !reflect.DeepEqual(s.Mounts[0].UIDMappings, wantUID) {
 		t.Errorf("Mounts[0].UIDMappings = %+v, want %+v", s.Mounts[0].UIDMappings, wantUID)
 	}
-	wantGID := []specs.LinuxIDMapping{{ContainerID: 20, HostID: 1000, Size: 1}}
-	if !reflect.DeepEqual(s.Mounts[0].GIDMappings, wantGID) {
-		t.Errorf("Mounts[0].GIDMappings = %+v, want %+v", s.Mounts[0].GIDMappings, wantGID)
+	if got := mapID(s.Mounts[0].GIDMappings, 20); got != 1000 {
+		t.Errorf("the host's gid 20 is seen as %d, want the container's 1000", got)
 	}
+}
+
+// Every on-disk id must have a mapping, or the kernel refuses writes to any file owned by it
+// — a file in group wheel under /tmp was unwritable with the host's gid as the only entry.
+func TestSwapIDMappingCoversEveryIDOneToOne(t *testing.T) {
+	for _, c := range []struct{ onDisk, seen uint32 }{{501, 1000}, {1000, 501}, {20, 1000}, {0, 1000}, {1000, 1000}, {idSpace - 1, 0}} {
+		m := swapIDMapping(c.onDisk, c.seen)
+		var next, total uint32
+		for _, e := range m {
+			if e.ContainerID != next {
+				t.Fatalf("swapIDMapping(%d, %d) = %+v: on-disk ids from %d are unmapped", c.onDisk, c.seen, m, next)
+			}
+			next, total = e.ContainerID+e.Size, total+e.Size
+		}
+		if total != idSpace {
+			t.Errorf("swapIDMapping(%d, %d) covers %d ids, want %d", c.onDisk, c.seen, total, idSpace)
+		}
+		for _, id := range []uint32{0, 20, 501, 1000, 65534, c.onDisk, c.seen} {
+			want := id
+			switch id {
+			case c.onDisk:
+				want = c.seen
+			case c.seen:
+				want = c.onDisk
+			}
+			if got := mapID(m, id); got != want {
+				t.Errorf("swapIDMapping(%d, %d) sees on-disk %d as %d, want %d", c.onDisk, c.seen, id, got, want)
+			}
+		}
+	}
+}
+
+// mapID is the kernel's lookup of an on-disk id in a mount's mapping.
+func mapID(m []specs.LinuxIDMapping, onDisk uint32) uint32 {
+	for _, e := range m {
+		if onDisk >= e.ContainerID && onDisk-e.ContainerID < e.Size {
+			return e.HostID + onDisk - e.ContainerID
+		}
+	}
+	return 65534
 }
 
 // Without a guest that can idmap, the mechanism must fall back to exactly today's behavior —
