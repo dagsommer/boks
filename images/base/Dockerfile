@@ -173,6 +173,25 @@ RUN set -eux; \
 
 # The base image's own start-up scripts. Derived images add theirs to the same directory;
 # boks-prepare runs whatever is there in name order, which is why these are numbered.
+# Docker, so an agent can build and run containers inside its sandbox. The sandbox's container
+# is privileged inside its VM (internal/sandbox, withPrivileged), which is what the engine needs:
+# measured 2026-10-07, dockerd, `docker build`, `docker run` and `docker compose` all worked.
+#
+# docker-cli separately because Debian 13 split the client out of docker.io, and
+# --no-install-recommends would otherwise leave an engine with no `docker` command.
+# fuse-overlayfs because overlay2 cannot stack on the sandbox's own overlay root ("failed to
+# mount overlay: invalid argument"); daemon.json selects it. prepare.d/30-docker.sh starts the
+# engine when an agent starts.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      docker.io \
+      docker-cli \
+      docker-compose \
+      fuse-overlayfs \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /etc/docker \
+ && printf '{\n  "storage-driver": "fuse-overlayfs"\n}\n' > /etc/docker/daemon.json
+
 COPY --chmod=0755 prepare.d/ /etc/boks/prepare.d/
 
 COPY --chmod=0755 boks-install-ca boks-entrypoint boks-open boks-prepare /usr/local/bin/
