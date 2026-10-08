@@ -88,6 +88,16 @@ type Agent struct {
 	// agent for models served on this machine, which must not quietly fall back to a cloud
 	// provider it also knows how to use.
 	Deny []Destination
+	// Credentials are the stored credentials this agent uses, by name in the secret store:
+	// its provider's login or API key, and github. Only these are attached to its sandboxes
+	// from the store. A Claude subscription is Claude Code's, and a shell, a kit or another
+	// agent has no business carrying it into its sandbox — which is what happened while every
+	// stored credential went to every sandbox. A kit declares its own, in its spec.
+	//
+	// What is not listed can still be attached: --inject and --oauth name a credential
+	// explicitly, and a credential stored for one sandbox ('boks secret set --sandbox') is
+	// that sandbox's whatever its agent.
+	Credentials []string
 }
 
 // Destination is one network destination an agent needs, with the reason it is here.
@@ -331,9 +341,10 @@ func Builtin() *Registry {
 			Summary: "a plain shell in the Boks base image",
 			// The shell agent is the base image itself: it is the one agent whose
 			// environment is "everything the others share and nothing more".
-			Image:   Image("base"),
-			Command: []string{"/bin/bash"},
-			Args:    ArgsCommand,
+			Image:       Image("base"),
+			Command:     []string{"/bin/bash"},
+			Args:        ArgsCommand,
+			Credentials: []string{"github"},
 		},
 		{
 			Name: "pi-local", Summary: "pi, with models served on this machine only (llama-server, Ollama, LM Studio)",
@@ -342,8 +353,9 @@ func Builtin() *Registry {
 			// (images/pi/prepare.d), and boks-pi-local points pi's built-in llama.cpp
 			// provider at a router when one was found. Run with --allow-host-port PORT for
 			// the model server.
-			Command: []string{"boks-pi-local"},
-			Deny:    piCloudProviders,
+			Command:     []string{"boks-pi-local"},
+			Deny:        piCloudProviders,
+			Credentials: []string{"local-model", "github"},
 		},
 		{
 			Name: "claude", Summary: "Claude Code", Image: Image("claude"),
@@ -351,7 +363,8 @@ func Builtin() *Registry {
 			// permission prompts. The VM boundary is the containment layer here;
 			// asking the agent to confirm its own actions inside the sandbox adds
 			// friction without adding isolation.
-			Command: []string{"claude", "--dangerously-skip-permissions"},
+			Command:     []string{"claude", "--dangerously-skip-permissions"},
+			Credentials: []string{"claude-code", "anthropic", "github"},
 			Allow: []Destination{
 				// Observed: a real `boks run claude` under the standard preset was
 				// refused here, and the agent could not start work until it was
@@ -376,7 +389,8 @@ func Builtin() *Registry {
 		},
 		{
 			Name: "codex", Summary: "OpenAI Codex", Image: Image("codex"),
-			Command: []string{"codex"},
+			Command:     []string{"codex"},
+			Credentials: []string{"openai", "github"},
 			Allow: []Destination{
 				// openai/codex ships its own firewall for a sandboxed dev
 				// container: .devcontainer/init-firewall.sh allows
@@ -395,7 +409,8 @@ func Builtin() *Registry {
 		},
 		{
 			Name: "copilot", Summary: "GitHub Copilot CLI", Image: Image("copilot"),
-			Command: []string{"copilot"},
+			Command:     []string{"copilot"},
+			Credentials: []string{"github"},
 			Allow: []Destination{
 				// GitHub publishes an allowlist reference for Copilot. The
 				// wildcard is theirs and is kept as written: githubcopilot.com
@@ -411,7 +426,8 @@ func Builtin() *Registry {
 		},
 		{
 			Name: "cursor", Summary: "Cursor CLI", Image: Image("cursor"),
-			Command: []string{"cursor-agent"},
+			Command:     []string{"cursor-agent"},
+			Credentials: []string{"cursor", "github"},
 			Allow: []Destination{
 				// cursor.com's enterprise network-configuration page names each
 				// of these and what it is for. Its CLI page names the broader
@@ -430,11 +446,14 @@ func Builtin() *Registry {
 		// list is the honest state — their users will see the denial in
 		// `boks policy log` and write the rule — and it is a cheap thing to fill
 		// in the day someone produces the evidence.
-		{Name: "docker-agent", Summary: "Docker Agent", Image: Image("docker-agent"), Command: []string{"docker-agent"}},
-		{Name: "droid", Summary: "Factory Droid", Image: Image("droid"), Command: []string{"droid"}},
+		{Name: "docker-agent", Summary: "Docker Agent", Image: Image("docker-agent"), Command: []string{"docker-agent"},
+			Credentials: modelProviders},
+		{Name: "droid", Summary: "Factory Droid", Image: Image("droid"), Command: []string{"droid"},
+			Credentials: []string{"droid", "github"}},
 		{
 			Name: "gemini", Summary: "Google Gemini CLI", Image: Image("gemini"),
-			Command: []string{"gemini"},
+			Command:     []string{"gemini"},
+			Credentials: []string{"google", "github"},
 			Allow: []Destination{
 				// Google's Code Assist network-access page names the endpoint
 				// and says, in as many words, not to use a wildcard for it.
@@ -454,8 +473,9 @@ func Builtin() *Registry {
 		// manifest with no documented version-pinned URL — so there is no artifact to
 		// pin and checksum the way every other image here does. Both would have to
 		// change before this becomes an image.
-		{Name: "kiro", Summary: "Kiro"},
-		{Name: "opencode", Summary: "OpenCode", Image: Image("opencode"), Command: []string{"opencode"}},
+		{Name: "kiro", Summary: "Kiro", Credentials: []string{"github"}},
+		{Name: "opencode", Summary: "OpenCode", Image: Image("opencode"), Command: []string{"opencode"},
+			Credentials: modelProviders},
 	} {
 		// Every image Boks ships carries the same init and entrypoint, so the prefix is
 		// applied here rather than repeated in ten definitions. An agent with no image
@@ -470,6 +490,10 @@ func Builtin() *Registry {
 	}
 	return r
 }
+
+// modelProviders are the credentials of an agent that can use any of the model APIs Boks has
+// a service for (docker-agent, opencode): every provider key, and github.
+var modelProviders = []string{"anthropic", "openai", "google", "groq", "mistral", "nebius", "openrouter", "xai", "github"}
 
 // piCloudProviders are the model APIs pi knows how to use, which pi-local must not reach: its
 // point is that the code it works on goes to a model on this machine and nowhere else. Taken

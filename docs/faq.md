@@ -165,8 +165,10 @@ Not in a file yet — the registry is Go, and a loader for declarative definitio
 
 ## Can a credential apply to only one sandbox?
 
-No. A stored credential applies to every sandbox; `--no-secrets` turns all of them off for a
-run, and there is nothing in between.
+Yes: `boks secret set --sandbox NAME SERVICE` stores it for that sandbox, in preference to the
+machine-wide one. A machine-wide credential goes to the sandboxes of the agents that use it —
+each agent lists its own, so a Claude login reaches `claude` sandboxes and not a `shell` or
+`pi-local` — and `--no-secrets` leaves the store out of a run.
 
 ## How does this compare to Docker Sandboxes feature by feature?
 
