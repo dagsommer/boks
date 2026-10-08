@@ -21,4 +21,13 @@ if [ -z "${LLAMA_BASE_URL:-}" ] && [ -r "$router_file" ]; then
 	fi
 fi
 
-exec pi "$@"
+# pi-background-tasks is shipped for its background shell tasks (bg_run and the tools that
+# watch and stop them). Its other tools delegate to further agents and run its "Fusion"
+# workflows: subagents already covers delegation, and together they cost about 3,800 tokens of
+# tool schema and guidance on every request, which a local model's context pays for.
+# Only for a session: in front of a subcommand (pi install, pi list, ...) the option turns the
+# subcommand's name into a prompt for the model.
+case "${1:-}" in
+install | remove | uninstall | update | list | config | auth | mcp) exec pi "$@" ;;
+esac
+exec pi --exclude-tools 'bg_delegate,bg_run_pi_attested,fusion_*' "$@"
