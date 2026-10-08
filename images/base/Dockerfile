@@ -44,7 +44,7 @@ RUN apt-get update \
 # Node from nodejs.org rather than the distro, because the agent CLIs are published to npm
 # and track Node LTS, while Debian's node is pinned to whatever was current at freeze. The
 # version is an ARG so a release can move it without editing the recipe.
-ARG NODE_VERSION=24.19.0
+ARG NODE_VERSION=24.21.0
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
       amd64) node_arch=x64 ;; \

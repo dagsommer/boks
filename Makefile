@@ -10,7 +10,7 @@ LDFLAGS := -X $(PKG)/internal/cli.Version=$(VERSION)
 IMAGE_REPO := ghcr.io/dagsommer/boks
 IMAGE_TAG  := $(shell scripts/image-tag.sh)
 # Every directory under images/ except the base, which everything else builds on.
-AGENT_IMAGES := $(filter-out base,$(notdir $(wildcard images/*)))
+AGENT_IMAGES := $(filter-out base,$(notdir $(patsubst %/Dockerfile,%,$(wildcard images/*/Dockerfile))))
 
 # `docker-agent version`, not `docker-agent --version`; everything else takes the flag.
 VERSION_ARG_docker-agent := version
@@ -92,8 +92,12 @@ release-notes:
 release:
 	@test -n "$(VERSION)" || { echo "usage: make release VERSION=x.y.z" >&2; exit 2; }
 	@git diff --quiet && git diff --cached --quiet || { echo "release: working tree is dirty; commit or stash first" >&2; exit 2; }
+	@# Every release ships each agent's latest CLI: the pins move here, with their digests, and
+	@# the release commit carries the diff. A vendor that cannot be reached keeps its pin (exit
+	@# 2, and the script names it) rather than holding the release.
+	python3 scripts/bump-agents.py || [ $$? -eq 2 ]
 	perl -i -pe 's/^(const ImageTag = )"[^"]*"/$${1}"$(VERSION)"/' internal/agent/agent.go
-	git add internal/agent/agent.go
+	git add internal/agent/agent.go images
 	git commit -m "release: $(VERSION)"
 	git tag v$(VERSION)
 	@echo ""

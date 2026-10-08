@@ -9,14 +9,14 @@ FROM ${BASE_IMAGE}
 
 USER root
 
-ARG OPENCODE_VERSION=1.18.16
+ARG OPENCODE_VERSION=1.18.35
 # sha256 of the release tarballs, recorded at the version above. A bump changes these lines,
 # which is the point: the diff is what a reviewer checks.
 #
 # The amd64 asset is the "baseline" build. The vendor also publishes an AVX2 one, but a
 # Dockerfile cannot know what the guest CPU will be — the baseline binary runs on any x86-64.
-ARG OPENCODE_SHA256_AMD64=b075251f373b45fa01cc41b7b1fd6eb2b61c9544383e3399a5e7f1447d1fb95f
-ARG OPENCODE_SHA256_ARM64=4fdce5f9bc877d977304d71c0c90ad6e83efa381fe0edf0a61e6142a625e1c41
+ARG OPENCODE_SHA256_AMD64=90c97d4a24d36437bce36f27195c9cd2e0b70ed037a04d1c6a6740eb246c2a73
+ARG OPENCODE_SHA256_ARM64=f7f2ba59ee8aa94d388f9696575a32d20e71c2ee48def9f80fc693a60fec6c72
 
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
