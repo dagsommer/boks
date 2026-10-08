@@ -46,6 +46,19 @@ RUN set -eux; \
     chown -R 1000:1000 "$(npm config get prefix)" /home/agent/.npm 2>/dev/null || true; \
     pi --version
 
+# pi extensions, from the pinned lockfile in extensions/: every package in it, dependencies
+# included, carries a sha512 integrity that `npm ci` checks, and --ignore-scripts keeps their
+# lifecycle hooks from running, as for pi itself. They live under /opt, owned by root, so they
+# belong to the image rather than to a sandbox's home: a new image version replaces them, and
+# the agent cannot rewrite what pi loads. prepare.d/20-pi-extensions.sh registers them.
+# --legacy-peer-deps because each names pi, pi-tui and typebox as peers, which pi provides to
+# its extensions at runtime; installing them would only add a second, unused copy of pi.
+COPY extensions/package.json extensions/package-lock.json /opt/pi-extensions/
+RUN set -eux; \
+    cd /opt/pi-extensions; \
+    npm ci --ignore-scripts --legacy-peer-deps --omit=dev; \
+    npm cache clean --force
+
 # Prepare.d scripts run at sandbox start-up via boks-prepare.
 # This one discovers model servers on opened host ports and writes models.json.
 COPY --chmod=0755 prepare.d/ /etc/boks/prepare.d/
