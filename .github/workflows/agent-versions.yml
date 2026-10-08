@@ -1,0 +1,75 @@
+# Keep the agent images' pinned CLIs current: once a week, move every pin to the vendor's
+# latest release and open a pull request with the result.
+#
+# WHY THIS EXISTS. Each image pins a version and the digest of what it downloads, which makes
+# an image reproducible and a tampered download a failed build. Nothing moved the pins, though:
+# by 2026-10-08 Claude Code was 66 releases behind and every other agent was behind too, and a
+# sandbox starts from its image's version however often the vendor ships.
+#
+# WHAT IT DOES. scripts/bump-agents.py rewrites the Dockerfiles, taking each digest from where
+# the vendor publishes it (see the script; Cursor's is the one computed here). The pull request
+# is the review point: the diff is versions and digests and nothing else. Merging it does not
+# publish images — those are built when a release is tagged — so a merged bump reaches users
+# with the next release.
+#
+# A pull request opened with the workflow's token starts no other workflow, so the images job
+# does not run on it; the release that follows a merge builds them. Opening it needs
+# "Allow GitHub Actions to create and approve pull requests" in the repository's Actions
+# settings.
+name: agent versions
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: agent-versions
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Move the pins to the latest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/bump-agents.py | tee "$RUNNER_TEMP/bump.txt"
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then
+            echo "every agent is current"
+            exit 0
+          fi
+          branch="bump/agents-$(date -u +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -qam "images: move agent CLIs to their latest releases"
+          git push -f origin "$branch"
+          {
+            echo "The pinned agent CLIs, moved to the vendors' latest releases by"
+            echo "\`scripts/bump-agents.py\`. Digests come from where each vendor publishes them;"
+            echo "Cursor publishes none, so its digest was computed by this run."
+            echo
+            echo '```'
+            grep -- '->' "$RUNNER_TEMP/bump.txt" || true
+            echo '```'
+            echo
+            echo "Images are built when the next release is tagged."
+          } > "$RUNNER_TEMP/body.md"
+          if gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr edit "$branch" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --head "$branch" --title "Move agent CLIs to their latest releases" \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi
