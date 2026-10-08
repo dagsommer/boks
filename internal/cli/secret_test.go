@@ -56,8 +56,8 @@ func TestSecretSetForAKnownServiceNeedsNoInject(t *testing.T) {
 		}
 	}
 
-	// And a run picks it up with no flags at all.
-	var flags policyFlags
+	// And a run of an agent that uses it picks it up with no flags at all.
+	flags := (&policyFlags{}).forAgent(mustAgent(t, "claude"))
 	plan, err := flags.planCredentials(store)
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestALoginTakesPrecedenceOverAStoredKeyAtRunTime(t *testing.T) {
 	}
 	storeLogin(t, store, "claude-code", "api.anthropic.com")
 
-	var flags policyFlags
+	flags := (&policyFlags{}).forAgent(mustAgent(t, "claude"))
 	plan, err := flags.planCredentials(store)
 	if err != nil {
 		t.Fatal(err)
@@ -596,57 +596,62 @@ func TestImportRefusesToPromptWithoutATerminal(t *testing.T) {
 	}
 }
 
-// pi-local denies every cloud model API, so a stored Anthropic key is a credential it could
-// never use: it is left out and said so, while a stored GitHub token — whose hosts pi-local
-// may reach — is still attached.
-func TestStoredCredentialsAnAgentDeniesEveryHostOfAreLeftOut(t *testing.T) {
+// A stored credential goes to the agents that use it and no others. A Claude login belongs
+// in claude's sandboxes; a shell or pi-local carrying it would hold a credential it has no
+// use for, which is what happened while every stored credential went everywhere.
+func TestStoredCredentialsGoOnlyToTheAgentsThatUseThem(t *testing.T) {
 	store := secretStore(t)
-	if _, _, err := runCLI(t, theKey+"\n", "secret", "set", "anthropic"); err != nil {
-		t.Fatalf("secret set anthropic: %v", err)
+	if err := store.Set("anthropic", secret.NewValue(theKey)); err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err := runCLI(t, "ghp_cli_canary_value\n", "secret", "set", "github"); err != nil {
-		t.Fatalf("secret set github: %v", err)
+	if err := store.Set("github", secret.NewValue("ghp_cli_canary_value")); err != nil {
+		t.Fatal(err)
 	}
-	piLocal, ok := agent.Builtin().Lookup("pi-local")
-	if !ok {
-		t.Fatal("no pi-local agent")
+	storeLogin(t, store, "claude-code", "api.anthropic.com")
+
+	for _, c := range []struct {
+		agent string
+		want  []string
+	}{
+		{"claude", []string{"anthropic", "claude-code (oauth)", "github"}},
+		{"shell", []string{"github"}},
+		{"pi-local", []string{"github"}},
+		{"codex", []string{"github"}},
+	} {
+		flags := (&policyFlags{}).forAgent(mustAgent(t, c.agent))
+		plan, err := flags.planCredentials(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := slices.Sorted(slices.Values(plan.adopted))
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%s adopted %v, want %v", c.agent, got, c.want)
+		}
 	}
 
-	var flags policyFlags
-	flags.forAgent(piLocal)
+	// A credential named on the command line is the user's choice, whatever the agent.
+	flags := (&policyFlags{oauth: []string{"claude-code"}}).forAgent(mustAgent(t, "shell"))
 	plan, err := flags.planCredentials(store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := plan.dropUnreachable(flags.agent, nil); err != nil {
-		t.Fatal(err)
+	if !slices.Contains(plan.oauth, "claude-code") {
+		t.Errorf("--oauth claude-code on a shell was dropped: %v", plan.oauth)
 	}
-	if got := strings.Join(plan.inject, " "); strings.Contains(got, "anthropic@") || !strings.Contains(got, "github@") {
-		t.Errorf("inject = %v, want github and not anthropic", plan.inject)
-	}
-	if strings.Contains(strings.Join(plan.guest, " "), "anthropic=") {
-		t.Errorf("the guest still gets an anthropic placeholder: %v", plan.guest)
-	}
-	if !slices.Equal(plan.unreachable, []string{"anthropic"}) || slices.Contains(plan.adopted, "anthropic") {
-		t.Errorf("unreachable = %v, adopted = %v", plan.unreachable, plan.adopted)
-	}
-	var out strings.Builder
-	plan.describe(&out)
-	if !strings.Contains(out.String(), "not attaching anthropic") {
-		t.Errorf("the run does not say what it left out:\n%s", out.String())
-	}
+}
 
-	// A credential the user names is their explicit choice, and stays even where it is denied.
-	flags = policyFlags{inject: []string{"anthropic@api.anthropic.com=x-api-key"}}
-	flags.forAgent(piLocal)
-	plan, err = flags.planCredentials(store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := plan.dropUnreachable(flags.agent, nil); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(plan.inject, "anthropic@api.anthropic.com=x-api-key") || len(plan.unreachable) != 0 {
-		t.Errorf("a named credential was dropped: inject = %v, unreachable = %v", plan.inject, plan.unreachable)
+// Every name an agent lists must be a credential Boks can attach: a misspelt one would
+// silently attach nothing.
+func TestAgentCredentialsAreKnownServices(t *testing.T) {
+	for _, a := range agent.Builtin().All() {
+		for _, name := range a.Credentials {
+			if _, ok := knownServices.Lookup(name); ok {
+				continue
+			}
+			if _, err := secret.Profile(name); err == nil {
+				continue
+			}
+			t.Errorf("agent %s lists %q, which is neither a known service nor a login Boks can adopt", a.Name, name)
+		}
 	}
 }

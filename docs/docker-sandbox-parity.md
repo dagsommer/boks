@@ -406,9 +406,10 @@ has the same registry, in the shape `internal/agent` uses (a struct, an ordered 
 `Add` as the seam a user-defined entry arrives through), and the ceremony is now the same one
 line. A row renders itself into the `--inject`/`--guest-credential` grammar rather than
 building rules directly, so there is one parser and one validator, and nothing a registry
-entry can express that a user could not have typed. A stored credential applies to every
-sandbox without being named again, `--inject` still overrides it, and `--no-secrets` leaves
-the store out of a run.
+entry can express that a user could not have typed. A stored credential goes to the
+sandboxes of the agents that use it without being named again — each built-in agent lists its
+credentials (`Credentials` in `internal/agent`), as an sbx agent or kit does — `--inject` still
+overrides it, and `--no-secrets` leaves the store out of a run.
 
 **Nine of the eleven names carry a rule; `cursor` and `droid` do not.** The bar is the one
 `internal/agent` sets for an allowlist: vendor documentation, cited in the entry, or nothing.
@@ -454,7 +455,7 @@ Three further findings from the same output, and what each became:
   vendor.
 
 | Service registry | A fixed list of known services; the name is the whole configuration | Same list, same names, same order, as data in `internal/secret/service.go` | P0 | done | 9 of 11 configured, each citing the vendor page it was read from; `cursor` and `droid` registered with no rule, which is the honest state. `Add` is the seam a user-defined service arrives through, and it overrides an empty row |
-| Global vs per-sandbox scope | `-g` stores globally; a sandbox-scoped variant exists | Global only: a stored credential applies to every sandbox | P2 | partial | Scoping a credential to one sandbox is not implemented. `--no-secrets` is the only narrowing, and it is all-or-nothing |
+| Global vs per-sandbox scope | `-g` stores globally; a sandbox-scoped variant exists | Machine-wide, attached to the agents that list it; `boks secret set --sandbox NAME` stores one for a single sandbox, used in preference to the machine-wide one | P2 | done | Each built-in agent declares the credentials it uses, so a Claude login reaches claude's sandboxes and no others. `--no-secrets` leaves the store out of a run |
 | Registry secrets | `sbx secret set --registry ghcr.io --password-stdin`, with three scopes: host-only (template and kit pulls, never injected), global (injected by the proxy into every new sandbox's registry login), or one sandbox | None | P2 | none | A category Boks does not have at all. Note the property worth copying: the credential authenticates the pull **without entering the sandbox filesystem** |
 | `secret set` | `sbx secret set <sandbox> <name> -t <value>`; global variant | `boks secret set SERVICE` | P1 | done | Reads from stdin by default; `--value` documented as visible in the process list. A known service resolves to its rule and the command prints what the sandbox will do with it; a known service with no rule is refused by name, because storing it would leave a credential nothing ever attaches |
 | `secret set --oauth` | Runs an OAuth flow from the host | Refused, with the reason, and the refusal now names two routes that work | P2 | none | Still not a missing afternoon's work: every host-side flow starts with a client id the vendor issues to a registered application, and Boks holds none. Note that sbx's `--oauth` is documented "openai/global only", which is what holding exactly one registered client id looks like. `boks secret adopt` covers a machine you have logged in on; `boks secret login` + `boks run claude -- auth login` covers a fresh one, by letting the agent use *its* client id |

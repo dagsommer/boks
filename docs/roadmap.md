@@ -95,8 +95,6 @@ would sell.
 - **Two of the eleven known services have no rule.** Neither Cursor nor Factory documents the
   host their CLI sends its API key to, so `boks secret set cursor` and `boks secret set droid`
   refuse and explain rather than guessing.
-- **A credential cannot be scoped to one sandbox.** A stored credential applies to every
-  sandbox; `--no-secrets` turns all of them off for a run, and there is nothing in between.
 
 ### Agents and images
 

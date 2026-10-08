@@ -753,12 +753,11 @@ nobody can correct." A kit-supplied service has no such citation. Either `source
 kit stands in, or kit-supplied services are marked as uncited in `boks secret ls`. This is a
 small decision with a real UX consequence and should be made deliberately.
 
-*Scoping.* `docs/roadmap.md` records: "**A credential cannot be scoped to one sandbox.** A
-stored credential applies to every sandbox; `--no-secrets` turns all of them off for a run, and
-there is nothing in between." The kit model's stage-2 resolution puts **sandbox-scoped secret
-store first, global second** (`BIND`). So per-sandbox credential scoping is a prerequisite for
-faithful kit credential semantics, and it is an existing known gap rather than something kits
-introduce.
+*Scoping.* The kit model's stage-2 resolution puts **sandbox-scoped secret store first, global
+second** (`BIND`), so per-sandbox credential scoping is a prerequisite for faithful kit
+credential semantics. It exists: `boks secret set --sandbox` stores a credential for one
+sandbox, in preference to the machine-wide one, and a machine-wide credential goes only to the
+agents that list it.
 
 **Genuinely new.**
 
