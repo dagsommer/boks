@@ -28,6 +28,7 @@ RUN apt-get update \
       jq \
       less \
       libatomic1 \
+      libnss-myhostname \
       openssh-client \
       procps \
       python3 \
@@ -191,6 +192,17 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /etc/docker \
  && printf '{\n  "storage-driver": "fuse-overlayfs"\n}\n' > /etc/docker/daemon.json
+
+# Name resolution for the sandbox itself. The container gets no /etc/hosts — nerdbox writes
+# one inside the VM, not in the container's root — so nothing resolved the sandbox's own
+# hostname: sudo warned "unable to resolve host" on every call, and anything asking for the
+# local host's address (Java's InetAddress.getLocalHost, among others) failed. The hostname is
+# per sandbox, so a file cannot carry it; nss-myhostname answers for whatever the hostname is,
+# and the file covers localhost for programs that read /etc/hosts directly rather than through
+# glibc.
+COPY --chmod=0644 hosts /etc/hosts
+RUN sed -i 's/^hosts:.*/hosts:          files myhostname dns/' /etc/nsswitch.conf \
+ && grep -q '^hosts:.*myhostname' /etc/nsswitch.conf
 
 COPY --chmod=0755 prepare.d/ /etc/boks/prepare.d/
 
