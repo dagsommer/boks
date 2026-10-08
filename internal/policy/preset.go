@@ -131,6 +131,13 @@ func standardPolicy() Policy {
 			MustRule(Allow, "crates.io:443", "crates.io API"),
 			MustRule(Allow, "index.crates.io:443", "Cargo sparse index"),
 			MustRule(Allow, "static.crates.io:443", "crate downloads"),
+			// Every sandbox runs Docker, and pulling from Docker Hub takes three hosts: the
+			// registry API, its token service, and the CDN the image layers come from.
+			// Docker's own, not a general-purpose CDN: production.cloudfront.docker.com
+			// serves Docker Hub's blobs and nothing else.
+			MustRule(Allow, "registry-1.docker.io:443", "Docker Hub registry"),
+			MustRule(Allow, "auth.docker.io:443", "Docker Hub tokens"),
+			MustRule(Allow, "production.cloudfront.docker.com:443", "Docker Hub image layers"),
 		},
 	}
 }
