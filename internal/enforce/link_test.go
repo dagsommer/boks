@@ -7,9 +7,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// lockedLog is the operational log a watchdog writes from its own goroutine while the test
+// reads it. A bare strings.Builder there is a data race the race detector reports, and that
+// fails the test however the two happen to be ordered in time.
+type lockedLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
 
 // unexercised stands in for network.Unexercised()'s Windows answer.
 //
@@ -84,7 +105,7 @@ func TestTheLinkWatchdogFailsWhenNothingDials(t *testing.T) {
 // must not be accused afterwards.
 func TestTheLinkWatchdogIsSilentWhenTheGuestAttaches(t *testing.T) {
 	connected := make(chan struct{})
-	var log strings.Builder
+	var log lockedLog
 	w := watchLink(context.Background(), unexercised, "box", "/run/boks/net.sock",
 		connected, 10*time.Millisecond, &log)
 	w.taskStarted()
