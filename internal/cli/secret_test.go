@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
 )
@@ -592,5 +593,60 @@ func TestImportRefusesToPromptWithoutATerminal(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not mention %q:\n%v", want, err)
 		}
+	}
+}
+
+// pi-local denies every cloud model API, so a stored Anthropic key is a credential it could
+// never use: it is left out and said so, while a stored GitHub token — whose hosts pi-local
+// may reach — is still attached.
+func TestStoredCredentialsAnAgentDeniesEveryHostOfAreLeftOut(t *testing.T) {
+	store := secretStore(t)
+	if _, _, err := runCLI(t, theKey+"\n", "secret", "set", "anthropic"); err != nil {
+		t.Fatalf("secret set anthropic: %v", err)
+	}
+	if _, _, err := runCLI(t, "ghp_cli_canary_value\n", "secret", "set", "github"); err != nil {
+		t.Fatalf("secret set github: %v", err)
+	}
+	piLocal, ok := agent.Builtin().Lookup("pi-local")
+	if !ok {
+		t.Fatal("no pi-local agent")
+	}
+
+	var flags policyFlags
+	flags.forAgent(piLocal)
+	plan, err := flags.planCredentials(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.dropUnreachable(flags.agent, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(plan.inject, " "); strings.Contains(got, "anthropic@") || !strings.Contains(got, "github@") {
+		t.Errorf("inject = %v, want github and not anthropic", plan.inject)
+	}
+	if strings.Contains(strings.Join(plan.guest, " "), "anthropic=") {
+		t.Errorf("the guest still gets an anthropic placeholder: %v", plan.guest)
+	}
+	if !slices.Equal(plan.unreachable, []string{"anthropic"}) || slices.Contains(plan.adopted, "anthropic") {
+		t.Errorf("unreachable = %v, adopted = %v", plan.unreachable, plan.adopted)
+	}
+	var out strings.Builder
+	plan.describe(&out)
+	if !strings.Contains(out.String(), "not attaching anthropic") {
+		t.Errorf("the run does not say what it left out:\n%s", out.String())
+	}
+
+	// A credential the user names is their explicit choice, and stays even where it is denied.
+	flags = policyFlags{inject: []string{"anthropic@api.anthropic.com=x-api-key"}}
+	flags.forAgent(piLocal)
+	plan, err = flags.planCredentials(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.dropUnreachable(flags.agent, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(plan.inject, "anthropic@api.anthropic.com=x-api-key") || len(plan.unreachable) != 0 {
+		t.Errorf("a named credential was dropped: inject = %v, unreachable = %v", plan.inject, plan.unreachable)
 	}
 }
