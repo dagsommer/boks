@@ -1,13 +1,13 @@
 module github.com/dagsommer/boks
 
-go 1.25.0
+go 1.25.5
 
 require (
 	github.com/containerd/containerd/api v1.10.0
 	github.com/containerd/containerd/v2 v2.2.6
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/platforms v1.0.0-rc.2
-	github.com/containers/gvisor-tap-vsock v0.8.9
+	github.com/containers/gvisor-tap-vsock v0.8.9-0.20260604135120-b843c673cdcc
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/spf13/cobra v1.10.2
@@ -16,7 +16,7 @@ require (
 	golang.org/x/term v0.44.0
 	google.golang.org/protobuf v1.36.10
 	gopkg.in/yaml.v3 v3.0.1
-	gvisor.dev/gvisor v0.0.0-20240916094835-a174eb65023f
+	gvisor.dev/gvisor v0.0.0-20260413194555-9680d69bf798
 )
 
 require (
@@ -63,6 +63,7 @@ require (
 	go.opentelemetry.io/otel v1.38.0 // indirect
 	go.opentelemetry.io/otel/metric v1.38.0 // indirect
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
+	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
