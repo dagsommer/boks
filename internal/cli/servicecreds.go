@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/dagsommer/boks/internal/agent"
+	"github.com/dagsommer/boks/internal/policy"
 	"github.com/dagsommer/boks/internal/secret"
 )
 
@@ -50,6 +52,12 @@ type credentialPlan struct {
 	adopted []string
 	// shadowed names the API-key credentials an OAuth credential took precedence over.
 	shadowed []string
+	// fromStore is the set of services adopted from the store, the only ones dropUnreachable
+	// may leave out: a credential named on the command line is the user's explicit choice.
+	fromStore map[string]bool
+	// unreachable names the stored credentials left out because the agent denies every host
+	// they are for.
+	unreachable []string
 }
 
 // planCredentials assembles the plan.
@@ -102,6 +110,7 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 			// nothing for the user to type.
 			plan.oauth = append(plan.oauth, e.Name)
 			plan.adopted = append(plan.adopted, e.Name+" (oauth)")
+			plan.markFromStore(e.Name)
 			continue
 		}
 		service, ok := knownServices.Lookup(e.Name)
@@ -116,8 +125,120 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 			plan.guest = append(plan.guest, g)
 		}
 		plan.adopted = append(plan.adopted, e.Name)
+		plan.markFromStore(e.Name)
 	}
 	return plan, nil
+}
+
+func (p *credentialPlan) markFromStore(name string) {
+	if p.fromStore == nil {
+		p.fromStore = map[string]bool{}
+	}
+	p.fromStore[name] = true
+}
+
+// dropUnreachable leaves out the stored credentials the agent could never use: those whose
+// every host the agent's own deny rules refuse. pi-local denies every cloud model API, so a
+// stored Claude login attached to it would sit in the proxy unused while the run announced
+// it — a credential carried for nothing, and a line that says the sandbox has something it
+// does not.
+//
+// Only an exact hostname counts as denied. A wildcard credential host would need the denies
+// to cover every name under it, which they are not written to do, so such a credential is
+// kept: the cost of a wrong guess here is an agent silently without a credential it needed.
+func (p *credentialPlan) dropUnreachable(a agent.Agent, records map[string]secret.OAuthRecord) error {
+	if len(p.fromStore) == 0 || len(a.Deny) == 0 {
+		return nil
+	}
+	denies := make([]policy.Rule, 0, len(a.Deny))
+	for _, d := range a.Deny {
+		r, err := policy.ParseRule(policy.Deny, d.Spec)
+		if err != nil {
+			return fmt.Errorf("agent %s: deny %q: %w", a.Name, d.Spec, err)
+		}
+		denies = append(denies, r)
+	}
+	denied := func(host string) bool {
+		if strings.Contains(host, "*") {
+			return false
+		}
+		t, err := policy.ParseTarget(host, 443)
+		if err != nil {
+			return false
+		}
+		for _, r := range denies {
+			if r.Match(t) {
+				return true
+			}
+		}
+		return false
+	}
+	allDenied := func(hosts []string) bool {
+		if len(hosts) == 0 {
+			return false
+		}
+		for _, h := range hosts {
+			if !denied(h) {
+				return false
+			}
+		}
+		return true
+	}
+
+	credentials, err := secret.ParseCredentials(p.inject, p.guest)
+	if err != nil {
+		return err
+	}
+	drop := map[string]bool{}
+	for _, c := range credentials {
+		if !p.fromStore[c.Service] {
+			continue
+		}
+		var hosts []string
+		for _, r := range c.Inject {
+			hosts = append(hosts, r.Domain.String())
+		}
+		if allDenied(hosts) {
+			drop[c.Service] = true
+		}
+	}
+	for _, name := range p.oauth {
+		if !p.fromStore[name] {
+			continue
+		}
+		c, err := records[name].Credential()
+		if err != nil || c.OAuth == nil {
+			continue
+		}
+		hosts := []string{c.OAuth.TokenEndpoint.Host}
+		for _, h := range c.OAuth.ResourceHosts {
+			hosts = append(hosts, h.String())
+		}
+		if allDenied(hosts) {
+			drop[name] = true
+		}
+	}
+	if len(drop) == 0 {
+		return nil
+	}
+
+	p.inject = filterSpecs(p.inject, drop, func(spec string) string {
+		service, _, _ := secret.ParseInject(spec)
+		return service
+	})
+	p.guest = filterSpecs(p.guest, drop, func(spec string) string {
+		service, _, _, _ := secret.ParseGuestCredential(spec)
+		return service
+	})
+	p.oauth = slices.DeleteFunc(p.oauth, func(name string) bool { return drop[name] })
+	p.adopted = slices.DeleteFunc(p.adopted, func(label string) bool {
+		return drop[strings.TrimSuffix(label, " (oauth)")]
+	})
+	for name := range drop {
+		p.unreachable = append(p.unreachable, name)
+	}
+	slices.Sort(p.unreachable)
+	return nil
 }
 
 // preferOAuth applies the precedence rule: for a destination an OAuth credential already
@@ -196,6 +317,14 @@ func (p credentialPlan) describe(w io.Writer) {
 	if len(p.adopted) > 0 {
 		fmt.Fprintf(w, "credentials: %s, from the store · --no-secrets leaves them out\n",
 			strings.Join(p.adopted, ", "))
+	}
+	if len(p.unreachable) > 0 {
+		which := "its hosts are"
+		if len(p.unreachable) > 1 {
+			which = "their hosts are"
+		}
+		fmt.Fprintf(w, "credentials: not attaching %s from the store: all %s denied to this agent\n",
+			strings.Join(p.unreachable, ", "), which)
 	}
 	for _, name := range p.shadowed {
 		fmt.Fprintf(w, "note: the API key %q is NOT being attached: an OAuth credential already covers\n"+
@@ -279,6 +408,12 @@ func (f *policyFlags) resolveCredentials(ctx context.Context, stderr io.Writer) 
 		if err := plan.preferOAuth(records); err != nil {
 			return credentialPlan{}, nil, err
 		}
+	}
+	if err := plan.dropUnreachable(f.agent, records); err != nil {
+		return credentialPlan{}, nil, err
+	}
+	for _, name := range plan.unreachable {
+		delete(records, name)
 	}
 	return plan, records, nil
 }
