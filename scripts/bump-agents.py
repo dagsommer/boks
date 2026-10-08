@@ -112,7 +112,9 @@ def droid():
     version = fetch("https://downloads.factory.ai/factory-cli/LATEST").decode().strip()
     base = f"https://downloads.factory.ai/factory-cli/releases/{version}/linux"
     sums = {}
-    for arg, arch in (("DROID_SHA256_AMD64", "x64"), ("DROID_SHA256_ARM64", "arm64")):
+    # x64-baseline, as the Dockerfile downloads: the plain x64 build needs AVX2, which a
+    # guest's CPU may not have.
+    for arg, arch in (("DROID_SHA256_AMD64", "x64-baseline"), ("DROID_SHA256_ARM64", "arm64")):
         sums[arg] = fetch(f"{base}/{arch}/droid.sha256").decode().split()[0]
     return version, sums
 
@@ -177,15 +179,20 @@ def main():
             failed.append(name)
             print(f"{name:13} {current:24} ?  could not read the latest release: {e}")
             continue
-        if version == current:
+        wanted = {version_arg: version, **args}
+        if all(pinned(text, arg) == value for arg, value in wanted.items()):
             print(f"{name:13} {current:24} up to date")
             continue
         behind.append(name)
         note = "  (digest computed here: Cursor publishes none)" if name == "cursor" else ""
+        if version == current:
+            # The same release with a different digest: a pin written wrong, or an artifact
+            # the vendor replaced. Either way the Dockerfile's digest is not what is published.
+            note = "  (same version; the pinned digest is not the published one)" + note
         print(f"{name:13} {current:24} -> {version}{note}")
         if check:
             continue
-        for arg, value in {version_arg: version, **args}.items():
+        for arg, value in wanted.items():
             pinned(text, arg)
             text = re.sub(rf"^ARG {arg}=\S+$", f"ARG {arg}={value}", text, flags=re.M)
         path.write_text(text)
