@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,13 +28,13 @@ import (
 type testProxy struct {
 	*Server
 	url    *url.URL
-	logBuf *bytes.Buffer
+	logBuf *lockedBuffer
 }
 
 func newTestProxy(t *testing.T, p policy.Policy, inj *secret.Injector, opts ...func(*Config)) *testProxy {
 	t.Helper()
 
-	logBuf := &bytes.Buffer{}
+	logBuf := &lockedBuffer{}
 	cfg := Config{
 		Engine:   policy.NewEngine(p, policy.NewLog(64)),
 		Injector: inj,
@@ -63,6 +64,26 @@ func newTestProxy(t *testing.T, p policy.Policy, inj *secret.Injector, opts ...f
 		t.Fatalf("parse proxy url: %v", err)
 	}
 	return &testProxy{Server: srv, url: u, logBuf: logBuf}
+}
+
+// lockedBuffer is the proxy's error log in tests. The proxy writes it from its connection
+// goroutines, which can still be finishing a flow when a test reads it; log.Logger serialises
+// its own writes but not a reader, and a bare bytes.Buffer there is a data race.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // client returns an HTTP client that sends everything through the proxy. rootCA is what the

@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -214,7 +215,7 @@ func TestPublishingTheSamePortTwiceIsRefused(t *testing.T) {
 // nothing outside the VM can reach it. sbx documents the same constraint, and a message that
 // only said "connection refused" would send the user looking in the wrong place.
 func TestNothingListeningInTheGuestSaysWhy(t *testing.T) {
-	var log strings.Builder
+	var log lockedLog
 	dial := DialGuest(func(context.Context, int) (net.Conn, error) {
 		return nil, errors.New("connection refused")
 	})
@@ -238,6 +239,12 @@ func TestNothingListeningInTheGuestSaysWhy(t *testing.T) {
 	}
 	conn.Close()
 
+	// The forwarder logs from the connection's goroutine, which can finish after the client
+	// has seen the connection close.
+	logDeadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(log.String(), "external interface") && time.Now().Before(logDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !strings.Contains(log.String(), "external interface") {
 		t.Errorf("the log does not mention the guest's binding: %q", log.String())
 	}
@@ -319,4 +326,23 @@ func mustUnpublish(t *testing.T, s string) Spec {
 		t.Fatalf("ParseUnpublish(%q): %v", s, err)
 	}
 	return spec
+}
+
+// lockedLog is a forwarder's log in tests: written from its connection goroutines while the
+// test reads it, which a bare strings.Builder makes a data race.
+type lockedLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
