@@ -10,13 +10,13 @@ FROM ${BASE_IMAGE}
 
 USER root
 
-ARG DROID_VERSION=0.236.0
+ARG DROID_VERSION=0.238.0
 # From https://downloads.factory.ai/factory-cli/releases/${DROID_VERSION}/linux/<arch>/droid.sha256
 #
 # amd64 uses the vendor's "-baseline" build: the installer picks between it and an AVX2 build
 # by reading /proc/cpuinfo, which a Dockerfile cannot do for a guest that does not exist yet.
-ARG DROID_SHA256_AMD64=efcedcd578ce586a003e2fa9673d9cd90a1dd54ecad375029e181357ad376b07
-ARG DROID_SHA256_ARM64=67059247e165d33ac25513454222c076b5e2c94e70bb411f287e314d7a24554b
+ARG DROID_SHA256_AMD64=a6451f315d210607ef30b0230a87e50687c26aa1b00826864ac4416c5e3dd75d
+ARG DROID_SHA256_ARM64=b62bbc7caff53dc9e17a93f9d670c6e9b04ef348155c8f6f96e6c97024e2d1fd
 
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
