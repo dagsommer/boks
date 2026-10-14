@@ -385,6 +385,10 @@ func Builtin() *Registry {
 				// succeeded and the guest would have kept the token — silently, which is
 				// the worst way for this particular property to fail.
 				{Spec: "platform.claude.com:443", Why: "the OAuth token endpoint a subscription login exchanges and refreshes against"},
+				// Observed: `claude update` in a sandbox fetched only from here. The image's
+				// first start updates Claude Code (images/claude/prepare.d/30-claude-update.sh),
+				// and the native install that leaves behind keeps itself current from then on.
+				{Spec: "downloads.claude.ai:443", Why: "Claude Code's own updates"},
 			},
 		},
 		{

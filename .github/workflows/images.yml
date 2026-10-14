@@ -26,13 +26,32 @@ permissions:
 jobs:
   # Resolve the tag once, from internal/agent, so the images and the registry that resolves
   # an agent to an image can never disagree about what version means.
+  #
+  # And decide, per image, whether this release builds it or retags the previous release's.
+  # Every image is tagged with the Boks version, and a build is never byte-identical to the
+  # last one (apt, timestamps), so rebuilding an unchanged image made every client download
+  # hundreds of MB for nothing on each upgrade. An image whose inputs are unchanged is now
+  # the previous release's image under the new tag: same digest, so a client that has it
+  # fetches a manifest and nothing else.
+  #
+  # An image's inputs are its directory under images/ (git's tree hash of it) and, for an
+  # agent image, the base's. Each build records them in the label org.dagsommer.boks.inputs,
+  # and the previous release's published image is asked for its label: equal means retag. No
+  # label (an image from before this), no previous release, or a failed lookup all mean build.
   tag:
     runs-on: ubuntu-24.04
     outputs:
       image_tag: ${{ steps.resolve.outputs.image_tag }}
       images: ${{ steps.resolve.outputs.images }}
+      rebuild: ${{ steps.plan.outputs.rebuild }}
+      retag: ${{ steps.plan.outputs.retag }}
+      inputs: ${{ steps.plan.outputs.inputs }}
+      previous: ${{ steps.plan.outputs.previous }}
+      base_ref: ${{ steps.plan.outputs.base_ref }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the previous release tag, for the retag decision
       - id: resolve
         run: |
           set -euo pipefail
@@ -48,6 +67,48 @@ jobs:
           images="$(find images -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -v '^base$' | sort | jq -R . | jq -sc .)"
           echo "images=$images" >>"$GITHUB_OUTPUT"
 
+      - id: plan
+        env:
+          IMAGES: ${{ steps.resolve.outputs.images }}
+        run: |
+          set -euo pipefail
+          previous="$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)"
+          previous="${previous#v}"
+          base_inputs="$(git rev-parse HEAD:images/base)"
+          inputs_of() {
+            if [ "$1" = base ]; then echo "$base_inputs"; return; fi
+            printf '%s+%s' "$(git rev-parse "HEAD:images/$1")" "$base_inputs" | sha256sum | cut -c1-40
+          }
+          published_inputs() {
+            [ -n "$previous" ] || return 0
+            docker buildx imagetools inspect "${IMAGE_REPO}/$1:${previous}" --format '{{json .Image}}' 2>/dev/null |
+              jq -r '[.. | objects | select(has("Labels")) | .Labels["org.dagsommer.boks.inputs"]? | select(. != null)][0] // ""' ||
+              true
+          }
+          rebuild=() retag=() inputs='{}'
+          for name in base $(jq -r '.[]' <<<"$IMAGES"); do
+            mine="$(inputs_of "$name")"
+            inputs="$(jq -c --arg n "$name" --arg v "$mine" '. + {($n): $v}' <<<"$inputs")"
+            if [ "$(published_inputs "$name")" = "$mine" ]; then
+              retag+=("$name"); echo "  $name: unchanged since ${previous}: retag"
+            else
+              rebuild+=("$name"); echo "  $name: changed: build"
+            fi
+          done
+          base_ref=""
+          if [[ " ${retag[*]} " == *" base "* ]]; then
+            # Agents that do change build on the published base, so its layers are the ones
+            # clients already hold.
+            base_ref="${IMAGE_REPO}/base:${previous}"
+          fi
+          {
+            echo "previous=$previous"
+            echo "base_ref=$base_ref"
+            echo "inputs=$inputs"
+            echo "rebuild=$(printf '%s\n' "${rebuild[@]}" | jq -R . | jq -sc 'map(select(. != ""))')"
+            echo "retag=$(printf '%s\n' "${retag[@]}" | jq -R . | jq -sc 'map(select(. != ""))')"
+          } >>"$GITHUB_OUTPUT"
+
   # The job that executes third-party code. Every image here runs an installer, a vendor
   # binary, or an unpacked archive we did not write, so this job is assumed to be the one
   # an attacker gets to. It therefore holds no registry credential: `permissions` is
@@ -59,6 +120,7 @@ jobs:
   # minutes instead of an hour, and an emulated apt/npm run is its own source of flakiness.
   build:
     needs: tag
+    if: needs.tag.outputs.rebuild != '[]'
     permissions:
       contents: read
     strategy:
@@ -92,27 +154,32 @@ jobs:
             [registry."localhost:5000"]
               http = true
 
-      - name: Build every image to an OCI archive
+      - name: Build the changed images to OCI archives
         env:
           IMAGE_TAG: ${{ needs.tag.outputs.image_tag }}
           ARCH: ${{ matrix.arch }}
           PLATFORM: ${{ matrix.platform }}
-          AGENT_IMAGES: ${{ join(fromJSON(needs.tag.outputs.images), ' ') }}
+          REBUILD: ${{ join(fromJSON(needs.tag.outputs.rebuild), ' ') }}
+          INPUTS: ${{ needs.tag.outputs.inputs }}
+          BASE_REF: ${{ needs.tag.outputs.base_ref }}
         run: |
           set -euo pipefail
           mkdir -p oci
-          staged="localhost:5000/base:${IMAGE_TAG}"
+          staged="${BASE_REF:-localhost:5000/base:${IMAGE_TAG}}"
 
-          # The base first, into the local registry, so the agent builds can pull it.
-          docker buildx build --platform "$PLATFORM" --tag "$staged" --push images/base
+          # The base first, into the local registry, so the agent builds can pull it — when
+          # it changed. When it did not, BASE_REF is the published one and nothing is staged.
+          if [ -z "$BASE_REF" ]; then
+            docker buildx build --platform "$PLATFORM" --tag "$staged" --push images/base
+          fi
 
           # Then everything, base included, exported as archives. The base build repeats
           # here but is served from cache; it is exported rather than re-run.
           #
           # Provenance and an SBOM on every image: if we ask people to run our images, they
           # are entitled to know what went into them and which workflow put it there.
-          for name in base $AGENT_IMAGES; do
-            args=()
+          for name in $REBUILD; do
+            args=(--label "org.dagsommer.boks.inputs=$(jq -r --arg n "$name" '.[$n]' <<<"$INPUTS")")
             if [ "$name" != base ]; then
               args+=(--build-arg "BASE_IMAGE=${staged}")
             fi
@@ -142,7 +209,7 @@ jobs:
       # `--dangerously-skip-permissions` as root and so will not start at all.
       - name: Assert every built image runs as a numeric non-root user
         env:
-          AGENT_IMAGES: ${{ join(fromJSON(needs.tag.outputs.images), ' ') }}
+          REBUILD: ${{ join(fromJSON(needs.tag.outputs.rebuild), ' ') }}
           # ARCH is set on the build step above rather than on the job, so it has to be
           # repeated here. Without it `set -u` aborted this step on the first expansion, and
           # the failure printed NOTHING — no verdict, no archive name, just exit 1 — which is
@@ -151,7 +218,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for name in base $AGENT_IMAGES; do
+          for name in $REBUILD; do
             tar="oci/${name}-${ARCH}.tar"
             # Said out loud, because everything below is a pipeline under `set -e`: an
             # archive that is missing or not an OCI layout would otherwise kill the step
@@ -232,13 +299,19 @@ jobs:
   # same runner. Do not merge this back into `build` for tidiness.
   push:
     needs: [tag, build]
-    if: github.ref_type == 'tag' || inputs.publish
+    # always(), because a release that rebuilds nothing skips `build`, and a skipped need
+    # would otherwise skip this job and with it every retag.
+    if: >-
+      always() && needs.tag.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (github.ref_type == 'tag' || inputs.publish)
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/download-artifact@v4
+        if: needs.tag.outputs.rebuild != '[]'
         with:
           pattern: oci-*
           path: oci
@@ -258,10 +331,10 @@ jobs:
       - name: Push each architecture, then join them into one multi-arch tag
         env:
           IMAGE_TAG: ${{ needs.tag.outputs.image_tag }}
-          AGENT_IMAGES: ${{ join(fromJSON(needs.tag.outputs.images), ' ') }}
+          REBUILD: ${{ join(fromJSON(needs.tag.outputs.rebuild), ' ') }}
         run: |
           set -euo pipefail
-          for name in base $AGENT_IMAGES; do
+          for name in $REBUILD; do
             for arch in amd64 arm64; do
               # --all carries the attestation manifests alongside the image manifest.
               skopeo copy --all \
@@ -303,4 +376,34 @@ jobs:
               echo "The per-arch tags are published; only the multi-arch tag is missing." >&2
               exit 1
             fi
+          done
+
+      # The unchanged images: the previous release's index, published again under this
+      # release's tag. imagetools copies the index — attestations included — within the same
+      # repository, so no layer moves and the digest a client already has is the one it gets.
+      # Retried for the same eventual-consistency reason as the join above.
+      - name: Retag the unchanged images
+        env:
+          IMAGE_TAG: ${{ needs.tag.outputs.image_tag }}
+          PREVIOUS: ${{ needs.tag.outputs.previous }}
+          RETAG: ${{ join(fromJSON(needs.tag.outputs.retag), ' ') }}
+        run: |
+          set -euo pipefail
+          for name in $RETAG; do
+            done_=""
+            for attempt in 1 2 3 4 5; do
+              if docker buildx imagetools create \
+                  --tag "${IMAGE_REPO}/${name}:${IMAGE_TAG}" \
+                  "${IMAGE_REPO}/${name}:${PREVIOUS}"; then
+                done_=yes
+                break
+              fi
+              echo "::warning::retagging ${name}:${PREVIOUS} as ${IMAGE_TAG} failed (attempt ${attempt}/5)" >&2
+              sleep $((attempt * 5))
+            done
+            if [ -z "$done_" ]; then
+              echo "could not retag ${name}:${PREVIOUS} as ${IMAGE_TAG} after five attempts." >&2
+              exit 1
+            fi
+            echo "  ${name}:${IMAGE_TAG} = ${name}:${PREVIOUS}"
           done
