@@ -804,7 +804,10 @@ func resourceAnnotations(cfg Config) map[string]string {
 // runTask starts the guest process, streams its IO, and returns its exit code.
 func runTask(ctx context.Context, container client.Container, cfg Config) (int, error) {
 	stdin := watchStdin(cfg.Stdin)
-	creator := ioCreator(cfg.TTY, stdin.input(), cfg.Stdout, cfg.Stderr)
+	creator, err := ioCreator(cfg.TTY, stdin.input(), cfg.Stdout, cfg.Stderr)
+	if err != nil {
+		return 1, err
+	}
 
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
@@ -870,8 +873,12 @@ func runTask(ctx context.Context, container client.Container, cfg Config) (int, 
 	return int(code), nil
 }
 
-func ioCreator(tty bool, stdin io.Reader, stdout, stderr io.Writer) cio.Creator {
-	return cio.NewCreator(ioOpts(tty, stdin, stdout, stderr)...)
+func ioCreator(tty bool, stdin io.Reader, stdout, stderr io.Writer) (cio.Creator, error) {
+	dir, err := fifoDirOpts()
+	if err != nil {
+		return nil, err
+	}
+	return cio.NewCreator(append(ioOpts(tty, stdin, stdout, stderr), dir...)...), nil
 }
 
 // ioOpts chooses the streams cio wires between the host and the guest process.

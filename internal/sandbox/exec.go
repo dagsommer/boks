@@ -121,7 +121,11 @@ func execProcess(ctx context.Context, container client.Container, task client.Ta
 	}
 
 	stdin := watchStdin(cfg.Stdin)
-	proc, err := task.Exec(ctx, id, &process, ioCreator(cfg.TTY, stdin.input(), cfg.Stdout, cfg.Stderr))
+	creator, err := ioCreator(cfg.TTY, stdin.input(), cfg.Stdout, cfg.Stderr)
+	if err != nil {
+		return 1, err
+	}
+	proc, err := task.Exec(ctx, id, &process, creator)
 	if err != nil {
 		return 1, describeExecError(cfg, err)
 	}
