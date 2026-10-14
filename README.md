@@ -26,7 +26,7 @@ and not inferred from the code:
 | Platform | What has been observed there |
 |---|---|
 | **macOS on Apple silicon** | The most thoroughly measured. The VM boundary on 2026-08-11 — a Linux guest against a Darwin host, its own `boot_id`, an uptime of hundredths of a second, vCPU and memory counts tracking the flags rather than the host. Network policy, credential injection and the sandbox lifecycle against a real guest on 2026-08-13. |
-| **Windows 11 on x64** | `boks run` boots a sandbox natively through the Windows Hypervisor Platform, from an ordinary unelevated terminal. On 2026-08-15 an allowed host returned HTTP 200 through Boks' own network stack while a denied one was refused, and workspace write-through, persistence across `stop`, eight-vCPU SMP and clean teardown were all confirmed. One machine, x64 only — there is no arm64 build, and no release you can install yet. |
+| **Windows 11 on x64** | `boks run` boots a sandbox natively through the Windows Hypervisor Platform, from an ordinary unelevated terminal. On 2026-08-15 an allowed host returned HTTP 200 through Boks' own network stack while a denied one was refused, and workspace write-through, persistence across `stop`, eight-vCPU SMP and clean teardown were all confirmed. One machine, x64 only — there is no arm64 build. |
 | **Linux with `/dev/kvm`** | Verified end to end for the first time on 2026-08-15, in WSL2 on Ubuntu 26.04: 25 of 26 checks passed, three distinct `boot_id`s, and the network boundary held with its positive control — an allowed address completed TLS against the origin's own certificate while a denied one was refused in the same sandbox. |
 
 Two limits worth reading before you count Linux as done: that run was **inside WSL2, not on
@@ -70,13 +70,14 @@ each one leaves you holding. The short version:
   erofs-utils, a nerdbox shim signed with the entitlement libkrun needs, and nerdbox's guest
   kernel and root filesystem from a Boks release. `boks doctor` reports those last two as
   `guest image` and fails when they are missing, so a green `doctor` is worth more than it
-  used to be. The tap is not published yet, and no Mac has run the formulae.
+  used to be. `brew tap dagsommer/boks`, then `brew install boks`.
 - **Linux** — a tarball, a `.deb` or an `.rpm`. The packages vendor the runtime alongside the
   CLI, because no distribution ships a containerd new enough and nerdbox is packaged nowhere.
   Expect to run as root for now: sandbox creation still needs more privilege than an ordinary
   user has.
-- **Windows** — a winget manifest and a zip, for the native Windows Hypervisor Platform
-  route. No release has been cut yet, so building from source is the way in today.
+- **Windows** — Scoop (`scoop bucket add boks https://github.com/dagsommer/boks`, then
+  `scoop install boks`) or a winget manifest, for the native Windows Hypervisor Platform
+  route. `winget install boks` is waiting for review in `microsoft/winget-pkgs`.
 
 Nothing has been published to a package repository yet — the first release tag is what turns
 any of the above from a described route into a downloadable file.

@@ -92,6 +92,9 @@ release-notes:
 release:
 	@test -n "$(VERSION)" || { echo "usage: make release VERSION=x.y.z" >&2; exit 2; }
 	@git diff --quiet && git diff --cached --quiet || { echo "release: working tree is dirty; commit or stash first" >&2; exit 2; }
+	@# The scoop workflow commits bucket/boks.json to main after each release, so origin can be
+	@# ahead of a local main that was current a release ago; a tag made on it would not push.
+	@git fetch -q origin main && [ -z "$$(git rev-list HEAD..origin/main)" ] || { echo "release: origin/main has commits this branch lacks (the scoop manifest, usually); git pull --rebase first" >&2; exit 2; }
 	@# Every release ships each agent's latest CLI: the pins move here, with their digests, and
 	@# the release commit carries the diff. A vendor that cannot be reached keeps its pin (exit
 	@# 2, and the script names it) rather than holding the release.

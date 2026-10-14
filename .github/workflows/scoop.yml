@@ -1,0 +1,64 @@
+# Update the Scoop manifest, bucket/boks.json, when a release is published.
+#
+# The repository is its own Scoop bucket (`scoop bucket add boks
+# https://github.com/dagsommer/boks`), so the manifest lives here rather than in a second
+# repository, and this commits the rendered manifest to main. A push made with the
+# workflow's token starts no other workflow, so this cannot set off a build of its own.
+#
+# The commit lands on main after the release commit, which is why `make release` checks that
+# the local main is not behind origin before it tags anything.
+name: scoop
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to render the manifest from, e.g. v0.1.40"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scoop
+  cancel-in-progress: false
+
+jobs:
+  manifest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Render bucket/boks.json from the release's SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "refusing to render a manifest for '$tag': expected a vX.Y.Z release tag" >&2
+               exit 1 ;;
+          esac
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          packaging/scoop/render.sh "${tag#v}" "$RUNNER_TEMP/SHA256SUMS"
+          python3 -m json.tool bucket/boks.json >/dev/null
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git add bucket/boks.json
+          if git diff --cached --quiet; then
+            echo "bucket/boks.json is already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qm "scoop: boks $(jq -r .version bucket/boks.json)"
+          git push origin HEAD:main

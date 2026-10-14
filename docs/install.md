@@ -3,12 +3,12 @@
 Pick your platform below. Each route is the install that platform is meant to have, marked
 with its honest, current status — and the status to know first is this one:
 
-> [!IMPORTANT]
-> **Nothing has been released yet.** There are no tags and no published binaries, so none of
-> the package-manager routes below is live today. They are written here so you can see what
-> installing Boks will look like — and so the first release lands somewhere prepared — but
-> until it exists, the working route is [building from source](#building-from-source), which
-> takes one `make`.
+> [!NOTE]
+> **Releases are published.** Every tagged version ships the Homebrew formulae for macOS, the
+> Linux packages and tarballs, and the Windows zip — see the
+> [releases page](https://github.com/dagsommer/boks/releases). `winget install boks` is still
+> waiting for review in `microsoft/winget-pkgs`; on Windows, use [Scoop](#windows-with-scoop)
+> until it is accepted.
 
 Whichever route you take, run `boks doctor` immediately afterwards. It is the only thing
 that knows whether your machine can actually start a sandbox, and it prints a remedy for
@@ -20,6 +20,29 @@ followed on 2026-08-14 and 2026-08-15. Each section below says what was observed
 platform and what was not, and [verification.md](verification.md) is the record every one of
 those claims is taken from.
 
+
+## Windows, with Scoop
+
+[Scoop](https://scoop.sh) installs Boks from this repository, which is its own bucket:
+
+```powershell
+scoop bucket add boks https://github.com/dagsommer/boks
+scoop install boks
+boks doctor
+```
+
+`scoop update boks` moves to a new release; the manifest, [`bucket/boks.json`](../bucket/boks.json),
+is rendered from each release's `SHA256SUMS` by the `scoop` workflow when the release is
+published, so Scoop refuses a download whose bytes differ from what the release built. Only
+`boks.exe` goes on your `PATH` — Scoop's shim — not the directory beside it with
+`containerd.exe` and `ctr.exe`, which winget cannot avoid on a machine without symlinks.
+
+> [!NOTE]
+> **New, and not yet installed on a Windows machine.** The manifest was added on 2026-10-14
+> and follows Scoop's schema; everything it points at is the same release zip the winget
+> route below has installed. Stop the daemon (`boks daemon stop`) before `scoop update`: the
+> boks-managed containerd runs from inside the installed directory, and Windows will not
+> replace a running binary.
 
 ## Windows, with winget, before the package is in winget-pkgs
 
@@ -80,12 +103,8 @@ To reverse it later, `brew uninstall boks` is the second of two steps — see
 image layers Boks writes to `~/Library/Application Support/boks`.
 
 > [!NOTE]
-> **Not published yet.** The tap does not exist. The formulae are written and reviewed — they
-> are in [`packaging/homebrew/`](../packaging/homebrew/) with the procedure for creating the
-> tap — but no macOS machine has ever run them: there is no macOS CI on this project. They
-> have been linted, audited, dependency-resolved and trust-tested against a real Homebrew
-> 6.0.17 on Linux, which is a document check and not an install. Until the tap is live,
-> [build from source](#building-from-source).
+> **Live.** The tap, [dagsommer/homebrew-boks](https://github.com/dagsommer/homebrew-boks), is
+> updated by every release, and `brew upgrade boks` moves to the newest.
 
 That installs the whole stack — containerd, erofs-utils, libkrun and a nerdbox shim signed
 with the entitlement libkrun needs — rather than the CLI alone, because a CLI alone would
@@ -229,9 +248,8 @@ reaches a gigabyte after one image pull — see
 [Uninstalling](#uninstalling--two-steps-not-one).
 
 > [!NOTE]
-> **Not published yet.** The release workflow that builds these packages exists and the
-> files above are what it names — but no release has been cut, so there is nothing to
-> download until the first tag. Until then, [build from source](#building-from-source).
+> **Attached to every release.** The files above are on each release's page, beside
+> `SHA256SUMS`.
 
 The packages carry the runtime as well as the CLI: `boks` in `/usr/bin`, and `containerd`,
 `containerd-shim-nerdbox-v1` and `libkrun.so` under `/usr/libexec/boks`. That directory is
@@ -288,11 +306,9 @@ To reverse it later, `winget uninstall boks` is the second of two steps — see
 2026-08-16, `winget uninstall` on its own leaves `%LOCALAPPDATA%\boks` behind at 1,768.8 MB.
 
 > [!NOTE]
-> **Not published yet.** The manifests are written and schema-checked — they are in
-> [`packaging/winget/`](../packaging/winget/) — but no release exists to install, nothing has
-> been submitted to `microsoft/winget-pkgs`, and no one has run `winget` against any of it.
-> That directory's README says exactly what has and has not been checked. Until it is live,
-> [build from source](#building-from-source) or use the WSL2 route below.
+> **In review.** The package is submitted to `microsoft/winget-pkgs` and has passed its
+> automated validation; it is waiting for a moderator. Until it is accepted, use
+> [Scoop](#windows-with-scoop) or the [manifest route](#windows-with-winget-before-the-package-is-in-winget-pkgs).
 
 ### What the Windows download contains
 
@@ -398,9 +414,9 @@ produced the file, rather than only that somebody paid for a certificate.
   and is labelled as one.
 - **One machine.** Every Windows result above comes from a single Windows 11 x64 host. There
   is no Windows arm64 build at all — the WHP backend and the guest kernel are both x86_64.
-- **No release has been cut.** Every Windows piece is now a *release asset* rather than an
-  expiring artifact — `release.yml` calls the five workflows that build them and assembles the
-  zip described above — but that workflow has never run on a tag. See
+- **winget is in review.** Every Windows piece is a release asset — `release.yml` calls the
+  five workflows that build them and assembles the zip described above — but
+  `winget install boks` waits on `microsoft/winget-pkgs`. See
   [distribution.md](distribution.md).
 
 [windows.md](windows.md) has the full architectural picture and
