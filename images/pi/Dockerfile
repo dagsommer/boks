@@ -22,11 +22,11 @@ FROM ${BASE_IMAGE}
 
 USER root
 
-ARG PI_VERSION=1.2.0
+ARG PI_VERSION=1.3.0
 # From https://registry.npmjs.org/@earendil-works/pi-coding-agent/${PI_VERSION}
 # The npm registry provides a SHA-1 shasum (called "shasum"); we verify with sha512
 # from the SRI integrity field instead.
-ARG PI_INTEGRITY=sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==
+ARG PI_INTEGRITY=sha512-V/WoCjA2hQSe3QLWIUB24cTRdtEdeLiIzkDqU5RMXV6VWuD+KGZnzVBMhglwdnQTySkehZsjt8a3g6Jd2g4nnw==
 
 RUN set -eux; \
     # Download the npm tarball.
