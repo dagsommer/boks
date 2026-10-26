@@ -19,12 +19,12 @@ FROM ${BASE_IMAGE}
 
 USER root
 
-ARG CLAUDE_CODE_VERSION=2.1.299
+ARG CLAUDE_CODE_VERSION=2.1.310
 # From https://downloads.claude.ai/claude-code-releases/${CLAUDE_CODE_VERSION}/manifest.json,
 # the same digests the vendor's installer verifies against. glibc builds, because the base
 # image is Debian.
-ARG CLAUDE_CODE_SHA256_AMD64=2d894a4b1bfaaa9aab72aeff7803e3c73bc2510f279a171f6b8f59f72d17d077
-ARG CLAUDE_CODE_SHA256_ARM64=4cd5ab006b49dc12a247fed4dbc42a925ad1aea1e711d9aa24587d285ee87c2f
+ARG CLAUDE_CODE_SHA256_AMD64=b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56
+ARG CLAUDE_CODE_SHA256_ARM64=9c64d9a7442436b65fcd7cc02c1aa0051bb5a7041e7788576ed3b5f29c447d54
 
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
