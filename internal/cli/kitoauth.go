@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"path"
 	"strings"
 
@@ -25,7 +26,7 @@ import (
 //
 // # What is not mapped
 //
-//   - passthrough is REFUSED. It sends the real token into the guest, which is the one thing
+//   - passthrough is SKIPPED with a warning. It sends the real token into the guest, which is the one thing
 //     Boks' OAuth handling exists to prevent, and a kit — someone else's file — must not be
 //     able to switch that off for the person running it.
 //   - credentialFile.structure is refused: the reference page says the sbx engine does not
@@ -47,13 +48,23 @@ type kitOAuth struct {
 // an apiKey, whether or not a key is stored — Boks has no per-run "did that resolve" to fall
 // back on, and silently choosing by what happens to be in the store would make the same kit
 // behave differently on two machines.
-func kitOAuthShapes(spec *kit.Spec) ([]kitOAuth, error) {
+func kitOAuthShapes(spec *kit.Spec, warn io.Writer) ([]kitOAuth, error) {
 	if spec == nil {
 		return nil, nil
 	}
 	var out []kitOAuth
 	for _, c := range spec.Credentials {
 		if c.OAuth == nil || c.APIKey != nil {
+			continue
+		}
+		// passthrough asks for the real token to enter the guest, which Boks never does. The
+		// credential is skipped with a warning rather than failing the run: the rest of the
+		// kit is still usable, and the user can see exactly what was left out.
+		if c.OAuth.Passthrough {
+			if warn != nil {
+				fmt.Fprintf(warn, "kit %q: credential %q asks for passthrough (the real OAuth token inside the sandbox); "+
+					"Boks keeps tokens on the host, so this credential is skipped\n", spec.Name, c.Service)
+			}
 			continue
 		}
 		shape, err := kitOAuthShape(c.Service, c.OAuth)
@@ -69,10 +80,6 @@ func kitOAuthShapes(spec *kit.Spec) ([]kitOAuth, error) {
 // result through the record's own validation so a kit is judged by the rules a stored
 // credential is.
 func kitOAuthShape(service string, o *kit.OAuth) (secret.OAuthRecord, error) {
-	if o.Passthrough {
-		return secret.OAuthRecord{}, fmt.Errorf("oauth.passthrough is not supported: it would send the " +
-			"real token into the sandbox, and Boks keeps tokens on the host")
-	}
 	r := secret.OAuthRecord{
 		V:               secret.OAuthRecordVersion,
 		Service:         service,

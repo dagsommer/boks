@@ -732,7 +732,7 @@ laid over the OAuth credential stored under the service's name (endpoint, resour
 response fields, file template); tokens never leave the store. `credentialFile.path` is redirected
 into `/etc/boks/credentials/` because Boks shares directories, not files. An entry declaring both
 `apiKey` and `oauth` uses the API key, as sbx does, decided within the entry only; a login adopted
-separately still beats a key by destination. `passthrough` is refused with an error and
+separately still beats a key by destination. `passthrough` is skipped with a warning (the run goes on without that credential) and
 `credentialFile.structure` is refused (sbx's engine does not support it either). OAuth entries go
 through the same approval prompt, and the approval is bound to the whole shape. **Unverified:** no
 guest has run a kit-declared login end to end; what is tested is the mapping, approval, merge and

@@ -80,7 +80,7 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 		}
 		// Only what the user has approved. See kitapproval.go: a kit names a service, and the
 		// value is whatever the user stored under that name.
-		shapes, err := kitOAuthShapes(u.spec)
+		shapes, err := kitOAuthShapes(u.spec, f.errOut())
 		if err != nil {
 			return credentialPlan{}, err
 		}

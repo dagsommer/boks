@@ -112,7 +112,7 @@ credentials:
   looks from `setup.startup`. Templates may use `.AccessToken`, `.RefreshToken`, `.ExpiresAt`,
   `.ExpiresAtSeconds`, `.Scopes`, `.ScopesJSON` and `.SubscriptionType`. `structure` is not
   supported (the same is true of sbx's engine); use `template`.
-- **`passthrough: true` is refused**, and the run fails naming the credential. It would put the
+- **`passthrough: true` is skipped with a warning**; the rest of the run goes ahead. It would put the
   real token in the sandbox, which Boks never does.
 - **An entry that declares both `apiKey` and `oauth` uses the API key**, as the kit spec says;
   its `oauth` is not applied. This is decided within the entry. A login you adopted separately

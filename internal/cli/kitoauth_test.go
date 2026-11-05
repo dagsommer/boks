@@ -38,7 +38,7 @@ func kitWith(creds ...kit.Credential) *kit.Spec {
 func TestKitOAuthShapeMapsTheBlockOntoARecord(t *testing.T) {
 	c := kitOAuthCredential()
 	c.OAuth.ResponseFields = &kit.OAuthResponseFields{AccessToken: "token"}
-	shapes, err := kitOAuthShapes(kitWith(c))
+	shapes, err := kitOAuthShapes(kitWith(c), nil)
 	if err != nil || len(shapes) != 1 {
 		t.Fatalf("shapes = %+v, err = %v", shapes, err)
 	}
@@ -60,7 +60,6 @@ func TestKitOAuthShapeMapsTheBlockOntoARecord(t *testing.T) {
 
 func TestKitOAuthRefusesWhatItWillNotDo(t *testing.T) {
 	cases := map[string]func(*kit.Credential){
-		"passthrough": func(c *kit.Credential) { c.OAuth.Passthrough = true },
 		"structure": func(c *kit.Credential) {
 			c.OAuth.CredentialFile = &kit.OAuthCredentialFile{Path: "/x", Structure: map[string]any{"a": 1}}
 		},
@@ -73,7 +72,7 @@ func TestKitOAuthRefusesWhatItWillNotDo(t *testing.T) {
 	for name, mutate := range cases {
 		c := kitOAuthCredential()
 		mutate(&c)
-		_, err := kitOAuthShapes(kitWith(c))
+		_, err := kitOAuthShapes(kitWith(c), nil)
 		if err == nil {
 			t.Errorf("%s: accepted", name)
 			continue
@@ -89,7 +88,7 @@ func TestKitOAuthAPIKeyInTheSameEntryWins(t *testing.T) {
 	both.APIKey = &kit.APIKey{Name: "GHE_TOKEN", Inject: []kit.APIKeyInject{{Domain: "api.ghe.example", Scheme: "bearer"}}}
 	spec := kitWith(both)
 
-	shapes, err := kitOAuthShapes(spec)
+	shapes, err := kitOAuthShapes(spec, nil)
 	if err != nil || len(shapes) != 0 {
 		t.Fatalf("the oauth half was applied beside an apiKey: %+v, %v", shapes, err)
 	}
@@ -99,7 +98,7 @@ func TestKitOAuthAPIKeyInTheSameEntryWins(t *testing.T) {
 	}
 	// A passthrough block beside a key is therefore never looked at: nothing of it is used.
 	both.OAuth.Passthrough = true
-	if _, err := kitOAuthShapes(kitWith(both)); err != nil {
+	if _, err := kitOAuthShapes(kitWith(both), nil); err != nil {
 		t.Errorf("an unused oauth block was judged: %v", err)
 	}
 }
@@ -119,7 +118,7 @@ func storedLoginFor(t *testing.T, store *secret.FileStore, name string) secret.O
 func TestKitOAuthApplyKeepsTheStoredTokens(t *testing.T) {
 	store := secretStore(t)
 	stored := storedLoginFor(t, store, "ghe-login")
-	shapes, err := kitOAuthShapes(kitWith(kitOAuthCredential()))
+	shapes, err := kitOAuthShapes(kitWith(kitOAuthCredential()), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +161,7 @@ func TestKitOAuthApplyKeepsTheStoredTokens(t *testing.T) {
 
 func TestKitOAuthFingerprintCoversEveryDeclaredField(t *testing.T) {
 	base := func() kitOAuth {
-		shapes, err := kitOAuthShapes(kitWith(kitOAuthCredential()))
+		shapes, err := kitOAuthShapes(kitWith(kitOAuthCredential()), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -183,7 +182,7 @@ func TestKitOAuthFingerprintCoversEveryDeclaredField(t *testing.T) {
 	for name, mutate := range cases {
 		c := kitOAuthCredential()
 		mutate(&c)
-		shapes, err := kitOAuthShapes(kitWith(c))
+		shapes, err := kitOAuthShapes(kitWith(c), nil)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -195,7 +194,7 @@ func TestKitOAuthFingerprintCoversEveryDeclaredField(t *testing.T) {
 
 func TestKitOAuthIsAskedAboutAndNotAppliedWithoutApproval(t *testing.T) {
 	f, stderr := kitFlags(t)
-	shapes, _ := kitOAuthShapes(kitWith(kitOAuthCredential()))
+	shapes, _ := kitOAuthShapes(kitWith(kitOAuthCredential()), nil)
 
 	_, got, err := f.gateKit(soleUnit(f), nil, shapes, nil, stderr)
 	if err != nil || len(got) != 0 {
@@ -217,7 +216,7 @@ func TestKitOAuthIsAskedAboutAndNotAppliedWithoutApproval(t *testing.T) {
 
 func TestKitOAuthApprovalIsForExactlyWhatWasShown(t *testing.T) {
 	f, _ := kitFlags(t)
-	shapes, _ := kitOAuthShapes(kitWith(kitOAuthCredential()))
+	shapes, _ := kitOAuthShapes(kitWith(kitOAuthCredential()), nil)
 
 	// The interactive prompt itself.
 	asks := kitOAuthAsks(shapes, nil)
@@ -243,7 +242,7 @@ func TestKitOAuthApprovalIsForExactlyWhatWasShown(t *testing.T) {
 	// A kit that later names another resource host is a different request.
 	c := kitOAuthCredential()
 	c.OAuth.ResourceHosts = []string{"api.ghe.example", "exfil.example"}
-	widened, _ := kitOAuthShapes(kitWith(c))
+	widened, _ := kitOAuthShapes(kitWith(c), nil)
 	if _, got, _ := f.gateKit(soleUnit(f), nil, widened, nil, &bytes.Buffer{}); len(got) != 0 {
 		t.Error("an approval carried over to a wider request")
 	}
@@ -329,5 +328,18 @@ func TestPlanCredentialsUserOAuthFlagWinsOverTheKit(t *testing.T) {
 	}
 	if len(plan.kitOAuth) != 0 || len(plan.oauth) != 1 {
 		t.Errorf("the kit reshaped a login the user named: %+v", plan)
+	}
+}
+
+func TestKitOAuthPassthroughIsSkippedWithAWarning(t *testing.T) {
+	c := kitOAuthCredential()
+	c.OAuth.Passthrough = true
+	var warn bytes.Buffer
+	shapes, err := kitOAuthShapes(kitWith(c), &warn)
+	if err != nil || len(shapes) != 0 {
+		t.Fatalf("shapes = %v, err = %v; want the credential skipped without an error", shapes, err)
+	}
+	if !strings.Contains(warn.String(), `"ghe-login"`) || !strings.Contains(warn.String(), "skipped") {
+		t.Errorf("warning = %q", warn.String())
 	}
 }
