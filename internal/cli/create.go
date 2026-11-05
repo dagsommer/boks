@@ -27,6 +27,10 @@ and is what 'boks run' executes when it is given none of its own.
 --clone belongs here too, and only here: the mode lives in the sandbox's mounts, so it is
 fixed when the sandbox is created and cannot be changed afterwards.
 
+--kit applies a kit as it does for 'boks run', and so does a git+ kit reference in the agent's
+place. The sandbox remembers its kits: 'boks start' and 'boks exec' read them again to attach
+the credentials you have approved and to run the kit's startup commands.
+
 Agents:
 %s`, agentList(agents)),
 		Example: `  boks create shell .
@@ -57,6 +61,14 @@ Agents:
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
 		ctx := cmd.Context()
+		// As for `run`: a kit reference in the agent's place is the kit, and the agent it
+		// defines is the one that is created.
+		var kitAsAgent bool
+		if len(netFlags.kitRefs) == 0 {
+			if ref, rest, ok := kitFromPositional(positional); ok {
+				netFlags.kitRefs, positional, kitAsAgent = []string{ref}, rest, true
+			}
+		}
 
 		// See internal/cli/update.go. Never blocks, never fails.
 		noticeUpdate(env.Stderr)
@@ -73,6 +85,17 @@ Agents:
 		netFlags.stdin, netFlags.stderr = env.Stdin, env.Stderr
 		if err := netFlags.loadKit(env.Stderr); err != nil {
 			return err
+		}
+		// A `kind: sandbox` kit defines an agent, and has to be in the registry before the
+		// positional arguments are read, exactly as in `run`. The terminal test is run's too,
+		// because the command recorded on the sandbox is the one `boks run` will execute.
+		kitAgent := netFlags.kitAgentSpec()
+		if err := registerKitAgent(agents, kitAgent,
+			isTerminal(env.Stdin) && isTerminal(env.Stdout)); err != nil {
+			return err
+		}
+		if kitAsAgent && kitAgent != nil {
+			positional = append([]string{kitAgent.Name}, positional...)
 		}
 		if err := ensureDaemon(ctx, dev, env.Stderr); err != nil {
 			return err
@@ -97,9 +120,16 @@ Agents:
 		if err != nil {
 			return err
 		}
+		if err := applyKitVolumes(netFlags.kitSpec, false, &cfg, env.Stderr); err != nil {
+			return err
+		}
 		if err := applyCloneMode(flags, inv, &cfg, env); err != nil {
 			return err
 		}
+		if err := netFlags.applyKit(&cfg); err != nil {
+			return err
+		}
+		cfg.Kits = netFlags.kitRecord()
 		cfg.Stderr = env.Stderr
 		if verbose {
 			cfg.Progress = env.Stderr
@@ -121,7 +151,8 @@ Agents:
 		// recorded on the container and honoured when `run`, `exec` or `start` brings
 		// the sandbox up. They are still validated, because a typo should cost a message
 		// rather than a sandbox that fails to start tomorrow.
-		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, netFlags.publish, env.Stderr)
+		publish := append(kitPublish(netFlags.kitSpec, env.Stderr), netFlags.publish...)
+		spec, err := netFlags.enforceSpec(ctx, inv.name, dev.address, mode, record, publish, env.Stderr)
 		if err != nil {
 			return err
 		}
@@ -133,7 +164,7 @@ Agents:
 			return err
 		}
 		cfg.Policy = record
-		cfg.Ports = netFlags.publish
+		cfg.Ports = publish
 		cfg.Annotations = withNetworkAnnotations(guest.Annotations, cfg.Annotations)
 		cfg.Env = append(cfg.Env, guest.Env...)
 		cfg.Mounts = guest.Mounts

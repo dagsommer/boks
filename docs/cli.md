@@ -317,6 +317,10 @@ and is what 'boks run' executes when it is given none of its own.
 \--clone belongs here too, and only here: the mode lives in the sandbox's mounts, so it is
 fixed when the sandbox is created and cannot be changed afterwards.
 
+\--kit applies a kit as it does for 'boks run', and so does a git+ kit reference in the agent's
+place. The sandbox remembers its kits: 'boks start' and 'boks exec' read them again to attach
+the credentials you have approved and to run the kit's startup commands.
+
 ```
 Agents:
   shell          a plain shell in the Boks base image
