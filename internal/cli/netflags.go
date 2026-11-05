@@ -279,8 +279,10 @@ func (f *policyFlags) describeKit(w io.Writer) {
 	// Listing them here as ignored was wrong in the direction that makes a working feature
 	// look broken, which is the worse direction.
 	var ignored []string
-	if n := len(f.kitSpec.Ports); n > 0 {
-		ignored = append(ignored, fmt.Sprintf("%d port(s)", n))
+	for _, c := range f.kitSpec.Credentials {
+		if c.OAuth != nil && c.APIKey == nil {
+			ignored = append(ignored, fmt.Sprintf("oauth credential %s", c.Service))
+		}
 	}
 	if len(ignored) > 0 {
 		fmt.Fprintf(w, "kit: NOT applied — %s.\n", strings.Join(ignored, ", "))

@@ -209,6 +209,9 @@ Agents:
 		if err != nil {
 			return err
 		}
+		if err := applyKitVolumes(netFlags.kitSpec, inv.exists, &cfg, env.Stderr); err != nil {
+			return err
+		}
 		// Decided before anything is pulled or started, so that a --clone against a
 		// directory Boks will not clone costs a message rather than a sandbox.
 		if err := applyCloneMode(flags, inv, &cfg, env); err != nil {
