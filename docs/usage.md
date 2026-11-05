@@ -275,6 +275,53 @@ Publishing has never been driven by a real guest. The datapath is exercised end 
 against a simulated one, which proves the host side works; a real VM reaching it through
 libkrun's virtio-net device has not been tried.
 
+## The dashboard
+
+Bare `boks` in a terminal opens a live view of every sandbox, as bare `sbx` does; `boks tui`
+opens it explicitly. Piped, redirected or run from a script, bare `boks` still prints its
+usage and exits 2.
+
+```text
+ ╭──────────────────────────────────────────────────────────────────────────────────────╮
+ │ Boks  Run untrusted developer tooling in isolated microVMs               (Ctrl+s) ⚙ │
+ ╰──────────────────────────────────────────────────────────────────────────────────────╯
+ ╭────────────────────────────────── Sandbox ╮ │ t1
+ │ ■ t1                                      │ │
+ │ ───────────────────────────────────────── │ │ Network Log (6)    Network Rules (15)
+ │ shell                               ↵ run │ │ ──────────────────────────────────────────
+ │ …/src/project                             │ │
+ │ running                                   │ │ 6 total  ● 4 allowed  ● 2 blocked
+ │ ───────────────────────────────────────── │ │
+ │  stop             exec            remove  │ │ Date ↑              Host       Hits  Status
+ ╰───────────────────────────────────────────╯ │ ● 05 Nov, 20:47:39  evil.org      1 Blocked
+```
+
+A card per sandbox on the left; on the right, the selected sandbox's network log (what
+`boks policy log --sandbox NAME` records, one row per host) and the rules it runs under (what
+`boks policy ls --sandbox NAME` resolves, with where each rule comes from).
+
+| Key | Does | Same as |
+|---|---|---|
+| `Enter` | attach to the sandbox's agent, starting it if stopped | `boks run --name NAME` |
+| `s` | start or stop | `boks start` / `boks stop` |
+| `x` | a login shell in the sandbox | `boks exec -it NAME sh` |
+| `r` | remove, after asking | `boks rm` (`--force` when running) |
+| `c` | create: pick an agent, give a directory | `boks create AGENT DIR` |
+| `→`/`Tab`, `←`/`→` | into the network pane, then between its tabs | |
+| `Enter` on a log row | block an allowed host, or allow a blocked one, for that sandbox | `boks policy deny\|allow --sandbox NAME HOST` |
+| `a`, `r` on the rules tab | add a rule (HTTP method and path optional); remove a stored one, after asking | `boks policy allow\|deny`, `boks policy rm` |
+| `n` | every sandbox's network at full width; `s` picks a sandbox, `Esc` returns | `boks policy log` |
+| `o`, `/` | filter allowed/blocked, search | |
+| `Ctrl+s` | version, state directory, containerd address | |
+
+Every action runs the boks command in the last column, so it behaves, prints and fails exactly
+as that command does; the status line shows what it said. Attaching and the shell hand the
+terminal over, and the dashboard comes back when the session ends. Rules from a preset or an
+agent are shown but cannot be removed here, because they are not in the policy store. The view
+refreshes every second and a half, costs a stat of the decision log when nothing changed, and
+respects `NO_COLOR`. Below 90 columns the network pane is dropped (`Tab` opens the network view
+instead), and below 30x8 it says the terminal is too small.
+
 ## Flags worth knowing
 
 Spelled the way the equivalent flags are spelled elsewhere, because muscle memory is part of

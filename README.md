@@ -319,7 +319,8 @@ on all three platforms; what is left is mostly reach and repair rather than the 
    cannot make
 3. Policy over names for raw flows, so that `--allow example.com` can authorise a direct
    connection to the address it resolves to rather than denying it
-4. The interactive dashboard that bare `boks` should open
+4. ~~The interactive dashboard that bare `boks` should open~~ — done: bare `boks` on a
+   terminal, and `boks tui`
 5. Clone mode measured behind a hypervisor — it is built and verified on runc, where the
    read-only source share is a bind mount rather than virtiofs
 6. Docker daemon inside the guest, UDP port publishing, and kits / declarative configuration

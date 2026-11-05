@@ -23,7 +23,7 @@ out that people can actually install.
    host mount Boks makes to read the image config — see below.
 3. **Policy over names for raw flows**, so that `--allow example.com` can authorise a direct
    connection to the address it resolves to rather than denying it.
-4. **The interactive dashboard** that bare `boks` should open.
+4. *(done)* The interactive dashboard: bare `boks` on a terminal, and `boks tui`.
 5. **Clone mode measured behind a hypervisor.** `--clone` is built and verified against runc,
    where the read-only source share is a bind mount rather than virtiofs; nothing about it
    has been measured behind a VM boundary yet.
@@ -108,9 +108,10 @@ would sell.
 
 ### CLI
 
-- **No terminal dashboard** for bare `boks`, and no `--kit`. See the CLI surface section of
-  the [parity matrix](docker-sandbox-parity.md). `--clone` exists, and has only been
-  exercised against runc — see item 5 above.
+- The terminal dashboard exists (bare `boks`, `boks tui`); what it does and does not match
+  is in the [parity matrix](docker-sandbox-parity.md#the-dashboard-bare-boks-boks-tui-compared-with-sbx-v0510).
+  `--kit` is partial; see the CLI surface section of the same matrix. `--clone` exists, and
+  has only been exercised against runc — see item 5 above.
 - **No nested Docker** and no kits.
 - **Ctrl-C reports badly.** It cleans up completely, but exits 1 with an RPC error rather than
   exiting 130 silently.

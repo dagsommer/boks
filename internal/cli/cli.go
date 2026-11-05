@@ -120,6 +120,7 @@ Boks is experimental. See docs/security-model.md before trusting it with anythin
 // Every command is constructed against this Env rather than reading os.Std*, so a test can
 // drive the whole CLI through buffers.
 func newRootCommand(env Env) *cobra.Command {
+	dev := &devFlags{}
 	root := &cobra.Command{
 		Use:           "boks",
 		Short:         "Run untrusted developer tooling in isolated microVMs",
@@ -127,9 +128,13 @@ func newRootCommand(env Env) *cobra.Command {
 		Version:       Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		// Bare `boks` is not a no-op that exits 0: there is no dashboard yet, so it is
-		// a user who has not said what they want. Usage, exit 2.
+		// Bare `boks` on a terminal is the dashboard, as bare `sbx` is. Anywhere else —
+		// a pipe, a script, a test — it is a caller who has not said what they want, and
+		// it gets the usage and exit 2 it always got.
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if dashboardWanted(env) {
+				return runDashboard(cmd.Context(), env, dev)
+			}
 			return &usageError{err: errors.New("a command is required"), silent: true}
 		},
 		// With a RunE above, cobra would otherwise hand any argument to it rather than
@@ -149,15 +154,13 @@ func newRootCommand(env Env) *cobra.Command {
 	root.SetOut(env.Stdout)
 	root.SetErr(env.Stderr)
 	root.SetVersionTemplate("boks {{.Version}}\n")
+	dev.register(root.PersistentFlags())
 
 	// A malformed flag is a usage error wherever it happens; cobra looks this up through
 	// the parents, so registering it once covers the whole tree.
 	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		return &usageError{err: err}
 	})
-
-	dev := &devFlags{}
-	dev.register(root.PersistentFlags())
 
 	root.AddCommand(
 		newRunCommand(env, dev),
@@ -181,6 +184,7 @@ func newRootCommand(env Env) *cobra.Command {
 		newSecretCommand(env),
 		newCaCommand(env),
 		newDoctorCommand(env, dev),
+		newTUICommand(env, dev),
 		newVersionCommand(env),
 	)
 	return root
