@@ -214,17 +214,31 @@ func writeTarEntry(tw *tar.Writer, srcPath, name string, fi os.FileInfo) error {
 // extractTar unpacks a tar stream into destDir, renaming the archive's top-level component
 // to entryName.
 //
-// The stream comes from inside a sandbox and is therefore untrusted: an entry naming
-// "../../etc/cron.d/x" would otherwise write outside the destination. Every path is checked
-// after cleaning, and anything that escapes is refused.
+// The stream comes from inside a sandbox and is therefore untrusted. Two things are checked,
+// and both are needed:
+//
+//   - Every entry's path is cleaned and must stay under destDir (resolveEntry). That alone is
+//     not enough: it is a statement about the spelling of a path, and the archive can first
+//     create a symlink and then name a file beneath it — `x/link -> /home/me/.ssh`, then
+//     `x/link/authorized_keys` — which is inside the destination by every lexical test and
+//     outside it on disk.
+//   - So every write goes through an os.Root on destDir, which refuses to resolve any path
+//     out of it, symlinks included; and a symlink whose target leaves the destination is
+//     refused when it is made (checkLinkTarget), so the copy never plants a link that points
+//     at the host's files for something else to follow later.
 func extractTar(r io.Reader, destDir, entryName string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", destDir, err)
 	}
-	root, err := filepath.Abs(destDir)
+	abs, err := filepath.Abs(destDir)
 	if err != nil {
 		return err
 	}
+	dest, err := os.OpenRoot(abs)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", abs, err)
+	}
+	defer dest.Close()
 
 	tr := tar.NewReader(r)
 	for {
@@ -236,21 +250,25 @@ func extractTar(r io.Reader, destDir, entryName string) error {
 			return fmt.Errorf("reading the copied archive: %w", err)
 		}
 
-		target, err := resolveEntry(root, header.Name, entryName)
+		target, err := resolveEntry(abs, header.Name, entryName)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(abs, target)
 		if err != nil {
 			return err
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+			if err := dest.MkdirAll(rel, os.FileMode(header.Mode).Perm()); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := dest.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode).Perm())
+			f, err := dest.OpenFile(rel, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode).Perm())
 			if err != nil {
 				return err
 			}
@@ -262,11 +280,14 @@ func extractTar(r io.Reader, destDir, entryName string) error {
 				return err
 			}
 		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := checkLinkTarget(header.Name, rel, header.Linkname); err != nil {
 				return err
 			}
-			_ = os.Remove(target)
-			if err := os.Symlink(header.Linkname, target); err != nil {
+			if err := dest.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
+				return err
+			}
+			_ = dest.Remove(rel)
+			if err := dest.Symlink(header.Linkname, rel); err != nil {
 				return err
 			}
 		default:
@@ -275,6 +296,24 @@ func extractTar(r io.Reader, destDir, entryName string) error {
 			continue
 		}
 	}
+}
+
+// checkLinkTarget refuses a symlink that points outside the copy destination: an absolute
+// target, or a relative one that climbs out of it from where the link sits. rel is the link's
+// own place under the destination.
+func checkLinkTarget(name, rel, linkname string) error {
+	slashed := filepath.ToSlash(linkname)
+	if path.IsAbs(slashed) || filepath.IsAbs(linkname) || strings.HasPrefix(linkname, `\`) ||
+		strings.ContainsRune(linkname, 0) {
+		return fmt.Errorf("refusing to copy the symlink %q: it points at %q, outside the copy destination",
+			name, linkname)
+	}
+	resolved := path.Join(path.Dir(filepath.ToSlash(rel)), slashed)
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		return fmt.Errorf("refusing to copy the symlink %q: it points at %q, outside the copy destination",
+			name, linkname)
+	}
+	return nil
 }
 
 // resolveEntry maps an archive entry name onto a host path under root, replacing the

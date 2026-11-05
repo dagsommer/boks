@@ -151,3 +151,127 @@ func TestResolveEntryRenamesTopLevel(t *testing.T) {
 		t.Errorf("resolveEntry = %q, want %q", got, want)
 	}
 }
+
+// A guest can send a symlink entry and then a file entry that passes through it. Every path in
+// the archive is lexically inside the destination, so only refusing to follow the link — or
+// refusing the link — keeps the write on the destination's side of the boundary.
+func TestExtractTarDoesNotWriteThroughASymlink(t *testing.T) {
+	cases := map[string]func(outside string) []copyEntry{
+		"absolute target": func(outside string) []copyEntry {
+			return []copyEntry{
+				{name: "payload/", dir: true},
+				{name: "payload/link", link: outside},
+				{name: "payload/link/pwned", body: "x"},
+			}
+		},
+		"relative target": func(outside string) []copyEntry {
+			return []copyEntry{
+				{name: "payload/", dir: true},
+				{name: "payload/link", link: "../../" + filepath.Base(outside)},
+				{name: "payload/link/pwned", body: "x"},
+			}
+		},
+		"link alone": func(outside string) []copyEntry {
+			return []copyEntry{
+				{name: "payload/", dir: true},
+				{name: "payload/link", link: outside},
+			}
+		},
+	}
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			dest := filepath.Join(base, "dest")
+			outside := filepath.Join(base, "outside")
+			if err := os.MkdirAll(outside, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			writeCopyEntries(t, &buf, build(outside))
+
+			if err := extractTar(&buf, dest, "payload"); err == nil {
+				t.Error("extractTar accepted a symlink leaving the destination")
+			}
+			if _, err := os.Lstat(filepath.Join(outside, "pwned")); err == nil {
+				t.Error("a file was written outside the destination through a symlink")
+			}
+			if _, err := os.Lstat(filepath.Join(dest, "payload", "link")); err == nil {
+				t.Error("the escaping symlink was created")
+			}
+		})
+	}
+}
+
+func TestExtractTarKeepsASymlinkThatStaysInside(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	var buf bytes.Buffer
+	writeCopyEntries(t, &buf, []copyEntry{
+		{name: "payload/", dir: true},
+		{name: "payload/real.txt", body: "hello"},
+		{name: "payload/alias", link: "real.txt"},
+	})
+	if err := extractTar(&buf, dest, "payload"); err != nil {
+		t.Fatalf("extractTar: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "payload", "alias"))
+	if err != nil || string(got) != "hello" {
+		t.Errorf("reading through the safe symlink: %q, %v", got, err)
+	}
+}
+
+type copyEntry struct {
+	name string
+	body string
+	link string
+	dir  bool
+}
+
+func writeCopyEntries(t *testing.T, w *bytes.Buffer, entries []copyEntry) {
+	t.Helper()
+	tw := tar.NewWriter(w)
+	for _, e := range entries {
+		h := &tar.Header{Name: e.name, Mode: 0o644}
+		switch {
+		case e.dir:
+			h.Typeflag, h.Mode = tar.TypeDir, 0o755
+		case e.link != "":
+			h.Typeflag, h.Linkname = tar.TypeSymlink, e.link
+		default:
+			h.Typeflag, h.Size = tar.TypeReg, int64(len(e.body))
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Typeflag == tar.TypeReg {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The link can already be on the host: a destination that has a symlink out of it, which a
+// copied file would otherwise be written through.
+func TestExtractTarDoesNotFollowAnExistingSymlinkOut(t *testing.T) {
+	base := t.TempDir()
+	dest, outside := filepath.Join(base, "dest"), filepath.Join(base, "outside")
+	for _, d := range []string{dest, outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(dest, "payload")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	var buf bytes.Buffer
+	writeCopyEntries(t, &buf, []copyEntry{{name: "payload/", dir: true}, {name: "payload/f", body: "x"}})
+	if err := extractTar(&buf, dest, "payload"); err == nil {
+		t.Error("extractTar wrote through a symlink already in the destination")
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "f")); err == nil {
+		t.Error("a file landed outside the destination")
+	}
+}
