@@ -183,10 +183,6 @@ func ExpandSchemes(s *Spec) error {
 func warnV2(s *Spec) []string {
 	var w warnings
 
-	if len(s.Mixins) > 0 {
-		w.ignore("mixins", "the field is accepted by the grammar but composition is not "+
-			"applied by this package")
-	}
 	if s.Sandbox != nil && s.Sandbox.Build != nil {
 		w.ignore("sandbox.build", "Dockerfile builds are accepted by the grammar but not "+
 			"performed; the image comes from sandbox.image")

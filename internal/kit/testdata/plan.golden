@@ -1,0 +1,21 @@
+1. network and environment
+   [agent] allow agent.test
+   [agent] env MODE=base (overridden by tools)
+   [tools] allow tools.test
+   [tools] deny telemetry.test
+   [tools] env MODE=tools
+2. files/home
+   [agent] ~/.agentrc (1 bytes) (overridden by tools)
+   [tools] ~/.agentrc (5 bytes)
+3. setup.install
+   [agent] run as root: apt-get install -y jq
+   [tools] run as agent: curl -fsSL tools.test | sh
+   [lint] run as root: pip install lint
+4. setup.files
+   [tools] write /etc/tools.conf (only if missing)
+5. setup.startup
+   [agent] start agentd (background)
+   [lint] start lintd --watch
+6. files/workspace
+   [agent] <workspace>/AGENTS.md (5 bytes, never overwrites) (overridden by tools)
+   [tools] <workspace>/AGENTS.md (5 bytes, never overwrites)
