@@ -1209,6 +1209,7 @@ boks run                              # a shell in the current directory
   boks run shell ~/src/foo ~/src/lib:ro
   boks run --clone claude ~/src/foo     # the agent works on a clone; your files are read-only
   boks run --name claude-boks           # re-attach by name, from anywhere
+  boks run "git+ssh://git@host/org/kits.git#dir=team" .   # a kit's agent, from a git reference
 ```
 
 | Flag | Default | Meaning |

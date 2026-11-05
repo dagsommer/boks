@@ -393,3 +393,15 @@ func TestSandboxSummary(t *testing.T) {
 		t.Errorf("memoryText(1536) = %q", memoryText(1536))
 	}
 }
+
+func TestKitFromPositional(t *testing.T) {
+	ref, rest, ok := kitFromPositional([]string{"git+ssh://h/o/r.git#dir=x", ".", "~/lib:ro"})
+	if !ok || ref != "git+ssh://h/o/r.git#dir=x" || !slices.Equal(rest, []string{".", "~/lib:ro"}) {
+		t.Errorf("got %q %v %v", ref, rest, ok)
+	}
+	for _, args := range [][]string{nil, {"claude", "."}, {"."}, {"./git+x"}} {
+		if _, rest, ok := kitFromPositional(args); ok || !slices.Equal(rest, args) {
+			t.Errorf("%v was read as a kit", args)
+		}
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/agent"
+	"github.com/dagsommer/boks/internal/kit"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
@@ -53,7 +54,8 @@ Agents:
   boks run shell . -- uname -a
   boks run shell ~/src/foo ~/src/lib:ro
   boks run --clone claude ~/src/foo     # the agent works on a clone; your files are read-only
-  boks run --name claude-boks           # re-attach by name, from anywhere`,
+  boks run --name claude-boks           # re-attach by name, from anywhere
+  boks run "git+ssh://git@host/org/kits.git#dir=team" .   # a kit's agent, from a git reference`,
 		Args: cobra.ArbitraryArgs,
 	}
 
@@ -96,6 +98,14 @@ Agents:
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
+		// `boks run git+ssh://host/org/kits.git#dir=team .` — a kit reference in the agent's
+		// place is the kit, as in sbx, and the agent it defines is the one that runs.
+		var kitAsAgent bool
+		if netFlags.kitRef == "" {
+			if ref, rest, ok := kitFromPositional(positional); ok {
+				netFlags.kitRef, positional, kitAsAgent = ref, rest, true
+			}
+		}
 
 		// Early, so the background refresh has the whole of a VM start to finish in.
 		// It never blocks and never fails; see internal/cli/update.go.
@@ -148,6 +158,9 @@ Agents:
 		if err := registerKitAgent(agents, netFlags.kitSpec,
 			isTerminal(env.Stdin) && isTerminal(env.Stdout)); err != nil {
 			return err
+		}
+		if kitAsAgent && netFlags.kitSpec != nil && netFlags.kitSpec.Kind == kit.KindSandbox {
+			positional = append([]string{netFlags.kitSpec.Name}, positional...)
 		}
 
 		ctx := cmd.Context()
@@ -325,4 +338,14 @@ func isTerminal(stream any) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// kitFromPositional recognises a kit reference in the first position. Only a git+ reference
+// counts: every other first argument is already an agent or a directory, and a directory that
+// happens to hold a spec.yaml must stay a workspace. --kit is the unambiguous spelling for those.
+func kitFromPositional(positional []string) (ref string, rest []string, ok bool) {
+	if len(positional) == 0 || !strings.HasPrefix(positional[0], "git+") {
+		return "", positional, false
+	}
+	return positional[0], positional[1:], true
 }
