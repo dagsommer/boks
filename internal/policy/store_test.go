@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,7 +37,8 @@ func TestStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got.Version != StoreVersion || got.Preset != PresetLocked {
+	// A store with no HTTP rule is still written as version 1, so an older Boks reads it.
+	if got.Version != storeVersionNoHTTP || got.Preset != PresetLocked {
 		t.Errorf("version/preset lost: %+v", got)
 	}
 	if len(got.Global) != 1 || got.Global[0].Action != Allow || got.Global[0].Note != "git" {
@@ -239,13 +241,55 @@ func TestAddIsIdempotentAndCaseFolding(t *testing.T) {
 	if added {
 		t.Error("the same destination was stored twice under a different spelling")
 	}
-	// The same destination with the other disposition is a different rule, and both are
-	// kept: the deny is what will win, and the allow being visible is how a user sees why.
-	if added, err = s.Add(GlobalScope(), RuleSpec{Action: Deny, Spec: "github.com:443"}); err != nil || !added {
-		t.Fatalf("deny of an allowed destination: %v %v", added, err)
+	// The same destination with the other disposition, in the same scope, is refused, as sbx
+	// refuses it: two opposite rules for one resource in one place is a policy whose author
+	// changed their mind without saying which way. The error says how to get there.
+	_, err = s.Add(GlobalScope(), RuleSpec{Action: Deny, Spec: "github.com:443"})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("deny of an allowed destination in the same scope: %v, want a ConflictError", err)
 	}
-	if len(s.Global) != 2 {
-		t.Errorf("expected an allow and a deny, got %+v", s.Global)
+	if !strings.Contains(err.Error(), "boks policy rm --action allow GitHub.com:443") {
+		t.Errorf("the refusal does not say how to remove the existing rule: %v", err)
+	}
+	if len(s.Global) != 1 {
+		t.Errorf("a refused rule was stored: %+v", s.Global)
+	}
+	// In a different scope it is fine: a sandbox-scoped deny of a globally allowed host is
+	// exactly what scoping is for, and deny wins.
+	if added, err = s.Add(SandboxScope("web"), RuleSpec{Action: Deny, Spec: "github.com:443"}); err != nil || !added {
+		t.Fatalf("a sandbox-scoped deny of a globally allowed destination: %v %v", added, err)
+	}
+}
+
+// TestConflictRefusalForHTTPRules: for an HTTP rule the conflict is the same destination with
+// the same selector — the methods overlapping, the path and the query the same. A connection
+// rule and an HTTP rule for one host are different things and coexist.
+func TestConflictRefusalForHTTPRules(t *testing.T) {
+	s := tempStore(t)
+	mustAdd(t, s, GlobalScope(), RuleSpec{Action: Allow, Spec: "api.test", Methods: []string{"GET", "HEAD"}, Path: "/v1/**"})
+
+	coexist := []RuleSpec{
+		{Action: Deny, Spec: "api.test"},                                                                   // a connection rule
+		{Action: Deny, Spec: "api.test", Methods: []string{"POST"}, Path: "/v1/**"},                        // other methods
+		{Action: Deny, Spec: "api.test", Methods: []string{"GET"}, Path: "/v2/**"},                         // other path
+		{Action: Deny, Spec: "api.test", Methods: []string{"GET"}, Path: "/v1/**", Query: []string{"a=1"}}, // other query
+		{Action: Deny, Spec: "other.test", Methods: []string{"GET"}, Path: "/v1/**"},                       // other host
+	}
+	for _, r := range coexist {
+		if _, err := s.Add(GlobalScope(), r); err != nil {
+			t.Errorf("%s was refused: %v", r, err)
+		}
+	}
+	conflicting := []RuleSpec{
+		{Action: Deny, Spec: "API.test", Methods: []string{"get"}, Path: "/v1/**"},
+		{Action: Deny, Spec: "api.test", Methods: []string{"ANY"}, Path: "/v1/**"},
+	}
+	for _, r := range conflicting {
+		var conflict *ConflictError
+		if _, err := s.Add(GlobalScope(), r); !errors.As(err, &conflict) {
+			t.Errorf("%s was not refused as a conflict: %v", r, err)
+		}
 	}
 }
 
@@ -262,22 +306,38 @@ func TestAddRejectsAnUnusableRule(t *testing.T) {
 func TestRemove(t *testing.T) {
 	s := tempStore(t)
 	mustAdd(t, s, GlobalScope(), RuleSpec{Action: Allow, Spec: "a.test:443"})
-	mustAdd(t, s, GlobalScope(), RuleSpec{Action: Deny, Spec: "a.test:443"})
 	mustAdd(t, s, GlobalScope(), RuleSpec{Action: Allow, Spec: "b.test:443"})
+	mustAdd(t, s, SandboxScope("web"), RuleSpec{Action: Allow, Spec: "a.test:443"})
+	mustAdd(t, s, SandboxScope("web"), RuleSpec{Action: Deny, Spec: "a.test:443", Methods: []string{"POST"}})
 
-	allow := Allow
-	removed, err := s.Remove(GlobalScope(), &allow, "a.test:443")
-	if err != nil || len(removed) != 1 || removed[0].Action != Allow {
-		t.Fatalf("removing one disposition: %v %+v", err, removed)
+	deny := Deny
+	if _, err := s.Remove(GlobalScope(), &deny, "a.test:443"); err == nil {
+		t.Fatal("removing a disposition that is not stored should say so")
 	}
-	if len(s.Global) != 2 {
-		t.Fatalf("expected two rules left, got %+v", s.Global)
-	}
-	if removed, err = s.Remove(GlobalScope(), nil, "a.test:443"); err != nil || len(removed) != 1 {
+	if removed, err := s.Remove(GlobalScope(), nil, "a.test:443"); err != nil || len(removed) != 1 {
 		t.Fatalf("removing without an action: %v %+v", err, removed)
+	}
+	if len(s.Global) != 1 {
+		t.Fatalf("expected one rule left, got %+v", s.Global)
 	}
 	if _, err := s.Remove(GlobalScope(), nil, "a.test:443"); err == nil {
 		t.Error("removing a rule that is not there should say so")
+	}
+
+	// A connection-rule removal leaves the HTTP rule for the same host alone.
+	allow := Allow
+	if removed, err := s.Remove(SandboxScope("web"), &allow, "a.test:443"); err != nil || len(removed) != 1 {
+		t.Fatalf("removing the connection allow: %v %+v", err, removed)
+	}
+	// And with only the HTTP rule left, removing by destination alone is refused with the
+	// command that would remove it, rather than removing it on a guess.
+	_, err := s.Remove(SandboxScope("web"), nil, "a.test:443")
+	if err == nil || !strings.Contains(err.Error(), "boks policy rm --sandbox web --action deny a.test:443 --method POST --path '/**'") {
+		t.Fatalf("removing an HTTP rule by destination alone: %v", err)
+	}
+	removed, err := s.RemoveRule(SandboxScope("web"), nil, RuleSpec{Spec: "A.test:443", Methods: []string{"post"}, Path: "/**"})
+	if err != nil || len(removed) != 1 || !removed[0].IsHTTP() {
+		t.Fatalf("removing the HTTP rule by its selector: %v %+v", err, removed)
 	}
 	if _, err := s.Remove(SandboxScope("ghost"), nil, "a.test:443"); err == nil {
 		t.Error("removing from a scope that does not exist should say so")

@@ -179,7 +179,9 @@ func (req Request) Resolve() (Resolution, error) {
 		baseScope = "profile " + req.Profile
 	}
 	for _, r := range base.Rules {
-		res.Rules = append(res.Rules, RuleSpec{Action: r.Action, Spec: r.Spec(), Note: r.Why, Scope: baseScope})
+		spec := r.RuleSpec()
+		spec.Scope = baseScope
+		res.Rules = append(res.Rules, spec)
 	}
 	baseDetail := presetDetail(base)
 	if strings.HasPrefix(baseScope, "profile ") {
@@ -448,11 +450,11 @@ func writeRuleSection(b *strings.Builder, title string, rules []RuleSpec) {
 		return
 	}
 	sorted := append([]RuleSpec(nil), rules...)
-	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Spec < sorted[j].Spec })
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Describe() < sorted[j].Describe() })
 
 	specWidth, scopeWidth := 0, 0
 	for _, r := range sorted {
-		if n := len(r.Spec); n > specWidth {
+		if n := len(r.Describe()); n > specWidth {
 			specWidth = n
 		}
 		if n := len(r.Scope); n > scopeWidth {
@@ -461,10 +463,10 @@ func writeRuleSection(b *strings.Builder, title string, rules []RuleSpec) {
 	}
 	for _, r := range sorted {
 		if r.Note == "" {
-			fmt.Fprintf(b, "  %-*s  %s\n", specWidth, r.Spec, r.Scope)
+			fmt.Fprintf(b, "  %-*s  %s\n", specWidth, r.Describe(), r.Scope)
 			continue
 		}
-		fmt.Fprintf(b, "  %-*s  %-*s  %s\n", specWidth, r.Spec, scopeWidth, r.Scope, r.Note)
+		fmt.Fprintf(b, "  %-*s  %-*s  %s\n", specWidth, r.Describe(), scopeWidth, r.Scope, r.Note)
 	}
 }
 

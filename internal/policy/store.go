@@ -61,8 +61,18 @@ import (
 	"strings"
 )
 
-// StoreVersion is the schema version this build writes and is the highest it will read.
-const StoreVersion = 1
+// StoreVersion is the highest schema version this build reads, and the one it writes for a
+// store that holds an HTTP rule.
+//
+// Version 2 added the HTTP selector (`methods`, `path`, `query`). A store with no HTTP rule is
+// still written as version 1, which is byte-for-byte what a version-1 build wrote, so that a
+// machine can go back to an older Boks without losing its policy. One with an HTTP rule must
+// not be read by such a build: an HTTP allow read without its selector is an allow for every
+// request, so the version bump is what makes the older build refuse instead.
+const StoreVersion = 2
+
+// storeVersionNoHTTP is the version written for a store without HTTP rules.
+const storeVersionNoHTTP = 1
 
 // storeFileName is the file under <state>/policy that holds everything.
 const storeFileName = "policy.json"
@@ -99,6 +109,14 @@ type RuleSpec struct {
 	// Spec is the destination in the syntax ParseRule accepts: "host", "host:ports",
 	// "10.0.0.0/8", "[::1]:8080", "*:22".
 	Spec string `json:"spec"`
+	// Methods, Path and Query are an HTTP rule's selector, exactly as `--method`, `--path`
+	// and `--query` give them (sbx's flags). All three are empty for a connection rule, which
+	// is every rule a store written before HTTP rules existed holds, so such a store reads
+	// unchanged. A store holding an HTTP rule is written as version 2, which an older Boks
+	// refuses rather than enforcing the rule as if it allowed every request.
+	Methods []string `json:"methods,omitempty"`
+	Path    string   `json:"path,omitempty"`
+	Query   []string `json:"query,omitempty"`
 	// Note is why the rule exists. JSON has no comments; this is the replacement.
 	Note string `json:"note,omitempty"`
 	// Scope is filled in during resolution and is not stored: a rule inside the global
@@ -108,7 +126,7 @@ type RuleSpec struct {
 
 // Rule compiles the stored strings into a matchable rule.
 func (r RuleSpec) Rule() (Rule, error) {
-	rule, err := ParseRule(r.Action, r.Spec)
+	rule, err := ParseHTTPRule(r.Action, r.Spec, r.Methods, r.Path, r.Query)
 	if err != nil {
 		return Rule{}, err
 	}
@@ -117,18 +135,51 @@ func (r RuleSpec) Rule() (Rule, error) {
 	return rule, nil
 }
 
-func (r RuleSpec) String() string {
-	if r.Note == "" {
-		return r.Action.String() + " " + r.Spec
+// IsHTTP reports whether the stored rule carries an HTTP selector.
+func (r RuleSpec) IsHTTP() bool { return len(r.Methods) > 0 || r.Path != "" || len(r.Query) > 0 }
+
+// Selector renders the HTTP selector in flag form, or "" for a connection rule.
+func (r RuleSpec) Selector() string {
+	if !r.IsHTTP() {
+		return ""
 	}
-	return r.Action.String() + " " + r.Spec + "  # " + r.Note
+	m, err := ParseHTTPMatch(r.Methods, r.Path, r.Query)
+	if err != nil || m == nil {
+		return strings.TrimSpace("--method " + strings.Join(r.Methods, ",") + " --path " + r.Path)
+	}
+	return m.String()
 }
 
-// canonical returns the rule's destination as the engine will see it, so that
+// Describe is the destination followed by the selector, as a user would type both.
+func (r RuleSpec) Describe() string {
+	if sel := r.Selector(); sel != "" {
+		return r.Spec + " " + sel
+	}
+	return r.Spec
+}
+
+func (r RuleSpec) String() string {
+	if r.Note == "" {
+		return r.Action.String() + " " + r.Describe()
+	}
+	return r.Action.String() + " " + r.Describe() + "  # " + r.Note
+}
+
+// canonical returns the rule's destination and selector as the engine will see them, so that
 // "GitHub.com:443" and "github.com:443" are recognised as the same rule when adding and
-// removing. Falls back to the raw text for a spec that does not parse, which only a
-// hand-edited store can produce and which loading rejects anyway.
+// removing, as are "--method head,get" and "--method GET,HEAD". Falls back to the raw text for
+// a spec that does not parse, which only a hand-edited store can produce and which loading
+// rejects anyway.
 func (r RuleSpec) canonical() string {
+	rule, err := r.Rule()
+	if err != nil {
+		return strings.ToLower(strings.TrimSpace(r.Describe()))
+	}
+	return rule.Describe()
+}
+
+// destination is the canonical destination alone, without the selector.
+func (r RuleSpec) destination() string {
 	rule, err := ParseRule(r.Action, r.Spec)
 	if err != nil {
 		return strings.ToLower(strings.TrimSpace(r.Spec))
@@ -136,11 +187,27 @@ func (r RuleSpec) canonical() string {
 	return rule.Spec()
 }
 
+// conflicts reports whether two rules are the opposite decision for the same thing, in sbx's
+// sense: the same resource and, for HTTP rules, the same methods, path and query constraints.
+// A connection rule and an HTTP rule for one host do not conflict; they are different
+// protocols in sbx's terms, and deny-wins already says which one prevails.
+func (r RuleSpec) conflicts(o RuleSpec) bool {
+	if r.Action == o.Action || r.destination() != o.destination() {
+		return false
+	}
+	a, errA := r.Rule()
+	b, errB := o.Rule()
+	if errA != nil || errB != nil {
+		return false
+	}
+	return a.HTTP.Overlaps(b.HTTP)
+}
+
 // SameDestination reports whether the rule names the destination in spec, comparing them as
 // the engine would rather than as text: "GitHub.com" and "github.com:*" are one destination.
 func (r RuleSpec) SameDestination(spec string) bool {
 	other := RuleSpec{Action: r.Action, Spec: spec}
-	return r.canonical() == other.canonical()
+	return r.destination() == other.destination()
 }
 
 // Profile is a named policy a run can select: a base preset plus rules.
@@ -361,6 +428,15 @@ func (s *Store) Add(scope ScopeRef, spec RuleSpec) (bool, error) {
 	}
 	rules, _ := s.Rules(scope)
 	for i := range rules {
+		if rules[i].conflicts(spec) {
+			// sbx refuses the same thing in the same place, and for the same reason: two
+			// opposite rules for one resource in one scope is a policy whose author has
+			// changed their mind and not said which way. Deny would win, silently. Rules in
+			// different scopes may still disagree; that is what scoping is for.
+			return false, &ConflictError{Scope: scope, New: spec, Existing: rules[i]}
+		}
+	}
+	for i := range rules {
 		if rules[i].Action == spec.Action && rules[i].canonical() == spec.canonical() {
 			if spec.Note != "" && rules[i].Note != spec.Note {
 				rules[i].Note = spec.Note
@@ -378,7 +454,17 @@ func (s *Store) Add(scope ScopeRef, spec RuleSpec) (bool, error) {
 // which is what a user who typed one destination usually means; passing an action is how the
 // ambiguous case is resolved.
 func (s *Store) Remove(scope ScopeRef, action *Action, spec string) ([]RuleSpec, error) {
-	probe := RuleSpec{Action: Deny, Spec: spec}
+	return s.RemoveRule(scope, action, RuleSpec{Spec: spec})
+}
+
+// RemoveRule deletes rules from a scope by destination and, for an HTTP rule, selector.
+//
+// The selector is part of a rule's identity, as it is in sbx (`sbx policy rm network
+// --resource api.example.com --method GET --path '/v1/**'`). A probe with no selector removes
+// only the connection rules for the destination; if the destination has only HTTP rules, the
+// error lists them in the form that removes each, rather than removing them all on a guess.
+func (s *Store) RemoveRule(scope ScopeRef, action *Action, probe RuleSpec) ([]RuleSpec, error) {
+	probe.Action = Deny
 	if action != nil {
 		probe.Action = *action
 	}
@@ -392,19 +478,84 @@ func (s *Store) Remove(scope ScopeRef, action *Action, spec string) ([]RuleSpec,
 		return nil, fmt.Errorf("no rules are stored for %s", scope)
 	}
 	kept := make([]RuleSpec, 0, len(rules))
-	var removed []RuleSpec
+	var removed, httpOnly []RuleSpec
 	for _, r := range rules {
 		if r.canonical() == want && (action == nil || r.Action == *action) {
 			removed = append(removed, r)
 			continue
 		}
+		if !probe.IsHTTP() && r.IsHTTP() && r.destination() == probe.destination() &&
+			(action == nil || r.Action == *action) {
+			httpOnly = append(httpOnly, r)
+		}
 		kept = append(kept, r)
 	}
 	if len(removed) == 0 {
-		return nil, fmt.Errorf("no rule for %q is stored in %s", spec, scope)
+		if len(httpOnly) > 0 {
+			var b strings.Builder
+			fmt.Fprintf(&b, "no connection rule for %q is stored in %s; it has HTTP rules, which are removed by naming their selector:", probe.Spec, scope)
+			for _, r := range httpOnly {
+				fmt.Fprintf(&b, "\n  boks policy rm%s --action %s %s", scopeFlag(scope), r.Action, r.Describe())
+			}
+			return nil, errors.New(b.String())
+		}
+		return nil, fmt.Errorf("no rule for %q is stored in %s", probe.Describe(), scope)
 	}
 	s.setRules(scope, kept)
 	return removed, nil
+}
+
+// ConflictError is the refusal to store a rule whose opposite is already in the same scope.
+type ConflictError struct {
+	Scope    ScopeRef
+	New      RuleSpec
+	Existing RuleSpec
+}
+
+func (e *ConflictError) Error() string {
+	return fmt.Sprintf("%q conflicts with existing %s rule %q in %s.\n"+
+		"Remove the existing rule first:\n  boks policy rm%s --action %s %s",
+		e.New.Describe(), e.Existing.Action, e.Existing.Describe(), e.Scope,
+		scopeFlag(e.Scope), e.Existing.Action, e.Existing.Describe())
+}
+
+// scopeFlag is the flag that selects a scope on the command line, with a leading space, or ""
+// for the global scope.
+func scopeFlag(scope ScopeRef) string {
+	switch scope.Kind {
+	case ScopeSandbox:
+		return " --sandbox " + scope.Name
+	case ScopeProfile:
+		return " --profile " + scope.Name
+	}
+	return ""
+}
+
+// HasHTTPRules reports whether any stored rule carries an HTTP selector, which decides the
+// version the store is written as.
+func (s *Store) HasHTTPRules() bool {
+	check := func(rules []RuleSpec) bool {
+		for _, r := range rules {
+			if r.IsHTTP() {
+				return true
+			}
+		}
+		return false
+	}
+	if check(s.Global) {
+		return true
+	}
+	for _, rules := range s.Sandboxes {
+		if check(rules) {
+			return true
+		}
+	}
+	for _, p := range s.Profiles {
+		if check(p.Rules) {
+			return true
+		}
+	}
+	return false
 }
 
 // setRules writes a scope's rules back, dropping an empty per-sandbox scope entirely so that
@@ -523,7 +674,10 @@ func (s *Store) Save() error {
 	if s.path == "" {
 		return errors.New("policy store has no path to save to")
 	}
-	s.Version = StoreVersion
+	s.Version = storeVersionNoHTTP
+	if s.HasHTTPRules() {
+		s.Version = StoreVersion
+	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding the policy store: %w", err)
