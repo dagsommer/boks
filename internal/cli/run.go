@@ -92,6 +92,7 @@ Agents:
 	var netFlags policyFlags
 	netFlags.register(cmd.Flags())
 	netFlags.registerPublish(cmd.Flags())
+	netFlags.registerKitApproval(cmd.Flags())
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		positional, agentArgs := splitAtDash(cmd, args)
@@ -132,6 +133,7 @@ Agents:
 		// Before the daemon is touched and before anything is created: a kit that does
 		// not parse should cost nothing, and its rules decide the policy the sandbox is
 		// built with.
+		netFlags.stdin, netFlags.stderr = env.Stdin, env.Stderr
 		if err := netFlags.loadKit(env.Stderr); err != nil {
 			return err
 		}

@@ -5,15 +5,34 @@ tools to install, the files to drop in — so that the same setup can be applied
 without being typed out each time. The format is [Docker Sandboxes'](https://docs.docker.com/ai/sandboxes/customize/kits/),
 and a kit written for `sbx` is a kit Boks reads.
 
-> **What Boks does with a kit today: its network rules, and nothing else.**
+> **What Boks does with a kit today:** its network rules, the agent a `kind: sandbox` kit
+> defines, and the API-key credentials it declares — after you approve them.
 >
-> `--kit` applies `permissions.network` and refuses remote references. Everything else in a
-> spec — the image, the entrypoint, `setup`, `files`, `credentials`, `ports`, `volumes` — is
-> parsed, validated, and **not applied**. The flag says so, and so does every example below
-> that shows a field Boks ignores.
->
-> This is a deliberate order of work rather than an unfinished feature. Why, and what comes
-> next, is in [kits-design.md](kits-design.md).
+> `setup`, `files`, `ports`, `volumes` and `oauth` credentials are parsed, validated, and
+> **not applied**. The flag says so, and so does every example below that shows a field Boks
+> ignores. Why, and what comes next, is in [kits-design.md](kits-design.md).
+
+### Credentials need your approval
+
+A kit names a service and the hosts its credential is sent to; the value is whatever you
+stored under that name. So before a kit's credentials are used, Boks shows them and asks:
+
+```console
+$ boks run team-copilot . --kit git+ssh://git@ghe.example/team/kits.git#dir=copilot
+
+The kit "copilot" wants to use these credentials:
+  ghe-token    API key → sent to api.ghe.example, ghe.example   (stored)
+  wiki-token   API key → sent to wiki.example                   (not set)
+[A]pprove all · [R]eview each · [N]o (default):
+```
+
+An approval is remembered for that kit and that service, and only for exactly the hosts and
+header the kit declared. If the kit later adds a host, you are asked again. A credential you
+do not approve is left out and the sandbox still starts.
+
+With no terminal to ask on, nothing is approved. Run once interactively to remember the
+answer, or pass `--approve-kit-credentials` to approve for that one run. `--inject` is
+unaffected: what you type yourself is never asked about.
 
 ## Using a kit
 

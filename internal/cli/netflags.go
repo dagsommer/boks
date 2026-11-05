@@ -45,6 +45,11 @@ type policyFlags struct {
 	// so that an error can name what the user typed rather than the kit's internal name.
 	kitRef  string
 	kitSpec *kit.Spec
+	// approveKit answers the kit credential approval for this run, and stdin is where it is
+	// asked when it is not answered. A nil stdin — `boks proxy`, `policy ls` — never asks.
+	approveKit bool
+	stdin      io.Reader
+	stderr     io.Writer
 }
 
 // forAgent labels the flags with the agent whose allowlist applies.
@@ -67,7 +72,7 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	// The help says what it DOES, not what a kit is, because a kit declares an image, an
 	// entrypoint, setup commands and credentials too and none of those are applied yet. A
 	// flag advertised as "apply this kit" would be read as all of it.
-	fs.StringVar(&f.kitRef, "kit", "", "apply a kit's network rules: a directory containing "+
+	fs.StringVar(&f.kitRef, "kit", "", "apply a kit: its network rules, agent and credentials (which you approve): a directory containing "+
 		kit.SpecFileName+", a path to one, or git+https://…#ref=<branch|tag|commit>&dir=<path>")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
@@ -460,4 +465,13 @@ func hostnameRuleCaveat(p policy.Policy) string {
 		"  name, but a connection made straight to an address carries none — so a guest\n" +
 		"  that dials an IP is refused even when that IP belongs to an allowed host.\n" +
 		"  Add an address or CIDR rule if a sandbox needs to reach one directly.\n\n"
+}
+
+// errOut is where a question about a kit's credentials is printed. Only `run` and `create` set
+// it; a command that never loads a kit has nothing to say.
+func (f *policyFlags) errOut() io.Writer {
+	if f.stderr == nil {
+		return io.Discard
+	}
+	return f.stderr
 }

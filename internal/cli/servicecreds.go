@@ -67,6 +67,11 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 	if err != nil {
 		return credentialPlan{}, err
 	}
+	// Only what the user has approved. See kitapproval.go: a kit names a service, and the
+	// value is whatever the user stored under that name.
+	if kitSpecs, err = f.gateKitCredentials(kitSpecs, store, f.errOut()); err != nil {
+		return credentialPlan{}, err
+	}
 	plan := credentialPlan{
 		inject: append(kitSpecs, f.inject...),
 		guest:  slices.Clone(f.guest),

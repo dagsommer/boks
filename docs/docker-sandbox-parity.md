@@ -13,7 +13,8 @@ descriptions are written from reading the public documentation and testing behav
 **Status key** — `done` implemented and locally tested · `partial` implemented, incompletely
 verified · `planned` designed, not built · `none` not started.
 
-Last reviewed against Docker's docs: 2026-08-12.
+Last reviewed against Docker's docs: 2026-08-12. sbx release notes through v0.51.0 (2026-11-03) read
+on 2026-11-05; the gap list from that read is in the section at the end.
 
 ---
 
@@ -680,3 +681,35 @@ has yet to build.
 
 *(Moved here from `architecture.md`, which is published on the documentation site; these
 are notes about another vendor's product and belong with the rest of the parity material.)*
+
+
+## Catch-up with sbx v0.49–v0.51 (read 2026-11-05)
+
+Done in this pass: `run`/`create --workdir` (a guest path inside a workspace, fixed at creation
+and refused on re-attach when it differs), `exec` exiting 125 when the command could not be
+run, and `boks ports -p` as the short form of `--publish`.
+
+Also done: `boks cp` out of a sandbox no longer writes through a symlink the guest planted
+(sbx 0.50/0.51 fixed the same class). Extraction now goes through an `os.Root`, and a symlink whose
+target leaves the destination is refused. Before this a guest could write any file the user could,
+anywhere on the host, with an archive of two entries.
+
+Also done: kit credentials are approved by the user before they are used, as sbx now does
+(`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
+were applied unasked, to whatever the user had stored under the service's name.
+
+Not yet built, roughly in the order worth doing:
+
+| Kit `oauth` credentials, `credentialFile`, and `apiKey.proxyManaged` guest placeholders | 0.50/0.51 | Slice 5 remainder. When a credential declares both, sbx lets the API key win; Boks' stored-credential rule is OAuth-first, so the two must be reconciled here |
+
+| sbx feature | Release | Notes |
+|---|---|---|
+| Additional workspaces as `PATH:TARGET[:ro]` and `--mount HOST:SANDBOX_PATH` | 0.50/0.51 | Needs the Windows drive-colon rule in `splitMode` extended |
+| `boks reset` | — | Still `none` above |
+| `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Proxy rule matcher |
+| `sbx secret set-custom --value-stdin`, and custom secrets with no destination host no longer substituting | 0.51 | Boks `secret set` already reads stdin |
+| `kit inspect --resolved`, kit install logs, kit loopback port requests, persistent kit volumes | 0.50/0.51 | Kits slices in kits-design.md |
+| `--no-input`, `run --no-progress` | 0.51 | |
+| Split-horizon DNS via the proxy, 502 for failed upstream connections, upstream connection reuse | 0.51 | |
+| `sandbox.fuse` | 0.51 | Guest kernel support unverified |
+| Cloud sandboxes, `sbx move`, `sbx skills`, `run --model` | 0.42+ | Won't, or later: Boks has no cloud |

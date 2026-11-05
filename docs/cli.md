@@ -342,13 +342,14 @@ boks create shell .
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
 | `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--annotation stringArray` |  | extra OCI annotation KEY=VALUE passed to the runtime (repeatable) |
+| `--approve-kit-credentials` |  | approve the credentials a --kit asks for, for this run only, without asking |
 | `--clone` |  | keep guest writes off your disk: work on a git clone made inside the guest, with the host repository shared read-only at /run/sandbox/source |
 | `--cpus int` | `0` | vCPUs for the guest (0: all host CPUs) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--env stringArray` |  | extra environment variable KEY=VALUE (repeatable) |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
@@ -359,6 +360,7 @@ boks create shell .
 | `-p`, `--publish stringArray` |  | publish a sandbox port on the host, bound to loopback (repeatable): [[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL] |
 | `-t`, `--template string` |  | OCI image for the guest root filesystem (default: the agent's image) |
 | `-v`, `--verbose` |  | describe what is happening: the image, the kit, the command, and the network summary |
+| `--workdir string` |  | directory inside a workspace to start the agent in (fixed when the sandbox is created) |
 
 ## boks daemon
 
@@ -716,7 +718,7 @@ boks policy check github.com:443
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
@@ -872,7 +874,7 @@ Presets:
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
@@ -1037,7 +1039,7 @@ boks ports web --publish 3000            # an ephemeral host port -> 3000 in the
 | Flag | Default | Meaning |
 |---|---|---|
 | `--json` |  | Output in JSON format (for port listing) |
-| `--publish stringArray` |  | Publish a port (can be repeated): [[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL] |
+| `-p`, `--publish stringArray` |  | Publish a port (can be repeated): [[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL] |
 | `--unpublish stringArray` |  | Unpublish a port (can be repeated): [HOST_IP:]HOST_PORT:SANDBOX_PORT[/PROTOCOL] |
 
 ## boks proxy
@@ -1077,7 +1079,7 @@ boks proxy --policy standard
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
 | `--listen string` | `127.0.0.1:0` | address to listen on |
 | `--log string` | `~/.local/state/boks/policy-log.jsonl` | append decisions to this file |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
@@ -1214,6 +1216,7 @@ boks run                              # a shell in the current directory
 | `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
 | `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
 | `--annotation stringArray` |  | extra OCI annotation KEY=VALUE passed to the runtime (repeatable) |
+| `--approve-kit-credentials` |  | approve the credentials a --kit asks for, for this run only, without asking |
 | `--clone` |  | keep guest writes off your disk: work on a git clone made inside the guest, with the host repository shared read-only at /run/sandbox/source |
 | `--cpus int` | `0` | vCPUs for the guest (0: all host CPUs) |
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
@@ -1221,7 +1224,7 @@ boks run                              # a shell in the current directory
 | `--env stringArray` |  | extra environment variable KEY=VALUE (repeatable) |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit's network rules: a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
@@ -1233,6 +1236,7 @@ boks run                              # a shell in the current directory
 | `--rm` |  | destroy the sandbox when the command exits |
 | `-t`, `--template string` |  | OCI image for the guest root filesystem (default: the agent's image) |
 | `-v`, `--verbose` |  | describe what is happening: the image, the kit, the command, and the network summary |
+| `--workdir string` |  | directory inside a workspace to start the agent in (fixed when the sandbox is created) |
 
 ## boks secret
 
