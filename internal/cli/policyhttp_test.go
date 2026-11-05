@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/spf13/pflag"
 )
 
 // TestPolicyHTTPRulesRoundTrip: the sbx flags add, list, check and remove an HTTP rule.
