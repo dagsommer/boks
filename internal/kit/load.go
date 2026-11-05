@@ -31,11 +31,25 @@ import (
 // So an unsupported form fails with the reason rather than with "no such file or directory",
 // which is what a bare os.Stat would have said about `oci://…`.
 func Load(reference string) (*Spec, []string, error) {
-	if reference == "" {
-		return nil, nil, fmt.Errorf("no kit reference given")
-	}
+	spec, warnings, _, err := LoadResolved(reference)
+	return spec, warnings, err
+}
+
+// LoadResolved is Load that also returns, for a git reference whose ref is not already a full
+// commit, the same reference pinned to the commit that was fetched. It is empty for everything
+// else. A caller that has to read the kit again later — a sandbox restarted by a command with
+// no --kit — keeps it instead of the reference, which a branch or tag can move out from under.
+func LoadResolved(reference string) (*Spec, []string, string, error) {
 	if strings.HasPrefix(reference, "git+") {
 		return loadGit(reference)
+	}
+	spec, warnings, err := loadLocal(reference)
+	return spec, warnings, "", err
+}
+
+func loadLocal(reference string) (*Spec, []string, error) {
+	if reference == "" {
+		return nil, nil, fmt.Errorf("no kit reference given")
 	}
 	if scheme, ok := remoteForm(reference); ok {
 		// "a"/"an" from the word itself: "a OCI reference" is the kind of wrongness that

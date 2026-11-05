@@ -155,6 +155,22 @@ permissions:
 		}
 	})
 
+	t.Run("a mutable ref comes back pinned to the commit, a full SHA does not", func(t *testing.T) {
+		_, _, pin, err := LoadResolved("git+file://" + repo + "#dir=vale")
+		if err != nil {
+			t.Fatalf("LoadResolved: %v", err)
+		}
+		want := "git+file://" + repo + "#dir=vale&ref=" + commit
+		if pin != want {
+			t.Errorf("pin = %q, want %q", pin, want)
+		}
+		// The pin must itself load, and be reported as already fixed.
+		s, _, again, err := LoadResolved(pin)
+		if err != nil || s.Name != "vale" || again != "" {
+			t.Errorf("loading the pin: %v, spec %v, pin %q", err, s, again)
+		}
+	})
+
 	t.Run("a full SHA is fetched and warns about nothing", func(t *testing.T) {
 		_, warnings, err := Load("git+file://" + repo + "#ref=" + commit + "&dir=vale")
 		if err != nil {

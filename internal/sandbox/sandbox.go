@@ -142,6 +142,9 @@ type Config struct {
 	// Ports are the `-p/--publish` specifications the sandbox is created with, recorded
 	// on the container so that `boks start` — which has no port flags — republishes them.
 	Ports []string
+	// Kits records the kits the sandbox is created with, so that `boks start` and `boks exec`
+	// — which have no --kit — can read them again and apply what a kit does at every boot.
+	Kits *KitRecord
 	// TTY allocates a pseudo-terminal for the guest process.
 	TTY bool
 	// Ephemeral removes the sandbox, its task and its snapshot when the command exits.
@@ -713,6 +716,11 @@ func containerLabels(cfg Config, command []string) (map[string]string, error) {
 		return nil, err
 	}
 
+	kitsJSON, err := encodeKitsLabel(cfg.Kits)
+	if err != nil {
+		return nil, err
+	}
+
 	labels := map[string]string{
 		LabelManaged:    "1",
 		LabelWorkspaces: workspacesJSON,
@@ -735,6 +743,9 @@ func containerLabels(cfg Config, command []string) (map[string]string, error) {
 				len(portsJSON), maxLabelBytes-len(LabelPorts))
 		}
 		labels[LabelPorts] = portsJSON
+	}
+	if kitsJSON != "" {
+		labels[LabelKits] = kitsJSON
 	}
 	if cfg.Agent != "" {
 		labels[LabelAgent] = cfg.Agent

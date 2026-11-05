@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/v2/client"
+
+	"github.com/dagsommer/boks/internal/workspace"
 )
 
 // Setup is what a kit asks to have done inside the guest: commands to install things, files to
@@ -310,6 +312,39 @@ func ensureSetup(ctx context.Context, container client.Container, task client.Ta
 		}
 	}
 	return nil
+}
+
+// setupConfig rebuilds the part of a Config that ensureSetup reads — where the workspace is and
+// whether it is a clone — from what the sandbox recorded, for a command that did not create it
+// and so has no flags to build one from.
+func setupConfig(labels map[string]string, name string, setup *Setup, progress io.Writer) Config {
+	cfg := Config{Name: name, Setup: setup, Progress: progress}
+	for _, ref := range decodeWorkspaces(labels) {
+		guest := ref.GuestPath
+		if guest == "" {
+			guest = ref.HostPath
+		}
+		cfg.Workspaces = append(cfg.Workspaces, workspace.Workspace{
+			HostPath: ref.HostPath, GuestPath: guest, Mode: workspace.Mode(ref.Mode),
+		})
+	}
+	cfg.Clone = decodeFilesystem(labels).IsClone()
+	return cfg
+}
+
+// ensureRecordedSetup applies a kit's setup to a sandbox a command with no --kit has just
+// brought up. It is ensureSetup for a caller that reloaded the kit from the sandbox's record:
+// the markers make it what ensureSetup always is — install and files once, startup commands once
+// per boot.
+func ensureRecordedSetup(ctx context.Context, container client.Container, task client.Task, setup *Setup, progress io.Writer) error {
+	if setup.Empty() {
+		return nil
+	}
+	labels, err := container.Labels(ctx)
+	if err != nil {
+		return fmt.Errorf("reading sandbox %q: %w", container.ID(), err)
+	}
+	return ensureSetup(ctx, container, task, setupConfig(labels, container.ID(), setup, progress))
 }
 
 // resolveUser maps the names kits use to something exec accepts. Kits write "0", "1000", "root"

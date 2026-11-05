@@ -56,10 +56,13 @@ type Info struct {
 	// Ports are the publish specifications the sandbox was created with. They are the
 	// request rather than the result: what is actually bound right now lives with the
 	// running network stack, and `boks ports` is what shows it.
-	Ports    []string `json:"ports,omitempty"`
-	Cwd      string   `json:"cwd,omitempty"`
-	PID      uint32   `json:"pid,omitempty"`
-	ExitCode *uint32  `json:"exit_code,omitempty"`
+	Ports []string `json:"ports,omitempty"`
+	// Kits is what the sandbox recorded about the kits it was created with. Nil for a
+	// sandbox created without one, or before Boks recorded it.
+	Kits     *KitRecord `json:"kits,omitempty"`
+	Cwd      string     `json:"cwd,omitempty"`
+	PID      uint32     `json:"pid,omitempty"`
+	ExitCode *uint32    `json:"exit_code,omitempty"`
 }
 
 // Workspace returns the sandbox's primary workspace host path, or "" if it has none.
@@ -215,6 +218,13 @@ func Inspect(ctx context.Context, address, name string) (Info, error) {
 // sandbox reporting its first clone and what the host's dirty working tree did not bring
 // with it. A nil out discards it.
 func Start(ctx context.Context, address, name string, out io.Writer) error {
+	return StartWithSetup(ctx, address, name, out, nil)
+}
+
+// StartWithSetup is Start for a caller that has reloaded the sandbox's kit from its record: the
+// kit's setup is applied once the sandbox is up, so a restart runs its startup commands as the
+// `boks run` that created the sandbox did. A nil or empty setup is Start.
+func StartWithSetup(ctx context.Context, address, name string, out io.Writer, setup *Setup) error {
 	ctx = namespaces.WithNamespace(ctx, runtimecfg.Namespace)
 	c, err := connect(ctx, address)
 	if err != nil {
@@ -226,8 +236,11 @@ func Start(ctx context.Context, address, name string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	_, err = ensureRunning(ctx, container, out)
-	return err
+	task, err := ensureRunning(ctx, container, out)
+	if err != nil {
+		return err
+	}
+	return ensureRecordedSetup(ctx, container, task, setup, out)
 }
 
 // Stop shuts a sandbox down without destroying it. The task goes away; the container record
@@ -560,6 +573,7 @@ func describe(ctx context.Context, container client.Container) (Info, error) {
 		Command:     decodeCommand(info.Labels),
 		Policy:      decodePolicy(info.Labels),
 		Ports:       decodePorts(info.Labels),
+		Kits:        decodeKits(info.Labels),
 	}
 
 	if spec, err := container.Spec(ctx); err == nil {

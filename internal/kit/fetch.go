@@ -34,6 +34,18 @@ var fullSHA = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 // user between two runs.
 func (g gitRef) Immutable() bool { return fullSHA.MatchString(g.Ref) }
 
+// pinnedTo is the reference that names commit instead of the ref this one carries, keeping the
+// repository and directory. A sandbox records it so that bringing it back up reads the kit it
+// was created with, whatever a branch or tag has moved to since.
+func (g gitRef) pinnedTo(commit string) string {
+	v := url.Values{}
+	v.Set("ref", commit)
+	if g.Dir != "" {
+		v.Set("dir", g.Dir)
+	}
+	return "git+" + g.URL + "#" + v.Encode()
+}
+
 // parseGitRef splits a git+ reference into its parts.
 //
 // The grammar is Docker's: `git+https://host/org/repo.git#ref=<branch|tag|commit>&dir=<path>`,
@@ -210,15 +222,15 @@ func fetchGit(ctx context.Context, g gitRef, dest string) (string, error) {
 // The commit is reported in the warnings whatever the ref was, because that is the fact a
 // reader needs later: "which kit did this sandbox actually run" has one answer, and a branch
 // name is not it.
-func loadGit(reference string) (*Spec, []string, error) {
+func loadGit(reference string) (*Spec, []string, string, error) {
 	g, err := parseGitRef(reference)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	dest, err := os.MkdirTemp("", "boks-kit-")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 	// The clone is read and dropped: spec.yaml and the files/ tree are both read into memory
 	// before this returns, so nothing needs the directory afterwards.
@@ -229,7 +241,7 @@ func loadGit(reference string) (*Spec, []string, error) {
 
 	commit, err := fetchGit(ctx, g, dest)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	// FromSlash: g.Dir is a repository path and dest is a host path, so this is the one
@@ -241,23 +253,25 @@ func loadGit(reference string) (*Spec, []string, error) {
 		if g.Dir != "" {
 			where = g.Dir
 		}
-		return nil, nil, fmt.Errorf("%s has no %s in %s (at commit %s)",
+		return nil, nil, "", fmt.Errorf("%s has no %s in %s (at commit %s)",
 			g.URL, SpecFileName, where, commit)
 	}
 
 	spec, warnings, err := ParseSpec(data)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%s#%s: %w", g.URL, commit, err)
+		return nil, nil, "", fmt.Errorf("%s#%s: %w", g.URL, commit, err)
 	}
 
 	tree, treeWarnings, err := ReadTree(filepath.Dir(specPath))
 	if err != nil {
-		return nil, nil, fmt.Errorf("%s#%s: %w", g.URL, commit, err)
+		return nil, nil, "", fmt.Errorf("%s#%s: %w", g.URL, commit, err)
 	}
 	spec.Tree = tree
 	warnings = append(warnings, treeWarnings...)
 	warnings = append(warnings, fmt.Sprintf("fetched from %s at commit %s", g.URL, commit))
+	pinned := ""
 	if !g.Immutable() {
+		pinned = g.pinnedTo(commit)
 		// Reported, not refused. Docker's normative specification requires an immutable
 		// ref and its product documentation says the opposite — `#ref=<branch|tag|commit>`,
 		// "Defaults to the repository's default branch", with a tag in its own example —
@@ -276,7 +290,7 @@ func loadGit(reference string) (*Spec, []string, error) {
 			"%s is not a fixed commit, so this kit may differ on the next run; "+
 				"use #ref=%s to pin it", named, commit))
 	}
-	return spec, warnings, nil
+	return spec, warnings, pinned, nil
 }
 
 // isTerminal reports whether f is a character device — a terminal rather than a pipe or file.

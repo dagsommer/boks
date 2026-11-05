@@ -30,6 +30,10 @@ type ExecConfig struct {
 	User string
 	// TTY allocates a pseudo-terminal for the process.
 	TTY bool
+	// Setup is a kit's setup reloaded from the sandbox's record, applied once the sandbox is up
+	// and before the command runs, so that an exec which boots a stopped sandbox gives it the
+	// startup commands `boks run` would have. Nil does nothing.
+	Setup *Setup
 
 	Stdin  io.Reader
 	Stdout io.Writer
@@ -68,6 +72,9 @@ func Exec(ctx context.Context, cfg ExecConfig) (int, error) {
 	// give. sbx starts it too. Only a sandbox that cannot be started is an error.
 	task, err := ensureRunning(ctx, container, cfg.Stderr)
 	if err != nil {
+		return 1, err
+	}
+	if err := ensureRecordedSetup(ctx, container, task, cfg.Setup, cfg.Stderr); err != nil {
 		return 1, err
 	}
 

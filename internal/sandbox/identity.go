@@ -70,6 +70,13 @@ const (
 	// when a sandbox is created because it lives in the OCI mounts, so this label is
 	// both what `boks ls` reports and what a re-attach checks a `--clone` against.
 	LabelFilesystem = "dev.boks.filesystem"
+	// LabelKits is the kits the sandbox was created with: the references as typed, where
+	// each one is to be read from now, and a digest of what they composed to. See KitRecord.
+	//
+	// Without it `boks start` and `boks exec` — which take no --kit — brought a sandbox back
+	// up without what the kit does at every boot: the credentials attached to its traffic
+	// and the setup.startup commands. It holds references and a digest, never the spec.
+	LabelKits = "dev.boks.kits"
 )
 
 // maxLabelBytes is containerd's limit on the size of one label's key and value together.
@@ -523,4 +530,68 @@ func decodePolicy(labels map[string]string) *policy.SandboxPolicy {
 		return nil
 	}
 	return &p
+}
+
+// KitRecord is what a sandbox remembers about the kits it was created with: enough to read
+// them again when a command that names no kit brings the sandbox back up, and to notice when
+// what they say has changed.
+//
+// It is references and a digest rather than the spec, for the label's size: a kit carries a
+// files/ tree and setup scripts, and containerd rejects a label over maxLabelBytes.
+type KitRecord struct {
+	V int `json:"v"`
+	// Refs are the --kit references as the user gave them, in order. The credential approval
+	// is keyed by a kit's reference, so these are what an approval is looked up under.
+	Refs []string `json:"refs"`
+	// Pins maps a reference to what is read in its place on a restart: a remote reference
+	// pinned to the commit that was fetched, or a relative local path made absolute. A
+	// reference missing here is read as it stands.
+	Pins map[string]string `json:"pins,omitempty"`
+	// Digest identifies the composed kits at creation. A later load that differs is a kit
+	// that changed on disk, which is worth a line and not a refusal.
+	Digest string `json:"digest,omitempty"`
+}
+
+// KitRecordVersion is the version of the record's shape.
+const KitRecordVersion = 1
+
+// Target is what to read for a recorded reference.
+func (k *KitRecord) Target(ref string) string {
+	if p, ok := k.Pins[ref]; ok {
+		return p
+	}
+	return ref
+}
+
+// encodeKitsLabel serialises the record, refusing one containerd would reject. A sandbox that
+// quietly failed to remember its kit would be one whose credentials vanish on restart.
+func encodeKitsLabel(k *KitRecord) (string, error) {
+	if k == nil || len(k.Refs) == 0 {
+		return "", nil
+	}
+	raw, err := encodeLabel(k)
+	if err != nil {
+		return "", err
+	}
+	if len(raw)+len(LabelKits) > maxLabelBytes {
+		return "", fmt.Errorf("the kit references are too long to record on the sandbox (%d bytes, limit %d).\n"+
+			"A sandbox that cannot remember its kits comes back up without them, so boks refuses\n"+
+			"rather than create it. Use fewer or shorter --kit references",
+			len(raw), maxLabelBytes-len(LabelKits))
+	}
+	return raw, nil
+}
+
+// decodeKits reads the record back. As with every other label, one that is absent or
+// unreadable is a sandbox that predates it and simply has no kits to reload.
+func decodeKits(labels map[string]string) *KitRecord {
+	raw := labels[LabelKits]
+	if raw == "" {
+		return nil
+	}
+	var k KitRecord
+	if err := json.Unmarshal([]byte(raw), &k); err != nil || len(k.Refs) == 0 {
+		return nil
+	}
+	return &k
 }
