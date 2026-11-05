@@ -162,7 +162,6 @@ func newRootCommand(env Env) *cobra.Command {
 		return &usageError{err: err}
 	})
 
-
 	root.AddCommand(
 		newRunCommand(env, dev),
 		newExecCommand(env, dev),

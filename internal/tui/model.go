@@ -529,9 +529,17 @@ func (m Model) keyCards(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.moveSelection(1)
 	case "right", "l", "tab":
-		if _, ok := m.Selected(); ok {
-			m.focus = focusPane
+		if _, ok := m.Selected(); !ok {
+			break
 		}
+		if m.width < minPaneWidth {
+			// Too narrow for the pane beside the cards: the network view, narrowed
+			// to this sandbox, is the same information at full width.
+			m.openNetwork()
+			m.netFilter = m.sel
+			break
+		}
+		m.focus = focusPane
 	case "enter":
 		return m.attach()
 	case "s":

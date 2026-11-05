@@ -26,9 +26,9 @@ const (
 type styles struct {
 	r *lipgloss.Renderer
 
-	border, borderSel, cardTitle, name, faint, text, bold lipgloss.Style
+	border, borderSel, cardTitle, name, faint, text, bold   lipgloss.Style
 	green, yellow, red, blue, tabActive, sep, key, errStyle lipgloss.Style
-	paneBar, paneBarFocus                                     lipgloss.Style
+	paneBar, paneBarFocus                                   lipgloss.Style
 }
 
 func newStyles(noColor bool) styles {
@@ -37,7 +37,9 @@ func newStyles(noColor bool) styles {
 		r = lipgloss.NewRenderer(io.Discard)
 		r.SetColorProfile(termenv.Ascii)
 	}
-	c := func(light, dark string) lipgloss.AdaptiveColor { return lipgloss.AdaptiveColor{Light: light, Dark: dark} }
+	c := func(light, dark string) lipgloss.AdaptiveColor {
+		return lipgloss.AdaptiveColor{Light: light, Dark: dark}
+	}
 	s := styles{r: r}
 	s.border = r.NewStyle().Foreground(c("248", "240"))
 	s.borderSel = r.NewStyle().Foreground(c("26", "75"))

@@ -644,6 +644,11 @@ func TestSmallTerminalDegrades(t *testing.T) {
 	if !strings.Contains(v, "claude-web") {
 		t.Error("a narrow terminal still shows the cards")
 	}
+	// Tab, which would move into the hidden pane, opens the network view for the sandbox.
+	m, _ = press(t, m, "tab")
+	if m.view != viewNetwork || m.netFilter != "claude-web" || len(m.LogRows()) != 2 {
+		t.Fatalf("narrow tab: view=%v filter=%q", m.view, m.netFilter)
+	}
 }
 
 func TestNoColorEmitsNoEscapes(t *testing.T) {
