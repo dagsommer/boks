@@ -114,3 +114,24 @@ func TestPolicyHTTPRuleRefusals(t *testing.T) {
 	mustPolicy(t, "deny", "--sandbox", "web", "api.example.com", "--method", "GET")
 	mustPolicy(t, "deny", "api.example.com", "--method", "DELETE")
 }
+
+func TestPolicyScopeRefusesAnEmptySandbox(t *testing.T) {
+	for _, name := range []string{"sandbox", "profile"} {
+		var sc scopeSelector
+		fs := pflag.NewFlagSet("t", pflag.ContinueOnError)
+		sc.register(fs)
+		if err := fs.Parse([]string{"--" + name + "="}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sc.scope(); err == nil || !strings.Contains(err.Error(), "must not be empty") {
+			t.Errorf("--%s=: err = %v, want a refusal", name, err)
+		}
+	}
+	var none scopeSelector
+	fs := pflag.NewFlagSet("t", pflag.ContinueOnError)
+	none.register(fs)
+	_ = fs.Parse(nil)
+	if _, err := none.scope(); err != nil {
+		t.Errorf("no scope flags: %v", err)
+	}
+}

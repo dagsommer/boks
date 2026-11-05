@@ -41,14 +41,27 @@ func openPolicyStore() (*policy.Store, error) {
 type scopeSelector struct {
 	sandbox string
 	profile string
+	fs      *pflag.FlagSet
 }
 
 func (sc *scopeSelector) register(fs *pflag.FlagSet) {
+	sc.fs = fs
 	fs.StringVar(&sc.sandbox, "sandbox", "", "scope the rule to one sandbox instead of all of them")
 	fs.StringVar(&sc.profile, "profile", "", "scope the rule to a stored policy profile")
 }
 
 func (sc *scopeSelector) scope() (policy.ScopeRef, error) {
+	// An empty value is refused rather than read as "not given": it would otherwise widen the
+	// change to every sandbox (sbx 0.51 fixed the same thing).
+	for _, name := range []string{"sandbox", "profile"} {
+		v := sc.sandbox
+		if name == "profile" {
+			v = sc.profile
+		}
+		if sc.fs != nil && sc.fs.Changed(name) && strings.TrimSpace(v) == "" {
+			return policy.ScopeRef{}, usagef("--%s must not be empty; leave it out to change every sandbox", name)
+		}
+	}
 	return policy.ParseScope(sc.sandbox, sc.profile)
 }
 
