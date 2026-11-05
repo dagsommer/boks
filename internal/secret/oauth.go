@@ -434,6 +434,8 @@ type CredentialFileData struct {
 	ExpiresAt        int64 // unix milliseconds, which is what Claude Code's file uses
 	ExpiresAtSeconds int64
 	Scopes           []string
+	// ScopesJSON is Scopes as a JSON array, for the kit grammar's .ScopesJSON.
+	ScopesJSON       string
 	SubscriptionType string
 }
 
@@ -452,6 +454,8 @@ func (o *OAuth) renderFile() ([]byte, error) {
 		Scopes:           o.Scopes,
 		SubscriptionType: o.SubscriptionType,
 	}
+	scopes, _ := json.Marshal(append([]string{}, o.Scopes...))
+	data.ScopesJSON = string(scopes)
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("oauth credential file template: %w", err)

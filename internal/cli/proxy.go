@@ -98,7 +98,7 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 			if err != nil {
 				return err
 			}
-			oauthRules, err := oauthCredentials(cmd.Context(), fileStore, plan.oauth)
+			oauthRules, err := oauthCredentials(cmd.Context(), fileStore, plan.oauth, plan.kitOAuth)
 			if err != nil {
 				return err
 			}
@@ -189,7 +189,7 @@ func (s stderrSink) Record(d policy.Decision) { fmt.Fprintln(s.w, d) }
 // stored record rather than from a flag, because it is a property of the credential that was
 // imported and not of this run. `--oauth NAME` is therefore all a user has to type, and two
 // commands cannot disagree about what a credential means.
-func oauthCredentials(ctx context.Context, store secret.Store, names []string) ([]secret.Credential, error) {
+func oauthCredentials(ctx context.Context, store secret.Store, names []string, kitShapes map[string]kitOAuth) ([]secret.Credential, error) {
 	var out []secret.Credential
 	for _, name := range names {
 		record, err := store.LookupOAuthRecord(ctx, name)
@@ -198,6 +198,11 @@ func oauthCredentials(ctx context.Context, store secret.Store, names []string) (
 				return nil, fmt.Errorf("no oauth credential named %q; import one with 'boks secret import %s'", name, name)
 			}
 			return nil, err
+		}
+		if k, ok := kitShapes[name]; ok {
+			if record, err = k.apply(record); err != nil {
+				return nil, err
+			}
 		}
 		c, err := record.Credential()
 		if err != nil {

@@ -44,10 +44,21 @@ import (
 // kitCredentialAsk is one service a kit wants a credential attached for.
 type kitCredentialAsk struct {
 	service string
-	// specs are the --inject specs the kit declared for the service.
+	// specs are the --inject specs the kit declared for the service, or for an OAuth
+	// credential the one line kitOAuth.fingerprint gives.
 	specs  []string
 	hosts  []string
 	stored bool
+	oauth  bool
+}
+
+// key is what an approval is recorded and looked up under. A login and an API key for one
+// service name are different requests, and approving one must not approve the other.
+func (a kitCredentialAsk) key() string {
+	if a.oauth {
+		return a.service + " (oauth)"
+	}
+	return a.service
 }
 
 // fingerprint identifies exactly what the kit asked for, order aside.
@@ -82,6 +93,18 @@ func kitCredentialAsks(specs []string, stored map[string]bool) ([]kitCredentialA
 	return asks, nil
 }
 
+// kitOAuthAsks is kitCredentialAsks for a kit's OAuth credentials.
+func kitOAuthAsks(shapes []kitOAuth, stored map[string]bool) []kitCredentialAsk {
+	var asks []kitCredentialAsk
+	for _, k := range shapes {
+		asks = append(asks, kitCredentialAsk{
+			service: k.service, specs: []string{k.fingerprint()}, hosts: k.hosts(),
+			stored: stored[k.service], oauth: true,
+		})
+	}
+	return asks
+}
+
 // kitApprovals is the file the answers are kept in: kit key → service → fingerprint.
 type kitApprovals struct {
 	path string
@@ -111,14 +134,14 @@ func loadKitApprovals(path string) (*kitApprovals, error) {
 }
 
 func (a *kitApprovals) approved(kitKey string, ask kitCredentialAsk) bool {
-	return a.Kits[kitKey][ask.service] == ask.fingerprint()
+	return a.Kits[kitKey][ask.key()] == ask.fingerprint()
 }
 
 func (a *kitApprovals) record(kitKey string, ask kitCredentialAsk) {
 	if a.Kits[kitKey] == nil {
 		a.Kits[kitKey] = map[string]string{}
 	}
-	a.Kits[kitKey][ask.service] = ask.fingerprint()
+	a.Kits[kitKey][ask.key()] = ask.fingerprint()
 }
 
 func (a *kitApprovals) save() error {
@@ -145,24 +168,36 @@ func (f *policyFlags) registerKitApproval(fs *pflag.FlagSet) {
 // gateKitCredentials returns the part of a kit's credential specs the user has approved,
 // asking about the rest when there is a terminal to ask on.
 func (f *policyFlags) gateKitCredentials(specs []string, store secret.Store, stderr io.Writer) ([]string, error) {
-	if len(specs) == 0 || f.kitSpec == nil {
-		return nil, nil
+	specs, _, err := f.gateKit(specs, nil, store, stderr)
+	return specs, err
+}
+
+// gateKit is gateKitCredentials for API-key specs and OAuth shapes together: they are asked
+// about in one prompt, and either kind is applied only if approved.
+func (f *policyFlags) gateKit(specs []string, shapes []kitOAuth, store secret.Store, stderr io.Writer) ([]string, []kitOAuth, error) {
+	if (len(specs) == 0 && len(shapes) == 0) || f.kitSpec == nil {
+		return nil, nil, nil
 	}
-	stored := map[string]bool{}
+	stored, storedOAuth := map[string]bool{}, map[string]bool{}
 	if store != nil && !f.noSecrets {
 		if entries, err := store.Entries(); err == nil {
 			for _, e := range entries {
-				stored[e.Name] = true
+				if e.OAuth {
+					storedOAuth[e.Name] = true
+				} else {
+					stored[e.Name] = true
+				}
 			}
 		}
 	}
 	asks, err := kitCredentialAsks(specs, stored)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	asks = append(asks, kitOAuthAsks(shapes, storedOAuth)...)
 	approvals, err := loadKitApprovals(kitApprovalsPath())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	key := f.kitSpec.Name + "\x00" + f.kitRef
 
@@ -170,7 +205,7 @@ func (f *policyFlags) gateKitCredentials(specs []string, store secret.Store, std
 	granted := map[string]bool{}
 	for _, a := range asks {
 		if approvals.approved(key, a) {
-			granted[a.service] = true
+			granted[a.key()] = true
 		} else {
 			pending = append(pending, a)
 		}
@@ -180,17 +215,17 @@ func (f *policyFlags) gateKitCredentials(specs []string, store secret.Store, std
 	case len(pending) == 0:
 	case f.approveKit:
 		for _, a := range pending {
-			granted[a.service] = true
+			granted[a.key()] = true
 		}
 		fmt.Fprintf(stderr, "kit %q: credentials approved for this run by --approve-kit-credentials: %s\n",
 			f.kitSpec.Name, askNames(pending))
 	case f.stdin != nil && !f.noInput && isTerminal(f.stdin):
 		answered, err := f.askKitCredentials(pending, bufio.NewReader(f.stdin), stderr)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, a := range answered {
-			granted[a.service] = true
+			granted[a.key()] = true
 			approvals.record(key, a)
 		}
 		if len(answered) > 0 {
@@ -210,13 +245,19 @@ func (f *policyFlags) gateKitCredentials(specs []string, store secret.Store, std
 			out = append(out, spec)
 		}
 	}
-	return out, nil
+	var outOAuth []kitOAuth
+	for _, k := range shapes {
+		if granted[k.service+" (oauth)"] {
+			outOAuth = append(outOAuth, k)
+		}
+	}
+	return out, outOAuth, nil
 }
 
 func askNames(asks []kitCredentialAsk) string {
 	names := make([]string, len(asks))
 	for i, a := range asks {
-		names[i] = a.service
+		names[i] = a.key()
 	}
 	return strings.Join(names, ", ")
 }
@@ -232,8 +273,12 @@ func describeKitCredentials(w io.Writer, kitName string, asks []kitCredentialAsk
 		if a.stored {
 			state = "stored"
 		}
-		fmt.Fprintf(w, "  %-*s  API key → sent to %s   (%s)\n",
-			width, a.service, strings.Join(a.hosts, ", "), state)
+		kind := "API key"
+		if a.oauth {
+			kind = "OAuth login"
+		}
+		fmt.Fprintf(w, "  %-*s  %s → sent to %s   (%s)\n",
+			width, a.service, kind, strings.Join(a.hosts, ", "), state)
 	}
 }
 
@@ -247,7 +292,7 @@ func (f *policyFlags) askKitCredentials(asks []kitCredentialAsk, in *bufio.Reade
 	case "r", "review", "review each":
 		var approved []kitCredentialAsk
 		for _, a := range asks {
-			fmt.Fprintf(w, "Send %s to %s? [y/N]: ", a.service, strings.Join(a.hosts, ", "))
+			fmt.Fprintf(w, "Send %s to %s? [y/N]: ", a.key(), strings.Join(a.hosts, ", "))
 			if r := answer(in); r == "y" || r == "yes" {
 				approved = append(approved, a)
 			}

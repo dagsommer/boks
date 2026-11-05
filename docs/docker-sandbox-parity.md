@@ -75,7 +75,7 @@ output, plus a live `sbx ls`.
 | Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
 | `-p/--publish` | Publishes a sandbox port on the host at creation; ignored when re-attaching | Same flag, same short form, same rule — a re-attaching run says so rather than looking obeyed, and points at `boks ports` | P1 | done |
 | `--clone` | Run flag for clone mode | Implemented — `internal/cli/common.go` registers it, `internal/sandbox/clone.go` is the machinery | P1 | done |
-| `--kit` | Run flag naming a kit to apply | Partial: `--kit <dir>` applies a kit's `permissions.network` as its own policy layer. Local directories and `git+https`/`git+ssh` references work; OCI and ZIP are refused by name. Image, entrypoint, `setup` (install/files/startup) and API-key credentials are applied; the `files/` tree is applied (workspace files never overwrite); ports, volumes and OAuth credentials are parsed and not applied. Usage in [kits.md](kits.md); design and slices in [kits-design.md](kits-design.md) | P1 | partial |
+| `--kit` | Run flag naming a kit to apply | Partial: `--kit <dir>` applies a kit's `permissions.network` as its own policy layer. Local directories and `git+https`/`git+ssh` references work; OCI and ZIP are refused by name. Image, entrypoint, `setup` (install/files/startup), API-key and OAuth credentials are applied (after approval); the `files/` tree is applied (workspace files never overwrite); ports and volumes are parsed and not applied. Usage in [kits.md](kits.md); design and slices in [kits-design.md](kits-design.md) | P1 | partial |
 | `--profile` | "Governance profile to assign to the sandbox" | `-profile NAME` on `run` and `create`, selecting a stored profile — a named preset plus rules. Local rules still apply on top of it, and a deny in any scope still wins | P1 | done |
 | `ssh` | `sbx ssh` opens an SSH session into a sandbox | None | P2 | none |
 | `daemon` | `sbx daemon start\|stop` controls a background service | Boks has no daemon and needs none today; it drives containerd directly | P2 | none |
@@ -717,9 +717,18 @@ Also done: kit credentials are approved by the user before they are used, as sbx
 (`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
 were applied unasked, to whatever the user had stored under the service's name.
 
-Not yet built, roughly in the order worth doing:
+Also done: kit `oauth` credentials and `credentialFile`. The block is the *shape* of a login and is
+laid over the OAuth credential stored under the service's name (endpoint, resource hosts, sentinels,
+response fields, file template); tokens never leave the store. `credentialFile.path` is redirected
+into `/etc/boks/credentials/` because Boks shares directories, not files. An entry declaring both
+`apiKey` and `oauth` uses the API key, as sbx does, decided within the entry only; a login adopted
+separately still beats a key by destination. `passthrough` is refused with an error and
+`credentialFile.structure` is refused (sbx's engine does not support it either). OAuth entries go
+through the same approval prompt, and the approval is bound to the whole shape. **Unverified:** no
+guest has run a kit-declared login end to end; what is tested is the mapping, approval, merge and
+credential-file rendering.
 
-| Kit `oauth` credentials, `credentialFile`, and `apiKey.proxyManaged` guest placeholders | 0.50/0.51 | Slice 5 remainder. When a credential declares both, sbx lets the API key win; Boks' stored-credential rule is OAuth-first, so the two must be reconciled here |
+Not yet built, roughly in the order worth doing:
 
 | sbx feature | Release | Notes |
 |---|---|---|
