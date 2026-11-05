@@ -698,6 +698,11 @@ A deny in any scope beats an allow in any scope. A sandbox-scoped rule can add a
 machine's policy already tolerates and can take access away, but it can never widen past a
 deny someone wrote down.
 
+A rule is refused, and nothing is added, when the same scope already holds the opposite
+decision for the same destination (for HTTP rules, the same methods, path and query
+constraints). Remove the existing rule first; rules in different scopes can coexist, and the
+deny takes precedence.
+
 ```
 Destinations:
   github.com              any port
@@ -709,14 +714,37 @@ Destinations:
 ```
 
 ```
+HTTP rules:
+  Use --method to add an HTTP rule. --method accepts comma-separated HTTP methods or ANY;
+  --path defaults to /**. Repeat --query name=value to require query parameters. A path glob's
+  '*' matches within one segment and '**' across segments; a query value is URL-query-encoded,
+  with '*' as a wildcard (%2A is a literal star). The destination must be a host pattern, not
+  an IP address or a range.
+```
+
+```
+  An HTTP rule is applied to requests boks reads: plaintext HTTP through the proxy, and HTTPS
+  that boks decrypts with its CA, which it does for a host with an HTTP rule as it does for a
+  host with a credential. A flow boks cannot read — a raw socket, a tunnel without the CA — is
+  refused if an HTTP rule decides it: an HTTP allow never opens raw access to the host, and an
+  HTTP deny on an otherwise allowed host closes raw access to it, because the deny could not be
+  enforced there. A sandbox gets the CA when it is created with a credential or an HTTP rule.
+```
+
+```
 boks policy allow github.com:443 --note "git over HTTPS"
   boks policy allow --sandbox claude-myproject api.example.com:443
+  boks policy allow api.example.com --method GET,HEAD --path '/v1/**'
+  boks policy allow api.example.com --method ANY --query team=platform
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--method strings` |  | restrict the rule to these HTTP methods (comma-separated); use ANY to match all methods |
 | `--note string` |  | why this rule exists; shown by 'boks policy ls' |
+| `--path string` |  | restrict the rule to this HTTP path glob (e.g. /repos/**); defaults to /** |
 | `--profile string` |  | scope the rule to a stored policy profile |
+| `--query stringArray` |  | require an HTTP query parameter (name=value pattern); repeatable |
 | `--sandbox string` |  | scope the rule to one sandbox instead of all of them |
 
 ### boks policy check
@@ -741,10 +769,86 @@ at all, so a hostname-only policy denies it.
 Credential rules are not recorded on a sandbox, so pass --inject to see the mode a
 credential-bearing host would get.
 
+An http:// or https:// URL is checked as an HTTP request (GET unless --method says
+otherwise): network access first, then the HTTP method, path and query rules when the host
+has any, as 'sbx policy check http' does. Any other destination is checked as a connection;
+a host whose verdict depends on HTTP rules is reported as refused to a flow boks cannot read.
+The 'http' and 'network' subcommands are sbx's spellings of the two.
+
 ```
 boks policy check github.com:443
   boks policy check --sandbox web api.example.com:443
   boks policy check --policy locked --allow example.com:443 example.com:443
+  boks policy check --method POST https://api.example.com/v1/items
+  boks policy check http 'https://api.example.com/search?team=platform'
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--agent string` |  | include the allowlist this agent's definition carries (shell, pi-local, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
+| `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
+| `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
+| `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
+| `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
+| `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
+| `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
+| `--method string` |  | HTTP method to evaluate for a URL (default "GET") |
+| `--net string` |  | network mode: none (no network at all) or nat (default nat) |
+| `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
+| `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
+| `--policy string` |  | network policy preset: open, standard, locked (default standard) |
+| `--profile string` |  | stored policy profile to apply ('boks policy profile ls') |
+| `--sandbox string` |  | check as this sandbox, including rules scoped to it |
+
+#### boks policy check http
+
+Check an HTTP request to a URL, without making it
+
+```
+boks policy check http [flags] URL...
+```
+
+Evaluates the policy for an HTTP request to URL. URL must be an absolute HTTP or HTTPS URL.
+The check evaluates network access first, then the HTTP method, path and query rules when the
+host has any. Nothing is contacted.
+
+```
+boks policy check http https://api.example.com/v1/items
+  boks policy check http --method POST https://api.example.com/v1/items
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--agent string` |  | include the allowlist this agent's definition carries (shell, pi-local, claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode) |
+| `--allow stringArray` |  | allow a destination, host[:ports] (repeatable) |
+| `--allow-host-port ints` |  | let the sandbox reach a port on this machine's loopback as http://host.boks.internal:PORT, through the proxy only (repeatable) |
+| `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
+| `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
+| `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
+| `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
+| `--method string` |  | HTTP method to evaluate for a URL (default "GET") |
+| `--net string` |  | network mode: none (no network at all) or nat (default nat) |
+| `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
+| `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
+| `--policy string` |  | network policy preset: open, standard, locked (default standard) |
+| `--profile string` |  | stored policy profile to apply ('boks policy profile ls') |
+| `--sandbox string` |  | check as this sandbox, including rules scoped to it |
+
+#### boks policy check network
+
+Check network access to a host, without contacting it
+
+```
+boks policy check network [flags] TARGET...
+```
+
+Checks whether the policy allows a connection to TARGET. TARGET may be a hostname, host:port,
+IP literal, or URL; a bare host is checked on 443, and a URL supplies only its host and port:
+this evaluates network authorization, not HTTP method or path.
+
+```
+boks policy check network api.example.com
+  boks policy check network https://api.example.com/v1
 ```
 
 | Flag | Default | Meaning |
@@ -779,6 +883,11 @@ A deny in any scope beats an allow in any scope. A sandbox-scoped rule can add a
 machine's policy already tolerates and can take access away, but it can never widen past a
 deny someone wrote down.
 
+A rule is refused, and nothing is added, when the same scope already holds the opposite
+decision for the same destination (for HTTP rules, the same methods, path and query
+constraints). Remove the existing rule first; rules in different scopes can coexist, and the
+deny takes precedence.
+
 ```
 Destinations:
   github.com              any port
@@ -790,14 +899,36 @@ Destinations:
 ```
 
 ```
+HTTP rules:
+  Use --method to add an HTTP rule. --method accepts comma-separated HTTP methods or ANY;
+  --path defaults to /**. Repeat --query name=value to require query parameters. A path glob's
+  '*' matches within one segment and '**' across segments; a query value is URL-query-encoded,
+  with '*' as a wildcard (%2A is a literal star). The destination must be a host pattern, not
+  an IP address or a range.
+```
+
+```
+  An HTTP rule is applied to requests boks reads: plaintext HTTP through the proxy, and HTTPS
+  that boks decrypts with its CA, which it does for a host with an HTTP rule as it does for a
+  host with a credential. A flow boks cannot read — a raw socket, a tunnel without the CA — is
+  refused if an HTTP rule decides it: an HTTP allow never opens raw access to the host, and an
+  HTTP deny on an otherwise allowed host closes raw access to it, because the deny could not be
+  enforced there. A sandbox gets the CA when it is created with a credential or an HTTP rule.
+```
+
+```
 boks policy deny github.com:443 --note "git over HTTPS"
   boks policy deny --sandbox claude-myproject api.example.com:443
+  boks policy deny api.example.com --method POST --path '/admin/**'
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--method strings` |  | restrict the rule to these HTTP methods (comma-separated); use ANY to match all methods |
 | `--note string` |  | why this rule exists; shown by 'boks policy ls' |
+| `--path string` |  | restrict the rule to this HTTP path glob (e.g. /repos/**); defaults to /** |
 | `--profile string` |  | scope the rule to a stored policy profile |
+| `--query stringArray` |  | require an HTTP query parameter (name=value pattern); repeatable |
 | `--sandbox string` |  | scope the rule to one sandbox instead of all of them |
 
 ### boks policy init
@@ -896,6 +1027,12 @@ because they always win. Nothing here contacts the network or a sandbox.
 The --policy, --allow, --deny and --profile flags resolve a hypothetical: they show what a
 run given those flags would get, on top of what is stored.
 
+An HTTP rule is shown with its selector in the form 'boks policy allow' accepts back:
+"api.example.com --method GET,HEAD --path '/v1/**' --query team=platform".
+
+\--wide prints one row per effective rule, with the HTTP selector in its own METHODS, PATH and
+QUERY columns; --json prints the stored and effective rules for scripts.
+
 ```
 Presets:
   open      allow everything except this machine's own loopback and link-local addresses
@@ -911,6 +1048,7 @@ Presets:
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
+| `--json` |  | print the stored and effective rules as JSON |
 | `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
@@ -919,6 +1057,7 @@ Presets:
 | `--profile string` |  | stored policy profile to apply ('boks policy profile ls') |
 | `--sandbox string` |  | resolve as this sandbox, including rules scoped to it |
 | `--stored` |  | print only the stored rules, without resolving them |
+| `--wide` |  | print one row per effective rule, with scope, decision, resource and HTTP selector columns |
 
 ### boks policy profile
 
@@ -1021,15 +1160,24 @@ Removes stored rules. Without --action, both dispositions for the destination go
 only the one named. A destination is matched as the engine sees it, so "GitHub.com:443"
 removes the rule stored as "github.com:443".
 
+An HTTP rule is identified by its selector as well as its destination: give the same
+\--method, --path and --query it was added with (the path defaults to /**, as when adding).
+Without --method, only the destination's connection rules are removed; if it has only HTTP
+rules, the error lists the command that removes each.
+
 ```
 boks policy rm github.com:443
   boks policy rm --sandbox web --action allow api.example.com:443
+  boks policy rm api.example.com --method GET --path '/v1/**'
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--action string` |  | remove only the allow or only the deny for this destination |
+| `--method strings` |  | identify the rule to these HTTP methods (comma-separated); use ANY to match all methods |
+| `--path string` |  | identify the rule to this HTTP path glob (e.g. /repos/**); defaults to /** |
 | `--profile string` |  | scope the rule to a stored policy profile |
+| `--query stringArray` |  | require an HTTP query parameter (name=value pattern); repeatable |
 | `--sandbox string` |  | scope the rule to one sandbox instead of all of them |
 
 ## boks ports

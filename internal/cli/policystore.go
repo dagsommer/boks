@@ -13,7 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -67,6 +70,57 @@ const ruleGrammar = `Destinations:
   10.0.0.0/8              an address range
   [::1]:8080              an IPv6 literal with a port`
 
+// httpRuleHelp explains the HTTP selector flags, in the words sbx uses for the same flags plus
+// what Boks does with a flow it cannot read.
+const httpRuleHelp = `HTTP rules:
+  Use --method to add an HTTP rule. --method accepts comma-separated HTTP methods or ANY;
+  --path defaults to /**. Repeat --query name=value to require query parameters. A path glob's
+  '*' matches within one segment and '**' across segments; a query value is URL-query-encoded,
+  with '*' as a wildcard (%2A is a literal star). The destination must be a host pattern, not
+  an IP address or a range.
+
+  An HTTP rule is applied to requests boks reads: plaintext HTTP through the proxy, and HTTPS
+  that boks decrypts with its CA, which it does for a host with an HTTP rule as it does for a
+  host with a credential. A flow boks cannot read — a raw socket, a tunnel without the CA — is
+  refused if an HTTP rule decides it: an HTTP allow never opens raw access to the host, and an
+  HTTP deny on an otherwise allowed host closes raw access to it, because the deny could not be
+  enforced there. A sandbox gets the CA when it is created with a credential or an HTTP rule.`
+
+// httpSelector is the --method, --path and --query flags, as sbx spells them.
+type httpSelector struct {
+	methods []string
+	path    string
+	query   []string
+}
+
+func (h *httpSelector) register(fs *pflag.FlagSet, verb string) {
+	fs.StringSliceVar(&h.methods, "method", nil,
+		verb+" the rule to these HTTP methods (comma-separated); use ANY to match all methods")
+	fs.StringVar(&h.path, "path", "",
+		verb+" the rule to this HTTP path glob (e.g. /repos/**); defaults to /**")
+	fs.StringArrayVar(&h.query, "query", nil,
+		"require an HTTP query parameter (name=value pattern); repeatable")
+}
+
+// spec builds the stored form of a rule for one destination.
+func (h *httpSelector) spec(action policy.Action, dest, note string) policy.RuleSpec {
+	r := policy.RuleSpec{Action: action, Spec: dest, Note: note}
+	if len(h.methods) > 0 || h.path != "" || len(h.query) > 0 {
+		// Validated, and the path default filled in, by compiling it: what is stored is the
+		// canonical form, so the file reads the way 'boks policy ls' prints it.
+		rule, err := policy.ParseHTTPRule(action, dest, h.methods, h.path, h.query)
+		if err == nil && rule.HTTP != nil {
+			r.Methods, r.Path, r.Query = rule.HTTP.Methods(), rule.HTTP.Path(), rule.HTTP.Query()
+			return r
+		}
+		// Keep what was typed, so the error from the store names the user's own input.
+		r.Methods, r.Path, r.Query = h.methods, h.path, h.query
+	}
+	return r
+}
+
+func (h *httpSelector) isSet() bool { return len(h.methods) > 0 || h.path != "" || len(h.query) > 0 }
+
 func newPolicyAllowCommand(env Env) *cobra.Command {
 	return newPolicyAddCommand(env, policy.Allow)
 }
@@ -93,17 +147,29 @@ A deny in any scope beats an allow in any scope. A sandbox-scoped rule can add a
 machine's policy already tolerates and can take access away, but it can never widen past a
 deny someone wrote down.
 
-` + ruleGrammar,
+A rule is refused, and nothing is added, when the same scope already holds the opposite
+decision for the same destination (for HTTP rules, the same methods, path and query
+constraints). Remove the existing rule first; rules in different scopes can coexist, and the
+deny takes precedence.
+
+` + ruleGrammar + "\n\n" + httpRuleHelp,
 		Example: fmt.Sprintf("  boks policy %s github.com:443 --note \"git over HTTPS\"\n"+
-			"  boks policy %s --sandbox claude-myproject api.example.com:443", action, action),
+			"  boks policy %s --sandbox claude-myproject api.example.com:443\n", action, action) +
+			map[policy.Action]string{
+				policy.Allow: "  boks policy allow api.example.com --method GET,HEAD --path '/v1/**'\n" +
+					"  boks policy allow api.example.com --method ANY --query team=platform",
+				policy.Deny: "  boks policy deny api.example.com --method POST --path '/admin/**'",
+			}[action],
 		Args: needsDestination,
 	}
 	var (
-		scope scopeSelector
-		note  string
+		scope    scopeSelector
+		note     string
+		selector httpSelector
 	)
 	scope.register(cmd.Flags())
 	cmd.Flags().StringVar(&note, "note", "", "why this rule exists; shown by 'boks policy ls'")
+	selector.register(cmd.Flags(), "restrict")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		ref, err := scope.scope()
@@ -118,15 +184,16 @@ deny someone wrote down.
 		skippedWarns := 0
 		capWarnings := len(args) > 3
 		for _, spec := range args {
-			added, err := store.Add(ref, policy.RuleSpec{Action: action, Spec: spec, Note: note})
+			rule := selector.spec(action, spec, note)
+			added, err := store.Add(ref, rule)
 			if err != nil {
 				return err
 			}
 			if !added {
-				fmt.Fprintf(env.Stdout, "already stored: %s %s in %s\n", action, spec, ref)
+				fmt.Fprintf(env.Stdout, "already stored: %s %s in %s\n", action, rule.Describe(), ref)
 				continue
 			}
-			fmt.Fprintf(env.Stdout, "added: %s %s to %s\n", action, spec, ref)
+			fmt.Fprintf(env.Stdout, "added: %s %s to %s\n", action, rule.Describe(), ref)
 			if action == policy.Allow {
 				if rule, parseErr := policy.ParseRule(action, spec); parseErr == nil && rule.WarnSingleLabel() {
 					if !capWarnings || warnCount < 2 {
@@ -149,6 +216,12 @@ deny someone wrote down.
 			return err
 		}
 		fmt.Fprintf(env.Stdout, "stored in %s\n", store.Path())
+		if selector.isSet() {
+			fmt.Fprint(env.Stderr, "note: an HTTP rule is applied to requests boks reads. For HTTPS that means boks\n"+
+				"      decrypts flows to this host with its CA; a sandbox created with neither a\n"+
+				"      credential nor an HTTP rule has no Boks CA and must be recreated (boks rm) to\n"+
+				"      reach the host. A flow boks cannot read is refused when this rule decides it.\n")
+		}
 		if action == policy.Allow {
 			warnIfStillDenied(env, store, scope.sandbox, args)
 			hotReloadAllows(cmd.Context(), env, scope.sandbox)
@@ -235,7 +308,10 @@ func warnIfStillDenied(env Env, store *policy.Store, sandbox string, specs []str
 		if !ok {
 			continue
 		}
-		if v := pol.Evaluate(target); !v.Allowed && v.Rule != "" {
+		// A NeedsHTTP refusal is not "still denied": it is what an HTTP rule is supposed to do
+		// to a flow boks cannot read, and saying otherwise would send the user to remove the
+		// rule they just wrote.
+		if v := pol.Evaluate(target); !v.Allowed && v.Rule != "" && !v.NeedsHTTP {
 			fmt.Fprintf(env.Stderr,
 				"note: %s is still denied — %s, written in %s. Deny always wins;\n"+
 					"      remove that rule if you meant to permit this: boks policy rm %s\n",
@@ -250,18 +326,26 @@ func newPolicyRmCommand(env Env) *cobra.Command {
 		Short: "Remove a stored rule",
 		Long: `Removes stored rules. Without --action, both dispositions for the destination go; with it,
 only the one named. A destination is matched as the engine sees it, so "GitHub.com:443"
-removes the rule stored as "github.com:443".`,
+removes the rule stored as "github.com:443".
+
+An HTTP rule is identified by its selector as well as its destination: give the same
+--method, --path and --query it was added with (the path defaults to /**, as when adding).
+Without --method, only the destination's connection rules are removed; if it has only HTTP
+rules, the error lists the command that removes each.`,
 		Example: "  boks policy rm github.com:443\n" +
-			"  boks policy rm --sandbox web --action allow api.example.com:443",
+			"  boks policy rm --sandbox web --action allow api.example.com:443\n" +
+			"  boks policy rm api.example.com --method GET --path '/v1/**'",
 		Args: needsDestination,
 	}
 	var (
-		scope  scopeSelector
-		action string
+		scope    scopeSelector
+		action   string
+		selector httpSelector
 	)
 	scope.register(cmd.Flags())
 	cmd.Flags().StringVar(&action, "action", "",
 		"remove only the allow or only the deny for this destination")
+	selector.register(cmd.Flags(), "identify")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		ref, err := scope.scope()
@@ -281,12 +365,12 @@ removes the rule stored as "github.com:443".`,
 			return err
 		}
 		for _, spec := range args {
-			removed, err := store.Remove(ref, only, spec)
+			removed, err := store.RemoveRule(ref, only, selector.spec(policy.Deny, spec, ""))
 			if err != nil {
 				return err
 			}
 			for _, r := range removed {
-				fmt.Fprintf(env.Stdout, "removed: %s %s from %s\n", r.Action, r.Spec, ref)
+				fmt.Fprintf(env.Stdout, "removed: %s %s from %s\n", r.Action, r.Describe(), ref)
 			}
 		}
 		return store.Save()
@@ -448,22 +532,74 @@ instead — mode transparent, on the address in the packet — where hostname ru
 at all, so a hostname-only policy denies it.
 
 Credential rules are not recorded on a sandbox, so pass --inject to see the mode a
-credential-bearing host would get.`,
+credential-bearing host would get.
+
+An http:// or https:// URL is checked as an HTTP request (GET unless --method says
+otherwise): network access first, then the HTTP method, path and query rules when the host
+has any, as 'sbx policy check http' does. Any other destination is checked as a connection;
+a host whose verdict depends on HTTP rules is reported as refused to a flow boks cannot read.
+The 'http' and 'network' subcommands are sbx's spellings of the two.`,
 		Example: "  boks policy check github.com:443\n" +
 			"  boks policy check --sandbox web api.example.com:443\n" +
-			"  boks policy check --policy locked --allow example.com:443 example.com:443",
+			"  boks policy check --policy locked --allow example.com:443 example.com:443\n" +
+			"  boks policy check --method POST https://api.example.com/v1/items\n" +
+			"  boks policy check http 'https://api.example.com/search?team=platform'",
 		Args: needsDestination,
 	}
+	cmd.RunE = policyCheckRunner(env, cmd, checkAuto)
+	cmd.AddCommand(newPolicyCheckKindCommand(env, checkHTTP), newPolicyCheckKindCommand(env, checkNetwork))
+	return cmd
+}
+
+// checkKind says how `policy check` reads its arguments.
+type checkKind int
+
+const (
+	checkAuto    checkKind = iota // a URL is an HTTP request, anything else a connection
+	checkHTTP                     // sbx's `check http URL`
+	checkNetwork                  // sbx's `check network TARGET`
+)
+
+func newPolicyCheckKindCommand(env Env, kind checkKind) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "http [flags] URL...",
+		Short: "Check an HTTP request to a URL, without making it",
+		Long: `Evaluates the policy for an HTTP request to URL. URL must be an absolute HTTP or HTTPS URL.
+The check evaluates network access first, then the HTTP method, path and query rules when the
+host has any. Nothing is contacted.`,
+		Example: "  boks policy check http https://api.example.com/v1/items\n" +
+			"  boks policy check http --method POST https://api.example.com/v1/items",
+		Args: needsDestination,
+	}
+	if kind == checkNetwork {
+		cmd.Use = "network [flags] TARGET..."
+		cmd.Short = "Check network access to a host, without contacting it"
+		cmd.Long = `Checks whether the policy allows a connection to TARGET. TARGET may be a hostname, host:port,
+IP literal, or URL; a bare host is checked on 443, and a URL supplies only its host and port:
+this evaluates network authorization, not HTTP method or path.`
+		cmd.Example = "  boks policy check network api.example.com\n" +
+			"  boks policy check network https://api.example.com/v1"
+	}
+	cmd.RunE = policyCheckRunner(env, cmd, kind)
+	return cmd
+}
+
+// policyCheckRunner registers the check flags on cmd and returns its RunE.
+func policyCheckRunner(env Env, cmd *cobra.Command, kind checkKind) func(*cobra.Command, []string) error {
 	var (
 		flags     policyFlags
 		sandbox   string
 		agentName string
+		method    string
 	)
 	cmd.Flags().StringVar(&sandbox, "sandbox", "", "check as this sandbox, including rules scoped to it")
 	registerAgentFlag(cmd.Flags(), &agentName)
 	flags.register(cmd.Flags())
+	if kind != checkNetwork {
+		cmd.Flags().StringVar(&method, "method", "", `HTTP method to evaluate for a URL (default "GET")`)
+	}
 
-	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
 		if err := applyAgentFlag(&flags, agentName); err != nil {
 			return err
 		}
@@ -497,15 +633,103 @@ credential-bearing host would get.`,
 			if i > 0 {
 				fmt.Fprintln(env.Stdout)
 			}
-			target, err := policy.ParseTarget(arg, 443)
+			target, req, isRequest, err := parseCheckArg(arg, kind, method)
 			if err != nil {
 				return err
+			}
+			if isRequest {
+				writeCheckHTTP(env.Stdout, pol, resolution, target, req, credentials, mode)
+				continue
 			}
 			writeCheck(env.Stdout, pol, resolution, target, credentials, mode)
 		}
 		return nil
 	}
-	return cmd
+}
+
+// parseCheckArg reads one `policy check` argument: a URL becomes an HTTP request unless the
+// kind is network, and anything else is a connection target.
+func parseCheckArg(arg string, kind checkKind, method string) (policy.Target, policy.HTTPRequest, bool, error) {
+	u, err := url.Parse(arg)
+	isURL := err == nil && u.Scheme != "" && u.Host != ""
+	isHTTPURL := isURL && (strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https"))
+
+	if kind == checkHTTP && !isHTTPURL {
+		return policy.Target{}, policy.HTTPRequest{}, false, usagef("URL must be an absolute HTTP or HTTPS URL, got %q", arg)
+	}
+	if kind == checkAuto && method != "" && !isHTTPURL {
+		return policy.Target{}, policy.HTTPRequest{}, false,
+			usagef("--method needs an http:// or https:// URL to check, got %q", arg)
+	}
+	if !isURL {
+		t, err := policy.ParseTarget(arg, 443)
+		return t, policy.HTTPRequest{}, false, err
+	}
+	port := 0
+	switch {
+	case u.Port() != "":
+		port, err = strconv.Atoi(u.Port())
+		if err != nil {
+			return policy.Target{}, policy.HTTPRequest{}, false, fmt.Errorf("port %q in %q is not a number", u.Port(), arg)
+		}
+	case isHTTPURL:
+		port = defaultPortFor(u.Scheme)
+	default:
+		return policy.Target{}, policy.HTTPRequest{}, false,
+			usagef("a %s:// URL must include an explicit port", u.Scheme)
+	}
+	t, err := policy.NewTarget(u.Hostname(), port)
+	if err != nil {
+		return policy.Target{}, policy.HTTPRequest{}, false, err
+	}
+	if !isHTTPURL || kind == checkNetwork {
+		return t, policy.HTTPRequest{}, false, nil
+	}
+	if method == "" {
+		method = http.MethodGet
+	}
+	return t, policy.HTTPRequest{Method: strings.ToUpper(method), Path: u.EscapedPath(), RawQuery: u.RawQuery}, true, nil
+}
+
+func defaultPortFor(scheme string) int {
+	if strings.EqualFold(scheme, "http") {
+		return 80
+	}
+	return 443
+}
+
+// writeCheckHTTP prints the verdict on one HTTP request: the connection first, then — when the
+// host has HTTP rules — the request, which is what decides it.
+func writeCheckHTTP(w io.Writer, pol policy.Policy, res policy.Resolution, target policy.Target,
+	req policy.HTTPRequest, credentials []secret.Credential, mode network.Mode) {
+
+	if mode == network.ModeNone || !pol.HasHTTPRules(target) {
+		writeCheck(w, pol, res, target, credentials, mode)
+		fmt.Fprintf(w, "  request: %s %s — no HTTP rule covers this host, so the connection's verdict applies to every request\n",
+			req.Method, req.CanonicalPath())
+		return
+	}
+	verdict := pol.EvaluateHTTP(target, req)
+	outcome := "DENY "
+	if verdict.Allowed {
+		outcome = "ALLOW"
+	}
+	fmt.Fprintf(w, "%s %s %s %s\n", outcome, req.Method, target, req.CanonicalPath())
+	fmt.Fprintf(w, "  policy: %s (default %s)\n", res.Name, res.Default)
+	rule := verdict.Rule
+	if rule == "" {
+		rule = policy.NoRuleFor(target)
+	}
+	fmt.Fprintf(w, "  rule:   %s\n", rule)
+	fmt.Fprintf(w, "  scope:  %s\n", scopeOrDefault(verdict.Scope))
+	flowMode, why := flowModeFor(target, credentials, pol)
+	fmt.Fprintf(w, "  mode:   %s — %s\n", flowMode, why)
+	fmt.Fprintf(w, "  reason: %s\n", verdict.Reason)
+	if conn := pol.Evaluate(target); conn.NeedsHTTP {
+		fmt.Fprint(w, "  note:   HTTP rules decide this host, so only requests boks reads are judged this way;\n"+
+			"          a flow it cannot read (a raw socket, or HTTPS in a sandbox without the Boks CA)\n"+
+			"          is refused.\n")
+	}
 }
 
 // writeCheck prints one verdict. The first line is deliberately terse and greppable; the
@@ -536,10 +760,19 @@ func writeCheck(w io.Writer, pol policy.Policy, res policy.Resolution, target po
 	}
 	fmt.Fprintf(w, "  rule:   %s\n", rule)
 	fmt.Fprintf(w, "  scope:  %s\n", scopeOrDefault(verdict.Scope))
-	flowMode, why := flowModeFor(target, credentials)
+	flowMode, why := flowModeFor(target, credentials, pol)
 	fmt.Fprintf(w, "  mode:   %s — %s\n", flowMode, why)
 	fmt.Fprintf(w, "  reason: %s\n", verdict.Reason)
 
+	if verdict.NeedsHTTP {
+		host := target.String()
+		if target.Port == 443 {
+			host = target.Host
+		}
+		fmt.Fprintf(w, "  note:   HTTP rules decide this host; a request boks reads is judged on its method,\n"+
+			"          path and query. Check one with: boks policy check --method GET https://%s/PATH\n", host)
+		return
+	}
 	if verdict.Allowed && !target.IsIP() {
 		fmt.Fprint(w, "  note:   a raw connection to the address this name resolves to is judged as\n"+
 			"          transparent, where hostname rules cannot apply. Add an address or CIDR\n"+
@@ -558,15 +791,19 @@ func scopeOrDefault(scope string) string {
 // the same three words the decision log uses.
 //
 // The rule is the proxy's own: plaintext HTTP is read because there is nothing to break, a
-// TLS flow is terminated exactly when its host has a credential rule, and anything that is
-// not an HTTP port never reaches the proxy at all.
-func flowModeFor(target policy.Target, credentials []secret.Credential) (policy.Mode, string) {
+// TLS flow is terminated exactly when its host has a credential rule or an HTTP policy rule,
+// and anything that is not an HTTP port never reaches the proxy at all.
+func flowModeFor(target policy.Target, credentials []secret.Credential, pol policy.Policy) (policy.Mode, string) {
 	switch target.Port {
 	case 80:
 		return policy.ModeForward, "plaintext HTTP through the proxy, which boks reads"
 	case 443:
 		if credentialCovers(credentials, target) {
 			return policy.ModeForward, "a credential rule names this host, so boks terminates TLS for it and can read the flow"
+		}
+		if pol.HasHTTPRules(target) {
+			return policy.ModeForward, "an HTTP rule names this host, so boks terminates TLS for it and reads each request " +
+				"(the sandbox needs the Boks CA, which it gets when created with a credential or an HTTP rule)"
 		}
 		return policy.ModeForwardBypass, "tunnelled through the proxy; end-to-end TLS, boks sees ciphertext only"
 	}
@@ -707,7 +944,7 @@ func inspectRule(env Env, store *policy.Store, sandbox string, specs []string) e
 			fmt.Fprint(env.Stdout, "  no rule applies to this destination\n")
 		}
 		for _, m := range matches {
-			line := fmt.Sprintf("  %s %s in %s", m.Action, m.Spec, m.Scope)
+			line := fmt.Sprintf("  %s %s in %s", m.Action, m.Describe(), m.Scope)
 			if m.Note != "" {
 				line += "  — " + m.Note
 			}
@@ -721,8 +958,11 @@ func inspectRule(env Env, store *policy.Store, sandbox string, specs []string) e
 		}
 		v := pol.Evaluate(target)
 		outcome := "denied"
-		if v.Allowed {
+		switch {
+		case v.Allowed:
 			outcome = "allowed"
+		case v.NeedsHTTP:
+			outcome = "decided request by request by HTTP rules, and refused to a flow boks cannot read"
 		}
 		fmt.Fprintf(env.Stdout, "  effect: %s is %s — %s (%s)\n", target, outcome, v.Reason, scopeOrDefault(v.Scope))
 	}
@@ -762,20 +1002,20 @@ func writeStoredRules(w io.Writer, rules []policy.RuleSpec) {
 		if sorted[i].Action != sorted[j].Action {
 			return sorted[i].Action == policy.Deny
 		}
-		return sorted[i].Spec < sorted[j].Spec
+		return sorted[i].Describe() < sorted[j].Describe()
 	})
 	width := 0
 	for _, r := range sorted {
-		if n := len(r.Spec); n > width {
+		if n := len(r.Describe()); n > width {
 			width = n
 		}
 	}
 	for _, r := range sorted {
 		if r.Note == "" {
-			fmt.Fprintf(w, "  %-5s %s\n", r.Action, r.Spec)
+			fmt.Fprintf(w, "  %-5s %s\n", r.Action, r.Describe())
 			continue
 		}
-		fmt.Fprintf(w, "  %-5s %-*s  %s\n", r.Action, width, r.Spec, r.Note)
+		fmt.Fprintf(w, "  %-5s %-*s  %s\n", r.Action, width, r.Describe(), r.Note)
 	}
 	fmt.Fprintln(w)
 }

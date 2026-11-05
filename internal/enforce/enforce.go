@@ -685,7 +685,7 @@ func (s *Session) reloadPolicy() (string, error) {
 		for _, r := range oldPol.Rules {
 			if r.Action == policy.Deny {
 				oldDenies = append(oldDenies, r)
-				oldDenySet[r.Spec()] = true
+				oldDenySet[r.Describe()] = true
 			}
 		}
 
@@ -696,7 +696,7 @@ func (s *Session) reloadPolicy() (string, error) {
 		var allows []policy.Rule
 		for _, r := range newPol.Rules {
 			if r.Action == policy.Deny {
-				if !oldDenySet[r.Spec()] {
+				if !oldDenySet[r.Describe()] {
 					newDeniesCount++
 				}
 				continue // replaced by oldDenies below
