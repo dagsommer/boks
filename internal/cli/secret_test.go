@@ -137,6 +137,28 @@ func TestNoSecretsLeavesTheStoreOut(t *testing.T) {
 	}
 }
 
+// --value-stdin reads the whole of stdin and keeps the value out of argv and out of the output.
+func TestSecretSetValueStdin(t *testing.T) {
+	store := secretStore(t)
+	out, _, err := runCLI(t, theKey+"\r\n", "secret", "set", "--value-stdin", "my-internal-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, theKey) {
+		t.Fatal("secret set printed the credential")
+	}
+	v, err := store.Lookup(context.Background(), "my-internal-api")
+	if err != nil || v.Reveal() != theKey {
+		t.Fatalf("stored %v, %v; want the trimmed value", v, err)
+	}
+	if _, _, err := runCLI(t, theKey, "secret", "set", "--value-stdin", "--value", "x", "svc"); err == nil {
+		t.Error("--value and --value-stdin were accepted together")
+	}
+	if _, _, err := runCLI(t, "\n", "secret", "set", "--value-stdin", "empty-one"); err == nil {
+		t.Error("an empty credential was stored")
+	}
+}
+
 // A credential stored under a name boks does not know is inert until a --inject rule names it.
 // It must not be guessed at, and it must not vanish either.
 func TestAnUnknownNameIsStoredAndNotAttached(t *testing.T) {

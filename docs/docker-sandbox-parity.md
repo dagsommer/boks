@@ -43,7 +43,7 @@ on 2026-11-05; the gap list from that read is in the section at the end.
 | `exec` | `sbx exec [flags] SANDBOX COMMAND [ARG...]`, docker-exec flags; starts a stopped sandbox first | `boks exec [-i] [-t] [-it] [-e] [-w] [-u]` | P1 | partial | Starts a stopped sandbox, as sbx does. Streams IO, propagates the exit code; raw mode and resize unverified in a VM. `-u` takes numeric ids only; `--detach`, `--detach-keys`, `--env-file`, `--privileged` not implemented |
 | Persistence across stop/start | Packages, Docker images, config, shell history persist until `rm` | Same, via the container's writable snapshot | P1 | partial | Confirmed across stop/start on the non-VM runtime |
 | Naming | `--name`; reconnect from any directory | Same, `--name` | P1 | done | An explicit name overrides the derived one, and a `--name` run with no workspace argument does not re-mount the current directory — it reaches that sandbox from anywhere |
-| `reset` | Stops sandboxes gracefully (30s), clears image cache, registries, all sandbox state, policies and stored secrets, signs out, stops the daemon, removes state/cache/config dirs. Prompts `y/N`; `-f/--force` skips it, `--preserve-secrets` keeps credentials | `boks reset`, minus the account and daemon steps | P2 | none | Copy the confirmation prompt and `--preserve-secrets`: losing every stored credential to a cleanup command is a bad surprise |
+| `reset` | Stops sandboxes gracefully (30s), clears image cache, registries, all sandbox state, policies and stored secrets, signs out, stops the daemon, removes state/cache/config dirs. Prompts `y/N`; `-f/--force` skips it, `--preserve-secrets` keeps credentials | `boks reset`, minus the account and daemon steps | P2 | partial | Sandboxes (forced), their networks and stored credentials only: policy rules, CA, images and the daemon are left to `boks purge`. Copy the confirmation prompt and `--preserve-secrets`: losing every stored credential to a cleanup command is a bad surprise |
 
 ## 2a. CLI surface — where Boks matches sbx, and where it does not
 
@@ -132,7 +132,7 @@ website documents.
 | `daemon` | `start`, `stop`, `status`, `log-level` for the `sandboxd` daemon | no daemon; `boks net ls\|stop` covers the one background process Boks has — see below |
 | `diagnose` | Diagnose installation issues | `doctor` (same job, different name) |
 | `setup` | (Experimental) Detect host configuration and prepare | partly `doctor`'s remedies |
-| `reset` | Reset all sandboxes and clean up state | none |
+| `reset` | Reset all sandboxes and clean up state | `boks reset`, sandboxes, networks and credentials only |
 | `login` / `logout` | Sign in to Docker | **won't** — no accounts, ever |
 | `completion` | Shell autocompletion | `completion`, for bash, zsh, fish and powershell |
 | `version` | Version information | `version`, plus `-v, --version` |
@@ -698,6 +698,21 @@ Also done: additional workspaces as `PATH:TARGET[:ro]`, `boks run git+ssh://…#
 kit in the agent's place, the SANDBOX summary block and a single in-place download bar on a
 terminal, and kit `proxyManaged` credentials giving the guest a stand-in variable.
 
+Also done: `boks reset` (sandboxes, their networks and stored credentials; `--preserve-secrets`, `--force`,
+refuses without a terminal unless forced).
+
+Also done: `run`/`create --no-input` (the kit credential approval never prompts; it is the same as having no
+terminal, and `--approve-kit-credentials` still approves) and `run --no-progress` (no download bar or
+periodic pull lines; the "image: pulling" lines stay). `--no-input` does not change whether the
+agent session gets a pseudo-terminal.
+
+Also done: `secret set --value-stdin` (whole stdin, no prompt, refused with `--value`). A custom secret with no
+destination host was already impossible: `--inject` rejects an empty host list (`tok@=bearer`), and a
+stored name with no rule is attached to nothing.
+
+Not built: HTTP policy rules restricted by query parameter. Boks policy rules are host/port/CIDR only;
+there are no method or path rules to extend, so this needs the HTTP rule layer itself first.
+
 Also done: kit credentials are approved by the user before they are used, as sbx now does
 (`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
 were applied unasked, to whatever the user had stored under the service's name.
@@ -709,11 +724,8 @@ Not yet built, roughly in the order worth doing:
 | sbx feature | Release | Notes |
 |---|---|---|
 | `--mount HOST:SANDBOX_PATH` for kit-declared mounts | 0.50 | Waits for kit `volumes`/mounts; `PATH:TARGET[:ro]` workspaces are done |
-| `boks reset` | — | Still `none` above |
-| `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Proxy rule matcher |
-| `sbx secret set-custom --value-stdin`, and custom secrets with no destination host no longer substituting | 0.51 | Boks `secret set` already reads stdin |
+| `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Needs HTTP method/path rules first; Boks has none (host-level only) |
 | `kit inspect --resolved`, kit install logs, kit loopback port requests, persistent kit volumes | 0.50/0.51 | Kits slices in kits-design.md |
-| `--no-input`, `run --no-progress` | 0.51 | |
 | Split-horizon DNS via the proxy, 502 for failed upstream connections, upstream connection reuse | 0.51 | |
 | `sandbox.fuse` | 0.51 | Guest kernel support unverified |
 | Cloud sandboxes, `sbx move`, `sbx skills`, `run --model` | 0.42+ | Won't, or later: Boks has no cloud |

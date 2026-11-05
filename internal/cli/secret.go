@@ -520,7 +520,8 @@ attaches it and no --inject is needed. 'boks secret services' lists them.
 
 Any other name is stored just the same and attached by nothing until a 'boks run --inject'
 rule says where it goes.`,
-		Example: `  echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
+		Example: `  boks secret set --value-stdin my-internal-api < token.txt
+  echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
   echo -n "$GITHUB_TOKEN"     | boks secret set github
   echo -n "$KEY"              | boks secret set my-internal-api`,
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -531,8 +532,10 @@ rule says where it goes.`,
 		},
 	}
 	var value, path, sandbox string
-	var oauth bool
+	var oauth, valueStdin bool
 	cmd.Flags().StringVar(&value, "value", "", "the credential; omit to read it from stdin")
+	cmd.Flags().BoolVar(&valueStdin, "value-stdin", false,
+		"read the credential from stdin, whole and without a prompt, even on a terminal")
 	// Scoped to one sandbox rather than the machine. The resolution order is the same one
 	// the policy scopes use — the sandbox's own wins, the machine's serves everything that
 	// has not overridden it — so a per-sandbox credential is an addition and never takes
@@ -546,6 +549,9 @@ rule says where it goes.`,
 		name := args[0]
 		if oauth {
 			return errOAuthAcquisition(name)
+		}
+		if valueStdin && value != "" {
+			return usagef("--value and --value-stdin cannot be combined: one says the credential is on the command line")
 		}
 
 		// Judged before anything is read, for the same reason the service check below is:
@@ -573,7 +579,16 @@ rule says where it goes.`,
 		}
 
 		raw := value
-		if raw == "" {
+		if valueStdin {
+			// Always the pipe's form, never the prompt: a script that says where the value
+			// comes from must not hang on a terminal's double entry, and a terminal is
+			// read to end of input, as `echo tok | …` is.
+			data, err := io.ReadAll(env.Stdin)
+			if err != nil {
+				return fmt.Errorf("reading the credential from stdin: %w", err)
+			}
+			raw = strings.TrimRight(string(data), "\r\n")
+		} else if raw == "" {
 			// Prompts when stdin is a terminal and reads the pipe when it is not.
 			// Before this, typing the command with no pipe printed nothing and waited
 			// for Ctrl-D. See readSecretValue.

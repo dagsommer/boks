@@ -168,6 +168,9 @@ type Config struct {
 	// ProgressTTY says Progress is a terminal, so a download is drawn as one bar that
 	// updates in place rather than as a line every few seconds.
 	ProgressTTY bool
+	// NoProgress drops the download's running report — the bar on a terminal, the line every
+	// few seconds elsewhere — and keeps the lines that say what is about to happen.
+	NoProgress bool
 }
 
 // say writes a line of progress, if the caller asked for any.
@@ -404,7 +407,7 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 	// Progress runs alongside the pull and stops with it, however the pull ends. Only
 	// started when someone is listening: polling the content store every couple of seconds
 	// to build strings nobody reads is work for nothing.
-	if cfg.Progress != nil {
+	if cfg.Progress != nil && !cfg.NoProgress {
 		progressCtx, stop := context.WithCancel(ctx)
 		defer stop()
 		go reportPullProgress(progressCtx, c, cfg.say, cfg.pullBar())
@@ -413,7 +416,9 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 	if err != nil {
 		return nil, fmt.Errorf("pulling image %s: %w", cfg.Image, err)
 	}
-	cfg.endPullBar()
+	if !cfg.NoProgress {
+		cfg.endPullBar()
+	}
 	cfg.say("image: pulled and unpacked")
 	return image, nil
 }

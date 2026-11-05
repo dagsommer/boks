@@ -353,6 +353,7 @@ boks create shell .
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
+| `--no-input` |  | never prompt: treat stdin as not being a terminal, so a kit's credentials are not attached unless approved |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
 | `--policy string` |  | network policy preset: open, standard, locked (default standard) |
@@ -1137,6 +1138,37 @@ boks purge --dry-run     # what is there, and what it would free
 | `--force` |  | remove even though the daemon or a sandbox network is running |
 | `-y`, `--yes` |  | do not ask for confirmation |
 
+## boks reset
+
+Stop and remove every sandbox, its network and the stored credentials
+
+```
+boks reset [flags]
+```
+
+Returns Boks to a clean slate: every sandbox is stopped and deleted, every sandbox
+network and its per-sandbox state is removed, and the credentials stored with
+'boks secret set' are deleted.
+
+It keeps the certificate authority, the policy rules and the decision log, and it leaves the
+pulled images and the daemon alone. 'boks purge' is the command that gives the disk back.
+
+Credentials are the one thing here nothing recreates, so --preserve-secrets keeps them.
+
+It asks first, on a terminal. Without one it refuses rather than guess, and --force is the
+answer that skips the question for scripts.
+
+```
+boks reset                     # asks, then removes everything above
+  boks reset --preserve-secrets  # leaves the stored credentials alone
+  boks reset --force             # no prompt, for scripts
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-f`, `--force` |  | do not ask for confirmation |
+| `--preserve-secrets` |  | keep the stored credentials |
+
 ## boks rm
 
 Delete a sandbox and its filesystem
@@ -1231,6 +1263,8 @@ boks run                              # a shell in the current directory
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
+| `--no-input` |  | never prompt: treat stdin as not being a terminal, so a kit's credentials are not attached unless approved |
+| `--no-progress` |  | do not report image download progress (no bar, no periodic lines) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
 | `--policy string` |  | network policy preset: open, standard, locked (default standard) |
@@ -1488,7 +1522,8 @@ Any other name is stored just the same and attached by nothing until a 'boks run
 rule says where it goes.
 
 ```
-echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
+boks secret set --value-stdin my-internal-api < token.txt
+  echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
   echo -n "$GITHUB_TOKEN"     | boks secret set github
   echo -n "$KEY"              | boks secret set my-internal-api
 ```
@@ -1499,6 +1534,7 @@ echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
 | `--sandbox string` |  | store this credential for one sandbox only, in preference to the machine-wide one |
 | `--store string` |  | encrypted store file |
 | `--value string` |  | the credential; omit to read it from stdin |
+| `--value-stdin` |  | read the credential from stdin, whole and without a prompt, even on a terminal |
 
 ## boks start
 

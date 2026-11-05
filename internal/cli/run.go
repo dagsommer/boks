@@ -63,14 +63,17 @@ Agents:
 
 	flags := registerSandboxFlags(cmd.Flags(), dev)
 	var (
-		detached  bool
-		ephemeral bool
-		quiet     bool
-		verbose   bool
+		detached   bool
+		ephemeral  bool
+		quiet      bool
+		verbose    bool
+		noProgress bool
 	)
 	cmd.Flags().BoolVarP(&detached, "detached", "d", false,
 		"print the sandbox name and exit instead of attaching")
 	cmd.Flags().BoolVar(&ephemeral, "rm", false, "destroy the sandbox when the command exits")
+	cmd.Flags().BoolVar(&noProgress, "no-progress", false,
+		"do not report image download progress (no bar, no periodic lines)")
 	// -v adds detail; it does not gate anything a user needs to be told. The two things
 	// that are news rather than chatter — a host whose TLS boks is about to terminate for
 	// the first time, and a policy that has changed since this sandbox last ran — are
@@ -258,6 +261,7 @@ Agents:
 		// indistinguishable from a hang, which is how it was reported: a blank terminal
 		// with "nothing happening". Detail is optional; a several-minute pause is not.
 		cfg.Progress = env.Stderr
+		cfg.NoProgress = noProgress
 		// The block that says what is about to run. When a sandbox is being created, and
 		// with -v; see printSandboxSummary for why not on every run.
 		if verbose || (!inv.exists && isTerminal(env.Stderr)) {
