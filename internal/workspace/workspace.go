@@ -17,6 +17,7 @@ package workspace
 import (
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 )
@@ -41,7 +42,9 @@ type Workspace struct {
 	Mode      Mode
 }
 
-// Parse interprets a CLI workspace argument of the form "path" or "path:ro".
+// Parse interprets a CLI workspace argument of the form "path", "path:ro", "path:target" or
+// "path:target:ro", where target is an absolute path inside the guest to mount it at instead of
+// at the host path.
 //
 // The path is resolved against the current directory, cleaned, and checked to be an
 // existing directory. Symlinks are resolved so that the guest path matches what the
@@ -50,6 +53,7 @@ type Workspace struct {
 func Parse(arg string) (Workspace, error) {
 	style := hostStyle()
 	path, mode := splitMode(arg, style)
+	path, target := splitTarget(path, style)
 
 	if path == "" {
 		return Workspace{}, fmt.Errorf("empty workspace path")
@@ -86,9 +90,15 @@ func Parse(arg string) (Workspace, error) {
 		return Workspace{}, fmt.Errorf("resolving symlinks for %q: %w", abs, err)
 	}
 
+	if target == "/" {
+		return Workspace{}, fmt.Errorf("workspace target %q would cover the sandbox's whole filesystem", arg)
+	}
 	guest, err := guestPath(resolved, style)
 	if err != nil {
 		return Workspace{}, err
+	}
+	if target != "" {
+		guest = target
 	}
 
 	return Workspace{HostPath: resolved, GuestPath: guest, Mode: mode}, nil
@@ -112,6 +122,29 @@ func splitMode(arg string, style pathStyle) (string, Mode) {
 		return arg[:idx], ModeReadWrite
 	}
 	return arg, ModeReadWrite
+}
+
+// splitTarget separates a trailing ":/guest/path" from a workspace path.
+//
+// The target is the part after the last colon that is followed by a slash: a guest path is
+// always absolute, which is what tells it from a colon that is simply part of a host
+// directory's name. On Windows the colon at index 1 is the drive separator, so `C:/src` is a
+// path and not a share of `C` at `/src`. A POSIX directory whose name really does contain
+// ":/" is read as a target; `--` and an explicit ./ prefix cannot help, so the rule is stated
+// here and in the docs rather than discovered.
+//
+// The target is cleaned. Anything that cleans to "/" is refused by Parse's caller as not a
+// useful mount point: a share over the guest's root would hide the whole image.
+func splitTarget(path string, style pathStyle) (host, target string) {
+	for idx := strings.LastIndex(path, ":"); idx > 0; idx = strings.LastIndex(path[:idx], ":") {
+		if style == styleWindows && idx == 1 {
+			break
+		}
+		if strings.HasPrefix(path[idx+1:], "/") {
+			return path[:idx], pathpkg.Clean(path[idx+1:])
+		}
+	}
+	return path, ""
 }
 
 // Root reports the guest path a shell should start in.

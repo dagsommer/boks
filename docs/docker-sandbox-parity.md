@@ -694,6 +694,10 @@ Also done: `boks cp` out of a sandbox no longer writes through a symlink the gue
 target leaves the destination is refused. Before this a guest could write any file the user could,
 anywhere on the host, with an archive of two entries.
 
+Also done: additional workspaces as `PATH:TARGET[:ro]`, `boks run git+ssh://…#dir=kit .` with the
+kit in the agent's place, the SANDBOX summary block and a single in-place download bar on a
+terminal, and kit `proxyManaged` credentials giving the guest a stand-in variable.
+
 Also done: kit credentials are approved by the user before they are used, as sbx now does
 (`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
 were applied unasked, to whatever the user had stored under the service's name.
@@ -704,7 +708,7 @@ Not yet built, roughly in the order worth doing:
 
 | sbx feature | Release | Notes |
 |---|---|---|
-| Additional workspaces as `PATH:TARGET[:ro]` and `--mount HOST:SANDBOX_PATH` | 0.50/0.51 | Needs the Windows drive-colon rule in `splitMode` extended |
+| `--mount HOST:SANDBOX_PATH` for kit-declared mounts | 0.50 | Waits for kit `volumes`/mounts; `PATH:TARGET[:ro]` workspaces are done |
 | `boks reset` | — | Still `none` above |
 | `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Proxy rule matcher |
 | `sbx secret set-custom --value-stdin`, and custom secrets with no destination host no longer substituting | 0.51 | Boks `secret set` already reads stdin |

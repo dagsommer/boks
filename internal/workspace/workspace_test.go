@@ -174,3 +174,42 @@ func TestMountOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitTarget(t *testing.T) {
+	cases := []struct {
+		arg, host, target string
+		style             pathStyle
+	}{
+		{"/src/app", "/src/app", "", stylePOSIX},
+		{"/src/app:/work", "/src/app", "/work", stylePOSIX},
+		{"/src/app:/work/../proj/", "/src/app", "/proj", stylePOSIX},
+		{"/src/we:ird/app", "/src/we:ird/app", "", stylePOSIX},
+		{`C:\src\app`, `C:\src\app`, "", styleWindows},
+		{"C:/src/app", "C:/src/app", "", styleWindows},
+		{"C:/src/app:/work", "C:/src/app", "/work", styleWindows},
+		{"relative:/work", "relative", "/work", stylePOSIX},
+	}
+	for _, c := range cases {
+		host, target := splitTarget(c.arg, c.style)
+		if host != c.host || target != c.target {
+			t.Errorf("splitTarget(%q) = %q, %q; want %q, %q", c.arg, host, target, c.host, c.target)
+		}
+	}
+}
+
+func TestParseMountsAtATarget(t *testing.T) {
+	dir := t.TempDir()
+	ws, err := Parse(dir + ":/work:ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.GuestPath != "/work" || ws.Mode != ModeReadOnly || ws.Root() != "/work" {
+		t.Errorf("got %+v", ws)
+	}
+	if runtime.GOOS != "windows" && ws.HostPath == ws.GuestPath {
+		t.Errorf("the target did not replace the host path: %+v", ws)
+	}
+	if _, err := Parse(dir + ":/"); err == nil {
+		t.Error("a workspace over / was accepted")
+	}
+}

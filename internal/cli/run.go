@@ -24,7 +24,8 @@ func newRunCommand(env Env, dev *devFlags) *cobra.Command {
 sandbox contains; the workspaces follow and default to the current directory. Each
 workspace is shared into the guest at the same absolute path it has on the host, and the
 first one is the process's working directory. Nothing above them is exposed. A workspace
-may carry a ':ro' suffix for a read-only share.
+may carry a ':ro' suffix for a read-only share, and a guest path to mount it at instead:
+PATH:TARGET or PATH:TARGET:ro.
 
 By default the guest writes straight to those directories. --clone changes that: the
 workspace must be a git repository, it is shared read-only at /run/sandbox/source, and the
@@ -53,6 +54,7 @@ Agents:
 		Example: `  boks run                              # a shell in the current directory
   boks run shell . -- uname -a
   boks run shell ~/src/foo ~/src/lib:ro
+  boks run shell ~/src/foo ~/data:/data:ro   # ~/data appears at /data, read-only
   boks run --clone claude ~/src/foo     # the agent works on a clone; your files are read-only
   boks run --name claude-boks           # re-attach by name, from anywhere
   boks run "git+ssh://git@host/org/kits.git#dir=team" .   # a kit's agent, from a git reference`,
