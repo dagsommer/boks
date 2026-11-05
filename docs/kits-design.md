@@ -1126,6 +1126,55 @@ governance control and is not one.
 
 **Cannot be verified here.** Nothing new; composition is host-side.
 
+**Status: built** (`internal/kit/compose.go`, `plan.go`; `internal/cli/netflags.go`,
+`kitcmd.go`). Where the design left a choice, this is what was chosen:
+
+- **Stacking** follows §3.2 for `--kit`: allow/deny union with first-seen order, environment
+  last-wins, setup lists concatenated in `--kit` order, `files/` overlaid with the later kit
+  winning (a workspace file is deduplicated before it is applied, because workspace files are
+  never overwritten on disk and two entries would make the *earlier* kit win), `volumes` last-wins
+  by path, `ports` appended, `privileged` OR-ed. The three §3.4 errors and the
+  `requires.agent` error are all raised.
+- **`mixins:` is followed.** Upstream decodes and ignores it (`CODE types.go:675`) and §3.1's
+  "automatic on load" is prose only, so there is no behaviour to match. Boks resolves each
+  mixin as a kit in its own right (it must be `kind: mixin`, so it can neither extend nor carry
+  mixins, which is why no cycle is possible through them), places an ancestor's mixins before a
+  descendant's, and keeps them as separate members so their credentials are approved per kit and
+  the plan names them. The old "mixins is accepted but not applied" load warning is gone.
+- **`extends` under a `sandbox:` block.** Boks' validator already rejects a kit that has both
+  (`validate.go`), so a child inherits the parent's sandbox block whole and the §1.2
+  "`command` replaces the inherited tail" trap cannot arise.
+- **Named arrays under `extends`** error on a repeated credential `service` (as §3.2 says) and,
+  taking the conservative reading of "matching key is an ERROR", on a repeated volume `path`
+  too. Under `--kit` the volume rule is last-wins, as documented.
+- **`locked` is enforced for `extends`**, with the strictest reading of "may not override": a
+  descendant may not set a locked path at all (any non-empty value under it), including adding
+  to a list. Paths are the dotted YAML names, matched against the child's own spec. This is
+  stricter than upstream, where nothing enforces it (§3.3), and was chosen because the design
+  says to enforce it or report it unenforced, and a half-enforced control is worse than either.
+  Locks are inherited down the chain. They do not apply to `--kit` (§3.3's "wrong direction"
+  observation stands).
+- **`requires.agent`** is an exact match on the agent that actually runs. A kit-defined agent
+  also answers to the names of the kits in its `extends` lineage, the only reading of "left to
+  the consumer's extends-lineage check" that does not widen a match to unrelated agents. It is
+  checked once the agent is resolved (`run`, `create`), and by `policy ls`/`check` when
+  `--agent` is given; without an agent there is nothing to check against.
+- **A fetched kit may refer only to `git+` references.** A relative path in a kit whose clone
+  has been discarded has nothing to resolve against, and an absolute one would let a remote
+  file steer what is read from the local disk. A local kit's relative `extends`/`mixins`
+  resolve against its own directory. Depth cap 5 parents (§1.2) and 32 members total.
+- **Policy label.** One policy layer carries the whole stack, named by the kit names joined with
+  a comma; each rule's note names the kit that declared it. `policy check` therefore reports the
+  scope as the stack, not as the single kit.
+- **Credential approval stays per kit**, keyed by kit name and reference; a mixin reached through
+  `mixins:` is keyed by its resolved path.
+- **Not unified with the guest apply path:** `setup.*`, `files/` and `environment` are applied
+  from the merged spec, so the order the guest sees is exactly the concatenation in the plan
+  (`kit.Plan`, golden-tested in `compose_test.go`). Nothing here has run in a guest.
+
+`boks kit inspect [--resolved] REF...` prints the spec, and with `--resolved` the members, merged
+spec, credentials and the §1.4 execution plan.
+
 ### Not in any slice
 
 `volumes[]` (follow nested Docker, roadmap item 6). `sandbox.build` (not implemented upstream

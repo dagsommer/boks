@@ -14,6 +14,8 @@ and a kit written for `sbx` is a kit Boks reads.
 > agent) before the install commands, and `files/workspace/` into the primary workspace last,
 > **never overwriting a file that is already there** — in a direct mount that is your own disk.
 > Symlinks in the tree are skipped. `ports` and `volumes` are applied at creation (see below).
+> `--kit` repeats: kits are stacked, and `extends` and `mixins` are followed (see
+> [Stacking kits](#stacking-kits)).
 > Anything else Boks does not apply is named by the run, and so is every example below that
 > shows a field Boks
 > ignores. Why, and what comes next, is in [kits-design.md](kits-design.md).
@@ -81,7 +83,7 @@ credentials:
 
 ## Using a kit
 
-Point `--kit` at a directory containing `spec.yaml`, or at the file itself:
+Point `--kit` at a directory containing `spec.yaml`, or at the file itself (repeat the flag to stack kits):
 
 ```console
 $ boks run claude . --kit ./my-kit
@@ -142,6 +144,77 @@ policy standard+kit:vale
 An agent's allowlist is compiled into Boks and auditable by reading the release. A kit is a
 file on your disk. When something is reachable, `boks policy ls` names which of the two
 permitted it.
+
+## Stacking kits
+
+`--kit` may be given more than once. The kits are applied in the order of the flags, which is
+the merge order: it decides which kit's environment variable wins, which kit's file lands, and
+which install command runs first.
+
+```console
+$ boks run claude . --kit ./vale --kit ./no-telemetry
+$ boks kit inspect --resolved ./vale ./no-telemetry   # what that does, without running it
+```
+
+| What | Across stacked kits |
+|---|---|
+| `permissions.network.allow` / `deny` | Appended, duplicates removed. A deny in any kit beats an allow in any other, as every deny does. Each rule is labelled with the kit that declared it in `boks policy ls`; the layer as a whole is named after the stack (`kit:vale,no-telemetry`). |
+| `environment.variables` | Union; **the later kit wins**, silently in the run and marked `(overridden by KIT)` in `kit inspect --resolved`. |
+| `setup.install`, `setup.files`, `setup.startup` | Concatenated in kit order. |
+| `files/home/`, `files/workspace/` | One overlay; a later kit's file replaces an earlier kit's at the same path. |
+| `credentials` | Every kit's are asked about, **each kit on its own**: an approval is keyed by kit name and reference, so approving `vale` never approves another kit's credential. The same `service` in two kits is an error, even if they are identical. |
+| `ports` | Appended. `volumes` are united by `path`; the later kit wins. |
+| `security.privileged` | Any `true` is `true`. |
+| `kind: sandbox` | At most one kit may define the agent; a second is an error. It may sit anywhere in the order. A mixin's `agentInstructions` never becomes the agent's. |
+| `name` | Must be unique across the whole stack, including kits pulled in by `extends` and `mixins`. |
+| `requires.agent` | A mixin that names an agent is refused unless the sandbox runs that agent (`claude-vertex` is not `claude`). A kit-defined agent also counts as the kits it extends. Checked when the agent is known: `run`, `create`, and `policy ls`/`check` with `--agent`. |
+
+The execution order inside the guest is the one in Docker's reference, with each stage applied
+in `--kit` order: network and environment, `files/home/`, `setup.install`, `setup.files`,
+`setup.startup`, then `files/workspace/`. `kit inspect --resolved` prints it:
+
+```console
+$ boks kit inspect --resolved ./agent ./tools ./lint
+...
+execution plan:
+1. network and environment
+   [agent] allow agent.test
+   [agent] env MODE=base (overridden by tools)
+   [tools] allow tools.test
+   [tools] deny telemetry.test
+   [tools] env MODE=tools
+2. files/home
+   ...
+```
+
+### `extends` and `mixins`
+
+A `kind: sandbox` kit may name a parent with `extends` and kits to layer on with `mixins`.
+A reference is resolved like `--kit`: a local path relative to the kit that names it (or
+absolute), or a git reference. Resolution order is the parent chain merged into the kit
+(parent first), then the mixins the chain declares (an ancestor's before a descendant's), then
+the next `--kit`.
+
+- An extends chain climbs at most 5 parents, a cycle is an error, and every parent must be
+  `kind: sandbox`. A kit with `extends` carries no `sandbox:` block of its own, so it runs the
+  parent's image, entrypoint and command unchanged.
+- Under `extends` a repeated credential `service` or volume `path` is an error rather than a
+  merge, because Docker's own rule is that the merge cannot decide which shape wins. Lists are
+  appended parent first, scalars and variables take the child's, and the child's static files
+  replace the parent's.
+- Every mixin must be `kind: mixin`. They are kits in their own right: their credentials are
+  approved separately and they appear in the plan under their own name.
+- **A kit that was fetched may refer only to other `git+` references**, never to a local path:
+  a remote file does not get to decide what Boks reads from your disk.
+- **`locked`**, which Docker validates and does not enforce, is enforced here for `extends`:
+  a descendant that sets a path an ancestor locks, at all, fails. That is stricter than any
+  source documents, chosen because a lock that does nothing looks like a control. It does not
+  apply to stacked `--kit` flags, which are yours.
+- A composition holds at most 32 kits.
+
+`boks kit inspect REF` prints one kit's spec as Boks reads it; `--resolved` takes several
+references and prints the members in application order, the merged spec, the credentials that
+would be asked about, and the execution plan. It reads nothing from the credential store.
 
 ## Reference forms
 
@@ -238,8 +311,8 @@ permissions:
 ### A kit that defines a whole agent
 
 `kind: sandbox` names an image and an entrypoint — the same thing a Boks agent is, declared in
-a file instead of in Go. **Boks reads this and applies only the network block**; the image and
-command are ignored, and `boks run` uses the agent you named on the command line.
+a file instead of in Go. Boks runs it as an agent named after the kit, with the kit's image,
+entrypoint and command.
 
 ```yaml
 schemaVersion: "2"
