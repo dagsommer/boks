@@ -237,7 +237,27 @@ func (s Spec) proxyPort() int {
 // token, and its token endpoint is decrypted so a refresh can be answered rather than
 // relayed. Without a CA neither happens, which for an OAuth credential means the agent is
 // simply not logged in.
-func (s Spec) intercepts() bool { return s.Intercept && (len(s.Inject) > 0 || len(s.OAuth) > 0) }
+//
+// An HTTP policy rule counts too (`boks policy allow HOST --method GET`): judging a request to
+// an HTTPS host means reading it. Without a CA such a host is refused rather than tunnelled,
+// so a sandbox created before its first HTTP rule — which has no Boks CA in its trust store —
+// fails closed on that host, at certificate verification, until it is recreated.
+func (s Spec) intercepts() bool {
+	return s.Intercept && (len(s.Inject) > 0 || len(s.OAuth) > 0 || s.hasHTTPRules())
+}
+
+// hasHTTPRules reports whether the resolved policy holds any HTTP rule.
+func (s Spec) hasHTTPRules() bool {
+	if s.Resolution == nil {
+		return false
+	}
+	for _, r := range s.Resolution.Rules {
+		if r.IsHTTP() {
+			return true
+		}
+	}
+	return false
+}
 
 // CertDir is the host directory shared into the guest as GuestCADir. It is per-sandbox and
 // contains public certificates only.
