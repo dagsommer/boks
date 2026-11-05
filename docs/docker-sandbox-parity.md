@@ -809,7 +809,7 @@ Not yet built, roughly in the order worth doing:
 | sbx feature | Release | Notes |
 |---|---|---|
 | `--mount HOST:SANDBOX_PATH` for kit-declared mounts | 0.50 | Waits for kit `volumes`/mounts; `PATH:TARGET[:ro]` workspaces are done |
-| `kit inspect --resolved`, kit install logs, kit loopback port requests, persistent kit volumes | 0.50/0.51 | Kits slices in kits-design.md |
+| `kit inspect --resolved` (done), kit install logs (done: `/var/log/sbx-kits/<kit>/install-<n>.log`), kit loopback port requests, persistent kit volumes | 0.50/0.51 | Kits slices in kits-design.md |
 | Split-horizon DNS via the proxy, upstream connection reuse | 0.51 | Not built. A failed upstream already gives the guest a 502 with a readable body on every proxy path (`internal/proxy`: forward, inspected and host-service flows); checked in the code on 2026-11-05, not against sbx |
 | `sandbox.fuse` | 0.51 | Guest kernel support unverified |
 | Cloud sandboxes, `sbx move`, `sbx skills`, `run --model` | 0.42+ | Won't, or later: Boks has no cloud |

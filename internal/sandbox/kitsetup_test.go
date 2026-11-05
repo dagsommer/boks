@@ -135,3 +135,20 @@ func TestStaticFileScriptWritesAndKeeps(t *testing.T) {
 		t.Fatalf("overwrite failed: %q", got)
 	}
 }
+
+func TestPlanKeepsAKitsInstallOutputInTheGuest(t *testing.T) {
+	s := &Setup{Install: []InstallStep{{Command: "make", Kit: "my kit", N: 2}}}
+	ops, err := s.Plan("", "")
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("ops = %v, err = %v", ops, err)
+	}
+	got := strings.Join(ops[0].argv, "\x00")
+	if !strings.Contains(got, "/var/log/sbx-kits/my_kit/install-2.log") || !strings.HasSuffix(got, "make") {
+		t.Errorf("argv = %q", ops[0].argv)
+	}
+	plain := &Setup{Install: []InstallStep{{Command: "make", Kit: "my kit", N: 2}}}
+	other := &Setup{Install: []InstallStep{{Command: "make"}}}
+	if plain.fingerprint() != other.fingerprint() {
+		t.Error("the log path changed the setup fingerprint, which would re-run installs on existing sandboxes")
+	}
+}

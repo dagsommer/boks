@@ -126,6 +126,9 @@ credentials:
   the run says how to store one. `--oauth NAME` on the command line wins over the kit.
 - `skipIfEnv` is accepted and ignored.
 
+Each `setup.install` step's output is also kept in the guest at `/var/log/sbx-kits/<kit>/install-<n>.log`
+(`n` counts from 1 within the kit), as sbx does.
+
 ## Using a kit
 
 Point `--kit` at a directory containing `spec.yaml`, or at the file itself (repeat the flag to stack kits):

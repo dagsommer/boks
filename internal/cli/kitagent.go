@@ -245,8 +245,8 @@ func kitSetup(spec *kit.Spec) *sandbox.Setup {
 	if spec.Setup == nil {
 		return finishSetup(&s, spec)
 	}
-	for _, c := range spec.Setup.Install {
-		s.Install = append(s.Install, sandbox.InstallStep{Command: c.Command, User: c.User, Description: c.Description})
+	for i, c := range spec.Setup.Install {
+		s.Install = append(s.Install, sandbox.InstallStep{Command: c.Command, User: c.User, Description: c.Description, Kit: spec.Name, N: i + 1})
 	}
 	for _, f := range spec.Setup.Files {
 		s.Files = append(s.Files, sandbox.FileStep{Path: f.Path, Content: f.Content, Mode: f.Mode, OnlyIfMissing: f.OnlyIfMissing})

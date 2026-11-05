@@ -58,6 +58,14 @@ type InstallStep struct {
 	Command     string
 	User        string
 	Description string
+	// Kit and N name the kit that declared the step and its place in that kit's list (from 1).
+	// When Kit is set the step's output is also kept in the guest at
+	// /var/log/sbx-kits/<kit>/install-<N>.log, where sbx keeps it.
+	//
+	// Neither is part of the setup's fingerprint (json:"-"): adding the log must not make an
+	// existing sandbox run its installs again.
+	Kit string `json:"-"`
+	N   int    `json:"-"`
 }
 
 // FileStep is one `setup.files` entry.
@@ -122,6 +130,24 @@ cat > "$dst" && chmod "$mode" "$dst" && chown "$owner" "$dst"
 // after that exec returns and does not hold the CLI open.
 const backgroundScript = `nohup "$@" >/dev/null 2>&1 </dev/null &`
 
+// installLogScript runs "$@" with its output kept in the log file $1 as well as passed on, and
+// exits with the command's status.
+const installLogScript = `log=$1; shift
+mkdir -p "$(dirname "$log")" && : > "$log" || exec "$@"
+"$@" >"$log" 2>&1; rc=$?
+cat "$log"; exit $rc`
+
+// safeLogName keeps a kit name to characters that are safe in a directory name.
+func safeLogName(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			return r
+		}
+		return '_'
+	}, s)
+}
+
 // Plan turns a Setup into the ordered operations that carry it out. workdir is what ${WORKDIR}
 // expands to in file content; cloneTarget, when not empty, is the workspace path of a clone-mode
 // sandbox, which setup.files may not write at or under.
@@ -137,9 +163,15 @@ func (s *Setup) Plan(workdir, cloneTarget string) ([]setupOp, error) {
 		if strings.TrimSpace(step.Command) == "" {
 			return nil, fmt.Errorf("setup.install[%d] has no command", i)
 		}
+		argv := []string{"/bin/sh", "-c", step.Command}
+		if step.Kit != "" && step.N > 0 {
+			argv = []string{"/bin/sh", "-c", installLogScript, "sh",
+				fmt.Sprintf("/var/log/sbx-kits/%s/install-%d.log", safeLogName(step.Kit), step.N),
+				"/bin/sh", "-c", step.Command}
+		}
 		ops = append(ops, setupOp{
 			label: labelOf("install", i, step.Description, step.Command),
-			argv:  []string{"/bin/sh", "-c", step.Command},
+			argv:  argv,
 			user:  orDefault(step.User, "root"),
 		})
 	}
