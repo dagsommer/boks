@@ -8,7 +8,7 @@ and a kit written for `sbx` is a kit Boks reads.
 > **What Boks does with a kit today: its network rules, and nothing else.**
 >
 > `--kit` applies `permissions.network` and refuses remote references. Everything else in a
-> spec — the image, the entrypoint, `setup`, `files`, `credentials`, `ports`, `volumes` — is
+> spec — the image, the entrypoint, `setup`, `files`, `credentials` — is
 > parsed, validated, and **not applied**. The flag says so, and so does every example below
 > that shows a field Boks ignores.
 >
@@ -193,6 +193,33 @@ permissions:
     allow: [api.my-agent.example.com]
 ```
 
+### Ports and volumes
+
+`ports` and `volumes` are applied.
+
+```yaml
+ports: [{container: 8080, protocol: tcp}]
+volumes:
+  - path: /var/cache/tool           # block-backed: survives stop/start, removed by `boks rm`
+  - path: /tmp/scratch
+    type: tmpfs                     # RAM-backed
+    size: 64m
+    mode: "1777"
+```
+
+- **Ports.** Each TCP port is published as if you had typed `--publish PORT`: an ephemeral
+  host port on `127.0.0.1`, never one the kit picks. Boks prints each one when it publishes,
+  and `boks ports NAME` shows the host port. UDP is skipped with a note (Boks publishes TCP
+  only). A kit's ports are applied when the sandbox is created; on a sandbox that exists, use
+  `boks ports`.
+- **Volumes** are attached only when the sandbox is created, because they are part of the
+  container's spec. Running a kit with volumes against an existing sandbox prints a note and
+  changes nothing; `boks rm` and run again to get them. A block-backed volume is a directory
+  under Boks' state directory (`volumes/NAME/`), shared into the guest read-write, so it has
+  no size limit (a `size` is reported as not enforced) and `mode` sets that directory's
+  permissions. A tmpfs volume is an OCI `tmpfs` mount with `size` and `mode` applied.
+  `boks rm` and an ephemeral run's exit delete the block-backed directories.
+
 ### Fields Boks parses and does not apply
 
 Valid in a kit, accepted by `--kit`, and with no effect yet. They are listed so that a kit
@@ -215,7 +242,6 @@ credentials:                            # not applied — see internal/secret fo
       inject:
         - domain: api.my-service.com
           scheme: bearer
-ports: [{container: 8080, protocol: tcp}]   # not applied — use boks ports
 agentInstructions:                      # not applied
   filename: AGENT.md
   content: "Do not commit without asking."

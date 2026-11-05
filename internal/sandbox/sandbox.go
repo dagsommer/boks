@@ -107,6 +107,8 @@ type Config struct {
 	// because a workspace is part of the sandbox's identity, recorded in its labels and
 	// shown by `boks ls`, and a directory Boks put there for its own plumbing is not.
 	Mounts []workspace.Workspace
+	// Volumes are a kit's block-backed and tmpfs mounts, applied at creation only.
+	Volumes []Volume
 	// Env are additional environment variables, in KEY=VALUE form.
 	Env []string
 	// RunEnv are variables for this run's agent process only, never stored in the sandbox:
@@ -297,6 +299,7 @@ func runEphemeral(ctx context.Context, cfg Config) (exitCode int, err error) {
 		if delErr := container.Delete(cleanupCtx, client.WithSnapshotCleanup); delErr != nil && err == nil {
 			err = fmt.Errorf("removing sandbox %s: %w", cfg.Name, delErr)
 		}
+		_ = removeVolumes(policy.StateDir(), cfg.Name)
 	}()
 
 	if runsKeeper(cfg) {
@@ -440,6 +443,9 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 		processArgs = command
 	}
 
+	if err := prepareVolumes(cfg); err != nil {
+		return nil, err
+	}
 	specOpts := specOptions(cfg, imageConfigOpt(image), processArgs)
 
 	labels, err := containerLabels(cfg, command)
@@ -630,7 +636,7 @@ func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []o
 		// terminal; the command exec'd into it asks for its own.
 		specOpts = append(specOpts, oci.WithTTY)
 	}
-	if mounts := workspaceMounts(guestShares(cfg)); len(mounts) > 0 {
+	if mounts := append(workspaceMounts(guestShares(cfg)), tmpfsMounts(cfg.Volumes)...); len(mounts) > 0 {
 		specOpts = append(specOpts, oci.WithMounts(mounts))
 	}
 	if len(cfg.Workspaces) > 0 {
@@ -759,7 +765,7 @@ func guestShares(cfg Config) []workspace.Workspace {
 	if cfg.Clone && len(shares) > 0 {
 		shares[0] = shares[0].Source()
 	}
-	return append(shares, cfg.Mounts...)
+	return append(append(shares, cfg.Mounts...), volumeShares(cfg)...)
 }
 
 // configFilesystem is the record of how this sandbox's workspace reaches its guest.

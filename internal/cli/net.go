@@ -241,7 +241,7 @@ func attachSandboxNetwork(ctx context.Context, flags *policyFlags, inv invocatio
 // stopped sandbox brings its ports back up.
 func publishFor(flags *policyFlags, inv invocation, stderr io.Writer) []string {
 	if !inv.exists {
-		return flags.publish
+		return append(kitPublish(flags.kitSpec, stderr), flags.publish...)
 	}
 	if len(flags.publish) > 0 {
 		fmt.Fprintf(stderr,

@@ -448,6 +448,10 @@ func Remove(ctx context.Context, address, name string, force bool) error {
 	if err := container.Delete(deleteCtx, client.WithSnapshotCleanup); err != nil {
 		return fmt.Errorf("removing sandbox %q: %w", name, err)
 	}
+	// A kit's block-backed volumes live outside the container and go with it.
+	if err := removeVolumes(policy.StateDir(), name); err != nil {
+		return fmt.Errorf("removing the volumes of sandbox %q: %w", name, err)
+	}
 	return nil
 }
 

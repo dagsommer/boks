@@ -935,6 +935,13 @@ which is also where `sandbox.resources.{cpu,memory}` would land. `volumes[]` is 
 "how the nested Docker data disk is expressed rather than being a special case," and nested
 Docker is roadmap item 6 — so `volumes[]` should follow that work rather than lead it. Defer.
 
+*Update:* implemented without waiting for nested Docker. A block-backed volume is a host
+directory under `<state>/volumes/<sandbox>/` bound like a workspace (so it gets the same idmap
+treatment); tmpfs is an OCI `tmpfs` mount with `size=`/`mode=`. Both are set when the container
+is created, so a kit with volumes run against an existing sandbox is noted and not applied.
+Block volumes have no quota, and `boks rm` deletes the directory. Ports are fed through
+`--publish` with host IP and port omitted (TCP only), and announced on stderr.
+
 **Ports.** `internal/ports/spec.go` already implements sbx's grammar verbatim
 (`[[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]`, six protocol spellings, loopback-only
 default, "Nothing is opened implicitly"). A kit's `ports[]` entry — `{container, protocol,

@@ -285,9 +285,6 @@ func (f *policyFlags) describeKit(w io.Writer) {
 			ignored = append(ignored, fmt.Sprintf("%d file(s)", n))
 		}
 	}
-	if n := len(f.kitSpec.Ports); n > 0 {
-		ignored = append(ignored, fmt.Sprintf("%d port(s)", n))
-	}
 	if len(ignored) > 0 {
 		fmt.Fprintf(w, "kit: NOT applied — %s.\n", strings.Join(ignored, ", "))
 	}
