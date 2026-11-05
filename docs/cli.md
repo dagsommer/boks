@@ -1522,7 +1522,8 @@ Any other name is stored just the same and attached by nothing until a 'boks run
 rule says where it goes.
 
 ```
-echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
+boks secret set --value-stdin my-internal-api < token.txt
+  echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
   echo -n "$GITHUB_TOKEN"     | boks secret set github
   echo -n "$KEY"              | boks secret set my-internal-api
 ```
@@ -1533,6 +1534,7 @@ echo -n "$ANTHROPIC_API_KEY" | boks secret set anthropic
 | `--sandbox string` |  | store this credential for one sandbox only, in preference to the machine-wide one |
 | `--store string` |  | encrypted store file |
 | `--value string` |  | the credential; omit to read it from stdin |
+| `--value-stdin` |  | read the credential from stdin, whole and without a prompt, even on a terminal |
 
 ## boks start
 

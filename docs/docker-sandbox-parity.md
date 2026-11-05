@@ -706,6 +706,13 @@ terminal, and `--approve-kit-credentials` still approves) and `run --no-progress
 periodic pull lines; the "image: pulling" lines stay). `--no-input` does not change whether the
 agent session gets a pseudo-terminal.
 
+Also done: `secret set --value-stdin` (whole stdin, no prompt, refused with `--value`). A custom secret with no
+destination host was already impossible: `--inject` rejects an empty host list (`tok@=bearer`), and a
+stored name with no rule is attached to nothing.
+
+Not built: HTTP policy rules restricted by query parameter. Boks policy rules are host/port/CIDR only;
+there are no method or path rules to extend, so this needs the HTTP rule layer itself first.
+
 Also done: kit credentials are approved by the user before they are used, as sbx now does
 (`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
 were applied unasked, to whatever the user had stored under the service's name.
@@ -717,8 +724,7 @@ Not yet built, roughly in the order worth doing:
 | sbx feature | Release | Notes |
 |---|---|---|
 | `--mount HOST:SANDBOX_PATH` for kit-declared mounts | 0.50 | Waits for kit `volumes`/mounts; `PATH:TARGET[:ro]` workspaces are done |
-| `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Proxy rule matcher |
-| `sbx secret set-custom --value-stdin`, and custom secrets with no destination host no longer substituting | 0.51 | Boks `secret set` already reads stdin |
+| `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Needs HTTP method/path rules first; Boks has none (host-level only) |
 | `kit inspect --resolved`, kit install logs, kit loopback port requests, persistent kit volumes | 0.50/0.51 | Kits slices in kits-design.md |
 | Split-horizon DNS via the proxy, 502 for failed upstream connections, upstream connection reuse | 0.51 | |
 | `sandbox.fuse` | 0.51 | Guest kernel support unverified |
