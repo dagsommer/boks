@@ -200,3 +200,37 @@ func kitAttachForm(in kit.APIKeyInject) (string, error) {
 	}
 	return header + ":" + in.Format, nil
 }
+
+// kitGuestSpecs renders the credentials a kit declares as proxyManaged as --guest-credential
+// specifications: the environment variable the guest's own tools read, holding a stand-in.
+//
+// Without it the proxy would attach the credential to a request the guest never makes — `npm`
+// or `gh` finds no token in its environment and sends nothing worth rewriting. This is what
+// sbx's proxyManaged does, and what the kit's author is relying on.
+//
+// # The placeholder is minted, not the literal "proxy-managed"
+//
+// sbx sets the variable to the string proxy-managed. A client that checks a token's prefix or
+// length locally rejects that before any request reaches the proxy, so Boks mints one in the
+// shape of the vendor's credential where its registry knows the service, and a neutral
+// 40-character one where it does not. A service Boks has never heard of has no format to
+// imitate, and refusing it would break the common case — an internal token that is checked by
+// nothing but the server — to guard against a client check Boks cannot know exists. The
+// stand-in carries no secret either way.
+func kitGuestSpecs(spec *kit.Spec) []string {
+	if spec == nil {
+		return nil
+	}
+	var specs []string
+	for _, c := range spec.Credentials {
+		if c.APIKey == nil || !c.APIKey.ProxyManaged || c.APIKey.Name == "" {
+			continue
+		}
+		placeholder := secret.NewSentinel("", c.Service, 40)
+		if known, ok := knownServices.Lookup(c.Service); ok && known.Configured() {
+			placeholder = known.Placeholder()
+		}
+		specs = append(specs, c.Service+"="+c.APIKey.Name+"="+placeholder)
+	}
+	return specs
+}

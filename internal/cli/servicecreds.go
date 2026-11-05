@@ -72,9 +72,24 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 	if kitSpecs, err = f.gateKitCredentials(kitSpecs, store, f.errOut()); err != nil {
 		return credentialPlan{}, err
 	}
+	// The stand-ins follow their credentials: one the user did not approve gets no variable
+	// in the guest either.
+	var kitGuest []string
+	for _, spec := range kitGuestSpecs(f.kitSpec) {
+		service, _, _, perr := secret.ParseGuestCredential(spec)
+		if perr != nil {
+			return credentialPlan{}, perr
+		}
+		for _, in := range kitSpecs {
+			if s, _, ierr := secret.ParseInject(in); ierr == nil && s == service {
+				kitGuest = append(kitGuest, spec)
+				break
+			}
+		}
+	}
 	plan := credentialPlan{
 		inject: append(kitSpecs, f.inject...),
-		guest:  slices.Clone(f.guest),
+		guest:  append(kitGuest, f.guest...),
 		oauth:  slices.Clone(f.oauth),
 	}
 	if store == nil || f.noSecrets {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/dagsommer/boks/internal/kit"
 	"github.com/dagsommer/boks/internal/policy"
+	"github.com/dagsommer/boks/internal/secret"
 )
 
 var testKitSpecs = []string{
@@ -101,5 +102,43 @@ func TestGateRemembersAnApprovalUntilTheKitAsksForSomethingElse(t *testing.T) {
 	f.kitRef = "git+https://elsewhere/kit.git"
 	if got, _ := f.gateKitCredentials(testKitSpecs, nil, stderr); len(got) != 0 {
 		t.Errorf("approval leaked to another reference: %v", got)
+	}
+}
+
+func TestKitGuestSpecsMintAPlaceholderPerProxyManagedCredential(t *testing.T) {
+	spec := &kit.Spec{Name: "team", Credentials: []kit.Credential{
+		{Service: "ghe-token", APIKey: &kit.APIKey{Name: "GHE_TOKEN", ProxyManaged: true}},
+		{Service: "anthropic", APIKey: &kit.APIKey{Name: "ANTHROPIC_API_KEY", ProxyManaged: true}},
+		{Service: "quiet", APIKey: &kit.APIKey{Name: "QUIET"}},
+		{Service: "nameless", APIKey: &kit.APIKey{ProxyManaged: true}},
+	}}
+	got := kitGuestSpecs(spec)
+	if len(got) != 2 {
+		t.Fatalf("got %v", got)
+	}
+	_, env, placeholder, err := secret.ParseGuestCredential(got[0])
+	if err != nil || env != "GHE_TOKEN" || len(placeholder) != 40 || !strings.Contains(placeholder, "boksproxymanaged") {
+		t.Errorf("unknown service: %q %q %v", env, placeholder, err)
+	}
+	if _, _, placeholder, _ := secret.ParseGuestCredential(got[1]); !strings.HasPrefix(placeholder, "sk-ant-") {
+		t.Errorf("a known service should use its registry shape: %q", placeholder)
+	}
+}
+
+func TestPlanCredentialsGivesAnUnapprovedKitCredentialNoGuestVariable(t *testing.T) {
+	f, _ := kitFlags(t)
+	f.kitSpec = &kit.Spec{Name: "team", Credentials: []kit.Credential{{
+		Service: "ghe-token",
+		APIKey: &kit.APIKey{Name: "GHE_TOKEN", ProxyManaged: true,
+			Inject: []kit.APIKeyInject{{Domain: "ghe.example", Scheme: "bearer"}}},
+	}}}
+	plan, err := f.planCredentials(nil)
+	if err != nil || len(plan.inject) != 0 || len(plan.guest) != 0 {
+		t.Fatalf("unapproved: %+v, %v", plan, err)
+	}
+	f.approveKit = true
+	plan, err = f.planCredentials(nil)
+	if err != nil || len(plan.inject) != 1 || len(plan.guest) != 1 {
+		t.Fatalf("approved: %+v, %v", plan, err)
 	}
 }
