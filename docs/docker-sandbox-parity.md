@@ -692,7 +692,7 @@ run, and `boks ports -p` as the short form of `--publish`.
 
 Also done: `boks cp` out of a sandbox no longer writes through a symlink the guest planted
 (sbx 0.50/0.51 fixed the same class). Extraction now goes through an `os.Root`, and a symlink whose
-target leaves the destination is refused. Before this a guest could write any file the user could,
+target leaves the destination is skipped with a note (and so is anything the archive names beneath it); the rest of the copy goes on. Before this a guest could write any file the user could,
 anywhere on the host, with an archive of two entries.
 
 Also done: additional workspaces as `PATH:TARGET[:ro]`, `boks run git+ssh://…#dir=kit .` with the

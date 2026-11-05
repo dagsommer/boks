@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -47,7 +48,7 @@ func TestTarRoundTripDirectory(t *testing.T) {
 	dest := t.TempDir()
 	// The archive is unpacked under a different name, which is what makes
 	// `boks cp sandbox:/a/b ./c` land in ./c rather than ./c/b.
-	if err := extractTar(&buf, dest, "renamed"); err != nil {
+	if err := extractTar(&buf, dest, "renamed", nil); err != nil {
 		t.Fatalf("extractTar: %v", err)
 	}
 
@@ -97,7 +98,7 @@ func TestTarRoundTripSingleFile(t *testing.T) {
 	}
 
 	dest := t.TempDir()
-	if err := extractTar(&buf, dest, "copied.txt"); err != nil {
+	if err := extractTar(&buf, dest, "copied.txt", nil); err != nil {
 		t.Fatalf("extractTar: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(dest, "copied.txt"))
@@ -131,7 +132,7 @@ func TestExtractTarRefusesEscape(t *testing.T) {
 		}
 
 		dest := filepath.Join(t.TempDir(), "into")
-		if err := extractTar(&buf, dest, "payload"); err == nil {
+		if err := extractTar(&buf, dest, "payload", nil); err == nil {
 			t.Errorf("extractTar accepted %q", name)
 		}
 		if _, err := os.Stat(filepath.Join(filepath.Dir(dest), "escape.txt")); err == nil {
@@ -186,11 +187,14 @@ func TestExtractTarDoesNotWriteThroughASymlink(t *testing.T) {
 			if err := os.MkdirAll(outside, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			var buf bytes.Buffer
+			var buf, warn bytes.Buffer
 			writeCopyEntries(t, &buf, build(outside))
 
-			if err := extractTar(&buf, dest, "payload"); err == nil {
-				t.Error("extractTar accepted a symlink leaving the destination")
+			if err := extractTar(&buf, dest, "payload", &warn); err != nil {
+				t.Errorf("extractTar failed on a skipped symlink: %v", err)
+			}
+			if !strings.Contains(warn.String(), "outside the copy destination") {
+				t.Errorf("no warning for the skipped symlink: %q", warn.String())
 			}
 			if _, err := os.Lstat(filepath.Join(outside, "pwned")); err == nil {
 				t.Error("a file was written outside the destination through a symlink")
@@ -210,7 +214,7 @@ func TestExtractTarKeepsASymlinkThatStaysInside(t *testing.T) {
 		{name: "payload/real.txt", body: "hello"},
 		{name: "payload/alias", link: "real.txt"},
 	})
-	if err := extractTar(&buf, dest, "payload"); err != nil {
+	if err := extractTar(&buf, dest, "payload", nil); err != nil {
 		t.Fatalf("extractTar: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(dest, "payload", "alias"))
@@ -268,7 +272,7 @@ func TestExtractTarDoesNotFollowAnExistingSymlinkOut(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	writeCopyEntries(t, &buf, []copyEntry{{name: "payload/", dir: true}, {name: "payload/f", body: "x"}})
-	if err := extractTar(&buf, dest, "payload"); err == nil {
+	if err := extractTar(&buf, dest, "payload", nil); err == nil {
 		t.Error("extractTar wrote through a symlink already in the destination")
 	}
 	if _, err := os.Lstat(filepath.Join(outside, "f")); err == nil {

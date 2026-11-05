@@ -32,6 +32,7 @@ The sandbox must be running, and its image must contain 'tar'.`,
 				return err
 			}
 			cfg.Address = dev.address
+			cfg.Warn = cmd.ErrOrStderr()
 			return sandbox.Copy(cmd.Context(), cfg)
 		},
 	}

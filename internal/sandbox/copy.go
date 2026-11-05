@@ -31,6 +31,9 @@ type CopyConfig struct {
 	// ToSandbox.
 	HostPath  string
 	GuestPath string
+	// Warn receives a note for each symlink that was skipped because its target leaves the
+	// destination. Nil discards them.
+	Warn io.Writer
 }
 
 func Copy(ctx context.Context, cfg CopyConfig) error {
@@ -113,7 +116,7 @@ func copyFromSandbox(ctx context.Context, cfg CopyConfig) error {
 		errC <- err
 	}()
 
-	extractErr := extractTar(pr, destDir, entryName)
+	extractErr := extractTar(pr, destDir, entryName, cfg.Warn)
 	pr.CloseWithError(extractErr)
 	if err := <-errC; err != nil {
 		return err
@@ -226,7 +229,10 @@ func writeTarEntry(tw *tar.Writer, srcPath, name string, fi os.FileInfo) error {
 //     out of it, symlinks included; and a symlink whose target leaves the destination is
 //     refused when it is made (checkLinkTarget), so the copy never plants a link that points
 //     at the host's files for something else to follow later.
-func extractTar(r io.Reader, destDir, entryName string) error {
+func extractTar(r io.Reader, destDir, entryName string, warn io.Writer) error {
+	// skipped holds the places of symlinks left out, so an entry named beneath one is left
+	// out too rather than creating a plain directory where the link would have been.
+	skipped := map[string]bool{}
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", destDir, err)
 	}
@@ -259,6 +265,16 @@ func extractTar(r io.Reader, destDir, entryName string) error {
 			return err
 		}
 
+		for p := rel; p != "." && p != "/" && p != ""; p = filepath.Dir(p) {
+			if skipped[p] {
+				rel = ""
+				break
+			}
+		}
+		if rel == "" {
+			continue
+		}
+
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := dest.MkdirAll(rel, os.FileMode(header.Mode).Perm()); err != nil {
@@ -281,7 +297,13 @@ func extractTar(r io.Reader, destDir, entryName string) error {
 			}
 		case tar.TypeSymlink:
 			if err := checkLinkTarget(header.Name, rel, header.Linkname); err != nil {
-				return err
+				// Left out with a note, not an error: one stray link in a tree should not
+				// make the rest of the copy fail. Nothing is written for it.
+				skipped[rel] = true
+				if warn != nil {
+					fmt.Fprintf(warn, "boks: skipped %v\n", err)
+				}
+				continue
 			}
 			if err := dest.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 				return err
@@ -305,12 +327,12 @@ func checkLinkTarget(name, rel, linkname string) error {
 	slashed := filepath.ToSlash(linkname)
 	if path.IsAbs(slashed) || filepath.IsAbs(linkname) || strings.HasPrefix(linkname, `\`) ||
 		strings.ContainsRune(linkname, 0) {
-		return fmt.Errorf("refusing to copy the symlink %q: it points at %q, outside the copy destination",
+		return fmt.Errorf("symlink %q: it points at %q, outside the copy destination",
 			name, linkname)
 	}
 	resolved := path.Join(path.Dir(filepath.ToSlash(rel)), slashed)
 	if resolved == ".." || strings.HasPrefix(resolved, "../") {
-		return fmt.Errorf("refusing to copy the symlink %q: it points at %q, outside the copy destination",
+		return fmt.Errorf("symlink %q: it points at %q, outside the copy destination",
 			name, linkname)
 	}
 	return nil
