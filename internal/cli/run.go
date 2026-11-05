@@ -214,6 +214,9 @@ Agents:
 		if err := applyCloneMode(flags, inv, &cfg, env); err != nil {
 			return err
 		}
+		if err := netFlags.applyKit(&cfg); err != nil {
+			return err
+		}
 
 		// The network is decided, described and started before the sandbox: its
 		// annotations have to be on the container when it is created, and the host-side

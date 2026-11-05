@@ -110,6 +110,9 @@ type Config struct {
 	// because a workspace is part of the sandbox's identity, recorded in its labels and
 	// shown by `boks ls`, and a directory Boks put there for its own plumbing is not.
 	Mounts []workspace.Workspace
+	// Setup is a kit's install commands, files and startup commands, applied inside the guest
+	// once the sandbox is running. Nil does nothing.
+	Setup *Setup
 	// Env are additional environment variables, in KEY=VALUE form.
 	Env []string
 	// RunEnv are variables for this run's agent process only, never stored in the sandbox:
@@ -198,7 +201,11 @@ func Run(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	if _, err := ensureRunning(ctx, container, cfg.Stderr); err != nil {
+	task, err := ensureRunning(ctx, container, cfg.Stderr)
+	if err != nil {
+		return 1, err
+	}
+	if err := ensureSetup(ctx, container, task, cfg); err != nil {
 		return 1, err
 	}
 
@@ -244,7 +251,11 @@ func Up(ctx context.Context, cfg Config) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	if _, err := ensureRunning(ctx, container, cfg.Stderr); err != nil {
+	task, err := ensureRunning(ctx, container, cfg.Stderr)
+	if err != nil {
+		return Info{}, err
+	}
+	if err := ensureSetup(ctx, container, task, cfg); err != nil {
 		return Info{}, err
 	}
 	return describe(ctx, container)
@@ -276,7 +287,7 @@ func ensureContainer(ctx context.Context, c *client.Client, cfg Config) (client.
 // The alternative was to bootstrap the clone from inside the command's own process, which
 // cannot work: making the workspace's absolute path in the guest needs root, and the
 // command runs as the image's user.
-func runsKeeper(cfg Config) bool { return !cfg.Ephemeral || cfg.Clone }
+func runsKeeper(cfg Config) bool { return !cfg.Ephemeral || cfg.Clone || !cfg.Setup.Empty() }
 
 // runEphemeral is the create-run-destroy path: the command is the container process and
 // nothing survives it.
@@ -321,6 +332,9 @@ func runEphemeralInKeeper(ctx context.Context, container client.Container, cfg C
 		return 1, err
 	}
 	defer cleanupTask(ctx, task)
+	if err := ensureSetup(ctx, container, task, cfg); err != nil {
+		return 1, err
+	}
 
 	command := cfg.Command
 	if len(command) == 0 {

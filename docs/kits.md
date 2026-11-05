@@ -8,8 +8,10 @@ and a kit written for `sbx` is a kit Boks reads.
 > **What Boks does with a kit today:** its network rules, the agent a `kind: sandbox` kit
 > defines, and the API-key credentials it declares — after you approve them.
 >
-> `setup`, `files`, `ports`, `volumes` and `oauth` credentials are parsed, validated, and
-> **not applied**. The flag says so, and so does every example below that shows a field Boks
+> `setup.install`, `setup.files` and `setup.startup` run inside the guest after it starts
+> (install and files once per sandbox, startup once per boot; a failed install is retried on the
+> next run). `ports`, `volumes`, the `files/` tree and `oauth` credentials are parsed, validated,
+> and **not applied**. The flag says so, and so does every example below that shows a field Boks
 > ignores. Why, and what comes next, is in [kits-design.md](kits-design.md).
 
 ### Credentials need your approval
@@ -219,12 +221,12 @@ which relies on them is not mistaken for one that works:
 
 ```yaml
 setup:
-  install:                              # not applied — would run as uid 0 at creation
+  install:                              # applied once per sandbox, as uid 0 unless `user:` says otherwise
     - command: "apt-get update && apt-get install -y jq"
-  startup:                              # not applied — would run at each start as uid 1000
+  startup:                              # applied once per boot, as the agent user; `background: true` detaches
     - command: ["my-daemon"]
       background: true
-  files:                                # not applied
+  files:                                # applied once per sandbox; ${WORKDIR} expands
     - path: /home/agent/.my-tool/config.json
       content: '{"workspace": "{{.Workspace}}"}'
 credentials:                            # not applied — see internal/secret for what Boks does today

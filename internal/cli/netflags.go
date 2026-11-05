@@ -279,17 +279,6 @@ func (f *policyFlags) describeKit(w io.Writer) {
 	// Listing them here as ignored was wrong in the direction that makes a working feature
 	// look broken, which is the worse direction.
 	var ignored []string
-	if f.kitSpec.Setup != nil {
-		if n := len(f.kitSpec.Setup.Install); n > 0 {
-			ignored = append(ignored, fmt.Sprintf("%d install command(s)", n))
-		}
-		if n := len(f.kitSpec.Setup.Startup); n > 0 {
-			ignored = append(ignored, fmt.Sprintf("%d startup command(s)", n))
-		}
-		if n := len(f.kitSpec.Setup.Files); n > 0 {
-			ignored = append(ignored, fmt.Sprintf("%d file(s)", n))
-		}
-	}
 	if n := len(f.kitSpec.Ports); n > 0 {
 		ignored = append(ignored, fmt.Sprintf("%d port(s)", n))
 	}

@@ -126,6 +126,7 @@ func checkFixedAtCreation(f *sandboxFlags, net *policyFlags, inv invocation) err
 	checkRuntimeFlags(f, inv, &c)
 	checkCloneMode(f, inv, &c)
 	checkWorkdir(f, inv, &c)
+	checkWorkspaces(inv, &c)
 	return c.err()
 }
 
@@ -357,4 +358,26 @@ func checkWorkdir(f *sandboxFlags, inv invocation, c *fixedConflicts) {
 		return
 	}
 	c.add("--workdir "+f.workdir, "the sandbox starts in "+inv.info.Cwd)
+}
+
+// checkWorkspaces refuses workspaces the sandbox was not created with. The mounts are fixed at
+// creation, so a second `boks run . ../other` asks for a directory the guest will never see —
+// sbx refuses it as "can't be given new workspaces", and so does this. Asking for fewer than the
+// sandbox has is fine: the rest are simply still there.
+func checkWorkspaces(inv invocation, c *fixedConflicts) {
+	if len(inv.info.Workspaces) == 0 {
+		return
+	}
+	have := make(map[string]bool, len(inv.info.Workspaces))
+	var shared []string
+	for _, ws := range inv.info.Workspaces {
+		have[ws.HostPath] = true
+		shared = append(shared, ws.HostPath)
+	}
+	for _, ws := range inv.workspaces {
+		if !have[ws.HostPath] {
+			c.add("workspace "+ws.HostPath, "the sandbox shares "+strings.Join(shared, ", ")+
+				"; a sandbox can't be given new workspaces")
+		}
+	}
 }

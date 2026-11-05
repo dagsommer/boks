@@ -7,6 +7,7 @@ import (
 
 	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/kit"
+	"github.com/dagsommer/boks/internal/sandbox"
 	"github.com/dagsommer/boks/internal/secret"
 )
 
@@ -233,4 +234,56 @@ func kitGuestSpecs(spec *kit.Spec) []string {
 		specs = append(specs, c.Service+"="+c.APIKey.Name+"="+placeholder)
 	}
 	return specs
+}
+
+// kitSetup converts a kit's setup: block into what the sandbox package applies in the guest.
+func kitSetup(spec *kit.Spec) *sandbox.Setup {
+	if spec == nil || spec.Setup == nil {
+		return nil
+	}
+	var s sandbox.Setup
+	for _, c := range spec.Setup.Install {
+		s.Install = append(s.Install, sandbox.InstallStep{Command: c.Command, User: c.User, Description: c.Description})
+	}
+	for _, f := range spec.Setup.Files {
+		s.Files = append(s.Files, sandbox.FileStep{Path: f.Path, Content: f.Content, Mode: f.Mode, OnlyIfMissing: f.OnlyIfMissing})
+	}
+	for _, c := range spec.Setup.Startup {
+		s.Startup = append(s.Startup, sandbox.StartupStep{Command: c.Command, User: c.User, Background: c.Background, Description: c.Description})
+	}
+	if s.Empty() {
+		return nil
+	}
+	return &s
+}
+
+// applyKit puts what a kit asks of the guest into cfg: its setup, and — for a kit that is not
+// itself the agent — its environment variables. A kind: sandbox kit's variables already travel
+// on the agent it defines; a mixin has no agent, and without this its variables were dropped.
+//
+// Called after the clone mode is decided, because setup.files must not land inside a clone and
+// that is only knowable then. Validating here, rather than when the setup is applied, means a
+// refused kit costs a message instead of a created sandbox.
+func (f *policyFlags) applyKit(cfg *sandbox.Config) error {
+	if f.kitSpec == nil {
+		return nil
+	}
+	cfg.Setup = kitSetup(f.kitSpec)
+	if f.kitSpec.Kind != kit.KindSandbox {
+		cfg.Env = append(cfg.Env, kitEnv(f.kitSpec)...)
+	}
+	if cfg.Setup == nil {
+		return nil
+	}
+	workdir, clone := "", ""
+	if len(cfg.Workspaces) > 0 {
+		workdir = cfg.Workspaces[0].Root()
+		if cfg.Clone {
+			clone = workdir
+		}
+	}
+	if _, err := cfg.Setup.Plan(workdir, clone); err != nil {
+		return fmt.Errorf("kit %s: %w", f.kitSpec.Name, err)
+	}
+	return nil
 }
