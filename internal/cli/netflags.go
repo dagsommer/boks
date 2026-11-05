@@ -48,8 +48,10 @@ type policyFlags struct {
 	// approveKit answers the kit credential approval for this run, and stdin is where it is
 	// asked when it is not answered. A nil stdin — `boks proxy`, `policy ls` — never asks.
 	approveKit bool
-	stdin      io.Reader
-	stderr     io.Writer
+	// noInput makes the approval behave as it does without a terminal: it never asks.
+	noInput bool
+	stdin   io.Reader
+	stderr  io.Writer
 }
 
 // forAgent labels the flags with the agent whose allowlist applies.

@@ -138,6 +138,8 @@ func (a *kitApprovals) save() error {
 func (f *policyFlags) registerKitApproval(fs *pflag.FlagSet) {
 	fs.BoolVar(&f.approveKit, "approve-kit-credentials", false,
 		"approve the credentials a --kit asks for, for this run only, without asking")
+	fs.BoolVar(&f.noInput, "no-input", false,
+		"never prompt: treat stdin as not being a terminal, so a kit's credentials are not attached unless approved")
 }
 
 // gateKitCredentials returns the part of a kit's credential specs the user has approved,
@@ -182,7 +184,7 @@ func (f *policyFlags) gateKitCredentials(specs []string, store secret.Store, std
 		}
 		fmt.Fprintf(stderr, "kit %q: credentials approved for this run by --approve-kit-credentials: %s\n",
 			f.kitSpec.Name, askNames(pending))
-	case f.stdin != nil && isTerminal(f.stdin):
+	case f.stdin != nil && !f.noInput && isTerminal(f.stdin):
 		answered, err := f.askKitCredentials(pending, bufio.NewReader(f.stdin), stderr)
 		if err != nil {
 			return nil, err
@@ -198,7 +200,7 @@ func (f *policyFlags) gateKitCredentials(specs []string, store secret.Store, std
 		}
 	default:
 		describeKitCredentials(stderr, f.kitSpec.Name, pending)
-		fmt.Fprintf(stderr, "These are NOT attached: there is no terminal to ask on. Run once interactively to\n"+
+		fmt.Fprintf(stderr, "These are NOT attached: there is no terminal to ask on (or --no-input was given). Run once interactively to\n"+
 			"approve and remember them, or pass --approve-kit-credentials for this run.\n")
 	}
 

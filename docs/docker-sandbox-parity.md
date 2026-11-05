@@ -701,6 +701,11 @@ terminal, and kit `proxyManaged` credentials giving the guest a stand-in variabl
 Also done: `boks reset` (sandboxes, their networks and stored credentials; `--preserve-secrets`, `--force`,
 refuses without a terminal unless forced).
 
+Also done: `run`/`create --no-input` (the kit credential approval never prompts; it is the same as having no
+terminal, and `--approve-kit-credentials` still approves) and `run --no-progress` (no download bar or
+periodic pull lines; the "image: pulling" lines stay). `--no-input` does not change whether the
+agent session gets a pseudo-terminal.
+
 Also done: kit credentials are approved by the user before they are used, as sbx now does
 (`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
 were applied unasked, to whatever the user had stored under the service's name.
@@ -715,7 +720,6 @@ Not yet built, roughly in the order worth doing:
 | `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Proxy rule matcher |
 | `sbx secret set-custom --value-stdin`, and custom secrets with no destination host no longer substituting | 0.51 | Boks `secret set` already reads stdin |
 | `kit inspect --resolved`, kit install logs, kit loopback port requests, persistent kit volumes | 0.50/0.51 | Kits slices in kits-design.md |
-| `--no-input`, `run --no-progress` | 0.51 | |
 | Split-horizon DNS via the proxy, 502 for failed upstream connections, upstream connection reuse | 0.51 | |
 | `sandbox.fuse` | 0.51 | Guest kernel support unverified |
 | Cloud sandboxes, `sbx move`, `sbx skills`, `run --model` | 0.42+ | Won't, or later: Boks has no cloud |

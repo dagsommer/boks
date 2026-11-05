@@ -353,6 +353,7 @@ boks create shell .
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
+| `--no-input` |  | never prompt: treat stdin as not being a terminal, so a kit's credentials are not attached unless approved |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
 | `--policy string` |  | network policy preset: open, standard, locked (default standard) |
@@ -1262,6 +1263,8 @@ boks run                              # a shell in the current directory
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
+| `--no-input` |  | never prompt: treat stdin as not being a terminal, so a kit's credentials are not attached unless approved |
+| `--no-progress` |  | do not report image download progress (no bar, no periodic lines) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
 | `--policy string` |  | network policy preset: open, standard, locked (default standard) |
