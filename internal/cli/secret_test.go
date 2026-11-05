@@ -341,8 +341,12 @@ func TestImportRefusesToPreviewAShortValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "…") {
-		t.Errorf("a short value was previewed:\n%s", out)
+	// Only this value's line: the machine running the test may hold other vendors' keys in
+	// its own environment, and their previews are not what is under test.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "$GROQ_API_KEY") && strings.Contains(line, "…") {
+			t.Errorf("a short value was previewed:\n%s", out)
+		}
 	}
 	if !strings.Contains(out, "too short to preview") {
 		t.Errorf("the refusal to preview is not explained:\n%s", out)
