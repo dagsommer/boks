@@ -724,8 +724,7 @@ commit a git reference resolved to, a digest), so `boks start`, `boks exec` on a
 those paths. An unreadable kit is a warning and the sandbox comes up without it; a different `--kit` on a
 re-attach is refused like the other fixed values. `boks create --kit` now registers a `kind: sandbox`
 kit's agent, takes the kit as the positional, and applies volumes, ports and environment. Sandboxes made
-before this record nothing. **Unverified:** no VM has restarted a sandbox through this; the record, reload,
-approval gate and refusal are unit-tested.
+before this record nothing. **Verified on a real VM (2026-11-05, macOS arm64):** see "Verified in a real guest" below.
 
 Also done: kit `oauth` credentials and `credentialFile`. The block is the *shape* of a login and is
 laid over the OAuth credential stored under the service's name (endpoint, resource hosts, sentinels,
@@ -734,9 +733,46 @@ into `/etc/boks/credentials/` because Boks shares directories, not files. An ent
 `apiKey` and `oauth` uses the API key, as sbx does, decided within the entry only; a login adopted
 separately still beats a key by destination. `passthrough` is skipped with a warning (the run goes on without that credential) and
 `credentialFile.structure` is refused (sbx's engine does not support it either). OAuth entries go
-through the same approval prompt, and the approval is bound to the whole shape. **Unverified:** no
-guest has run a kit-declared login end to end; what is tested is the mapping, approval, merge and
-credential-file rendering.
+through the same approval prompt, and the approval is bound to the whole shape. Verified in a real guest with a stored login: the sentinel
+reaches the guest and the credential file is rendered (see "Verified in a real guest"); a refresh against a real token endpoint was not exercised.
+
+### Verified in a real guest (2026-11-05, macOS arm64, libkrun/nerdbox)
+
+Run with the real `udi-copilot-yolo` kit (`git+ssh`, three `proxyManaged` API-key credentials) and with
+small throwaway kits. All of the following held:
+
+- `go test ./internal/...` passes on this machine, including `TestRawFlowToAnAllowedAddressIsCarriedAndLogged`
+  and `TestCloseTearsDownAFlowInProgress` (five repeats). The earlier failure was the Linux sandbox that could
+  not run a VM, not a defect.
+- `boks run <git+ssh kit> .`: credential prompt, SANDBOX block, `files/home` (owned by the agent), the
+  `setup.startup` step, the agent session. Stand-in variables (`GH_TOKEN` etc.) are in the guest and the
+  proxy injects the real credential: a request to `api.udi-emu.ghe.com` is authenticated, one to
+  `api.github.com` is a 401.
+- `boks stop` then `boks start`: startup reran, the per-boot marker was fresh (`/run` is a tmpfs, so it is
+  memory-backed), the stand-ins were identical and injection still worked, with no new prompt.
+- Same on a `--clone` sandbox: the clone survived the restart, startup and credentials came back.
+- `boks run` with an extra workspace on an existing sandbox is refused ("a sandbox can't be given new
+  workspaces"), with or without the kit.
+- `boks cp` host to guest and guest to host (file and directory); a guest-planted symlink pointing outside the
+  destination is refused.
+- Stacked `--kit a --kit b`: install ran once as uid 0 (and not again after a restart), both startups ran
+  on every boot in kit order, environment merged.
+- Volumes: a block-backed volume is a virtiofs mount owned by `agent`, writable, and survives stop/start;
+  a tmpfs volume has the `size` and `mode` asked for (`8192k`, `1777`). A kit `ports` entry is published on an
+  ephemeral `127.0.0.1` port and is the same after a restart.
+- Kit OAuth credential: the sentinel is in `CLAUDE_CODE_OAUTH_TOKEN`, the credential file is rendered
+  into `/etc/boks/credentials/`, a `passthrough: true` entry is skipped with a warning.
+- `boks reset --force`, in an isolated `BOKS_STATE_DIR`: sandboxes and stored credentials removed.
+- Kit files are written with `cat` from stdin (no `tar` needed in the guest).
+- `/dev/fuse` exists in the guest and the kernel has `CONFIG_FUSE_FS=y`; the agent has no capabilities but
+  `sudo` has all of them, so FUSE mounts work as root. sbx's `sandbox.fuse` setting is therefore effectively
+  on; there is no switch to turn it off.
+
+Not compared side by side: `sbx run` needs `sbx login`, which was not done, so the credential prompt text,
+SANDBOX block and pull bar are not yet diffed against sbx. A kit credential approved with
+`--approve-kit-credentials` at `create` still bakes its OAuth sentinel into the container's environment, and
+`boks start` (which has no stored approval then) does not give the proxy the rule: the guest holds a sentinel
+that nothing substitutes. Harmless, but not tidy.
 
 Not yet built, roughly in the order worth doing:
 
