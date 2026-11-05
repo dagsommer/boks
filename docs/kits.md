@@ -6,15 +6,14 @@ without being typed out each time. The format is [Docker Sandboxes'](https://doc
 and a kit written for `sbx` is a kit Boks reads.
 
 > **What Boks does with a kit today:** its network rules, the agent a `kind: sandbox` kit
-> defines, and the API-key credentials it declares — after you approve them.
+> defines, and the API-key and OAuth credentials it declares — after you approve them.
 >
 > `setup.install`, `setup.files` and `setup.startup` run inside the guest after it starts
 > (install and files once per sandbox, startup once per boot; a failed install is retried on the
 > next run). The `files/` tree is applied too: `files/home/` into `/home/agent` (overwriting, owned by the
 > agent) before the install commands, and `files/workspace/` into the primary workspace last,
 > **never overwriting a file that is already there** — in a direct mount that is your own disk.
-> Symlinks in the tree are skipped. `ports`, `volumes` and `oauth` credentials are parsed, validated,
-> and **not applied**. The flag says so, and so does every example below that shows a field Boks
+> Symlinks in the tree are skipped. `ports` and `volumes` are parsed, validated, and **not applied**. The flag says so, and so does every example below that shows a field Boks
 > ignores. Why, and what comes next, is in [kits-design.md](kits-design.md).
 
 ### Credentials need your approval
@@ -28,16 +27,55 @@ $ boks run team-copilot . --kit git+ssh://git@ghe.example/team/kits.git#dir=copi
 The kit "copilot" wants to use these credentials:
   ghe-token    API key → sent to api.ghe.example, ghe.example   (stored)
   wiki-token   API key → sent to wiki.example                   (not set)
+  ghe-login    OAuth login → sent to api.ghe.example, auth.ghe.example   (stored)
 [A]pprove all · [R]eview each · [N]o (default):
 ```
 
-An approval is remembered for that kit and that service, and only for exactly the hosts and
-header the kit declared. If the kit later adds a host, you are asked again. A credential you
+An approval is remembered for that kit and that service, and only for exactly what the kit
+declared: the hosts, header and format of a key, or the whole shape of a login (endpoints,
+hosts, sentinels, credential file). If the kit later adds a host, you are asked again. A credential you
 do not approve is left out and the sandbox still starts.
 
 With no terminal to ask on, nothing is approved. Run once interactively to remember the
 answer, or pass `--approve-kit-credentials` to approve for that one run. `--inject` is
 unaffected: what you type yourself is never asked about.
+
+### OAuth credentials
+
+A kit's `oauth` block describes a login; it carries no token. Boks applies it to the OAuth
+credential you stored under the same service name (`boks secret adopt NAME` or
+`boks secret login NAME`), and the tokens stay in the store:
+
+```yaml
+credentials:
+  - service: ghe-login
+    oauth:
+      tokenEndpoint: {host: auth.ghe.example, path: /oauth/token}
+      sentinels: {accessToken: "ghe-access-0123456789", refreshToken: "ghe-refresh-0123456789"}
+      resourceHosts: [api.ghe.example]
+      credentialFile:
+        path: ~/.ghe/credentials.json
+        template: '{"token":"{{.AccessToken}}","refresh":"{{.RefreshToken}}"}'
+```
+
+- The kit's token endpoint, resource hosts, sentinels and `responseFields` replace those of the
+  stored login for this run. The client id, request encoding and headers stay the stored
+  login's, because the kit grammar has no spelling for them.
+- `credentialFile` is rendered on the host, from sentinels only, and shared read-only into the
+  guest. The kit's `path` is **redirected**: the file lands in `/etc/boks/credentials/` as
+  `SERVICE-<file name>`, and `BOKS_CREDENTIAL_FILE_<SERVICE>` names it, because Boks shares
+  whole directories and cannot mount your tool's own config directory. Put it where the tool
+  looks from `setup.startup`. Templates may use `.AccessToken`, `.RefreshToken`, `.ExpiresAt`,
+  `.ExpiresAtSeconds`, `.Scopes`, `.ScopesJSON` and `.SubscriptionType`. `structure` is not
+  supported (the same is true of sbx's engine); use `template`.
+- **`passthrough: true` is refused**, and the run fails naming the credential. It would put the
+  real token in the sandbox, which Boks never does.
+- **An entry that declares both `apiKey` and `oauth` uses the API key**, as the kit spec says;
+  its `oauth` is not applied. This is decided within the entry. A login you adopted separately
+  still takes precedence over a key for the same hosts, as it does outside kits.
+- If nothing is stored under that name as an OAuth login, the credential is not attached and
+  the run says how to store one. `--oauth NAME` on the command line wins over the kit.
+- `skipIfEnv` is accepted and ignored.
 
 ## Using a kit
 
@@ -232,7 +270,7 @@ setup:
   files:                                # applied once per sandbox; ${WORKDIR} expands
     - path: /home/agent/.my-tool/config.json
       content: '{"workspace": "{{.Workspace}}"}'
-credentials:                            # not applied — see internal/secret for what Boks does today
+credentials:                            # applied after approval, see above
   - service: my-service
     apiKey:
       name: MY_SERVICE_TOKEN
