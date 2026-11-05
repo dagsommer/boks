@@ -1742,6 +1742,43 @@ boks stop [flags] SANDBOX...
 Shuts sandboxes down without destroying them. Anything written inside a sandbox is still
 there when it starts again; 'boks rm' is what deletes it.
 
+## boks tui
+
+Show the interactive dashboard (what bare 'boks' shows on a terminal)
+
+```
+boks tui
+```
+
+Shows a live view of every sandbox: a card per sandbox with its agent, workspace and
+state, and for the selected one its network log and network rules. From it you can attach
+to a sandbox's agent, open a shell in it, start, stop and remove it, create a new one, and
+add or remove network rules. It is what bare 'boks' shows when it runs in a terminal.
+
+Every action runs the boks command that does the same thing — 'boks run --name', 'boks exec',
+'boks start', 'boks stop', 'boks rm', 'boks create', 'boks policy allow|deny|rm' — so it
+behaves exactly as that command does. Attaching and opening a shell hand the terminal over
+and the dashboard comes back when the session ends. Removing a sandbox or a rule asks first.
+
+```
+Keys (the bottom line shows the ones that apply where you are):
+  ↑/↓            select a sandbox, or a row in the network tables
+  →, Tab         move into the network pane; ←/→ there switch tabs, Tab/Esc go back
+  Enter          attach to the selected sandbox's agent (boks run --name NAME)
+  s / x / r      start or stop, open a shell (exec), remove — on the selected card
+  c              create a sandbox
+  n              the network view for every sandbox; s there picks a sandbox, Esc returns
+  a / r          add or remove a network rule, on the Network Rules tab
+  Enter          on a network log row: block an allowed host, or allow a blocked one
+  o, /           filter by status, search
+  Ctrl+s         settings and paths
+  q, Ctrl+c      quit
+```
+
+The view refreshes about every second and a half. NO_COLOR turns colour off.
+
+Also spelled: `dashboard`
+
 ## boks version
 
 Print the boks version

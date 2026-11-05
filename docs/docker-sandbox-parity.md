@@ -72,7 +72,7 @@ output, plus a live `sbx ls`.
 | Interactive by default | `sbx run` attaches an interactive session | Boks allocates a pty when stdin *and* stdout are terminals, and none when either is a pipe. There is no `-t` for it: `-t` is the template flag. Docker's `-it` on `run` is caught before pflag sees it and answered — `-ti` used to set `--template` to "i" and send the user to debug a missing image | P1 | done |
 | Agent network requirements | Not a separate concept: a kit carries its agent's network rules beside its image and entrypoint | An agent record carries the destinations its CLI cannot work without, resolved as an `agent <name>` layer in `boks policy ls`. `boks run claude` used to fail out of the box and teach the user to read `api.anthropic.com` out of a log. Vendor-documented hosts only, telemetry excluded, empty where no source was found. A deny in any scope still beats it, and `--policy locked` drops the layer | P0 | done |
 | Run output volume | A line or two per run | Full policy, TLS notice and enforcement note on a sandbox's first run and whenever its policy changes; two lines otherwise; `--quiet` for none. An interception host never announced before is announced whatever else is true. Fifty lines per run is how you train someone to grep past a security notice | P1 | done |
-| Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | Prints usage and exits 2 | P1 | none |
+| Bare `boks` | Opens an interactive terminal dashboard: sandbox cards with live status, CPU and memory. `c` create, `s` start/stop, `Enter` attach, `x` shell, `r` remove, `tab` network panel, `?` shortcuts | On a terminal, the same dashboard (`boks tui` too): cards, network log and rules, the same keys, actions that run the matching boks command. Off a terminal it still prints usage and exits 2. No CPU/memory figures, no filesystem rules tab — see "The dashboard" below | P1 | done |
 | `-p/--publish` | Publishes a sandbox port on the host at creation; ignored when re-attaching | Same flag, same short form, same rule — a re-attaching run says so rather than looking obeyed, and points at `boks ports` | P1 | done |
 | `--clone` | Run flag for clone mode | Implemented — `internal/cli/common.go` registers it, `internal/sandbox/clone.go` is the machinery | P1 | done |
 | `--kit` | Run flag naming a kit to apply | Partial: `--kit <dir>` applies a kit's `permissions.network` as its own policy layer. Local directories and `git+https`/`git+ssh` references work; OCI and ZIP are refused by name. Image, entrypoint, `setup` (install/files/startup), API-key and OAuth credentials are applied (after approval); the `files/` tree is applied (workspace files never overwrite); ports and volumes are applied. Several `--kit` flags stack, and `extends`/`mixins:` are followed (see Mixin composition below). Usage in [kits.md](kits.md); design and slices in [kits-design.md](kits-design.md) | P1 | partial |
@@ -115,7 +115,7 @@ website documents.
 
 | sbx command | Purpose | Boks |
 |---|---|---|
-| *(bare)* / `tui` | Interactive dashboard; `tui` also opens it explicitly | none |
+| *(bare)* / `tui` | Interactive dashboard; `tui` also opens it explicitly | bare `boks` on a terminal, and `tui` (alias `dashboard`) |
 | `run` | Run an agent in a sandbox | `run`, agent-first, same grammar |
 | `create` | Create a sandbox for an agent | `create` |
 | `exec` | Execute a command in a sandbox; **starts it first if stopped** | `exec`, starting a stopped sandbox as sbx does |
@@ -683,6 +683,61 @@ has yet to build.
 *(Moved here from `architecture.md`, which is published on the documentation site; these
 are notes about another vendor's product and belong with the rest of the parity material.)*
 
+
+## The dashboard (bare `boks`, `boks tui`), compared with `sbx` v0.51.0
+
+Built 2026-11-05 by reading `sbx`'s own dashboard in a 160x50 terminal, tab by tab, and
+matching it where Boks has the same thing. Implementation: `internal/tui` (model, rendering,
+and a `Source` interface, tested against a fake) and `internal/cli/tui.go` (the real source).
+
+**Matched.** The header box with `(Ctrl+s) ⚙` on the right, and the `❮ esc` segment in the
+network view. One rounded card per sandbox titled `Sandbox`: `■ name`, a rule, the agent with
+`↵ run` on the selected card, the workspace truncated from the left with `…`, the state, a
+rule, and `start  exec  remove` with `s`, `x` and `r` picked out as their keys (`stop` on a
+running card). The selected card's border is coloured; the others are grey. The right pane:
+the sandbox's name, the tabs `Network Log (N)` and `Network Rules (N)`, the log's
+`N total  ● N allowed  ● N blocked` line and its `Date ↑ / Host / Hits / Status` table with
+coloured dots, newest first, collapsed per host; a `Sandbox` column in the all-sandboxes view;
+`N allowed entries · N blocked entries` at the bottom. The selected row names its action
+inline (`block`, `allow`, `delete`). `n` opens the full-width network view headed
+`All sandboxes ▾`, where `s` opens the same dropdown (`All sandboxes`, `Active only`,
+`Inactive only`, each sandbox) and the footer adds `N sandbox(es), N running`. `o` filters by
+status or type, `/` searches, `a` opens an `Add Network Rule` modal (Allow/Block as `[1]`/`[2]`,
+then the host), `c` opens a `Create Sandbox` wizard, `Ctrl+s` a settings panel, `^c` quits.
+The bottom line is sbx's hint line for where focus is, with the version on the right. Keys
+move the same way: `↑/↓` between cards, `→` or `Tab` into the pane, `←/→` between tabs there.
+
+**Adapted, because Boks differs.**
+
+- *No Filesystem Rules tab.* Boks has no filesystem rules; a tab that always said `(0)` would
+  suggest otherwise.
+- *Rules have a Source column instead of Proto.* Boks rules have no transport (TCP, UDP)
+  setting; what they have is an origin — `preset standard`, `agent claude`, `global`,
+  `sandbox NAME`, `profile NAME` — which is what decides whether `r` can remove one. An `HTTP`
+  column appears when an HTTP rule (method, path, query) is listed. The add-rule form has
+  optional method and path fields for the same reason, and no transport choice.
+- *Create is two steps.* sbx asks Cloud or Local first; Boks is local only, so it asks for
+  the agent and then the directory (and an optional name).
+- *Settings shows paths, not choices.* sbx offers Theme and Launch mode; Boks has neither, so
+  the panel shows the version, state directory, containerd address, refresh interval and
+  whether colour is on.
+- *Marks on the card.* sbx shows `✓§` beside the name; Boks shows `clone` for a clone-mode
+  sandbox and `--rm` for an ephemeral one, and the published ports after the state.
+- *Removing asks.* `r` on a card opens a confirmation that says what is lost (and that a
+  running sandbox's processes are killed, and that a clone's unbundled commits go); `Enter`
+  and `Esc` answer no. Removing a rule asks too.
+- *Narrow terminals.* Below 90 columns the pane is dropped and `Tab` opens the network view
+  for the selected sandbox; below 30x8 the dashboard says the terminal is too small.
+
+**Not matched.** No AI Governance banner, no cloud target, no login state. No CPU or memory
+figures on the cards (sbx's documentation mentions them; none were visible in v0.51.0
+either). The per-sandbox rules are resolved from the stored policy, the sandbox's recorded
+policy selection and its agent's allowlist; rules a kit contributes at start are not in that
+view yet. sbx's `Values` column (how many hosts one rule covers) has no equivalent: a Boks rule
+names one destination. sbx's create wizard ends by launching; Boks's creates (as
+`boks create` does) and leaves `Enter` to attach. Not compared, because doing so would have
+meant acting on real sandboxes: sbx's confirmation for remove, and what its `run` and `exec`
+look like from the dashboard.
 
 ## Catch-up with sbx v0.49–v0.51 (read 2026-11-05)
 
