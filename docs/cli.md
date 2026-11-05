@@ -1137,6 +1137,37 @@ boks purge --dry-run     # what is there, and what it would free
 | `--force` |  | remove even though the daemon or a sandbox network is running |
 | `-y`, `--yes` |  | do not ask for confirmation |
 
+## boks reset
+
+Stop and remove every sandbox, its network and the stored credentials
+
+```
+boks reset [flags]
+```
+
+Returns Boks to a clean slate: every sandbox is stopped and deleted, every sandbox
+network and its per-sandbox state is removed, and the credentials stored with
+'boks secret set' are deleted.
+
+It keeps the certificate authority, the policy rules and the decision log, and it leaves the
+pulled images and the daemon alone. 'boks purge' is the command that gives the disk back.
+
+Credentials are the one thing here nothing recreates, so --preserve-secrets keeps them.
+
+It asks first, on a terminal. Without one it refuses rather than guess, and --force is the
+answer that skips the question for scripts.
+
+```
+boks reset                     # asks, then removes everything above
+  boks reset --preserve-secrets  # leaves the stored credentials alone
+  boks reset --force             # no prompt, for scripts
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-f`, `--force` |  | do not ask for confirmation |
+| `--preserve-secrets` |  | keep the stored credentials |
+
 ## boks rm
 
 Delete a sandbox and its filesystem
