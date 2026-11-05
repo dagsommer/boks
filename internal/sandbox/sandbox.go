@@ -184,6 +184,28 @@ func (c Config) say(format string, args ...any) {
 	fmt.Fprintf(c.Progress, format+"\n", args...)
 }
 
+// tty says the progress stream is a terminal, where the image step is drawn the way sbx draws
+// it: an IMAGE heading and a tick when the image is ready, rather than "image:" log lines.
+func (c Config) tty() bool { return c.Progress != nil && c.ProgressTTY }
+
+// imageLine is an "image:" log line off a terminal, and on one the IMAGE heading (the tick
+// follows in imageReady, with the download bar between). It is called once per ensureImage.
+func (c Config) imageLine(format string, args ...any) {
+	if c.tty() {
+		fmt.Fprint(c.Progress, "  IMAGE\n")
+		return
+	}
+	c.say(format, args...)
+}
+
+// imageReady closes the IMAGE step on a terminal.
+func (c Config) imageReady() {
+	if !c.tty() {
+		return
+	}
+	fmt.Fprint(c.Progress, "    ✓ image — ready\n")
+}
+
 // Run executes the configured command in the sandbox and returns its exit code.
 //
 // For a persistent sandbox (the default) it creates the sandbox if it does not exist,
@@ -384,19 +406,21 @@ func connect(ctx context.Context, address string) (*client.Client, error) {
 func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Image, error) {
 	image, err := c.GetImage(ctx, cfg.Image)
 	if err == nil {
-		cfg.say("image: %s (already present)", cfg.Image)
+		cfg.imageLine("image: %s (already present)", cfg.Image)
 		// A locally present image may still be unpacked for a different snapshotter.
 		unpacked, uErr := image.IsUnpacked(ctx, cfg.Snapshotter)
 		if uErr != nil {
 			return nil, fmt.Errorf("checking image %s: %w", cfg.Image, uErr)
 		}
 		if unpacked {
+			cfg.imageReady()
 			return image, nil
 		}
 		cfg.say("image: unpacking for the %s snapshotter", cfg.Snapshotter)
 		if err := image.Unpack(ctx, cfg.Snapshotter); err != nil {
 			return nil, fmt.Errorf("unpacking image %s for snapshotter %q: %w", cfg.Image, cfg.Snapshotter, err)
 		}
+		cfg.imageReady()
 		return image, nil
 	}
 	if !errors.Is(err, errdefs.ErrNotFound) {
@@ -406,7 +430,7 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 	// Said BEFORE the pull rather than after. A pull of a few hundred megabytes is the
 	// longest silence in `boks run`, and a line that appears once it finishes explains a
 	// wait that has already happened.
-	cfg.say("image: pulling %s for %s", cfg.Image, runtimecfg.GuestPlatform())
+	cfg.imageLine("image: pulling %s for %s", cfg.Image, runtimecfg.GuestPlatform())
 	// Progress runs alongside the pull and stops with it, however the pull ends. Only
 	// started when someone is listening: polling the content store every couple of seconds
 	// to build strings nobody reads is work for nothing.
@@ -422,7 +446,11 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 	if !cfg.NoProgress {
 		cfg.endPullBar()
 	}
-	cfg.say("image: pulled and unpacked")
+	if cfg.tty() {
+		cfg.imageReady()
+	} else {
+		cfg.say("image: pulled and unpacked")
+	}
 	return image, nil
 }
 
@@ -492,6 +520,15 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 	)
 	if err != nil {
 		return nil, describeCreateError(cfg, err)
+	}
+	if cfg.tty() {
+		fmt.Fprintf(cfg.Progress, "    ✓ Created sandbox %s\n", cfg.Name)
+		if cfg.Agent != "" {
+			fmt.Fprintf(cfg.Progress, "    ○ %s — starting in sandbox %s…\n", cfg.Agent, cfg.Name)
+			if len(cfg.Workspaces) > 0 {
+				fmt.Fprintf(cfg.Progress, "        workspace %s\n", cfg.Workspaces[0].HostPath)
+			}
+		}
 	}
 	return container, nil
 }
