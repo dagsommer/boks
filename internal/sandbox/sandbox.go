@@ -93,6 +93,9 @@ type Config struct {
 	Command []string
 	// Workspaces are host directories shared into the guest.
 	Workspaces []workspace.Workspace
+	// Cwd is where the process starts, a guest path inside a workspace. Empty starts in the
+	// primary workspace.
+	Cwd string
 	// Clone selects clone mode for the primary workspace: the host directory is shared
 	// read-only at workspace.SourcePath, and the guest gets a git clone of it — in the
 	// guest's own filesystem — at the workspace's host path. Nothing the guest writes
@@ -641,7 +644,11 @@ func specOptions(cfg Config, imageConfig oci.SpecOpts, processArgs []string) []o
 		// In clone mode that path is not a mount but a directory in the guest's own
 		// filesystem, which does not exist yet at this point. The runtime creates a
 		// missing cwd (measured against runc), and the clone lands in it.
-		specOpts = append(specOpts, oci.WithProcessCwd(cfg.Workspaces[0].Root()))
+		cwd := cfg.Workspaces[0].Root()
+		if cfg.Cwd != "" {
+			cwd = cfg.Cwd
+		}
+		specOpts = append(specOpts, oci.WithProcessCwd(cwd))
 	}
 
 	// LAST, so it can see both the image's own user (set by imageConfig, above) and the

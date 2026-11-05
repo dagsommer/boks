@@ -78,7 +78,7 @@ Unpublishes are applied before publishes, so one invocation can move a port.`,
 	// StringArray, not StringSlice: a StringSlice splits on commas, and while no
 	// specification contains one today, silently turning one argument into two is the
 	// mistake this project already made once with policy rules.
-	cmd.Flags().StringArrayVar(&publish, "publish", nil,
+	cmd.Flags().StringArrayVarP(&publish, "publish", "p", nil,
 		"Publish a port (can be repeated): [[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]")
 	cmd.Flags().StringArrayVar(&unpublish, "unpublish", nil,
 		"Unpublish a port (can be repeated): [HOST_IP:]HOST_PORT:SANDBOX_PORT[/PROTOCOL]")

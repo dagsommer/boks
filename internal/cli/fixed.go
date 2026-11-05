@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 
@@ -124,6 +125,7 @@ func checkFixedAtCreation(f *sandboxFlags, net *policyFlags, inv invocation) err
 	checkNetworkMode(net, inv, &c)
 	checkRuntimeFlags(f, inv, &c)
 	checkCloneMode(f, inv, &c)
+	checkWorkdir(f, inv, &c)
 	return c.err()
 }
 
@@ -346,4 +348,13 @@ func checkCloneMode(f *sandboxFlags, inv invocation, c *fixedConflicts) {
 		return
 	}
 	c.add("--clone", "the sandbox's workspace is shared read-write ("+inv.info.Filesystem.Mode+")")
+}
+
+// checkWorkdir compares --workdir with the directory the sandbox's process was created to
+// start in. Like the other fixed values it is only compared against one the sandbox recorded.
+func checkWorkdir(f *sandboxFlags, inv invocation, c *fixedConflicts) {
+	if !f.changed("workdir") || inv.info.Cwd == "" || path.Clean(f.workdir) == inv.info.Cwd {
+		return
+	}
+	c.add("--workdir "+f.workdir, "the sandbox starts in "+inv.info.Cwd)
 }

@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/sandbox"
@@ -87,7 +89,10 @@ Flags must come before the sandbox name; everything after the name belongs to th
 
 		code, err := sandbox.Exec(cmd.Context(), cfg)
 		if err != nil {
-			return err
+			// 125 is docker exec's status for "the command never ran", which sbx
+			// adopted; it keeps a failure of boks apart from the command's own 1 or 2.
+			fmt.Fprintf(env.Stderr, "boks: %v\n", err)
+			return &ExitError{Code: 125}
 		}
 		if code != 0 {
 			return &ExitError{Code: code}

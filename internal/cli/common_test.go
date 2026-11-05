@@ -14,6 +14,7 @@ import (
 
 	"github.com/dagsommer/boks/internal/agent"
 	"github.com/dagsommer/boks/internal/sandbox"
+	"github.com/dagsommer/boks/internal/workspace"
 )
 
 // TestExecGrammar is what parseLeadingFlags used to be tested for, asserted through the real
@@ -349,4 +350,26 @@ func chdir(t *testing.T, dir string) func() {
 		t.Fatal(err)
 	}
 	return func() { _ = os.Chdir(previous) }
+}
+
+func TestStartDir(t *testing.T) {
+	ws := []workspace.Workspace{{HostPath: "/src/app", GuestPath: "/src/app"}}
+	cases := []struct {
+		workdir string
+		want    string
+		wantErr bool
+	}{
+		{"", "", false},
+		{"/src/app", "/src/app", false},
+		{"/src/app/pkg/../cmd", "/src/app/cmd", false},
+		{"/src/application", "", true},
+		{"/etc", "", true},
+		{"cmd", "", true},
+	}
+	for _, c := range cases {
+		got, err := (&sandboxFlags{workdir: c.workdir}).startDir(ws)
+		if (err != nil) != c.wantErr || got != c.want {
+			t.Errorf("startDir(%q) = %q, %v; want %q, error=%v", c.workdir, got, err, c.want, c.wantErr)
+		}
+	}
 }

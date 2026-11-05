@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -103,6 +104,7 @@ type sandboxFlags struct {
 	name        string
 	cpus        int
 	clone       bool
+	workdir     string
 	env         []string
 	annotations []string
 	// fs is the set these flags were registered on, kept so that "the user asked for
@@ -120,6 +122,8 @@ func registerSandboxFlags(fs *pflag.FlagSet, dev *devFlags) *sandboxFlags {
 	fs.StringVarP(&f.memory, "memory", "m", "",
 		"guest memory, binary units (1024m, 8g) (default: half the host's, max 32g)")
 	fs.StringVar(&f.name, "name", "", "sandbox name (default: <agent>-<workspace directory>)")
+	fs.StringVar(&f.workdir, "workdir", "",
+		"directory inside a workspace to start the agent in (fixed when the sandbox is created)")
 	fs.IntVar(&f.cpus, "cpus", 0, "vCPUs for the guest (0: all host CPUs)")
 	// StringArray, never StringSlice: a value may contain a comma — an -inject rule
 	// naming two hosts does — and splitting on it would silently mangle the rule.
@@ -351,7 +355,12 @@ func (f *sandboxFlags) config(inv invocation, agentArgs []string) (sandbox.Confi
 	if inv.exists && len(agentArgs) == 0 {
 		command = nil
 	}
+	cwd, err := f.startDir(inv.workspaces)
+	if err != nil {
+		return sandbox.Config{}, err
+	}
 	return sandbox.Config{
+		Cwd:         cwd,
 		Name:        inv.name,
 		Agent:       inv.agent.Name,
 		Image:       image,
@@ -365,4 +374,33 @@ func (f *sandboxFlags) config(inv invocation, agentArgs []string) (sandbox.Confi
 		Address:     f.dev.address,
 		Annotations: annotations,
 	}, nil
+}
+
+// startDir resolves --workdir to the guest path the agent starts in. It must be absolute and
+// inside one of the workspaces: those are the only places a user asked to be, and a path
+// elsewhere would start the agent in a directory nothing shared and nothing guarantees exists.
+// A sandbox that already exists has no workspaces here and keeps the directory it was made with.
+func (f *sandboxFlags) startDir(workspaces []workspace.Workspace) (string, error) {
+	if f.workdir == "" || len(workspaces) == 0 {
+		return "", nil
+	}
+	dir := path.Clean(f.workdir)
+	if !path.IsAbs(dir) {
+		return "", fmt.Errorf("--workdir %q must be an absolute path inside a workspace", f.workdir)
+	}
+	for _, ws := range workspaces {
+		if dir == ws.GuestPath || strings.HasPrefix(dir, strings.TrimSuffix(ws.GuestPath, "/")+"/") {
+			return dir, nil
+		}
+	}
+	return "", fmt.Errorf("--workdir %q is not inside any workspace; the workspaces are at %s",
+		f.workdir, guestPaths(workspaces))
+}
+
+func guestPaths(workspaces []workspace.Workspace) string {
+	paths := make([]string, len(workspaces))
+	for i, ws := range workspaces {
+		paths[i] = ws.GuestPath
+	}
+	return strings.Join(paths, ", ")
 }
