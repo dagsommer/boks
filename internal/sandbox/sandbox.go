@@ -160,6 +160,9 @@ type Config struct {
 	// A caller that wants both sends both to the same writer; one that wants the agent's
 	// output clean sets only Stderr.
 	Progress io.Writer
+	// ProgressTTY says Progress is a terminal, so a download is drawn as one bar that
+	// updates in place rather than as a line every few seconds.
+	ProgressTTY bool
 }
 
 // say writes a line of progress, if the caller asked for any.
@@ -387,12 +390,13 @@ func ensureImage(ctx context.Context, c *client.Client, cfg Config) (client.Imag
 	if cfg.Progress != nil {
 		progressCtx, stop := context.WithCancel(ctx)
 		defer stop()
-		go reportPullProgress(progressCtx, c, cfg.say)
+		go reportPullProgress(progressCtx, c, cfg.say, cfg.pullBar())
 	}
 	image, err = c.Pull(ctx, cfg.Image, pullOptions(cfg)...)
 	if err != nil {
 		return nil, fmt.Errorf("pulling image %s: %w", cfg.Image, err)
 	}
+	cfg.endPullBar()
 	cfg.say("image: pulled and unpacked")
 	return image, nil
 }

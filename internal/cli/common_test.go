@@ -373,3 +373,23 @@ func TestStartDir(t *testing.T) {
 		}
 	}
 }
+
+func TestSandboxSummary(t *testing.T) {
+	var out bytes.Buffer
+	printSandboxSummary(&out, sandboxSummary{
+		kit: "./kit",
+		cfg: sandbox.Config{
+			Name: "team-app", Agent: "team", Image: "example.com/img:1", CPUs: 4, MemoryMiB: 24 * 1024,
+			Workspaces: []workspace.Workspace{{HostPath: "/src/app", Mode: workspace.ModeReadWrite}},
+		},
+	})
+	for _, want := range []string{"SANDBOX", "Name:       team-app", "Kit:        ./kit",
+		"Workspace:  /src/app (rw)", "Image:      example.com/img:1", "CPU:        4", "Memory:     24 GiB"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("summary lacks %q:\n%s", want, out.String())
+		}
+	}
+	if memoryText(1536) != "1536 MiB" {
+		t.Errorf("memoryText(1536) = %q", memoryText(1536))
+	}
+}

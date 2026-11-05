@@ -237,20 +237,18 @@ Agents:
 		// indistinguishable from a hang, which is how it was reported: a blank terminal
 		// with "nothing happening". Detail is optional; a several-minute pause is not.
 		cfg.Progress = env.Stderr
+		// The block that says what is about to run. When a sandbox is being created, and
+		// with -v; see printSandboxSummary for why not on every run.
+		if verbose || (!inv.exists && isTerminal(env.Stderr)) {
+			printSandboxSummary(env.Stderr, sandboxSummary{cfg: cfg, kit: netFlags.kitRef})
+		}
 		if verbose {
-			// Before the image, because it is the fastest thing to establish and the
-			// order reads as a sequence: what will run, out of what, with which rules.
-			fmt.Fprintf(env.Stderr, "sandbox: %s (agent %s, %s)\n",
-				inv.name, inv.agent.Name, cfg.Image)
 			if len(cfg.Command) > 0 {
 				fmt.Fprintf(env.Stderr, "command: %s\n", strings.Join(cfg.Command, " "))
 			}
 			netFlags.describeKit(env.Stderr)
-			for _, ws := range cfg.Workspaces {
-				fmt.Fprintf(env.Stderr, "workspace: %s → %s (%s)\n",
-					ws.HostPath, ws.GuestPath, ws.Mode)
-			}
 		}
+		cfg.ProgressTTY = isTerminal(env.Stderr)
 		// An interactive session needs a pseudo-terminal, and a piped one must not have
 		// one: with a pty the guest's output would come back with carriage returns and
 		// no distinct stderr. The host terminal is the only thing that can decide this,

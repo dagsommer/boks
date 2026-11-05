@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
@@ -36,7 +37,7 @@ const pullProgressInterval = 2 * time.Second
 // Nothing here can fail the pull. Every error from the content store is dropped: this function
 // describes work happening elsewhere, and a progress reporter that could abort the thing it is
 // reporting on would be a worse bug than no progress at all.
-func reportPullProgress(ctx context.Context, c *client.Client, say func(string, ...any)) {
+func reportPullProgress(ctx context.Context, c *client.Client, say func(string, ...any), bar func(done, expected int64, layers int)) {
 	ticker := time.NewTicker(pullProgressInterval)
 	defer ticker.Stop()
 
@@ -76,6 +77,10 @@ func reportPullProgress(ctx context.Context, c *client.Client, say func(string, 
 		}
 		lastBytes = done
 
+		if bar != nil && stalledFor < 3*pullProgressInterval {
+			bar(done, expected, len(statuses))
+			continue
+		}
 		switch {
 		case stalledFor >= 3*pullProgressInterval:
 			say("image: %s downloaded, no progress for %s (%d layer(s) in flight)",
@@ -104,4 +109,37 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
+}
+
+// pullBar returns the function that draws a download as one bar redrawn in place, or nil when
+// Progress is not a terminal and the line-per-tick form is what should be used. A bar written
+// to a pipe or a log would be a thousand carriage returns.
+func (c Config) pullBar() func(done, expected int64, layers int) {
+	if c.Progress == nil || !c.ProgressTTY {
+		return nil
+	}
+	return func(done, expected int64, layers int) {
+		fmt.Fprint(c.Progress, "\r\033[K"+renderPullBar(done, expected, layers))
+	}
+}
+
+// endPullBar clears the bar's line so what is printed next starts at the margin.
+func (c Config) endPullBar() {
+	if c.Progress != nil && c.ProgressTTY {
+		fmt.Fprint(c.Progress, "\r\033[K")
+	}
+}
+
+// renderPullBar draws "    [█████░░░░░]  56.6 MiB / 720.5 MiB · 7 layers". Without a known
+// total there is nothing to fill a bar against, so it says the bytes and the layers only.
+func renderPullBar(done, expected int64, layers int) string {
+	const width = 10
+	if expected <= 0 {
+		return fmt.Sprintf("    %s downloaded · %d layers", humanBytes(done), layers)
+	}
+	filled := int(done * width / expected)
+	filled = max(0, min(width, filled))
+	return fmt.Sprintf("    [%s%s]  %s / %s · %d layers",
+		strings.Repeat("█", filled), strings.Repeat("░", width-filled),
+		humanBytes(done), humanBytes(expected), layers)
 }
