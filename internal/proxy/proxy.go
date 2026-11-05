@@ -251,11 +251,15 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Plaintext HTTP is readable by everything on the path, Boks included. Recording it
 	// as a distinct flow keeps "we read this" true in the log without implying that a TLS
 	// session was broken to do it.
+	//
+	// It is also the one flow where HTTP rules apply without interception: the request is
+	// in front of us, so it is judged as a request — method, path and query — rather than
+	// as a connection.
 	var decision policy.Decision
 	if isHost(target) {
 		decision = s.hostDecision(policy.StageHTTP, target)
 	} else {
-		decision = s.cfg.Engine.CheckMode(policy.StageHTTP, target, policy.ModeForward)
+		decision = s.cfg.Engine.CheckRequest(policy.StageHTTP, target, policy.ModeForward, httpRequestOf(r))
 	}
 	if !decision.Allowed {
 		writeDenied(w, decision)
@@ -334,11 +338,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		mode = policy.ModeForward
 	}
 
-	decision := s.cfg.Engine.CheckMode(policy.StageConnect, target, mode)
+	// CheckFlow, not CheckMode: a host whose verdict depends on HTTP rules may be connected to
+	// only if this flow will be read, and then every request in it is judged on its own.
+	// Deferred records that promise, and the code below keeps it — a deferred flow that turns
+	// out not to be readable is closed, never spliced.
+	decision := s.cfg.Engine.CheckFlow(policy.StageConnect, target, mode, mode == policy.ModeForward)
 	if !decision.Allowed {
 		writeDenied(w, decision)
 		return
 	}
+	deferred := decision.Deferred
 	if mode == policy.ModeForwardBypass && s.cfg.Injector.Handles(target) {
 		// A credential rule that cannot fire is worse than no rule: the request goes out
 		// unauthenticated and the guest's placeholder is what the origin sees. Say so
@@ -408,6 +417,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// interception nobody asked for.
 	if mode == policy.ModeForward && sniMatches && looksLikeTLS(head) {
 		s.inspect(r.Context(), target, client, buffered, head, upstream)
+		return
+	}
+	if deferred {
+		// The connection was let through on the understanding that its requests would be
+		// judged against HTTP rules, and they cannot be. Carrying it blind would turn an
+		// HTTP-restricted rule into raw access to the host, which is the one thing an HTTP
+		// rule must never do.
+		s.cfg.Engine.NoteRefused(policy.StageConnect, target, policy.ModeForwardBypass,
+			"HTTP rules apply to this host, but the tunnel is not TLS for this name, so its requests "+
+				"cannot be read and judged; closed rather than carried blind")
 		return
 	}
 	if mode == policy.ModeForward {
@@ -570,6 +589,25 @@ func writeDenied(w http.ResponseWriter, d policy.Decision) {
 // denialText is the body of a refusal, shared by the plain-HTTP path and the inspected
 // path, which has no http.ResponseWriter to write through.
 func denialText(d policy.Decision) string {
+	if d.Method != "" {
+		// A request refused by HTTP rules. The suggestion is the rule that would admit
+		// exactly this request — not the whole host, which is presumably what the user was
+		// trying not to allow.
+		return fmt.Sprintf(`boks: blocked by network policy
+
+  destination: %s:%d
+  request:     %s %s
+  stage:       %s
+  policy:      %s
+  reason:      %s
+
+To permit requests like this one, add an HTTP rule:
+
+  boks policy allow %s:%d --method %s --path '%s'
+
+Recent decisions: boks policy log
+`, d.Host, d.Port, d.Method, d.Path, d.Stage, d.Policy, d.Reason, d.Host, d.Port, d.Method, d.Path)
+	}
 	return fmt.Sprintf(`boks: blocked by network policy
 
   destination: %s:%d
@@ -603,6 +641,12 @@ func stripHopByHop(h http.Header) {
 	for _, name := range hopByHop {
 		h.Del(name)
 	}
+}
+
+// httpRequestOf is the part of a request HTTP rules are judged on: method, path as it was
+// sent, and the raw query. Nothing else of the request is handed to the policy engine.
+func httpRequestOf(r *http.Request) policy.HTTPRequest {
+	return policy.HTTPRequest{Method: r.Method, Path: r.URL.EscapedPath(), RawQuery: r.URL.RawQuery}
 }
 
 func defaultPortForScheme(scheme string) int {

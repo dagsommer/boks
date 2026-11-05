@@ -82,6 +82,10 @@ type Rule struct {
 	// deny beats allow no matter which scope either sits in. It exists so that a verdict
 	// can name the thing a user would have to edit to change it.
 	Scope string
+	// HTTP restricts the rule to HTTP requests matching a method, path and query selector.
+	// Nil is an ordinary connection rule. See http.go for what an HTTP rule means for a flow
+	// Boks cannot read.
+	HTTP *HTTPMatch
 }
 
 // WithScope labels a rule with where it came from.
@@ -119,6 +123,27 @@ func ParseRule(action Action, spec string) (Rule, error) {
 	return Rule{Action: action, Host: pattern, Ports: set}, nil
 }
 
+// ParseHTTPRule builds a rule with an optional HTTP selector from the --method, --path and
+// --query values. With none of them it is ParseRule.
+func ParseHTTPRule(action Action, spec string, methods []string, path string, query []string) (Rule, error) {
+	rule, err := ParseRule(action, spec)
+	if err != nil {
+		return Rule{}, err
+	}
+	match, err := ParseHTTPMatch(methods, path, query)
+	if err != nil {
+		return Rule{}, err
+	}
+	if match == nil {
+		return rule, nil
+	}
+	if rule.Host.kind == patternAddr || rule.Host.kind == patternPrefix {
+		return Rule{}, fmt.Errorf("HTTP rule resource %q must be a host pattern, not an IP address", spec)
+	}
+	rule.HTTP = match
+	return rule, nil
+}
+
 // MustRule is ParseRule for preset definitions.
 func MustRule(action Action, spec, why string) Rule {
 	r, err := ParseRule(action, spec)
@@ -129,10 +154,30 @@ func MustRule(action Action, spec, why string) Rule {
 	return r
 }
 
-// Match reports whether the rule covers the target.
+// Match reports whether the rule covers the target's host and port. For an HTTP rule that is
+// only half the question — the request has to match too — and an HTTP rule never covers an
+// address literal, even through "**": a flow addressed by IP is decided by address rules alone.
 func (r Rule) Match(t Target) bool {
+	if r.HTTP != nil && t.IsIP() {
+		return false
+	}
 	return r.Host.Match(t) && r.Ports.Match(t.Port)
 }
+
+// MatchRequest reports whether the rule covers an HTTP request to the target. A connection
+// rule covers every request to a destination it covers.
+func (r Rule) MatchRequest(t Target, req HTTPRequest) bool {
+	if !r.Match(t) {
+		return false
+	}
+	if r.HTTP == nil {
+		return true
+	}
+	return r.HTTP.matchRequest(req, r.Action == Deny)
+}
+
+// IsHTTP reports whether the rule has an HTTP selector.
+func (r Rule) IsHTTP() bool { return r.HTTP != nil }
 
 // Spec renders the rule's destination in the syntax ParseRule accepts.
 func (r Rule) Spec() string {
@@ -146,7 +191,27 @@ func (r Rule) Spec() string {
 	return host + ":" + r.Ports.String()
 }
 
-func (r Rule) String() string { return r.Action.String() + " " + r.Spec() }
+// Describe is the destination plus, for an HTTP rule, its selector in flag form:
+// "api.example.com --method GET --path /v1/**". It is what verdicts and the log name.
+func (r Rule) Describe() string {
+	if r.HTTP == nil {
+		return r.Spec()
+	}
+	return r.Spec() + " " + r.HTTP.String()
+}
+
+// RuleSpec is the rule in its stored form.
+func (r Rule) RuleSpec() RuleSpec {
+	spec := RuleSpec{Action: r.Action, Spec: r.Spec(), Note: r.Why, Scope: r.Scope}
+	if r.HTTP != nil {
+		spec.Methods = r.HTTP.Methods()
+		spec.Path = r.HTTP.Path()
+		spec.Query = r.HTTP.Query()
+	}
+	return spec
+}
+
+func (r Rule) String() string { return r.Action.String() + " " + r.Describe() }
 
 // Policy is a named set of rules plus the disposition for destinations no rule mentions.
 type Policy struct {
@@ -164,29 +229,116 @@ type Policy struct {
 // written for one sandbox and a deny written globally are the same kind of thing once they
 // are here, and either beats every allow. That is what makes "deny wins" a property a user
 // can hold in their head after adding a sandbox-scoped rule.
+//
+// A connection carries no request, so HTTP rules cannot be applied to it; what they do instead
+// is described in http.go. In short, the verdict is a refusal with NeedsHTTP set whenever the
+// outcome would depend on an HTTP rule — an HTTP allow is the only thing permitting the host,
+// or an HTTP deny covers a host that is otherwise permitted. A caller that cannot read the flow
+// as HTTP therefore refuses it without having to know anything about HTTP rules, and a caller
+// that can (the proxy, on a flow it reads) judges each request with EvaluateHTTP.
 func (p Policy) Evaluate(t Target) Verdict {
+	var httpDeny, httpAllow *Rule
+	for i := range p.Rules {
+		r := &p.Rules[i]
+		if !r.Match(t) {
+			continue
+		}
+		switch {
+		case r.Action == Deny && r.HTTP == nil:
+			return denyVerdict(*r)
+		case r.Action == Deny:
+			if httpDeny == nil {
+				httpDeny = r
+			}
+		case r.HTTP != nil:
+			if httpAllow == nil {
+				httpAllow = r
+			}
+		}
+	}
+
+	verdict, allowed := Verdict{}, false
 	for i := range p.Rules {
 		r := p.Rules[i]
-		if r.Action == Deny && r.Match(t) {
-			return Verdict{
-				Allowed: false,
-				Rule:    r.Spec(),
-				Scope:   r.Scope,
-				Reason:  fmt.Sprintf("denied by rule %q", r.Spec()),
-			}
+		if r.Action == Allow && r.HTTP == nil && r.Match(t) {
+			verdict, allowed = allowVerdict(r), true
+			break
+		}
+	}
+	if !allowed && p.Default == Allow {
+		verdict, allowed = defaultVerdict(p), true
+	}
+
+	switch {
+	case allowed && httpDeny != nil:
+		return Verdict{
+			NeedsHTTP: true,
+			Rule:      httpDeny.Describe(),
+			Scope:     httpDeny.Scope,
+			Reason: fmt.Sprintf("the HTTP deny rule %q covers this host and can only be enforced on "+
+				"requests boks reads; a connection boks cannot read as HTTP is refused", httpDeny.Describe()),
+		}
+	case allowed:
+		return verdict
+	case httpAllow != nil:
+		return Verdict{
+			NeedsHTTP: true,
+			Rule:      httpAllow.Describe(),
+			Scope:     httpAllow.Scope,
+			Reason: fmt.Sprintf("only HTTP requests matching %q are allowed to this host; a connection "+
+				"boks cannot read as HTTP is refused", httpAllow.Describe()),
+		}
+	}
+	return defaultVerdict(p)
+}
+
+// EvaluateHTTP decides one HTTP request, to a target, that Boks has read. Every rule takes
+// part: a connection rule covers every request to its destination, an HTTP rule only the
+// requests its selector matches. Deny still wins over allow, whichever kind either is.
+func (p Policy) EvaluateHTTP(t Target, req HTTPRequest) Verdict {
+	for i := range p.Rules {
+		r := p.Rules[i]
+		if r.Action == Deny && r.MatchRequest(t, req) {
+			return denyVerdict(r)
 		}
 	}
 	for i := range p.Rules {
 		r := p.Rules[i]
-		if r.Action == Allow && r.Match(t) {
-			return Verdict{
-				Allowed: true,
-				Rule:    r.Spec(),
-				Scope:   r.Scope,
-				Reason:  fmt.Sprintf("allowed by rule %q", r.Spec()),
-			}
+		if r.Action == Allow && r.MatchRequest(t, req) {
+			return allowVerdict(r)
 		}
 	}
+	return defaultVerdict(p)
+}
+
+// HasHTTPRules reports whether any HTTP rule covers the target's host and port — whether a
+// flow to it has to be read as HTTP to be decided. The proxy terminates TLS for such a host.
+func (p Policy) HasHTTPRules(t Target) bool {
+	for i := range p.Rules {
+		if p.Rules[i].HTTP != nil && p.Rules[i].Match(t) {
+			return true
+		}
+	}
+	return false
+}
+
+func denyVerdict(r Rule) Verdict {
+	reason := fmt.Sprintf("denied by rule %q", r.Describe())
+	if r.HTTP != nil {
+		reason = fmt.Sprintf("denied by HTTP rule %q", r.Describe())
+	}
+	return Verdict{Allowed: false, Rule: r.Describe(), Scope: r.Scope, Reason: reason}
+}
+
+func allowVerdict(r Rule) Verdict {
+	reason := fmt.Sprintf("allowed by rule %q", r.Describe())
+	if r.HTTP != nil {
+		reason = fmt.Sprintf("allowed by HTTP rule %q", r.Describe())
+	}
+	return Verdict{Allowed: true, Rule: r.Describe(), Scope: r.Scope, Reason: reason}
+}
+
+func defaultVerdict(p Policy) Verdict {
 	if p.Default == Allow {
 		return Verdict{
 			Allowed: true,
@@ -207,17 +359,13 @@ func (p Policy) Evaluate(t Target) Verdict {
 // resolved, and the address it resolved to is tested against the deny rules before any
 // packet is sent. Without that step `evil.test A 127.0.0.1` turns a hostname allowlist
 // into a path to the host's own services. The allow rules are deliberately not consulted,
-// because an allow written for a name says nothing about the address behind it.
+// because an allow written for a name says nothing about the address behind it. HTTP rules
+// never cover an address, so they take no part here; they were applied to the request.
 func (p Policy) EvaluateDeny(t Target) Verdict {
 	for i := range p.Rules {
 		r := p.Rules[i]
-		if r.Action == Deny && r.Match(t) {
-			return Verdict{
-				Allowed: false,
-				Rule:    r.Spec(),
-				Scope:   r.Scope,
-				Reason:  fmt.Sprintf("denied by rule %q", r.Spec()),
-			}
+		if r.Action == Deny && r.HTTP == nil && r.Match(t) {
+			return denyVerdict(r)
 		}
 	}
 	return Verdict{Allowed: true, Reason: "no deny rule matched the resolved address"}
@@ -245,4 +393,8 @@ type Verdict struct {
 	// which file or flag to change, which is the question they ask next.
 	Scope  string
 	Reason string
+	// NeedsHTTP marks a refusal that holds only for a flow Boks cannot read as HTTP: the
+	// destination has HTTP rules, and the decision has to be taken request by request with
+	// EvaluateHTTP. A caller that cannot do that treats it as the refusal it is.
+	NeedsHTTP bool
 }

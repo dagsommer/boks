@@ -391,12 +391,26 @@ inject credentials" cannot both be true. Boks chooses to intercept, narrowly, an
 loudly.
 
 **What is intercepted.** A flow is terminated **only if its destination host has a
-credential injection rule configured for it**. Nothing else: no flag, preset or default
-turns on wider interception, and the decision is taken from the `CONNECT` target before the
-guest has sent a byte. Interception scope and credential scope are the same set by
-construction — one predicate (`Injector.Handles`) answers both questions, so a host cannot
-be decrypted for no reason. With no CA configured, nothing is ever intercepted and HTTPS
-credential rules simply do not fire, which the log records rather than passing over.
+credential injection rule configured for it, or an HTTP policy rule** (`boks policy allow
+HOST --method GET --path '/v1/**'`). Nothing else: no flag, preset or default turns on wider
+interception, and the decision is taken from the `CONNECT` target before the guest has sent a
+byte. Both reasons are rules the user wrote naming the host, and both ask Boks to do
+something to requests — change them, or judge them — that cannot be done without reading
+them (`shouldInspect` in `internal/proxy/inspect.go` is the whole predicate). With no CA
+configured, nothing is ever intercepted: HTTPS credential rules simply do not fire, which the
+log records rather than passing over, and a host whose verdict depends on an HTTP rule is
+refused rather than tunnelled blind.
+
+**HTTP rules never open raw access.** An HTTP rule is applied only to a request Boks reads.
+A flow it cannot read — a raw socket judged in the network stack, a tunnel with no CA, a
+tunnel that turns out not to be TLS for the host — is refused whenever an HTTP rule decides
+it: an HTTP *allow* is not an allow for such a flow, and an HTTP *deny* on an otherwise allowed
+host closes it, because the deny could not be enforced there and deny always wins. HTTP rules
+apply to hostnames only, never to a flow addressed by IP. Request paths are percent-decoded,
+backslashes read as slashes and dot segments resolved before matching, and every reading of
+an ambiguous request (case, a trailing slash, `;` as a query separator, repeated parameters)
+is resolved toward the deny. A decision about such a request records its method and the
+canonical path — only for hosts with HTTP rules, and never the query string.
 
 **What Boks can read, for those hosts.** Everything: request line, headers, request and
 response bodies, in both directions. What it does with that is bounded by what the code

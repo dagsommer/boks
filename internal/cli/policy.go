@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -67,6 +68,12 @@ because they always win. Nothing here contacts the network or a sandbox.
 The --policy, --allow, --deny and --profile flags resolve a hypothetical: they show what a
 run given those flags would get, on top of what is stored.
 
+An HTTP rule is shown with its selector in the form 'boks policy allow' accepts back:
+"api.example.com --method GET,HEAD --path '/v1/**' --query team=platform".
+
+--wide prints one row per effective rule, with the HTTP selector in its own METHODS, PATH and
+QUERY columns; --json prints the stored and effective rules for scripts.
+
 Presets:
 ` + presets.String(),
 		Args: noArgs,
@@ -76,6 +83,8 @@ Presets:
 		sandbox   string
 		agentName string
 		stored    bool
+		wide      bool
+		asJSON    bool
 	)
 	flags.register(cmd.Flags())
 	cmd.Flags().StringVar(&sandbox, "sandbox", "",
@@ -83,14 +92,124 @@ Presets:
 	registerAgentFlag(cmd.Flags(), &agentName)
 	cmd.Flags().BoolVar(&stored, "stored", false,
 		"print only the stored rules, without resolving them")
+	cmd.Flags().BoolVar(&wide, "wide", false,
+		"print one row per effective rule, with scope, decision, resource and HTTP selector columns")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print the stored and effective rules as JSON")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if err := applyAgentFlag(&flags, agentName); err != nil {
 			return err
 		}
+		if wide || asJSON {
+			return policyLsRules(env, &flags, sandbox, stored, asJSON)
+		}
 		return policyLs(env, &flags, sandbox, stored)
 	}
 	return cmd
+}
+
+// policyRuleRow is one rule in `policy ls --wide` and `--json`. The field names follow sbx's
+// for the same things where it has them (decision, resource, methods, path, query).
+type policyRuleRow struct {
+	Scope    string   `json:"scope"`
+	Decision string   `json:"decision"`
+	Resource string   `json:"resource"`
+	Methods  []string `json:"methods,omitempty"`
+	Path     string   `json:"path,omitempty"`
+	Query    []string `json:"query,omitempty"`
+	Note     string   `json:"note,omitempty"`
+}
+
+func ruleRow(scope string, r policy.RuleSpec) policyRuleRow {
+	row := policyRuleRow{Scope: scope, Decision: r.Action.String(), Resource: r.Spec, Note: r.Note}
+	if r.IsHTTP() {
+		row.Methods, row.Path, row.Query = r.Methods, r.Path, r.Query
+		if rule, err := r.Rule(); err == nil && rule.HTTP != nil {
+			row.Methods, row.Path, row.Query = rule.HTTP.Methods(), rule.HTTP.Path(), rule.HTTP.Query()
+		}
+	}
+	return row
+}
+
+func storedRows(store *policy.Store) []policyRuleRow {
+	var rows []policyRuleRow
+	for _, r := range store.Global {
+		rows = append(rows, ruleRow("global", r))
+	}
+	for _, name := range store.SandboxNames() {
+		rules, _ := store.Rules(policy.SandboxScope(name))
+		for _, r := range rules {
+			rows = append(rows, ruleRow("sandbox "+name, r))
+		}
+	}
+	for _, name := range store.ProfileNames() {
+		for _, r := range store.Profiles[name].Rules {
+			rows = append(rows, ruleRow("profile "+name, r))
+		}
+	}
+	return rows
+}
+
+// policyLsRules is `policy ls --wide` and `--json`: the rules as rows rather than prose.
+func policyLsRules(env Env, flags *policyFlags, sandbox string, stored, asJSON bool) error {
+	store, err := openPolicyStore()
+	if err != nil {
+		return err
+	}
+	var effective []policyRuleRow
+	var resolution policy.Resolution
+	if !stored {
+		if err := flags.loadKit(env.Stderr); err != nil {
+			return err
+		}
+		if err := flags.checkKitAgent(flags.agent.Name); err != nil {
+			return err
+		}
+		if resolution, err = flags.resolution(sandbox, nil); err != nil {
+			return err
+		}
+		for _, r := range resolution.Rules {
+			effective = append(effective, ruleRow(r.Scope, r))
+		}
+	}
+
+	if asJSON {
+		out := struct {
+			Store     string          `json:"store"`
+			Preset    string          `json:"preset,omitempty"`
+			Stored    []policyRuleRow `json:"stored"`
+			Policy    string          `json:"policy,omitempty"`
+			Default   string          `json:"default,omitempty"`
+			Effective []policyRuleRow `json:"effective,omitempty"`
+		}{Store: store.Path(), Preset: store.Preset, Stored: storedRows(store), Effective: effective}
+		if out.Stored == nil {
+			out.Stored = []policyRuleRow{}
+		}
+		if !stored {
+			out.Policy, out.Default = resolution.Name, resolution.Default.String()
+		}
+		enc := json.NewEncoder(env.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
+	rows := effective
+	if stored {
+		rows = storedRows(store)
+	}
+	tw := tabwriter.NewWriter(env.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprint(tw, "SCOPE\tDECISION\tRESOURCE\tMETHODS\tPATH\tQUERY\tNOTE\n")
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
+	for _, r := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", r.Scope, r.Decision, r.Resource,
+			dash(strings.Join(r.Methods, ",")), dash(r.Path), dash(strings.Join(r.Query, "&")), dash(r.Note))
+	}
+	return tw.Flush()
 }
 
 // registerAgentFlag adds --agent, which is how `policy ls` and `policy check` answer the
@@ -401,8 +520,14 @@ func writeDecisionTable(w io.Writer, rows []policy.Aggregate, now time.Time) {
 			if mode == "" {
 				mode = "-"
 			}
+			host := r.Destination()
+			if req := r.Request(); req != "" {
+				// A request judged against HTTP rules: its method and path are what the
+				// rule decided on, so they are part of what was allowed or blocked.
+				host += " " + req
+			}
 			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
-				sandbox, r.Type, r.Destination(), mode, r.Rule, r.Reason, since(now, r.LastSeen), r.Count)
+				sandbox, r.Type, host, mode, r.Rule, r.Reason, since(now, r.LastSeen), r.Count)
 		}
 		tw.Flush()
 		fmt.Fprintln(w)

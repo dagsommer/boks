@@ -100,6 +100,17 @@ type Decision struct {
 	Mode Mode `json:"mode,omitempty"`
 	// Sandbox is the sandbox the flow came from, when the proxy knows it.
 	Sandbox string `json:"sandbox,omitempty"`
+	// Method and Path are set on a decision about one HTTP request that was judged against
+	// HTTP rules — and only then. Path is the canonical path the rules were matched against,
+	// never the query string: a query is where tokens travel, and it is not recorded even
+	// when a rule constrains it. A request to a host with no HTTP rule leaves both empty, so
+	// no path is recorded that the user did not ask Boks to judge.
+	Method string `json:"method,omitempty"`
+	Path   string `json:"path,omitempty"`
+	// Deferred marks a connection that was let through so that its requests could be judged
+	// one by one: the host has HTTP rules and Boks reads the flow. The verdict on each
+	// request is a separate decision.
+	Deferred bool `json:"deferred,omitempty"`
 }
 
 // TypeNetwork is the policy domain every decision Boks takes today belongs to.
@@ -109,6 +120,9 @@ const TypeNetwork = "network"
 // destination. It is spelled out rather than implied so that the log does not have to be
 // re-interpreted when a second action exists.
 const ActionConnectTCP = "net:connect:tcp"
+
+// ActionHTTPRequest is one HTTP request judged against HTTP rules.
+const ActionHTTPRequest = "net:http:request"
 
 // ResourceOf renders a target as a typed resource string.
 func ResourceOf(t Target) string {
@@ -139,8 +153,12 @@ func (d Decision) String() string {
 	if mode == "" {
 		mode = "-"
 	}
-	return fmt.Sprintf("%s %s %-7s %-14s %s:%d  %s",
-		d.Time.Format(time.RFC3339), verb, d.Stage, mode, d.Host, d.Port, d.Reason)
+	request := ""
+	if d.Method != "" {
+		request = " " + d.Method + " " + d.Path
+	}
+	return fmt.Sprintf("%s %s %-7s %-14s %s:%d%s  %s",
+		d.Time.Format(time.RFC3339), verb, d.Stage, mode, d.Host, d.Port, request, d.Reason)
 }
 
 // Sink receives decisions as they are made. Implementations must be safe for concurrent
@@ -369,14 +387,17 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 // Aggregate is a set of decisions that were, for a reader's purposes, the same decision:
 // one destination, one mode, one outcome, one reason.
 type Aggregate struct {
-	Sandbox  string
-	Type     string
-	Host     string
-	Port     int
-	Mode     Mode
-	Allowed  bool
-	Rule     string
-	Reason   string
+	Sandbox string
+	Type    string
+	Host    string
+	Port    int
+	Mode    Mode
+	Allowed bool
+	Rule    string
+	Reason  string
+	// Method and Path are those of a request judged against HTTP rules; see Decision.
+	Method   string
+	Path     string
 	First    time.Time
 	LastSeen time.Time
 	Count    int
@@ -399,11 +420,12 @@ func Aggregated(decisions []Decision) []Aggregate {
 		mode               Mode
 		allowed            bool
 		rule, reason       string
+		method, path       string
 	}
 	index := map[key]int{}
 	var out []Aggregate
 	for _, d := range decisions {
-		k := key{d.Sandbox, d.Type, d.Host, d.Port, d.Mode, d.Allowed, d.Rule, d.Reason}
+		k := key{d.Sandbox, d.Type, d.Host, d.Port, d.Mode, d.Allowed, d.Rule, d.Reason, d.Method, d.Path}
 		if i, ok := index[k]; ok {
 			out[i].Count++
 			if d.Time.After(out[i].LastSeen) {
@@ -418,6 +440,7 @@ func Aggregated(decisions []Decision) []Aggregate {
 		out = append(out, Aggregate{
 			Sandbox: d.Sandbox, Type: d.Type, Host: d.Host, Port: d.Port,
 			Mode: d.Mode, Allowed: d.Allowed, Rule: d.Rule, Reason: d.Reason,
+			Method: d.Method, Path: d.Path,
 			First: d.Time, LastSeen: d.Time, Count: 1,
 		})
 	}
@@ -436,6 +459,15 @@ func (a Aggregate) Destination() string {
 		return "[" + a.Host + "]:" + strconv.Itoa(a.Port)
 	}
 	return a.Host + ":" + strconv.Itoa(a.Port)
+}
+
+// Request renders the method and path of a request judged against HTTP rules, as
+// "GET /v1/items", or "" for a decision about a connection.
+func (a Aggregate) Request() string {
+	if a.Method == "" {
+		return ""
+	}
+	return a.Method + " " + a.Path
 }
 
 // DefaultLogPath is where the decision log lives when no path is given.
@@ -595,7 +627,63 @@ func (e *Engine) NoteRefused(stage Stage, t Target, m Mode, reason string) Decis
 	return e.record(stage, t, Verdict{Allowed: false, Reason: reason}, m, name)
 }
 
+// CheckFlow is CheckMode for a connection the caller is able to read as HTTP if it has to.
+//
+// When the destination's verdict depends on HTTP rules (Verdict.NeedsHTTP) and readable is
+// true, the connection is recorded as let through, with Deferred set, and the decision says
+// that each request will be judged. The caller is then bound to judge every request with
+// CheckRequest — and to refuse the flow if it turns out it cannot read it after all. When
+// readable is false this is exactly CheckMode.
+func (e *Engine) CheckFlow(stage Stage, t Target, m Mode, readable bool) Decision {
+	e.mu.RLock()
+	pol := e.policy
+	e.mu.RUnlock()
+	v := pol.Evaluate(t)
+	if v.Allowed || !v.NeedsHTTP || !readable {
+		return e.record(stage, t, v, m, pol.Name)
+	}
+	v = Verdict{
+		Allowed:   true,
+		NeedsHTTP: true,
+		Rule:      v.Rule,
+		Scope:     v.Scope,
+		Reason:    "HTTP rules apply to this host (" + v.Rule + "); the connection is read and each request is judged against them",
+	}
+	return e.recordWith(stage, t, v, m, pol.Name, func(d *Decision) { d.Deferred = true })
+}
+
+// CheckRequest judges one HTTP request that Boks has read, against every rule including the
+// HTTP ones, and records it. The method and path are recorded only when an HTTP rule covers
+// the host: a request to a host with connection rules only is decided exactly as its
+// connection was, and its path is none of the log's business.
+func (e *Engine) CheckRequest(stage Stage, t Target, m Mode, req HTTPRequest) Decision {
+	e.mu.RLock()
+	pol := e.policy
+	e.mu.RUnlock()
+	if !pol.HasHTTPRules(t) {
+		return e.record(stage, t, pol.Evaluate(t), m, pol.Name)
+	}
+	v := pol.EvaluateHTTP(t, req)
+	return e.recordWith(stage, t, v, m, pol.Name, func(d *Decision) {
+		d.Action = ActionHTTPRequest
+		d.Method = strings.ToUpper(req.Method)
+		d.Path = req.CanonicalPath()
+	})
+}
+
+// HasHTTPRules reports whether the policy being enforced has an HTTP rule covering t, which is
+// what makes the proxy read a flow to it.
+func (e *Engine) HasHTTPRules(t Target) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.policy.HasHTTPRules(t)
+}
+
 func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode, policyName string) Decision {
+	return e.recordWith(stage, t, v, m, policyName, nil)
+}
+
+func (e *Engine) recordWith(stage Stage, t Target, v Verdict, m Mode, policyName string, extra func(*Decision)) Decision {
 	resource := ResourceOf(t)
 	rule := v.Rule
 	if rule == "" {
@@ -615,6 +703,9 @@ func (e *Engine) record(stage Stage, t Target, v Verdict, m Mode, policyName str
 		Policy:   policyName,
 		Mode:     m,
 		Sandbox:  e.sandbox,
+	}
+	if extra != nil {
+		extra(&d)
 	}
 	e.log.Record(d)
 	return d

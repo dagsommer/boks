@@ -334,7 +334,8 @@ socket. No VM has ever been refused a destination by Boks. See
 | `policy inspect` | "Inspect policy or rule details" | Same, for a scope or a single destination | P2 | done | For a destination it lists every rule that *covers* it, from every scope, then what the engine decides |
 | Policy survives restart | Policy is state, so restarting changes nothing | A sandbox records its selection in `dev.boks.policy` | P0 | done | The bug this fixed: `start`/`exec` used to serve the default preset. Integration-tested through create → start → stop → start. The label is refused rather than truncated if it would exceed containerd's 4 KiB limit |
 | Per-run allow flags | **Not offered** — `sbx run` has no allow/deny/policy flags at all | `--allow`/`--deny` repeatable, `--policy PRESET`, `--net MODE` | P0 | done | A deliberate **Boks addition**, not parity: one-off overrides of the stored policy. `--policy`/`--allow` replace the posture and the allow list; `--deny` is added to the sandbox's own denies, so a run cannot drop a prohibition. A sandbox created with them records them, so a restart serves the same rules |
-| TLS interception | Used for credential injection, not for filtering: a "Docker Sandboxes Proxy CA" sits in the guest trust store and is also exposed as `PROXY_CA_CERT_B64` | Terminate **only** for hosts with a credential rule; local CA, certificate handed over as a file and as `BOKS_CA_CERT_B64` | P0 | done | Demonstrated end to end: the intercepted host presents a Boks-issued certificate, an unconfigured host presents the origin's own chain |
+| TLS interception | Used for credential injection and for HTTP policy rules: a "Docker Sandboxes Proxy CA" sits in the guest trust store and is also exposed as `PROXY_CA_CERT_B64` | Terminate **only** for hosts with a credential rule or an HTTP policy rule; local CA, certificate handed over as a file and as `BOKS_CA_CERT_B64` | P0 | done | Demonstrated end to end for credentials: the intercepted host presents a Boks-issued certificate, an unconfigured host presents the origin's own chain. HTTP-rule interception tested at the proxy level only |
+| HTTP policy rules | `policy allow/deny network HOST --method … --path … --query …` (0.50) | Same flags on `boks policy allow/deny/rm`; requests judged in the proxy, deny wins | P1 | partial | An HTTP rule never opens raw access to a host: a flow Boks cannot read is refused when an HTTP rule decides it. Proxy- and unit-tested; not run in a real guest, and sbx's own output not compared (needs `sbx login`). See "Catch-up with sbx v0.49–v0.51" |
 | Flow modes in the log | `PROXY` column carries `forward`, `forward-bypass`, `transparent` | Same three values, same meanings | P1 | done | All three are produced and attributed to the sandbox they came from. `transparent` comes from the netstack's own decisions, taken on address and port for flows that never touched the proxy |
 | Structured decisions | Blocked rows read `no applicable policies for op(action=net:connect:tcp, resource=net:domain:<host>:<port>)` | Same action/resource vocabulary on every decision | P1 | done | Recorded as fields rather than formatted prose, so the display layer can group, filter and aggregate |
 | Aggregated log display | Rows deduplicated per destination with `LAST SEEN` and `COUNT`, split into blocked and allowed | Same | P1 | done | One dependency install produces hundreds of identical allows; `--raw` still prints every decision |
@@ -710,8 +711,32 @@ Also done: `secret set --value-stdin` (whole stdin, no prompt, refused with `--v
 destination host was already impossible: `--inject` rejects an empty host list (`tok@=bearer`), and a
 stored name with no rule is attached to nothing.
 
-Not built: HTTP policy rules restricted by query parameter. Boks policy rules are host/port/CIDR only;
-there are no method or path rules to extend, so this needs the HTTP rule layer itself first.
+Also done: HTTP policy rules, with sbx's flags on `policy allow|deny|rm`: `--method GET,HEAD|ANY`,
+`--path GLOB` (default `/**`; `*` within a segment, `**` across segments) and repeatable `--query
+name=value` (a URL-query-encoded value pattern, `*` a wildcard). Validation messages are sbx 0.51's
+where sbx has one (read from `--help` and the binary: "--path applies only to HTTP rules; use --method
+ANY to match all methods", "unknown HTTP method %q: must be one of …, ANY", "http path must be
+canonical (…)", "HTTP rule resource %q must be a host pattern, not an IP address", the `--query` name
+and value rules). A rule is refused when the same scope holds the opposite decision for the same
+resource (for HTTP rules: overlapping methods, the same path and query), for connection rules too, as
+sbx does; Boks has no rule IDs, so the refusal prints the `boks policy rm` that removes the existing
+rule. `policy check` reads an `http(s)://` URL as a request (`--method`, default GET), with `check http`
+and `check network` as sbx's spellings; `policy ls` gains `--wide` and `--json`; `policy log` shows the
+method and path of a request judged against HTTP rules. The proxy judges every request it reads —
+plaintext HTTP, and HTTPS it now terminates for a host with an HTTP rule as for one with a credential
+— and an HTTP rule never opens raw access: a flow Boks cannot read is refused whenever an HTTP rule
+decides it (see security-model.md). The store keeps the selector as version 2, written only when an
+HTTP rule is present.
+
+**Not verified against sbx** (it needs `sbx login`, which was not done): the exact method list in
+sbx's error, sbx's `ls --wide`/`--json` column names and how it renders a selector, how sbx treats a
+repeated query parameter or `;` separators, whether its conflict check compares method sets by
+overlap or identity, and its log columns for HTTP decisions. Where unknown, Boks chose the stricter
+reading. **Differs from sbx**: Boks has no `--protocol` (no UDP rules), no rule IDs (`rm --id`), and
+destinations stay positional (`boks policy allow HOST`, not `allow network HOST`). An HTTPS host
+with HTTP rules needs the Boks CA in the sandbox, which a sandbox gets only when created with a
+credential or an HTTP rule; one created before is refused that host until recreated. Kits cannot
+declare HTTP rules yet. Not tried in a real guest.
 
 Also done: kit credentials are approved by the user before they are used, as sbx now does
 (`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
@@ -784,7 +809,6 @@ Not yet built, roughly in the order worth doing:
 | sbx feature | Release | Notes |
 |---|---|---|
 | `--mount HOST:SANDBOX_PATH` for kit-declared mounts | 0.50 | Waits for kit `volumes`/mounts; `PATH:TARGET[:ro]` workspaces are done |
-| `policy` HTTP rules restricted by query parameter (`--query name=value`) | 0.50 | Needs HTTP method/path rules first; Boks has none (host-level only) |
 | `kit inspect --resolved`, kit install logs, kit loopback port requests, persistent kit volumes | 0.50/0.51 | Kits slices in kits-design.md |
 | Split-horizon DNS via the proxy, 502 for failed upstream connections, upstream connection reuse | 0.51 | |
 | `sandbox.fuse` | 0.51 | Guest kernel support unverified |

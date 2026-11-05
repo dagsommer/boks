@@ -30,12 +30,18 @@ const (
 // shouldInspect is the whole opt-in rule for TLS interception, in one place so that it can
 // be read and audited in one place.
 //
-// A flow is terminated only when the destination has a credential rule *and* an authority
-// exists to sign with. There is no other input: no flag, no preset, no default, nothing the
-// guest sends. If this function ever grows a second reason to return true, that reason
-// needs to survive the same argument this one did.
+// A flow is terminated only when an authority exists to sign with and the destination has
+// either a credential rule or an HTTP policy rule. There is no other input: no flag, no
+// preset, no default, nothing the guest sends.
+//
+// The second reason survives the same argument as the first. A credential rule is the user
+// asking Boks to change requests to a host, which cannot be done without reading them; an
+// HTTP rule (`boks policy allow HOST --method GET`) is the user asking Boks to judge requests
+// to a host, which cannot be done without reading them either. Both are written by the user,
+// name the host, and are visible in `boks policy ls`. Without a CA the flow is not read, and
+// a host whose verdict depends on an HTTP rule is then refused rather than carried blind.
 func (s *Server) shouldInspect(t policy.Target) bool {
-	return s.cfg.CA != nil && s.cfg.Injector.Handles(t)
+	return s.cfg.CA != nil && (s.cfg.Injector.Handles(t) || s.cfg.Engine.HasHTTPRules(t))
 }
 
 // looksLikeTLS reports whether the bytes a client sent into a tunnel begin a TLS handshake.
@@ -87,8 +93,9 @@ func (s *Server) inspect(ctx context.Context, target policy.Target, client net.C
 		s.logf("verifying the certificate of %s failed: %v", target, err)
 		writeStatus(tlsClient, http.StatusBadGateway, fmt.Sprintf(
 			"boks: refused to connect to %s\n\n"+
-				"This host has a credential rule, so boks terminates TLS for it and verifies\n"+
-				"the origin's certificate itself. That verification failed, so nothing was sent.\n\n"+
+				"This host has a credential rule or an HTTP policy rule, so boks terminates TLS\n"+
+				"for it and verifies the origin's certificate itself. That verification failed,\n"+
+				"so nothing was sent.\n\n"+
 				"  reason: %v\n", target, err))
 		return
 	}
@@ -135,7 +142,18 @@ func (s *Server) serveInspected(ctx context.Context, target policy.Target, clien
 				writeStatus(client, http.StatusBadRequest, "boks: the request's Host header is not a usable destination\n")
 				return
 			}
-			if d := s.cfg.Engine.CheckMode(policy.StageRequest, t, policy.ModeForward); !d.Allowed {
+			if d := s.cfg.Engine.CheckRequest(policy.StageRequest, t, policy.ModeForward, httpRequestOf(req)); !d.Allowed {
+				writeStatus(client, http.StatusForbidden, denialText(d))
+				return
+			}
+		}
+
+		// HTTP rules for the host that was connected to are applied to every request, which
+		// is why this flow is being read at all when no credential is involved. A refusal
+		// closes the connection: the request's body is unread, and the next request on the
+		// connection could not be framed reliably.
+		if s.cfg.Engine.HasHTTPRules(target) {
+			if d := s.cfg.Engine.CheckRequest(policy.StageRequest, target, policy.ModeForward, httpRequestOf(req)); !d.Allowed {
 				writeStatus(client, http.StatusForbidden, denialText(d))
 				return
 			}
