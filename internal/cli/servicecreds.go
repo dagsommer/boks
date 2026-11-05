@@ -48,6 +48,12 @@ type credentialPlan struct {
 	// adopted names the services taken from the store rather than from a flag, for a note
 	// that says what a run is doing on the user's behalf.
 	adopted []string
+	// kitOAuth holds the approved OAuth shapes a kit declared, by service. Each is laid over
+	// the stored credential of that name; see kitOAuth.
+	kitOAuth map[string]kitOAuth
+	// notStored names the kit's OAuth credentials that were approved and have no stored login
+	// to apply to, for a note: there is nothing to attach and the run continues without.
+	notStored []string
 	// shadowed names the API-key credentials an OAuth credential took precedence over.
 	shadowed []string
 }
@@ -69,7 +75,11 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 	}
 	// Only what the user has approved. See kitapproval.go: a kit names a service, and the
 	// value is whatever the user stored under that name.
-	if kitSpecs, err = f.gateKitCredentials(kitSpecs, store, f.errOut()); err != nil {
+	kitShapes, err := kitOAuthShapes(f.kitSpec)
+	if err != nil {
+		return credentialPlan{}, err
+	}
+	if kitSpecs, kitShapes, err = f.gateKit(kitSpecs, kitShapes, store, f.errOut()); err != nil {
 		return credentialPlan{}, err
 	}
 	// The stand-ins follow their credentials: one the user did not approve gets no variable
@@ -93,6 +103,7 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 		oauth:  slices.Clone(f.oauth),
 	}
 	if store == nil || f.noSecrets {
+		plan.notStored = kitOAuthNames(kitShapes)
 		return plan, nil
 	}
 	entries, err := store.Entries()
@@ -110,6 +121,30 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 	}
 	for _, name := range f.oauth {
 		named[name] = true
+	}
+
+	// A kit's OAuth credential applies to the login stored under its service name. Like the
+	// kit's keys it yields to the flags: `--oauth NAME` is how the user says "this login, as
+	// stored", and a kit must not reshape it.
+	for _, k := range kitShapes {
+		if named[k.service] {
+			continue
+		}
+		stored := false
+		for _, e := range entries {
+			stored = stored || (e.Name == k.service && e.OAuth)
+		}
+		if !stored {
+			plan.notStored = append(plan.notStored, k.service)
+			continue
+		}
+		named[k.service] = true
+		if plan.kitOAuth == nil {
+			plan.kitOAuth = map[string]kitOAuth{}
+		}
+		plan.kitOAuth[k.service] = k
+		plan.oauth = append(plan.oauth, k.service)
+		plan.adopted = append(plan.adopted, k.service+" (oauth, from the kit)")
 	}
 
 	for _, e := range entries {
@@ -185,6 +220,27 @@ func (p *credentialPlan) preferOAuth(records map[string]secret.OAuthRecord) erro
 	return nil
 }
 
+// kitOAuthNames lists the services of a set of kit OAuth credentials.
+func kitOAuthNames(shapes []kitOAuth) []string {
+	var names []string
+	for _, k := range shapes {
+		names = append(names, k.service)
+	}
+	return names
+}
+
+// applyKitOAuth lays the kit's shapes over the stored records, in place.
+func (p credentialPlan) applyKitOAuth(records map[string]secret.OAuthRecord) error {
+	for name, k := range p.kitOAuth {
+		merged, err := k.apply(records[name])
+		if err != nil {
+			return err
+		}
+		records[name] = merged
+	}
+	return nil
+}
+
 // filterSpecs removes the specs belonging to the named services.
 func filterSpecs(specs []string, drop map[string]bool, service func(string) string) []string {
 	out := specs[:0:0]
@@ -220,6 +276,10 @@ func (p credentialPlan) describe(w io.Writer) {
 	if len(p.adopted) > 0 {
 		fmt.Fprintf(w, "credentials: %s, from the store · --no-secrets leaves them out\n",
 			strings.Join(p.adopted, ", "))
+	}
+	for _, name := range p.notStored {
+		fmt.Fprintf(w, "note: the kit's OAuth credential %q is NOT attached: no login is stored under that\n"+
+			"      name. 'boks secret adopt %s' or 'boks secret login %s' stores one.\n", name, name, name)
 	}
 	for _, name := range p.shadowed {
 		fmt.Fprintf(w, "note: the API key %q is NOT being attached: an OAuth credential already covers\n"+
@@ -298,6 +358,9 @@ func (f *policyFlags) resolveCredentials(ctx context.Context, stderr io.Writer) 
 	var records map[string]secret.OAuthRecord
 	if len(plan.oauth) > 0 {
 		if records, err = oauthRecords(ctx, store, plan.oauth); err != nil {
+			return credentialPlan{}, nil, err
+		}
+		if err := plan.applyKitOAuth(records); err != nil {
 			return credentialPlan{}, nil, err
 		}
 		if err := plan.preferOAuth(records); err != nil {
