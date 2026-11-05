@@ -717,6 +717,16 @@ Also done: kit credentials are approved by the user before they are used, as sbx
 (`boks run --kit`, `--approve-kit-credentials`; see kits.md). Before this a kit's `inject` rules
 were applied unasked, to whatever the user had stored under the service's name.
 
+Also done: a sandbox remembers the kits it was created with (`dev.boks.kits`: references, the
+commit a git reference resolved to, a digest), so `boks start`, `boks exec` on a stopped sandbox and a
+`boks run` that names no `--kit` re-apply what a kit does per boot — the approved credentials and
+`setup.startup` — instead of losing it. Approvals are the stored ones: no prompt and no new approval on
+those paths. An unreadable kit is a warning and the sandbox comes up without it; a different `--kit` on a
+re-attach is refused like the other fixed values. `boks create --kit` now registers a `kind: sandbox`
+kit's agent, takes the kit as the positional, and applies volumes, ports and environment. Sandboxes made
+before this record nothing. **Unverified:** no VM has restarted a sandbox through this; the record, reload,
+approval gate and refusal are unit-tested.
+
 Also done: kit `oauth` credentials and `credentialFile`. The block is the *shape* of a login and is
 laid over the OAuth credential stored under the service's name (endpoint, resource hosts, sentinels,
 response fields, file template); tokens never leave the store. `credentialFile.path` is redirected

@@ -44,6 +44,46 @@ With no terminal to ask on, nothing is approved. Run once interactively to remem
 answer, or pass `--approve-kit-credentials` to approve for that one run. `--inject` is
 unaffected: what you type yourself is never asked about.
 
+### A sandbox remembers its kits
+
+A sandbox is brought back up by commands that take no `--kit` — `boks start`, `boks exec` on a
+stopped sandbox, `boks run --name NAME`, or a plain `boks run claude .` in the same directory.
+So the sandbox records the kits it was created with, and those commands read them again:
+
+- **Recorded:** the `--kit` references as you typed them, where each is read from on a restart,
+  and a digest of what they composed to — in the container's `dev.boks.kits` label, never the
+  spec itself. A git reference whose `#ref=` is a branch or tag is recorded **pinned to the
+  commit that was fetched**, so a branch that moves cannot change what a restart reads; a
+  relative path is recorded as an absolute one, because `boks start` is run from anywhere.
+- **Applied again on every start, exec or re-attach:** the credentials, and the
+  `setup.startup` commands (once per boot, as before). Install commands and files stay marker-based:
+  once per sandbox.
+- **Credentials stay behind the approval.** There is no prompt on `start` or `exec`, and nothing is
+  approved anew. A credential is attached only if the approval stored in
+  `kit-credential-approvals.json` still matches what the kit asks for; otherwise it is left out
+  and the way to approve it (`boks run --name NAME` at a terminal) is printed. `boks run` at a
+  terminal asks, as it does with `--kit`.
+- **A kit that can no longer be read** — a directory that moved, a repository that is gone — is a
+  warning that says what is therefore missing, and the sandbox comes up without it. A kit that
+  changed on disk since (a local directory is not pinned) is applied as it now is, with a note;
+  a changed credential request is asked about again, not attached.
+- **`--kit` on a re-attach** has to be the kit the sandbox was created with. A different one is
+  refused, in the style of `--cpus` or `--net`, naming both; remove the sandbox to change it.
+  Naming no `--kit` is fine and means the recorded ones.
+- **Not retrofitted.** A sandbox created before this, or without `--kit`, records nothing; a
+  `--kit` on a later run still applies for that run only, as it always did. Recreate the sandbox to
+  have it remembered.
+- A running sandbox is not re-read by `start` or `exec`: whatever booted it applied its kit.
+
+`boks create --kit` records the kits the same way and, like `boks run`, accepts a `git+…`
+reference in the agent's place and registers the agent a `kind: sandbox` kit defines. It also
+applies the kit's volumes, ports and environment at creation; its setup runs when the sandbox
+first comes up.
+
+**Unverified:** none of this has run against a real guest. What is tested is the record and its
+round trip, the reload, the approval gate on a restart, the refusal of a different kit, and the
+setup configuration rebuilt from a sandbox's labels.
+
 ### OAuth credentials
 
 A kit's `oauth` block describes a login; it carries no token. Boks applies it to the OAuth
@@ -90,7 +130,8 @@ $ boks run claude . --kit ./my-kit
 $ boks run claude . --kit ./my-kit/spec.yaml
 ```
 
-The same flag works on `boks create`, and on the two commands that answer questions about
+The same flag works on `boks create` (which also takes a `git+…` reference in the agent's place),
+and on the two commands that answer questions about
 policy — which is how you see what a kit does *before* running it:
 
 ```console
