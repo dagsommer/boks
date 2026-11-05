@@ -761,7 +761,8 @@ agents that list it.
 
 **Genuinely new.**
 
-1. **The bindings file and the domain intersection.** Boks has no `~/.config/sbx/
+1. **The bindings file and the domain intersection.** (Superseded: what was built is an approval
+   gate keyed by fingerprint, described under Slice 5.) Boks has no `~/.config/sbx/
    credentials.yaml` analogue: no `bindings[<service>].allowedDomains`, no named variants
    (`github@work-org-a`), no workspace-`remembered` map, no `discovery[]` with `env:`/`file:`
    + `parser: "json:<dotted.path>"`. The one piece Boks **must** have before honouring any
@@ -1078,21 +1079,48 @@ containerd at minimum.
 
 ### Slice 5 — Credentials
 
-**Delivers** `credentials[]` → `secret.Service` + `[]secret.ServiceInject`; sentinel minting
-rather than literal `proxy-managed`; `oauth` mapped onto Boks' existing endpoint/sentinel/
-response-field machinery and `GuestCredentialDir`; a user-side `allowedDomains` gate; and
-per-service refusal when Boks cannot mint a credible sentinel.
+**Planned.** This slice was written to deliver `credentials[]` → `secret.Service` +
+`[]secret.ServiceInject`; sentinel minting rather than literal `proxy-managed`; `oauth` mapped
+onto Boks' existing endpoint/sentinel/response-field machinery and `GuestCredentialDir`; a
+user-side `allowedDomains` gate backed by a new bindings store; and per-service refusal when
+Boks cannot mint a credible sentinel.
 
-**Touches** `internal/secret/service.go` (accept runtime-registered services),
-`internal/secret/oauth.go` (`credentialFile.template` rendering),
-`internal/secret/import.go` (guest file placement), `internal/proxy/proxy.go` (nothing, if the
-`Injector` interface is unchanged — verify), plus a new bindings store for `allowedDomains`.
+**What was built instead of the bindings store.** There is no `allowedDomains` store and no
+domain intersection. The user-side half of "a kit may not choose where my key goes" is an
+**approval gate**, `internal/cli/kitapproval.go`, which does the same job without a second
+configuration surface:
+
+- A kit's credentials are rendered into `--inject`'s own grammar (`kitInjectSpecs`), so one
+  validator, one describer and one enforcer judge a kit's rule and a typed one alike.
+- Before they are used, the user is shown each service, the hosts it would be sent to and whether
+  a value is stored, and asked. The answer is kept in `kit-credential-approvals.json` (state
+  directory), keyed by **kit name + reference** and **service**, and valid only for the
+  **fingerprint** of what the kit declared (the rendered `--inject` specs, order aside; for OAuth,
+  the whole login shape). A kit that adds a host or moves the header is a different request and
+  is asked about again; a mutable git ref changing what it asks for cannot ride an old approval.
+- Without a terminal, or with `--no-input`, nothing is asked and nothing is approved: the
+  credential is left out and the sandbox still starts, with the way to approve it printed.
+  `--approve-kit-credentials` approves for one run and records nothing. `--inject` is never gated.
+  Each kit of a stack is gated on its own.
+- Sentinels are minted (`secret.NewSentinel`, or the registry's vendor-shaped placeholder), the
+  guest variable follows its credential, and `oauth` maps onto the existing machinery with
+  `credentialFile` redirected into `/etc/boks/credentials/`; `passthrough` is refused.
+- A sandbox records its kits (`dev.boks.kits`), and `start`/`exec` re-apply them behind the same
+  stored approvals; see [kits.md](kits.md#a-sandbox-remembers-its-kits).
+
+What was **not** built: named variants, the workspace-`remembered` map, `discovery[]`, and any
+per-user narrowing of a kit's hosts below what the kit declares. The approval is all-or-nothing
+per service, not per host.
+
+**Touches** `internal/secret/service.go`, `internal/secret/oauth.go`, `internal/secret/import.go`
+(as planned) and `internal/cli/kitapproval.go`, `kitoauth.go`, `servicecreds.go` (what replaced
+the bindings store). `internal/proxy` needed nothing.
 
 **Verification, no hypervisor.** This is the slice that verifies *best* without a guest,
-because the proxy is host-side. Drive `internal/proxy` with a kit-derived `Injector` and assert:
-the header and format land exactly as `inject[]` declared; injection happens **only** for the
-intersection of `inject[].domain` and `allowedDomains`, with a non-fatal skip otherwise
-(`PIT §14`); `Pattern.IsAny()` refuses a catch-all injection domain (`pattern.go:127`
+because the proxy is host-side. As planned, drive `internal/proxy` with a kit-derived `Injector`
+and assert: the header and format land exactly as `inject[]` declared; the approval gate decides
+what is attached, replacing the `allowedDomains` intersection the original text asked for;
+`Pattern.IsAny()` refuses a catch-all injection domain (`pattern.go:127`
 documents this as the case where the check matters most); a minted sentinel satisfies
 `validSentinel` and carries the vendor's documented prefix; a kit declaring a service with no
 Boks registry row and no derivable prefix is registered name-only rather than guessed at;
