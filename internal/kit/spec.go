@@ -170,6 +170,9 @@ type Spec struct {
 	// Environment carries static container environment variables.
 	Environment *Environment `yaml:"environment,omitempty"`
 
+	// Tree is the kit's files/ directory, read by Load. It is not part of spec.yaml.
+	Tree *Tree `yaml:"-"`
+
 	// Setup seeds files and runs install/startup commands.
 	Setup *Setup `yaml:"setup,omitempty"`
 

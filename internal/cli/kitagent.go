@@ -238,10 +238,13 @@ func kitGuestSpecs(spec *kit.Spec) []string {
 
 // kitSetup converts a kit's setup: block into what the sandbox package applies in the guest.
 func kitSetup(spec *kit.Spec) *sandbox.Setup {
-	if spec == nil || spec.Setup == nil {
+	if spec == nil || (spec.Setup == nil && spec.Tree.Empty()) {
 		return nil
 	}
 	var s sandbox.Setup
+	if spec.Setup == nil {
+		return finishSetup(&s, spec)
+	}
 	for _, c := range spec.Setup.Install {
 		s.Install = append(s.Install, sandbox.InstallStep{Command: c.Command, User: c.User, Description: c.Description})
 	}
@@ -251,10 +254,23 @@ func kitSetup(spec *kit.Spec) *sandbox.Setup {
 	for _, c := range spec.Setup.Startup {
 		s.Startup = append(s.Startup, sandbox.StartupStep{Command: c.Command, User: c.User, Background: c.Background, Description: c.Description})
 	}
+	return finishSetup(&s, spec)
+}
+
+// finishSetup adds the kit's static files and drops an empty result.
+func finishSetup(s *sandbox.Setup, spec *kit.Spec) *sandbox.Setup {
+	if spec.Tree != nil {
+		for _, f := range spec.Tree.Home {
+			s.Home = append(s.Home, sandbox.StaticFile{Path: f.Path, Mode: f.Mode, Data: f.Data})
+		}
+		for _, f := range spec.Tree.Workspace {
+			s.Workspace = append(s.Workspace, sandbox.StaticFile{Path: f.Path, Mode: f.Mode, Data: f.Data})
+		}
+	}
 	if s.Empty() {
 		return nil
 	}
-	return &s
+	return s
 }
 
 // applyKit puts what a kit asks of the guest into cfg: its setup, and — for a kit that is not

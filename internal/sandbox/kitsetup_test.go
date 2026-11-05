@@ -1,6 +1,10 @@
 package sandbox
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -76,5 +80,58 @@ func TestFingerprintChangesWithTheSetup(t *testing.T) {
 	b := &Setup{Install: []InstallStep{{Command: "b"}}}
 	if a.fingerprint() == b.fingerprint() || a.fingerprint() != a.fingerprint() {
 		t.Fatal("fingerprint is not a function of the content")
+	}
+}
+
+func TestStaticFilesComeFirstAndLast(t *testing.T) {
+	s := &Setup{
+		Install:   []InstallStep{{Command: "true"}},
+		Home:      []StaticFile{{Path: ".a/b", Mode: 0o600, Data: []byte("h")}},
+		Workspace: []StaticFile{{Path: ".c", Mode: 0o644, Data: []byte("w")}},
+		Startup:   []StartupStep{{Command: []string{"x"}}},
+	}
+	ops, err := s.Plan("/w", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var labels []string
+	for _, op := range ops {
+		labels = append(labels, op.label)
+	}
+	want := "files/home/.a/b|install 1: true|startup 1: x|files/workspace/.c"
+	if got := strings.Join(labels, "|"); got != want {
+		t.Fatalf("order = %s", got)
+	}
+	if _, err := (&Setup{Workspace: s.Workspace}).Plan("", ""); err == nil {
+		t.Fatal("workspace files without a workspace were accepted")
+	}
+}
+
+func TestStaticFileScriptWritesAndKeeps(t *testing.T) {
+	base := t.TempDir()
+	run := func(rel, content, keep string) {
+		t.Helper()
+		owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+		cmd := exec.Command("/bin/sh", "-c", staticFileScript, "sh", base, rel, "0640", keep, owner)
+		cmd.Stdin = strings.NewReader(content)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+	}
+	run("a b/c/f.txt", "one", "0")
+	got, err := os.ReadFile(filepath.Join(base, "a b/c/f.txt"))
+	if err != nil || string(got) != "one" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if fi, _ := os.Stat(filepath.Join(base, "a b/c/f.txt")); fi.Mode().Perm() != 0o640 {
+		t.Fatalf("mode %v", fi.Mode())
+	}
+	run("a b/c/f.txt", "two", "1")
+	if got, _ := os.ReadFile(filepath.Join(base, "a b/c/f.txt")); string(got) != "one" {
+		t.Fatalf("keep overwrote: %q", got)
+	}
+	run("a b/c/f.txt", "three", "0")
+	if got, _ := os.ReadFile(filepath.Join(base, "a b/c/f.txt")); string(got) != "three" {
+		t.Fatalf("overwrite failed: %q", got)
 	}
 }

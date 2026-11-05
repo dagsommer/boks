@@ -10,7 +10,10 @@ and a kit written for `sbx` is a kit Boks reads.
 >
 > `setup.install`, `setup.files` and `setup.startup` run inside the guest after it starts
 > (install and files once per sandbox, startup once per boot; a failed install is retried on the
-> next run). `ports`, `volumes`, the `files/` tree and `oauth` credentials are parsed, validated,
+> next run). The `files/` tree is applied too: `files/home/` into `/home/agent` (overwriting, owned by the
+> agent) before the install commands, and `files/workspace/` into the primary workspace last,
+> **never overwriting a file that is already there** — in a direct mount that is your own disk.
+> Symlinks in the tree are skipped. `ports`, `volumes` and `oauth` credentials are parsed, validated,
 > and **not applied**. The flag says so, and so does every example below that shows a field Boks
 > ignores. Why, and what comes next, is in [kits-design.md](kits-design.md).
 

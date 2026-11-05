@@ -220,9 +220,8 @@ func loadGit(reference string) (*Spec, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// The clone is read and dropped. Only spec.yaml is used today; when a slice needs the
-	// files/ tree it will need to keep this, and that is the moment to decide where a
-	// fetched kit lives rather than now.
+	// The clone is read and dropped: spec.yaml and the files/ tree are both read into memory
+	// before this returns, so nothing needs the directory afterwards.
 	defer os.RemoveAll(dest)
 
 	ctx, cancel := context.WithTimeout(context.Background(), FetchTimeout)
@@ -251,6 +250,12 @@ func loadGit(reference string) (*Spec, []string, error) {
 		return nil, nil, fmt.Errorf("%s#%s: %w", g.URL, commit, err)
 	}
 
+	tree, treeWarnings, err := ReadTree(filepath.Dir(specPath))
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s#%s: %w", g.URL, commit, err)
+	}
+	spec.Tree = tree
+	warnings = append(warnings, treeWarnings...)
 	warnings = append(warnings, fmt.Sprintf("fetched from %s at commit %s", g.URL, commit))
 	if !g.Immutable() {
 		// Reported, not refused. Docker's normative specification requires an immutable

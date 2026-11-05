@@ -74,7 +74,12 @@ func Load(reference string) (*Spec, []string, error) {
 		// names a field rather than a file.
 		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return spec, warnings, nil
+	tree, treeWarnings, err := ReadTree(filepath.Dir(path))
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	spec.Tree = tree
+	return spec, append(warnings, treeWarnings...), nil
 }
 
 // remoteForm reports whether a reference names something Boks would have to fetch, and what to

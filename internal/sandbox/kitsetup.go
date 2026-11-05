@@ -29,11 +29,26 @@ type Setup struct {
 	Install []InstallStep
 	Files   []FileStep
 	Startup []StartupStep
+	// Home and Workspace are a kit's static files: files/home/ is written under the agent's
+	// home, files/workspace/ into the primary workspace.
+	Home      []StaticFile
+	Workspace []StaticFile
 }
+
+// StaticFile is one file from a kit's files/ tree.
+type StaticFile struct {
+	Path string // relative, slash-separated
+	Mode uint32
+	Data []byte
+}
+
+// homeDir is where files/home/ lands. The agent's home is /home/agent in every image Boks ships
+// and in the images kits name, which is what the kit specification says too.
+const homeDir = "/home/agent"
 
 // Empty reports whether there is nothing to do.
 func (s *Setup) Empty() bool {
-	return s == nil || len(s.Install)+len(s.Files)+len(s.Startup) == 0
+	return s == nil || len(s.Install)+len(s.Files)+len(s.Startup)+len(s.Home)+len(s.Workspace) == 0
 }
 
 // InstallStep is one `setup.install` entry: a shell string, run as root unless it says otherwise.
@@ -69,6 +84,8 @@ type setupOp struct {
 	stdin string
 	// perBoot ops run once per boot of the guest; the rest once per sandbox.
 	perBoot bool
+	// owned ops get the agent's "uid:gid" appended as their last argument.
+	owned bool
 }
 
 // writeFileScript writes stdin to $1, creating its directory, unless $2 is "1" and $1 exists,
@@ -77,6 +94,26 @@ type setupOp struct {
 const writeFileScript = `
 if [ "$2" = 1 ] && [ -e "$1" ]; then exit 0; fi
 mkdir -p "$(dirname "$1")" && cat > "$1" && chmod "$3" "$1"
+`
+
+// staticFileScript writes stdin to $1/$2 for a kit's files/ tree: it creates the directories
+// between, hands each one it created and the file to $5 (the agent), and — when $4 is 1 — leaves
+// a file that already exists alone.
+const staticFileScript = `
+base=$1; rel=$2; mode=$3; keep=$4; owner=$5
+dst=$base/$rel
+if [ "$keep" = 1 ] && [ -e "$dst" ]; then exit 0; fi
+[ -d "$base" ] || { mkdir -p "$base" && chown "$owner" "$base"; } || exit 1
+dir=$(dirname "$rel")
+if [ "$dir" != . ]; then
+	d=$base; IFS=/; set -f
+	for part in $dir; do
+		d="$d/$part"
+		[ -d "$d" ] || { mkdir "$d" && chown "$owner" "$d"; } || exit 1
+	done
+	unset IFS
+fi
+cat > "$dst" && chmod "$mode" "$dst" && chown "$owner" "$dst"
 `
 
 // backgroundScript starts "$@" detached from the exec that dispatches it, so it keeps running
@@ -91,6 +128,9 @@ func (s *Setup) Plan(workdir, cloneTarget string) ([]setupOp, error) {
 		return nil, nil
 	}
 	var ops []setupOp
+	for _, f := range s.Home {
+		ops = append(ops, staticOp("home", homeDir, f, false))
+	}
 	for i, step := range s.Install {
 		if strings.TrimSpace(step.Command) == "" {
 			return nil, fmt.Errorf("setup.install[%d] has no command", i)
@@ -143,7 +183,30 @@ func (s *Setup) Plan(workdir, cloneTarget string) ([]setupOp, error) {
 			perBoot: true,
 		})
 	}
+	// Last, after the workspace is ready (and, in clone mode, cloned). Never overwriting: in
+	// a direct mount these land on the user's own disk, and a kit replacing their .editorconfig
+	// on every run would be a kit editing their repository.
+	for _, f := range s.Workspace {
+		if workdir == "" {
+			return nil, fmt.Errorf("the kit has files/workspace/ but the sandbox has no workspace")
+		}
+		ops = append(ops, staticOp("workspace", workdir, f, true))
+	}
 	return ops, nil
+}
+
+func staticOp(kind, base string, f StaticFile, keep bool) setupOp {
+	k := "0"
+	if keep {
+		k = "1"
+	}
+	return setupOp{
+		label: fmt.Sprintf("files/%s/%s", kind, f.Path),
+		argv:  []string{"/bin/sh", "-c", staticFileScript, "sh", base, f.Path, fmt.Sprintf("%04o", f.Mode&0o777), k},
+		user:  "root",
+		stdin: string(f.Data),
+		owned: true,
+	}
 }
 
 func labelOf(kind string, i int, description, command string) string {
@@ -265,9 +328,13 @@ func resolveUser(user, owner string) string {
 
 func runSetupOp(ctx context.Context, container client.Container, task client.Task, op setupOp, owner string) error {
 	var out bytes.Buffer
+	argv := op.argv
+	if op.owned {
+		argv = append(append([]string{}, argv...), owner)
+	}
 	ec := ExecConfig{
 		Name:    container.ID(),
-		Command: op.argv,
+		Command: argv,
 		User:    resolveUser(op.user, owner),
 		Stdout:  &out,
 		Stderr:  &out,
