@@ -28,17 +28,22 @@ stored under that name. So before a kit's credentials are used, Boks shows them 
 ```console
 $ boks run team-copilot . --kit git+ssh://git@ghe.example/team/kits.git#dir=copilot
 
-The kit "copilot" wants to use these credentials:
-  ghe-token    API key → sent to api.ghe.example, ghe.example   (stored)
-  wiki-token   API key → sent to wiki.example                   (not set)
-  ghe-login    OAuth login → sent to api.ghe.example, auth.ghe.example   (stored)
-[A]pprove all · [R]eview each · [N]o (default):
+  This kit wants to use these credentials:
+    ghe-token:  API key sent to api.ghe.example, ghe.example (stored)
+    wiki-token:  API key sent to wiki.example (not set)
+    ghe-login:  OAuth login sent to api.ghe.example, auth.ghe.example (stored)
+  Approve these credentials?
+    1. Approve all
+    2. Review each
+    3. No   start without them
+  Choice [1-3, default 3]:
 ```
 
 An approval is remembered for that kit and that service, and only for exactly what the kit
 declared: the hosts, header and format of a key, or the whole shape of a login (endpoints,
 hosts, sentinels, credential file). If the kit later adds a host, you are asked again. A credential you
-do not approve is left out and the sandbox still starts.
+do not approve is left out and the sandbox still starts. The wording is sbx's (v0.51.0); sbx's
+"Use a different source" and "Enter it now" choices are not built.
 
 With no terminal to ask on, nothing is approved. Run once interactively to remember the
 answer, or pass `--approve-kit-credentials` to approve for that one run. `--inject` is

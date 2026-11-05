@@ -271,12 +271,8 @@ func askNames(asks []kitCredentialAsk) string {
 	return strings.Join(names, ", ")
 }
 
-func describeKitCredentials(w io.Writer, kitName string, asks []kitCredentialAsk) {
-	width := 0
-	for _, a := range asks {
-		width = max(width, len(a.service))
-	}
-	fmt.Fprintf(w, "\nThe kit %q wants to use these credentials:\n", kitName)
+func describeKitCredentials(w io.Writer, _ string, asks []kitCredentialAsk) {
+	fmt.Fprintf(w, "\n  This kit wants to use these credentials:\n")
 	for _, a := range asks {
 		state := "not set"
 		if a.stored {
@@ -286,23 +282,34 @@ func describeKitCredentials(w io.Writer, kitName string, asks []kitCredentialAsk
 		if a.oauth {
 			kind = "OAuth login"
 		}
-		fmt.Fprintf(w, "  %-*s  %s → sent to %s   (%s)\n",
-			width, a.service, kind, strings.Join(a.hosts, ", "), state)
+		fmt.Fprintf(w, "    %s:  %s sent to %s (%s)\n", a.service, kind, strings.Join(a.hosts, ", "), state)
 	}
 }
 
-// askKitCredentials prompts and returns the asks the user approved.
+// askKitCredentials prompts and returns the asks the user approved. The wording and the numbered
+// choices are sbx's (v0.51.0), and the letters the earlier Boks prompt took are still accepted.
 func (f *policyFlags) askKitCredentials(u kitUnit, asks []kitCredentialAsk, in *bufio.Reader, w io.Writer) ([]kitCredentialAsk, error) {
 	describeKitCredentials(w, u.name, asks)
-	fmt.Fprint(w, "[A]pprove all · [R]eview each · [N]o (default): ")
+	fmt.Fprint(w, "  Approve these credentials?\n    1. Approve all\n    2. Review each\n    3. No   start without them\n  Choice [1-3, default 3]: ")
 	switch answer(in) {
-	case "a", "approve", "approve all":
+	case "1", "a", "approve", "approve all":
 		return asks, nil
-	case "r", "review", "review each":
+	case "2", "r", "review", "review each":
 		var approved []kitCredentialAsk
 		for _, a := range asks {
-			fmt.Fprintf(w, "Send %s to %s? [y/N]: ", a.key(), strings.Join(a.hosts, ", "))
-			if r := answer(in); r == "y" || r == "yes" {
+			what := "API key"
+			if a.oauth {
+				what = "OAuth login"
+			}
+			fmt.Fprintf(w, "  The sandbox wants to use your %s for %q.\n  Its secret value will be sent to:\n", what, a.service)
+			for _, h := range a.hosts {
+				fmt.Fprintf(w, "    • %s\n", h)
+			}
+			if a.stored {
+				fmt.Fprint(w, "  You already have this "+what+" stored locally.\n")
+			}
+			fmt.Fprint(w, "  Allow this "+what+"'s secret value to be sent to these domains?\n    1. Yes   send the stored value\n    2. No\n  Choice [1-2, default 2]: ")
+			if r := answer(in); r == "1" || r == "y" || r == "yes" {
 				approved = append(approved, a)
 			}
 		}

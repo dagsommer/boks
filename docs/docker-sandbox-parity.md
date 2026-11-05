@@ -771,9 +771,10 @@ small throwaway kits. All of the following held:
 Compared side by side with `sbx run` v0.51.0 (2026-11-05): the SANDBOX block is identical. On a terminal Boks now
 also prints sbx's IMAGE step (`✓ image — ready`), `✓ Created sandbox NAME` and `○ AGENT — starting in sandbox NAME…`
 with the workspace line. Still different: sbx draws a spinner with `N/N layers · finalizing image…` where Boks draws
-a byte bar; Boks prints kit fetch/pinning notices and `kit:` step lines that sbx does not; and sbx showed no
-credential approval prompt in four runs (a git kit with a pinned and an unpinned ref, a local kit, secrets stored
-and not stored), so the prompt's text could not be compared and its trigger in sbx is unknown. A kit credential approved with
+a byte bar; Boks prints kit fetch/pinning notices and `kit:` step lines that sbx does not; and the credential
+prompt now uses sbx's wording and numbered choices (sbx asks once per kit and service, then remembers, which is why
+an already-approved kit shows no prompt). Not built: sbx's "Use a different source" and, for a credential that is
+not set, "Enter it now". A kit credential approved with
 `--approve-kit-credentials` at `create` still bakes its OAuth sentinel into the container's environment, and
 `boks start` (which has no stored approval then) does not give the proxy the rule: the guest holds a sentinel
 that nothing substitutes. Harmless, but not tidy.
