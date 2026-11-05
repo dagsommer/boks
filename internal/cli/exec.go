@@ -66,7 +66,8 @@ Flags must come before the sandbox name; everything after the name belongs to th
 		// VM — and a VM that boots without something holding its link socket comes up
 		// with a NIC connected to nothing. The stack it starts outlives this command, as
 		// the sandbox does.
-		if err := ensureNetworkForExisting(cmd.Context(), name, dev.address, env.Stderr); err != nil {
+		setup, err := ensureNetworkForExisting(cmd.Context(), name, dev.address, env.Stderr)
+		if err != nil {
 			return err
 		}
 
@@ -74,6 +75,7 @@ Flags must come before the sandbox name; everything after the name belongs to th
 			Address: dev.address,
 			Name:    name,
 			Command: command,
+			Setup:   setup,
 			Env:     envVars,
 			Cwd:     workdir,
 			User:    user,

@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -151,6 +153,15 @@ Agents:
 		if err := netFlags.loadKit(env.Stderr); err != nil {
 			return err
 		}
+		// `boks run --name existing` names no kit, but the sandbox may have been created with
+		// one, and a kit that defines the agent has to be loaded before the sandbox's own
+		// agent can be resolved. Without --name the sandbox is found only after the agent is
+		// known, and the same record is read below.
+		if len(netFlags.kitRefs) == 0 && flags.name != "" && !ephemeral {
+			if err := adoptNamedSandboxKits(cmd.Context(), dev, flags.name, &netFlags, env); err != nil {
+				return err
+			}
+		}
 		// A `kind: sandbox` kit defines an agent, so it has to be in the registry before
 		// the positional arguments are read — `boks run team-copilot-default --kit …`
 		// names an agent that exists only in the file on the same command line, and
@@ -177,6 +188,12 @@ Agents:
 		inv, err := flags.resolve(ctx, agents, positional, env)
 		if err != nil {
 			return err
+		}
+		// A sandbox that exists carries the kits it was created with, and a run that names none
+		// is still that sandbox: its credentials are attached and its startup commands run as
+		// they did the first time. An ephemeral run is a sandbox of its own, with no record.
+		if inv.exists && !netFlags.kitAdopted && !(ephemeral && flags.name == "") {
+			netFlags.adoptRecordedKits(inv.name, inv.info.Kits, io.Discard, env.Stderr)
 		}
 		// The agent decides a layer of the policy — the destinations its own
 		// definition says it cannot work without — so the policy flags have to know
@@ -217,8 +234,13 @@ Agents:
 		if err != nil {
 			return err
 		}
-		if err := applyKitVolumes(netFlags.kitSpec, inv.exists, &cfg, env.Stderr); err != nil {
-			return err
+		cfg.Kits = netFlags.kitRecord()
+		// Said for a --kit on a re-attach, where it is news; a kit the sandbox remembered
+		// would repeat it on every run.
+		if netFlags.recordedFor == "" || !inv.exists {
+			if err := applyKitVolumes(netFlags.kitSpec, inv.exists, &cfg, env.Stderr); err != nil {
+				return err
+			}
 		}
 		// Decided before anything is pulled or started, so that a --clone against a
 		// directory Boks will not clone costs a message rather than a sandbox.
@@ -328,6 +350,22 @@ Agents:
 		return nil
 	}
 	return cmd
+}
+
+// adoptNamedSandboxKits reads the record of the sandbox a run names with --name, before the
+// agent is resolved, so that a kit which defines the agent is registered in time.
+func adoptNamedSandboxKits(ctx context.Context, dev *devFlags, name string, f *policyFlags, env Env) error {
+	if err := ensureDaemon(ctx, dev, env.Stderr); err != nil {
+		return err
+	}
+	info, exists, err := sandbox.Find(ctx, dev.address, name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		f.adoptRecordedKits(name, info.Kits, io.Discard, env.Stderr)
+	}
+	return nil
 }
 
 // agentList renders the registry for help output.

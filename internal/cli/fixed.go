@@ -123,6 +123,7 @@ func checkFixedAtCreation(f *sandboxFlags, net *policyFlags, inv invocation) err
 	checkEnv(f, inv, &c)
 	checkAnnotations(f, inv, &c)
 	checkNetworkMode(net, inv, &c)
+	checkKits(net, inv, &c)
 	checkRuntimeFlags(f, inv, &c)
 	checkCloneMode(f, inv, &c)
 	checkWorkdir(f, inv, &c)

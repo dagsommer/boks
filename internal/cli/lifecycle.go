@@ -34,10 +34,11 @@ a sandbox that is already running does nothing.`,
 				// policy flags of its own and needs none: the sandbox records
 				// the policy it was created with, and the durable store supplies
 				// the rest.
-				if err := ensureNetworkForExisting(cmd.Context(), name, dev.address, env.Stderr); err != nil {
+				setup, err := ensureNetworkForExisting(cmd.Context(), name, dev.address, env.Stderr)
+				if err != nil {
 					return err
 				}
-				return sandbox.Start(cmd.Context(), dev.address, name, env.Stderr)
+				return sandbox.StartWithSetup(cmd.Context(), dev.address, name, env.Stderr, setup)
 			})
 		},
 	}
@@ -105,40 +106,61 @@ a sandbox that is not in a shared workspace is gone.`,
 // missing feature — a sandbox created under `-policy locked` came back up under the default
 // preset, so restarting a sandbox silently widened its containment. The sandbox now carries
 // its own selection, and the durable store supplies the rest.
-func ensureNetworkForExisting(ctx context.Context, name, address string, stderr io.Writer) error {
+//
+// The kits are read back the same way. A sandbox records the kits it was created with, and what
+// a kit does at every boot — attaching its credentials, running its startup commands — is
+// re-applied here, so a restart does not quietly lose it. The credentials are the ones the user
+// has approved and no others: this path has no terminal to ask on, so nothing is prompted or
+// newly approved. The setup it returns is what the caller applies once the sandbox is up; nil
+// when the sandbox is already running, because whatever booted it applied the kit.
+func ensureNetworkForExisting(ctx context.Context, name, address string, stderr io.Writer) (*sandbox.Setup, error) {
 	info, exists, err := sandbox.Find(ctx, address, name)
 	if err != nil || !exists {
 		// A sandbox that is not there is the next command's error to report, with a
 		// better message than this one could give.
-		return nil
+		return nil, nil
 	}
-	if _, alive := enforce.Lookup(policy.StateDir(), name); alive {
-		return nil
-	}
-	mode, wired := network.ModeFromAnnotations(info.Annotations)
-	if !wired {
-		fmt.Fprint(stderr, unwiredSandboxWarning(name))
-		return nil
-	}
+	running := info.Status == sandbox.StatusRunning
+	_, alive := enforce.Lookup(policy.StateDir(), name)
 
 	// A sandbox records the agent it runs, so `start` and `exec` can serve the same agent
 	// layer `run` did without any flags of their own. An agent this build no longer knows
 	// contributes nothing, which is the safe direction: fewer allows, never more.
 	var flags policyFlags
-	if a, ok := agent.Builtin().Lookup(info.Agent); ok {
+	agents := agent.Builtin()
+	var setup *sandbox.Setup
+	if !running || !alive {
+		flags.adoptRecordedKits(name, info.Kits, io.Discard, stderr)
+		if err := registerKitAgent(agents, flags.kitAgentSpec(), false); err != nil {
+			fmt.Fprintf(stderr, "warning: the kit's agent could not be registered: %v\n", err)
+		}
+		if !running {
+			setup = kitSetup(flags.kitSpec)
+		}
+	}
+	if a, ok := agents.Lookup(info.Agent); ok {
 		flags.forAgent(a)
 	}
+	if alive {
+		return setup, nil
+	}
+	mode, wired := network.ModeFromAnnotations(info.Annotations)
+	if !wired {
+		fmt.Fprint(stderr, unwiredSandboxWarning(name))
+		return setup, nil
+	}
+
 	// The sandbox's own recorded publish specifications: `start` and `exec` have no port
 	// flags, and a sandbox that came back up without the ports it was created with would
 	// break a bookmark for reasons nothing on screen would explain.
 	spec, err := flags.enforceSpec(ctx, name, address, mode, info.Policy, info.Ports, stderr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if mode != network.ModeNone {
 		pol, err := spec.Policy()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		fmt.Fprintf(stderr, "network: starting a %s stack for %s under policy %s (%s).\n",
 			mode, name, pol.Name, info.Policy.String())
@@ -147,8 +169,8 @@ func ensureNetworkForExisting(ctx context.Context, name, address string, stderr 
 	// no -v of their own. Starting the stack is the thing those commands were asked to do,
 	// so its progress is their output rather than chatter — and silencing it here would
 	// leave no way to ask for it back.
-	_, _, err = attachNetwork(ctx, spec, info.Status == sandbox.StatusRunning, true, stderr)
-	return err
+	_, _, err = attachNetwork(ctx, spec, running, true, stderr)
+	return setup, err
 }
 
 // sandboxNames builds the argument validator for a command that operates on named

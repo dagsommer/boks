@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"maps"
 	"path/filepath"
 	"strings"
 
@@ -49,6 +50,14 @@ type policyFlags struct {
 	kitRefs []string
 	kitComp *kit.Composition
 	kitSpec *kit.Spec
+	// kitPins are the references a remote kit resolved to as it was loaded, to be recorded on
+	// the sandbox; kitReplay is the same thing read back from one, and kitAdopted says a run
+	// has already looked at the sandbox's record. recordedFor names the sandbox whose record
+	// supplied the kits, and is empty when they came from --kit. See kitrecord.go.
+	kitPins     map[string]string
+	kitReplay   map[string]string
+	kitAdopted  bool
+	recordedFor string
 	// approveKit answers the kit credential approval for this run, and stdin is where it is
 	// asked when it is not answered. A nil stdin — `boks proxy`, `policy ls` — never asks.
 	approveKit bool
@@ -249,10 +258,26 @@ func (f *policyFlags) loadKit(stderr io.Writer) error {
 	if len(f.kitRefs) == 0 {
 		return nil
 	}
-	comp, err := kit.Resolve(f.kitRefs, nil)
+	pins := maps.Clone(f.kitReplay)
+	if pins == nil {
+		pins = map[string]string{}
+	}
+	load := func(ref string) (*kit.Spec, []string, error) {
+		target := ref
+		if p, ok := f.kitReplay[ref]; ok {
+			target = p
+		}
+		spec, warnings, pin, err := kit.LoadResolved(target)
+		if pin != "" {
+			pins[ref] = pin
+		}
+		return spec, warnings, err
+	}
+	comp, err := kit.Resolve(f.kitRefs, load)
 	if err != nil {
 		return err
 	}
+	f.kitPins = pins
 	// Warnings are the loader's way of saying a field parsed and will not be honoured —
 	// a v1 field accepted for compatibility, or a composition key whose runtime support is
 	// pending upstream. Silence there would be a promise Boks cannot keep.

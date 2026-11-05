@@ -235,6 +235,13 @@ func (f *policyFlags) gateKit(u kitUnit, specs []string, shapes []kitOAuth, stor
 				fmt.Fprintf(stderr, "warning: the approval could not be remembered: %v\n", err)
 			}
 		}
+	case f.recordedFor != "":
+		// A sandbox brought back up by a command that has no --kit: it cannot ask and cannot
+		// approve, so the kit's credentials are exactly the ones already approved.
+		describeKitCredentials(stderr, u.name, pending)
+		fmt.Fprintf(stderr, "These are NOT attached: sandbox %q is being brought up without a terminal to ask on.\n"+
+			"Run 'boks run --name %s' at a terminal once to approve and remember them.\n",
+			f.recordedFor, f.recordedFor)
 	default:
 		describeKitCredentials(stderr, u.name, pending)
 		fmt.Fprintf(stderr, "These are NOT attached: there is no terminal to ask on (or --no-input was given). Run once interactively to\n"+
