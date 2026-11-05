@@ -473,6 +473,9 @@ credential-bearing host would get.`,
 		if err := flags.loadKit(env.Stderr); err != nil {
 			return err
 		}
+		if err := flags.checkKitAgent(flags.agent.Name); err != nil {
+			return err
+		}
 		resolution, err := flags.resolution(sandbox, nil)
 		if err != nil {
 			return err

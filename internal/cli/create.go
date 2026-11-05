@@ -89,6 +89,9 @@ Agents:
 		// The agent's own allowlist is part of the policy this sandbox will run under,
 		// exactly as it is for `run`.
 		netFlags.forAgent(inv.agent)
+		if err := netFlags.checkKitAgent(inv.agent.Name); err != nil {
+			return err
+		}
 
 		cfg, err := flags.config(inv, agentArgs)
 		if err != nil {

@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dagsommer/boks/internal/agent"
-	"github.com/dagsommer/boks/internal/kit"
 	"github.com/dagsommer/boks/internal/network"
 	"github.com/dagsommer/boks/internal/sandbox"
 )
@@ -106,9 +105,9 @@ Agents:
 		// `boks run git+ssh://host/org/kits.git#dir=team .` — a kit reference in the agent's
 		// place is the kit, as in sbx, and the agent it defines is the one that runs.
 		var kitAsAgent bool
-		if netFlags.kitRef == "" {
+		if len(netFlags.kitRefs) == 0 {
 			if ref, rest, ok := kitFromPositional(positional); ok {
-				netFlags.kitRef, positional, kitAsAgent = ref, rest, true
+				netFlags.kitRefs, positional, kitAsAgent = []string{ref}, rest, true
 			}
 		}
 
@@ -160,12 +159,13 @@ Agents:
 		// The TTY test is made here rather than inside, because it is the same one
 		// cfg.TTY makes below and the two must agree: a kit whose command.interactive
 		// was chosen for a terminal that then is not allocated would run the wrong argv.
-		if err := registerKitAgent(agents, netFlags.kitSpec,
+		kitAgent := netFlags.kitAgentSpec()
+		if err := registerKitAgent(agents, kitAgent,
 			isTerminal(env.Stdin) && isTerminal(env.Stdout)); err != nil {
 			return err
 		}
-		if kitAsAgent && netFlags.kitSpec != nil && netFlags.kitSpec.Kind == kit.KindSandbox {
-			positional = append([]string{netFlags.kitSpec.Name}, positional...)
+		if kitAsAgent && kitAgent != nil {
+			positional = append([]string{kitAgent.Name}, positional...)
 		}
 
 		ctx := cmd.Context()
@@ -182,6 +182,11 @@ Agents:
 		// definition says it cannot work without — so the policy flags have to know
 		// which agent this is before they resolve anything.
 		netFlags.forAgent(inv.agent)
+		// A mixin that names the agent it is for is checked against the one this sandbox
+		// actually runs, which is only known now.
+		if err := netFlags.checkKitAgent(inv.agent.Name); err != nil {
+			return err
+		}
 		if ephemeral && flags.name == "" {
 			// An ephemeral sandbox must not collide with the persistent one for
 			// this workspace, nor with another ephemeral run of it.
@@ -265,7 +270,7 @@ Agents:
 		// The block that says what is about to run. When a sandbox is being created, and
 		// with -v; see printSandboxSummary for why not on every run.
 		if verbose || (!inv.exists && isTerminal(env.Stderr)) {
-			printSandboxSummary(env.Stderr, sandboxSummary{cfg: cfg, kit: netFlags.kitRef})
+			printSandboxSummary(env.Stderr, sandboxSummary{cfg: cfg, kit: netFlags.kitLabel()})
 		}
 		if verbose {
 			if len(cfg.Command) > 0 {

@@ -41,9 +41,13 @@ type policyFlags struct {
 	// their own --agent flag; `run` and `create` from the resolved invocation; `start`
 	// and `exec` from what the sandbox recorded when it was created.
 	agent agent.Agent
-	// kitRef is the --kit reference, and kitSpec is what it loaded. The reference is kept
-	// so that an error can name what the user typed rather than the kit's internal name.
-	kitRef  string
+	// kitRefs are the --kit references, in the order given. kitComp is what they resolved to
+	// (each kit with its extends and mixins followed) and kitSpec is the single spec the
+	// composition merges into, which is what everything but the per-kit steps reads. The
+	// references are kept so that an error can name what the user typed rather than the
+	// kit's internal name.
+	kitRefs []string
+	kitComp *kit.Composition
 	kitSpec *kit.Spec
 	// approveKit answers the kit credential approval for this run, and stdin is where it is
 	// asked when it is not answered. A nil stdin — `boks proxy`, `policy ls` — never asks.
@@ -74,8 +78,9 @@ func (f *policyFlags) register(fs *pflag.FlagSet) {
 	// The help says what it DOES, not what a kit is, because a kit declares an image, an
 	// entrypoint, setup commands and credentials too and none of those are applied yet. A
 	// flag advertised as "apply this kit" would be read as all of it.
-	fs.StringVar(&f.kitRef, "kit", "", "apply a kit: its network rules, agent and credentials (which you approve): a directory containing "+
-		kit.SpecFileName+", a path to one, or git+https://…#ref=<branch|tag|commit>&dir=<path>")
+	fs.StringArrayVar(&f.kitRefs, "kit", nil, "apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing "+
+		kit.SpecFileName+", a path to one, or git+https://…#ref=<branch|tag|commit>&dir=<path>. "+
+		"Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox)")
 	fs.StringVar(&f.mode, "net", "", "network mode: none (no network at all) or nat (default "+
 		string(network.DefaultMode)+")")
 	fs.StringArrayVar(&f.allow, "allow", nil, "allow a destination, host[:ports] (repeatable)")
@@ -192,10 +197,14 @@ func (f *policyFlags) resolution(sandbox string, record *policy.SandboxPolicy) (
 	// subtracted: a deny in any scope still beats a kit's allow, which is the engine's
 	// invariant rather than this function's — see internal/policy.
 	if f.kitSpec != nil {
-		allow, deny := kit.NetworkRules(f.kitSpec)
 		req.Kit = f.kitSpec.Name
-		req.KitAllow = kitRules(policy.Allow, allow, f.kitSpec.Name)
-		req.KitDeny = kitRules(policy.Deny, deny, f.kitSpec.Name)
+		// One rule per kit that declared it, so the table names the kit a destination came
+		// from even when several are stacked.
+		for _, u := range f.kitUnits() {
+			allow, deny := kit.NetworkRules(u.spec)
+			req.KitAllow = append(req.KitAllow, kitRules(policy.Allow, allow, u.name)...)
+			req.KitDeny = append(req.KitDeny, kitRules(policy.Deny, deny, u.name)...)
+		}
 	}
 	if f.preset != "" {
 		req.Preset = f.preset
@@ -237,24 +246,73 @@ func kitRules(action policy.Action, specs []string, name string) []policy.RuleSp
 // user gets is "this file is wrong", not a half-built sandbox holding rules from a spec that
 // turned out to be invalid.
 func (f *policyFlags) loadKit(stderr io.Writer) error {
-	if f.kitRef == "" {
+	if len(f.kitRefs) == 0 {
 		return nil
 	}
-	spec, warnings, err := kit.Load(f.kitRef)
+	comp, err := kit.Resolve(f.kitRefs, nil)
 	if err != nil {
 		return err
-	}
-	if err := kit.Validate(spec); err != nil {
-		return fmt.Errorf("kit %s: %w", f.kitRef, err)
 	}
 	// Warnings are the loader's way of saying a field parsed and will not be honoured —
 	// a v1 field accepted for compatibility, or a composition key whose runtime support is
 	// pending upstream. Silence there would be a promise Boks cannot keep.
-	for _, w := range warnings {
-		fmt.Fprintf(stderr, "kit %s: %s\n", f.kitRef, w)
+	for _, w := range comp.Warnings {
+		fmt.Fprintln(stderr, w)
 	}
-	f.kitSpec = spec
+	f.kitComp, f.kitSpec = comp, comp.Merged
 	return nil
+}
+
+// kitUnit is one kit of a composition, as the steps that treat kits one at a time see it: the
+// credential approval, the policy layer's labels and the -v description.
+type kitUnit struct {
+	name, ref string
+	spec      *kit.Spec
+}
+
+// kitUnits lists the kits applied, in order. Without a composition (a spec set directly) the
+// merged spec is the one kit.
+func (f *policyFlags) kitUnits() []kitUnit {
+	if f.kitComp == nil {
+		if f.kitSpec == nil {
+			return nil
+		}
+		return []kitUnit{{name: f.kitSpec.Name, ref: f.kitLabel(), spec: f.kitSpec}}
+	}
+	units := make([]kitUnit, len(f.kitComp.Members))
+	for i, m := range f.kitComp.Members {
+		units[i] = kitUnit{name: m.Spec.Name, ref: m.Ref, spec: m.Spec}
+	}
+	return units
+}
+
+// kitLabel names the references the user gave, for messages.
+func (f *policyFlags) kitLabel() string { return strings.Join(f.kitRefs, ", ") }
+
+// kitAgentSpec is the spec of the agent a `kind: sandbox` kit defines, or nil when none does.
+// It is the composition merged — so the agent carries every stacked kit's environment — but
+// named, summarised and run as the sandbox kit itself, because the merged name is a label for
+// the whole stack.
+func (f *policyFlags) kitAgentSpec() *kit.Spec {
+	if f.kitSpec == nil || f.kitSpec.Kind != kit.KindSandbox {
+		return nil
+	}
+	spec := *f.kitSpec
+	for _, u := range f.kitUnits() {
+		if u.spec.Kind == kit.KindSandbox {
+			spec.Name, spec.DisplayName, spec.Description = u.spec.Name, u.spec.DisplayName, u.spec.Description
+		}
+	}
+	return &spec
+}
+
+// checkKitAgent refuses a stack holding a mixin that requires a different agent than the one
+// this sandbox runs. Called once the agent is known.
+func (f *policyFlags) checkKitAgent(agentName string) error {
+	if f.kitComp == nil || agentName == "" {
+		return nil
+	}
+	return f.kitComp.CheckAgent(agentName)
 }
 
 // describeKit says what a kit contributed, for -v.
@@ -270,9 +328,11 @@ func (f *policyFlags) describeKit(w io.Writer) {
 	if f.kitSpec == nil || w == nil {
 		return
 	}
-	allow, deny := kit.NetworkRules(f.kitSpec)
-	fmt.Fprintf(w, "kit: %s (%s) from %s — %d allow, %d deny\n",
-		f.kitSpec.Name, f.kitSpec.Kind, f.kitRef, len(allow), len(deny))
+	for _, u := range f.kitUnits() {
+		allow, deny := kit.NetworkRules(u.spec)
+		fmt.Fprintf(w, "kit: %s (%s) from %s — %d allow, %d deny\n",
+			u.name, u.spec.Kind, u.ref, len(allow), len(deny))
+	}
 
 	// Named individually rather than as "some fields are ignored", because the point is
 	// for the user to recognise the one they were relying on.

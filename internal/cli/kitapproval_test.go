@@ -17,11 +17,14 @@ var testKitSpecs = []string{
 	"confluence-token@wiki.example=Authorization:Bearer %s",
 }
 
+// soleUnit is the one kit of a flags value built with a spec and no composition.
+func soleUnit(f *policyFlags) kitUnit { return f.kitUnits()[0] }
+
 func kitFlags(t *testing.T) (*policyFlags, *bytes.Buffer) {
 	t.Helper()
 	t.Setenv(policy.StateDirEnv, t.TempDir())
 	var stderr bytes.Buffer
-	return &policyFlags{kitRef: "./kit", kitSpec: &kit.Spec{Name: "team"}}, &stderr
+	return &policyFlags{kitRefs: []string{"./kit"}, kitSpec: &kit.Spec{Name: "team"}}, &stderr
 }
 
 func TestKitCredentialAsksGroupByService(t *testing.T) {
@@ -44,7 +47,7 @@ func TestAskKitCredentialsAnswers(t *testing.T) {
 	cases := map[string]int{"a\n": 2, "approve all\n": 2, "r\ny\nn\n": 1, "r\nn\ny\n": 1, "n\n": 0, "\n": 0, "": 0, "yes\n": 0}
 	for input, want := range cases {
 		var out bytes.Buffer
-		got, err := f.askKitCredentials(asks, bufio.NewReader(strings.NewReader(input)), &out)
+		got, err := f.askKitCredentials(soleUnit(f), asks, bufio.NewReader(strings.NewReader(input)), &out)
 		if err != nil || len(got) != want {
 			t.Errorf("input %q: approved %d, err %v; want %d", input, len(got), err, want)
 		}
@@ -53,7 +56,7 @@ func TestAskKitCredentialsAnswers(t *testing.T) {
 
 func TestGateWithoutTerminalLeavesCredentialsOut(t *testing.T) {
 	f, stderr := kitFlags(t)
-	got, err := f.gateKitCredentials(testKitSpecs, nil, stderr)
+	got, err := f.gateKitCredentials(soleUnit(f), testKitSpecs, nil, stderr)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("got %v, %v; want nothing attached", got, err)
 	}
@@ -67,12 +70,12 @@ func TestGateWithoutTerminalLeavesCredentialsOut(t *testing.T) {
 func TestGateFlagApprovesOnlyThisRun(t *testing.T) {
 	f, stderr := kitFlags(t)
 	f.approveKit = true
-	got, _ := f.gateKitCredentials(testKitSpecs, nil, stderr)
+	got, _ := f.gateKitCredentials(soleUnit(f), testKitSpecs, nil, stderr)
 	if len(got) != 2 {
 		t.Fatalf("got %v", got)
 	}
 	f.approveKit = false
-	if got, _ := f.gateKitCredentials(testKitSpecs, nil, stderr); len(got) != 0 {
+	if got, _ := f.gateKitCredentials(soleUnit(f), testKitSpecs, nil, stderr); len(got) != 0 {
 		t.Errorf("the flag was remembered: %v", got)
 	}
 }
@@ -87,20 +90,20 @@ func TestGateRemembersAnApprovalUntilTheKitAsksForSomethingElse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _ := f.gateKitCredentials(testKitSpecs, nil, stderr)
+	got, _ := f.gateKitCredentials(soleUnit(f), testKitSpecs, nil, stderr)
 	if len(got) != 1 || !strings.HasPrefix(got[0], "ghe-token@") {
 		t.Fatalf("approved service only: got %v", got)
 	}
 
 	// The same kit now also sends the token to another host: a different request.
 	widened := append([]string{"ghe-token@evil.example=bearer"}, testKitSpecs...)
-	if got, _ := f.gateKitCredentials(widened, nil, stderr); len(got) != 0 {
+	if got, _ := f.gateKitCredentials(soleUnit(f), widened, nil, stderr); len(got) != 0 {
 		t.Errorf("a widened request was covered by the old approval: %v", got)
 	}
 
 	// And another kit, or the same name from elsewhere, has no approval at all.
-	f.kitRef = "git+https://elsewhere/kit.git"
-	if got, _ := f.gateKitCredentials(testKitSpecs, nil, stderr); len(got) != 0 {
+	f.kitRefs = []string{"git+https://elsewhere/kit.git"}
+	if got, _ := f.gateKitCredentials(soleUnit(f), testKitSpecs, nil, stderr); len(got) != 0 {
 		t.Errorf("approval leaked to another reference: %v", got)
 	}
 }

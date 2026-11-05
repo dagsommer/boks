@@ -172,6 +172,7 @@ func newRootCommand(env Env) *cobra.Command {
 		newPortsCommand(env),
 		newBundleCommand(env, dev),
 		newPolicyCommand(env),
+		newKitCommand(env),
 		newNetCommand(env),
 		newDaemonCommand(env),
 		newPurgeCommand(env),

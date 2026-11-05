@@ -197,7 +197,7 @@ func TestKitOAuthIsAskedAboutAndNotAppliedWithoutApproval(t *testing.T) {
 	f, stderr := kitFlags(t)
 	shapes, _ := kitOAuthShapes(kitWith(kitOAuthCredential()))
 
-	_, got, err := f.gateKit(nil, shapes, nil, stderr)
+	_, got, err := f.gateKit(soleUnit(f), nil, shapes, nil, stderr)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("got %v, %v; want nothing applied", got, err)
 	}
@@ -210,7 +210,7 @@ func TestKitOAuthIsAskedAboutAndNotAppliedWithoutApproval(t *testing.T) {
 	}
 
 	f.approveKit = true
-	if _, got, _ := f.gateKit(nil, shapes, nil, stderr); len(got) != 1 {
+	if _, got, _ := f.gateKit(soleUnit(f), nil, shapes, nil, stderr); len(got) != 1 {
 		t.Errorf("--approve-kit-credentials did not approve: %v", got)
 	}
 }
@@ -222,7 +222,7 @@ func TestKitOAuthApprovalIsForExactlyWhatWasShown(t *testing.T) {
 	// The interactive prompt itself.
 	asks := kitOAuthAsks(shapes, nil)
 	var out bytes.Buffer
-	answered, err := f.askKitCredentials(asks, bufio.NewReader(strings.NewReader("a\n")), &out)
+	answered, err := f.askKitCredentials(soleUnit(f), asks, bufio.NewReader(strings.NewReader("a\n")), &out)
 	if err != nil || len(answered) != 1 {
 		t.Fatalf("interactive approval: %v, %v", answered, err)
 	}
@@ -236,7 +236,7 @@ func TestKitOAuthApprovalIsForExactlyWhatWasShown(t *testing.T) {
 	if err := approvals.save(); err != nil {
 		t.Fatal(err)
 	}
-	if _, got, _ := f.gateKit(nil, shapes, nil, &bytes.Buffer{}); len(got) != 1 {
+	if _, got, _ := f.gateKit(soleUnit(f), nil, shapes, nil, &bytes.Buffer{}); len(got) != 1 {
 		t.Error("the approval was not remembered")
 	}
 
@@ -244,7 +244,7 @@ func TestKitOAuthApprovalIsForExactlyWhatWasShown(t *testing.T) {
 	c := kitOAuthCredential()
 	c.OAuth.ResourceHosts = []string{"api.ghe.example", "exfil.example"}
 	widened, _ := kitOAuthShapes(kitWith(c))
-	if _, got, _ := f.gateKit(nil, widened, nil, &bytes.Buffer{}); len(got) != 0 {
+	if _, got, _ := f.gateKit(soleUnit(f), nil, widened, nil, &bytes.Buffer{}); len(got) != 0 {
 		t.Error("an approval carried over to a wider request")
 	}
 

@@ -349,7 +349,7 @@ boks create shell .
 | `--env stringArray` |  | extra environment variable KEY=VALUE (repeatable) |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
@@ -558,6 +558,38 @@ shared read-only at "source" and the guest works on a clone at "clone"; the work
 still names the host directory the sandbox was created for, which in that mode is what was
 cloned rather than what the guest writes to.
 
+## boks kit
+
+Inspect kits
+
+```
+boks kit
+```
+
+Commands that read a kit and say what it declares, without creating a sandbox.
+See docs/kits.md.
+
+### boks kit inspect
+
+Print what a kit declares, or what stacked kits resolve to
+
+```
+boks kit inspect REF [REF...] [flags]
+```
+
+Reads each kit and prints its spec: the same fields 'boks run --kit' reads, with the
+files/ tree listed rather than dumped. Nothing is created and no credential is read.
+
+With --resolved the references are composed exactly as repeated --kit flags are: each kit's
+extends chain is merged into it, the kits its mixins field names follow, and the references
+are stacked in the order given. The output is then the members in application order, the
+merged spec, the credentials the stack would ask you to approve, and the execution plan —
+what runs in the guest, stage by stage, and which kit each step comes from.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--resolved` |  | compose the kits as --kit does and print the merged spec and the execution plan |
+
 ## boks ls
 
 List sandboxes
@@ -719,7 +751,7 @@ boks policy check github.com:443
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
@@ -875,7 +907,7 @@ Presets:
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
 | `--no-secrets` |  | do not attach credentials from the store; only what --inject names |
 | `--oauth stringArray` |  | name a stored OAuth credential; stored ones apply anyway, this pins one (repeatable) |
@@ -1080,7 +1112,7 @@ boks proxy --policy standard
 | `--deny stringArray` |  | deny a destination, host[:ports] (repeatable); deny always wins |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
 | `--listen string` | `127.0.0.1:0` | address to listen on |
 | `--log string` | `~/.local/state/boks/policy-log.jsonl` | append decisions to this file |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |
@@ -1259,7 +1291,7 @@ boks run                              # a shell in the current directory
 | `--env stringArray` |  | extra environment variable KEY=VALUE (repeatable) |
 | `--guest-credential stringArray` |  | what the guest holds instead: service=[ENV_NAME=]placeholder (repeatable) |
 | `--inject stringArray` |  | attach a credential: service@host[,host]=bearer\|basic[:user]\|header[:format] (repeatable) |
-| `--kit string` |  | apply a kit: its network rules, agent and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt; |
+| `--kit stringArray` |  | apply a kit: its network rules, agent, setup and credentials (which you approve): a directory containing spec.yaml, a path to one, or git+https://…#ref=&lt;branch\|tag\|commit&gt;&amp;dir=&lt;path&gt;. Repeatable: kits are stacked and applied in the order given (at most one may be kind sandbox) |
 | `-m`, `--memory string` |  | guest memory, binary units (1024m, 8g) (default: half the host's, max 32g) |
 | `--name string` |  | sandbox name (default: &lt;agent&gt;-&lt;workspace directory&gt;) |
 | `--net string` |  | network mode: none (no network at all) or nat (default nat) |

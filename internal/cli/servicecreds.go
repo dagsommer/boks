@@ -69,33 +69,40 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 	// A kit's credentials are rendered into --inject's own grammar and prepended, so the
 	// user's flags come last and therefore win: --inject is how someone overrides what a
 	// kit asked for, and a kit must not be able to override the person running it.
-	kitSpecs, err := kitInjectSpecs(f.kitSpec)
-	if err != nil {
-		return credentialPlan{}, err
-	}
-	// Only what the user has approved. See kitapproval.go: a kit names a service, and the
-	// value is whatever the user stored under that name.
-	kitShapes, err := kitOAuthShapes(f.kitSpec)
-	if err != nil {
-		return credentialPlan{}, err
-	}
-	if kitSpecs, kitShapes, err = f.gateKit(kitSpecs, kitShapes, store, f.errOut()); err != nil {
-		return credentialPlan{}, err
-	}
-	// The stand-ins follow their credentials: one the user did not approve gets no variable
-	// in the guest either.
-	var kitGuest []string
-	for _, spec := range kitGuestSpecs(f.kitSpec) {
-		service, _, _, perr := secret.ParseGuestCredential(spec)
-		if perr != nil {
-			return credentialPlan{}, perr
+	// Each kit of a stack is rendered and approved on its own, in order, so that a credential
+	// is judged against the kit that declared it.
+	var kitSpecs, kitGuest []string
+	var kitShapes []kitOAuth
+	for _, u := range f.kitUnits() {
+		specs, err := kitInjectSpecs(u.spec)
+		if err != nil {
+			return credentialPlan{}, err
 		}
-		for _, in := range kitSpecs {
-			if s, _, ierr := secret.ParseInject(in); ierr == nil && s == service {
-				kitGuest = append(kitGuest, spec)
-				break
+		// Only what the user has approved. See kitapproval.go: a kit names a service, and the
+		// value is whatever the user stored under that name.
+		shapes, err := kitOAuthShapes(u.spec)
+		if err != nil {
+			return credentialPlan{}, err
+		}
+		if specs, shapes, err = f.gateKit(u, specs, shapes, store, f.errOut()); err != nil {
+			return credentialPlan{}, err
+		}
+		// The stand-ins follow their credentials: one the user did not approve gets no
+		// variable in the guest either.
+		for _, spec := range kitGuestSpecs(u.spec) {
+			service, _, _, perr := secret.ParseGuestCredential(spec)
+			if perr != nil {
+				return credentialPlan{}, perr
+			}
+			for _, in := range specs {
+				if s, _, ierr := secret.ParseInject(in); ierr == nil && s == service {
+					kitGuest = append(kitGuest, spec)
+					break
+				}
 			}
 		}
+		kitSpecs = append(kitSpecs, specs...)
+		kitShapes = append(kitShapes, shapes...)
 	}
 	plan := credentialPlan{
 		inject: append(kitSpecs, f.inject...),

@@ -167,15 +167,17 @@ func (f *policyFlags) registerKitApproval(fs *pflag.FlagSet) {
 
 // gateKitCredentials returns the part of a kit's credential specs the user has approved,
 // asking about the rest when there is a terminal to ask on.
-func (f *policyFlags) gateKitCredentials(specs []string, store secret.Store, stderr io.Writer) ([]string, error) {
-	specs, _, err := f.gateKit(specs, nil, store, stderr)
+func (f *policyFlags) gateKitCredentials(u kitUnit, specs []string, store secret.Store, stderr io.Writer) ([]string, error) {
+	specs, _, err := f.gateKit(u, specs, nil, store, stderr)
 	return specs, err
 }
 
 // gateKit is gateKitCredentials for API-key specs and OAuth shapes together: they are asked
-// about in one prompt, and either kind is applied only if approved.
-func (f *policyFlags) gateKit(specs []string, shapes []kitOAuth, store secret.Store, stderr io.Writer) ([]string, []kitOAuth, error) {
-	if (len(specs) == 0 && len(shapes) == 0) || f.kitSpec == nil {
+// about in one prompt, and either kind is applied only if approved. Each kit of a stack is gated
+// on its own: the approval is keyed by that kit's name and reference, so approving one kit never
+// approves another's credentials.
+func (f *policyFlags) gateKit(u kitUnit, specs []string, shapes []kitOAuth, store secret.Store, stderr io.Writer) ([]string, []kitOAuth, error) {
+	if len(specs) == 0 && len(shapes) == 0 {
 		return nil, nil, nil
 	}
 	stored, storedOAuth := map[string]bool{}, map[string]bool{}
@@ -199,7 +201,7 @@ func (f *policyFlags) gateKit(specs []string, shapes []kitOAuth, store secret.St
 	if err != nil {
 		return nil, nil, err
 	}
-	key := f.kitSpec.Name + "\x00" + f.kitRef
+	key := u.name + "\x00" + u.ref
 
 	var pending []kitCredentialAsk
 	granted := map[string]bool{}
@@ -218,9 +220,9 @@ func (f *policyFlags) gateKit(specs []string, shapes []kitOAuth, store secret.St
 			granted[a.key()] = true
 		}
 		fmt.Fprintf(stderr, "kit %q: credentials approved for this run by --approve-kit-credentials: %s\n",
-			f.kitSpec.Name, askNames(pending))
+			u.name, askNames(pending))
 	case f.stdin != nil && !f.noInput && isTerminal(f.stdin):
-		answered, err := f.askKitCredentials(pending, bufio.NewReader(f.stdin), stderr)
+		answered, err := f.askKitCredentials(u, pending, bufio.NewReader(f.stdin), stderr)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -234,7 +236,7 @@ func (f *policyFlags) gateKit(specs []string, shapes []kitOAuth, store secret.St
 			}
 		}
 	default:
-		describeKitCredentials(stderr, f.kitSpec.Name, pending)
+		describeKitCredentials(stderr, u.name, pending)
 		fmt.Fprintf(stderr, "These are NOT attached: there is no terminal to ask on (or --no-input was given). Run once interactively to\n"+
 			"approve and remember them, or pass --approve-kit-credentials for this run.\n")
 	}
@@ -283,8 +285,8 @@ func describeKitCredentials(w io.Writer, kitName string, asks []kitCredentialAsk
 }
 
 // askKitCredentials prompts and returns the asks the user approved.
-func (f *policyFlags) askKitCredentials(asks []kitCredentialAsk, in *bufio.Reader, w io.Writer) ([]kitCredentialAsk, error) {
-	describeKitCredentials(w, f.kitSpec.Name, asks)
+func (f *policyFlags) askKitCredentials(u kitUnit, asks []kitCredentialAsk, in *bufio.Reader, w io.Writer) ([]kitCredentialAsk, error) {
+	describeKitCredentials(w, u.name, asks)
 	fmt.Fprint(w, "[A]pprove all · [R]eview each · [N]o (default): ")
 	switch answer(in) {
 	case "a", "approve", "approve all":
