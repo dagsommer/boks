@@ -35,6 +35,68 @@ hand-written entry that stands in for a history from before the first tag.
 
 <!-- release-notes: generated entries are inserted directly below this line -->
 
+## v0.2.0 — 2026-11-05
+
+[Commits](https://github.com/dagsommer/boks/compare/v0.1.40...v0.2.0), 43 of them.
+
+### Added
+
+- a Scoop bucket for Windows, in this repository
+- run --workdir, exec exits 125 when it cannot run, ports -p
+- the user approves a kit's credentials before they are used
+- proxyManaged credentials put a stand-in in the guest's environment
+- a SANDBOX summary on first run, and one download bar on a terminal
+- `boks run git+ssh://…#dir=kit .` takes the kit in the agent's place
+- PATH:TARGET[:ro] mounts a workspace at a chosen guest path
+- setup.install, setup.files and setup.startup run in the guest
+- files/home and files/workspace are copied into the guest
+- boks reset removes every sandbox, its network and the stored credentials
+- credential file templates can use .ScopesJSON
+- run/create --no-input and run --no-progress
+- ports and volumes are applied when the sandbox is created
+- secret set --value-stdin
+- oauth credentials apply to the login stored under the service name
+- compose stacked kits, follow extends and mixins, and plan their execution
+- repeatable --kit, per-kit credential approval, and boks kit inspect [--resolved]
+- record a sandbox's kits, and apply a reloaded kit's setup on start and exec
+- on a terminal, print sbx's IMAGE / Created / starting lines
+- the credential approval prompt uses sbx's wording and numbered choices
+- a symlink leaving the destination is skipped with a warning, not a failed copy
+- keep each install step's output in the guest at /var/log/sbx-kits/<kit>/install-<n>.log
+- the dashboard's model, rendering and data-source contract
+- bare boks on a terminal, and boks tui, show the dashboard
+
+### Fixed
+
+- never write through a symlink a sandbox planted
+- a sandbox restarted by start, exec or a kit-less run keeps its kit
+- boks create --kit registers a kind: sandbox kit's agent, and applies the kit
+- a kit OAuth credential with passthrough is skipped with a warning, not a failed run
+- an empty --sandbox or --profile is refused instead of widening the rule to every sandbox
+- a session that fails at once holds the screen; narrow terminals reach the network view
+
+### Documentation
+
+- oauth credentials and credentialFile are applied
+- stacking, extends and mixins, and what the design left open
+- slice 5 describes the approval gate that was built, not an allowedDomains store
+- a sandbox remembers its kits; create --kit parity
+- record what was verified in a real guest
+- HTTP policy rules in the parity matrix and the security model
+- 502 on a failed upstream already exists; split-horizon DNS and connection reuse do not
+- the dashboard — usage section, CLI reference, and what it matches of sbx's
+
+### Tests
+
+- the short-value preview test looks at its own line only
+- import pflag in the empty-scope test
+
+### Other changes
+
+- policy: HTTP rules — method, path glob and query selectors
+- proxy: judge requests against HTTP policy rules
+- cli: --method, --path and --query on policy allow/deny/rm; HTTP-aware check, ls --wide/--json, log
+
 ## Before 0.1.0
 
 The state `main` reached before the first tag. Written by hand, and phrased the way the
