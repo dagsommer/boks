@@ -3,6 +3,7 @@ package kit
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestReadTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tree.Home) != 1 || tree.Home[0].Path != ".config/x/y.toml" || tree.Home[0].Mode != 0o600 || string(tree.Home[0].Data) != "a" {
+	if len(tree.Home) != 1 || tree.Home[0].Path != ".config/x/y.toml" || (runtime.GOOS != "windows" && tree.Home[0].Mode != 0o600) || string(tree.Home[0].Data) != "a" {
 		t.Fatalf("home = %+v", tree.Home)
 	}
 	if len(tree.Workspace) != 1 || tree.Workspace[0].Path != ".editorconfig" {

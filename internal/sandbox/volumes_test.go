@@ -3,6 +3,7 @@ package sandbox
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -45,7 +46,7 @@ func TestBlockVolumesPersistUntilRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := VolumeDir(state, "dev", "/data")
-	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() || (runtime.GOOS != "windows" && fi.Mode().Perm() != 0o700) {
 		t.Fatalf("volume dir: %v %v", fi, err)
 	}
 	// A second creation attempt (or restart) keeps what is there.

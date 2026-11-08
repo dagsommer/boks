@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -108,6 +109,9 @@ func TestStaticFilesComeFirstAndLast(t *testing.T) {
 }
 
 func TestStaticFileScriptWritesAndKeeps(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the script runs under /bin/sh in the guest; there is none on Windows")
+	}
 	base := t.TempDir()
 	run := func(rel, content, keep string) {
 		t.Helper()
