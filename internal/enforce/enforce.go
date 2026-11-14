@@ -55,6 +55,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dagsommer/boks/internal/ca"
 	"github.com/dagsommer/boks/internal/network"
@@ -804,6 +805,10 @@ func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer)
 		CA:        authority,
 		ErrorLog:  log.New(orDiscard(logger), "boks net "+spec.Sandbox+": ", log.LstdFlags),
 		HostPorts: spec.HostPorts,
+		// BOKS_STALLED_CONNECTION_TIMEOUT_SECONDS: how long an upstream connection may go
+		// unacknowledged before it is closed. Unset is 30; 0 turns it off (sbx:
+		// egress.stalledConnectionTimeoutSeconds).
+		StalledTimeout: stalledTimeoutFromEnv(),
 	})
 	if err != nil {
 		return err
@@ -892,4 +897,21 @@ func orDiscard(w io.Writer) io.Writer {
 		return io.Discard
 	}
 	return w
+}
+
+// stalledTimeoutFromEnv reads BOKS_STALLED_CONNECTION_TIMEOUT_SECONDS. Unset or unreadable is
+// the proxy's default; 0 disables the timeout.
+func stalledTimeoutFromEnv() time.Duration {
+	v := strings.TrimSpace(os.Getenv("BOKS_STALLED_CONNECTION_TIMEOUT_SECONDS"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	if n == 0 {
+		return -1
+	}
+	return time.Duration(n) * time.Second
 }

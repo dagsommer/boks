@@ -131,6 +131,14 @@ type Config struct {
 	// DialTimeout bounds a single upstream connection attempt. Zero means the default.
 	DialTimeout time.Duration
 
+	// StalledTimeout is how long an upstream connection may go without its peer
+	// acknowledging anything before it is closed, so a client can reconnect after the host's
+	// network changed under it (connecting a VPN, say). It is TCP keepalive probing, not an
+	// application timeout: a slow server that answers the probes is never cut off, and
+	// neither is a connection that is merely quiet. Zero means the default (30 seconds); a
+	// negative value turns it off. sbx's equivalent is egress.stalledConnectionTimeoutSeconds.
+	StalledTimeout time.Duration
+
 	// HostPorts are the ports on the host's loopback this sandbox may reach as
 	// http://host.boks.internal:PORT. Empty means none. See HostName.
 	HostPorts []int
@@ -139,6 +147,7 @@ type Config struct {
 const (
 	defaultClientHelloTimeout = 5 * time.Second
 	defaultDialTimeout        = 15 * time.Second
+	defaultStalledTimeout     = 30 * time.Second
 
 	// plainHTTPTimeout bounds one plain-HTTP request forwarded through the proxy, now that
 	// its client's half-close no longer cancels it. Generous: a model server streaming a
@@ -165,8 +174,14 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Resolver == nil {
 		cfg.Resolver = defaultResolve
 	}
+	if cfg.StalledTimeout == 0 {
+		cfg.StalledTimeout = defaultStalledTimeout
+	}
 	if cfg.DialAddr == nil {
-		cfg.DialAddr = defaultDial
+		stalled := cfg.StalledTimeout
+		cfg.DialAddr = func(ctx context.Context, ap netip.AddrPort) (net.Conn, error) {
+			return dialWithKeepAlive(ctx, ap, stalled)
+		}
 	}
 	if cfg.ClientHelloTimeout == 0 {
 		cfg.ClientHelloTimeout = defaultClientHelloTimeout
@@ -567,8 +582,19 @@ func defaultResolve(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
-func defaultDial(ctx context.Context, ap netip.AddrPort) (net.Conn, error) {
+// dialWithKeepAlive connects with TCP keepalive tuned so that a peer that has stopped
+// acknowledging is noticed after about stalled: an idle period of half of it, then three
+// probes spread over the other half. A non-positive stalled leaves the platform defaults.
+func dialWithKeepAlive(ctx context.Context, ap netip.AddrPort, stalled time.Duration) (net.Conn, error) {
 	var d net.Dialer
+	if stalled > 0 {
+		d.KeepAliveConfig = net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     max(stalled/2, time.Second),
+			Interval: max(stalled/6, time.Second),
+			Count:    3,
+		}
+	}
 	return d.DialContext(ctx, "tcp", ap.String())
 }
 
