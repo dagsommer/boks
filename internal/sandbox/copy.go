@@ -31,6 +31,10 @@ type CopyConfig struct {
 	// ToSandbox.
 	HostPath  string
 	GuestPath string
+	// DestIsDir is set when the destination was written with a trailing separator, which
+	// means "a directory": it is created if missing and the source goes inside it, as with
+	// docker cp and sbx cp. Without it a path that does not exist is the source's new name.
+	DestIsDir bool
 	// Warn receives a note for each symlink that was skipped because its target leaves the
 	// destination. Nil discards them.
 	Warn io.Writer
@@ -57,7 +61,7 @@ func copyToSandbox(ctx context.Context, cfg CopyConfig) error {
 	if err != nil {
 		return err
 	}
-	if isDir {
+	if isDir || cfg.DestIsDir {
 		targetDir, entryName = cfg.GuestPath, filepath.Base(cfg.HostPath)
 	}
 
@@ -93,8 +97,15 @@ func copyFromSandbox(ctx context.Context, cfg CopyConfig) error {
 	// Work out the destination name before starting the stream, so a bad destination
 	// fails before anything is written.
 	destDir, entryName := filepath.Dir(cfg.HostPath), filepath.Base(cfg.HostPath)
-	if info, err := os.Stat(cfg.HostPath); err == nil && info.IsDir() {
+	if info, err := os.Stat(cfg.HostPath); (err == nil && info.IsDir()) || (err != nil && cfg.DestIsDir) {
 		destDir, entryName = cfg.HostPath, path.Base(cfg.GuestPath)
+		if cfg.DestIsDir {
+			if err := os.MkdirAll(destDir, 0o755); err != nil {
+				return fmt.Errorf("creating the destination directory %s: %w", destDir, err)
+			}
+		}
+	} else if err == nil && cfg.DestIsDir {
+		return fmt.Errorf("%s is not a directory", cfg.HostPath)
 	}
 
 	pr, pw := io.Pipe()

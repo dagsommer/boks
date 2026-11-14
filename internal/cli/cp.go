@@ -70,12 +70,14 @@ func parseCopyArgs(src, dst string) (sandbox.CopyConfig, error) {
 			ToSandbox: true,
 			HostPath:  hostPath(source.path),
 			GuestPath: destination.path,
+			DestIsDir: endsInSeparator(destination.path),
 		}, nil
 	default:
 		return sandbox.CopyConfig{
 			Name:      source.sandbox,
 			HostPath:  hostPath(destination.path),
 			GuestPath: source.path,
+			DestIsDir: endsInSeparator(destination.path),
 		}, nil
 	}
 }
@@ -106,6 +108,11 @@ func parseCopyEnd(arg string) (copyEnd, error) {
 		return copyEnd{}, fmt.Errorf("path %q inside sandbox %q must be absolute", rest, name)
 	}
 	return copyEnd{sandbox: name, path: rest}, nil
+}
+
+// endsInSeparator reports whether a path was written as a directory.
+func endsInSeparator(p string) bool {
+	return strings.HasSuffix(p, "/") || (filepath.Separator == '\\' && strings.HasSuffix(p, `\`))
 }
 
 // hostPath makes the host end absolute, so that the guest side of the copy never has to
