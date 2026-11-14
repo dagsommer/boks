@@ -510,6 +510,9 @@ func create(ctx context.Context, c *client.Client, cfg Config) (client.Container
 		return nil, err
 	}
 
+	if err := refuseCaseOnlyCollision(ctx, c, cfg.Name); err != nil {
+		return nil, err
+	}
 	container, err := c.NewContainer(ctx, cfg.Name,
 		client.WithImage(image),
 		client.WithSnapshotter(cfg.Snapshotter),
@@ -1068,6 +1071,23 @@ func killAndWait(ctx context.Context, task client.Task, sig syscall.Signal) bool
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// refuseCaseOnlyCollision rejects a name that differs from an existing sandbox's only in case.
+// containerd tells "Dev" from "dev", but the host's state directories, volumes included, are
+// named after the sandbox and live on a filesystem that does not on macOS and Windows: the two
+// would share one. sbx refuses it since v0.53.0.
+func refuseCaseOnlyCollision(ctx context.Context, c *client.Client, name string) error {
+	existing, err := c.Containers(ctx)
+	if err != nil {
+		return nil // the create that follows reports a real problem with the daemon
+	}
+	for _, e := range existing {
+		if e.ID() != name && strings.EqualFold(e.ID(), name) {
+			return fmt.Errorf("a sandbox named %q already exists and differs from %q only in case; choose another name", e.ID(), name)
+		}
+	}
+	return nil
 }
 
 // describeCreateError turns containerd's low-level errors into guidance, since the common

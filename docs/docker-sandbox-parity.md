@@ -868,3 +868,31 @@ Not yet built, roughly in the order worth doing:
 | Split-horizon DNS via the proxy, upstream connection reuse | 0.51 | Not built. A failed upstream already gives the guest a 502 with a readable body on every proxy path (`internal/proxy`: forward, inspected and host-service flows); checked in the code on 2026-11-05, not against sbx |
 | `sandbox.fuse` | 0.51 | Guest kernel support unverified |
 | Cloud sandboxes, `sbx move`, `sbx skills`, `run --model` | 0.42+ | Won't, or later: Boks has no cloud |
+
+## Catch-up with sbx v0.53.0 (read 2026-11-14)
+
+sbx v0.53.0 (v0.52.0 was skipped; v0.54.0 is at release-candidate stage with no notes yet) is read
+from its release notes only: the installed `sbx` is still v0.51.0, so none of this has been
+compared against the binary.
+
+Done in this pass:
+
+- **Kit install hooks as argument lists.** `setup.install[].command` is a string (run by `sh -c`)
+  or a list (run as an argv, no shell). Output is still kept in the guest's install log.
+- **HTTP policy rules ignore case** in paths and in query names and values, for allow and deny
+  alike. Before, only a deny was widened.
+- **Stalled upstream connections close after about 30 seconds.** Done as TCP keepalive tuned to
+  that window, so a black-holed path (a VPN coming up) is dropped while a slow-but-alive server
+  is not. `BOKS_STALLED_CONNECTION_TIMEOUT_SECONDS` sets it; `0` turns it off. sbx's own
+  mechanism is not documented beyond "stalled", so this is an equivalent, not a copy.
+- **`boks cp` to a destination written with a trailing slash** treats it as a directory, creating
+  it when missing, on both directions.
+- **Names that differ only in case are refused** at create time.
+- Already the case: kit setup runs after the clone, so install hooks see the cloned project;
+  update notices go to stderr; a same-named directory gets a qualified sandbox name instead of
+  taking over another's.
+
+Not done, on purpose: cloud sandboxes and `schedule`, Docker sign-in, org governance (all
+**won't**); the MCP gateway (still P2, see above); Claude in Chrome (`claude.chrome`) and Remote
+Control; `sbx df`, `template ls --digests`, `ports.publish` with `approval: none`, and `-v` on
+`policy check` (small, unscheduled).
