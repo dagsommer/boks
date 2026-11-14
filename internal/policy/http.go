@@ -269,15 +269,19 @@ func (m *HTTPMatch) matchRequest(req HTTPRequest, forDeny bool) bool {
 			return false
 		}
 	}
+	// Letters in a path are matched without regard to case, for allow and deny alike: sbx
+	// does since v0.53.0 ("treats ASCII letters in URL paths and query parameter names and
+	// values case-insensitively"), and it is what makes a deny for /Admin cover /admin on an
+	// origin that ignores case. Both sides are lowercased, so a rule can no longer tell /A
+	// from /a.
 	path := canonicalRequestPath(req.Path)
-	pathMatch := m.path.match(path)
+	folded := m.path.fold()
+	lower := strings.ToLower(path)
+	pathMatch := folded.match(lower)
 	if !pathMatch && forDeny {
-		// Many origins serve /admin/ and /admin alike, and some ignore case, so a deny
-		// written for one spelling covers the others. An allow gets no such widening.
-		folded := m.path.fold()
-		lower := strings.ToLower(path)
-		pathMatch = folded.match(lower) ||
-			(len(lower) > 1 && strings.HasSuffix(lower, "/") && folded.match(strings.TrimSuffix(lower, "/")))
+		// Many origins serve /admin/ and /admin alike, so a deny written for one spelling
+		// covers the other. An allow gets no such widening.
+		pathMatch = len(lower) > 1 && strings.HasSuffix(lower, "/") && folded.match(strings.TrimSuffix(lower, "/"))
 	}
 	if !pathMatch {
 		return false
@@ -564,12 +568,17 @@ func matchQuery(constraints []queryConstraint, raw string, forDeny bool) bool {
 }
 
 func (q queryConstraint) matchParams(params map[string][]string, forDeny bool) bool {
-	values, ok := params[q.name]
+	// Names and values are compared without regard to case, as sbx does (v0.53.0).
+	values, ok := params[strings.ToLower(q.name)]
 	if !ok || len(values) == 0 {
 		return false
 	}
+	toks := make([]token, len(q.value))
+	for i, t := range q.value {
+		toks[i] = token{star: t.star, lit: strings.ToLower(t.lit)}
+	}
 	for _, v := range values {
-		m := matchTokens(q.value, v)
+		m := matchTokens(toks, strings.ToLower(v))
 		if forDeny && m {
 			return true
 		}
@@ -603,6 +612,7 @@ func parseQueryParams(raw string, seps []string) (map[string][]string, bool) {
 		if err != nil {
 			return nil, false
 		}
+		name = strings.ToLower(name)
 		out[name] = append(out[name], value)
 	}
 	return out, true

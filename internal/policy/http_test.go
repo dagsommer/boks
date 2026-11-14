@@ -134,9 +134,9 @@ func TestRequestPathIsCanonicalised(t *testing.T) {
 	if !allow.MatchRequest(tgt, HTTPRequest{Method: "GET", Path: "/v1/items"}) {
 		t.Error("allow /v1/** did not match /v1/items")
 	}
-	// Case is folded for a deny only: an allow does not widen to /V1.
-	if allow.MatchRequest(tgt, HTTPRequest{Method: "GET", Path: "/V1/items"}) {
-		t.Error("allow /v1/** matched /V1/items")
+	// Case is ignored for allow and deny alike, as in sbx v0.53.0.
+	if !allow.MatchRequest(tgt, HTTPRequest{Method: "GET", Path: "/V1/items"}) {
+		t.Error("allow /v1/** did not match /V1/items")
 	}
 }
 
@@ -172,7 +172,8 @@ func TestQueryMatching(t *testing.T) {
 		{"team=platform;evil=1&q=x", false, true},     // ';' reading: allow needs both readings
 		{"team=plat%66orm&q=x", true, true},           // decoded before matching
 		{"team=platform&q=%zz", false, true},          // undecodable: allow no, deny yes
-		{"TEAM=platform&q=x", false, false},           // names are case-sensitive
+		{"TEAM=platform&q=x", true, true},             // names are case-insensitive (sbx 0.53)
+		{"team=PLATFORM&q=x", true, true},             // and so are values
 	}
 	for _, tc := range cases {
 		req := HTTPRequest{Method: "GET", Path: "/", RawQuery: tc.query}
