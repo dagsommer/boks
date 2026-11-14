@@ -126,7 +126,8 @@ credentials:
   the run says how to store one. `--oauth NAME` on the command line wins over the kit.
 - `skipIfEnv` is accepted and ignored.
 
-Each `setup.install` step's output is also kept in the guest at `/var/log/sbx-kits/<kit>/install-<n>.log`
+A `setup.install` `command` is a shell string, or a list that runs as an argv with no shell (each argument
+is passed literally). Each step's output is also kept in the guest at `/var/log/sbx-kits/<kit>/install-<n>.log`
 (`n` counts from 1 within the kit), as sbx does.
 
 ## Using a kit

@@ -31,6 +31,12 @@
 // StartupCommand.Command, InstallCommand.User and Volume.Type.
 package kit
 
+import (
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
 // Schema versions this package decodes. Both produce a *Spec.
 //
 // These are strings, not integers, in the YAML: `schemaVersion: "2"`. An unquoted `2` decodes
@@ -586,9 +592,13 @@ type Setup struct {
 // InstallCommand is one synchronous install step.
 type InstallCommand struct {
 	// Command is a shell command STRING, passed to sh -c, so shell metacharacters work as
-	// written. A list here is a type error, deliberately: the reference is explicit that
-	// install takes the string form only, and 28 contrib kits use it that way.
+	// written. This is the form the reference documents and the contrib kits use.
 	Command string `yaml:"command,omitempty"`
+
+	// Args is the other form, an argument list, which sbx has accepted since v0.53.0
+	// ("Kit install hooks expressed as argument lists pass each argument literally, without
+	// shell interpretation"). Exactly one of Command and Args is set; see UnmarshalYAML.
+	Args []string `yaml:"-"`
 
 	// User is the user to run as, defaulting to "0" (root).
 	//
@@ -602,6 +612,40 @@ type InstallCommand struct {
 
 	// Description is human-readable.
 	Description string `yaml:"description,omitempty"`
+}
+
+// UnmarshalYAML decodes install.command as either a string (run by sh -c) or a list (run as
+// an argv, no shell).
+func (c *InstallCommand) UnmarshalYAML(node *yaml.Node) error {
+	var raw struct {
+		Command     yaml.Node `yaml:"command"`
+		User        string    `yaml:"user"`
+		Description string    `yaml:"description"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	c.User, c.Description = raw.User, raw.Description
+	switch raw.Command.Kind {
+	case 0:
+	case yaml.SequenceNode:
+		if err := raw.Command.Decode(&c.Args); err != nil {
+			return err
+		}
+	default:
+		if err := raw.Command.Decode(&c.Command); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Display is the command as a person would read it, for plans and labels.
+func (c InstallCommand) Display() string {
+	if len(c.Args) > 0 {
+		return strings.Join(c.Args, " ")
+	}
+	return c.Command
 }
 
 // StartupCommand is one command run at every sandbox start.

@@ -55,7 +55,9 @@ func (s *Setup) Empty() bool {
 
 // InstallStep is one `setup.install` entry: a shell string, run as root unless it says otherwise.
 type InstallStep struct {
-	Command     string
+	Command string
+	// Args, when set, is an argv run without a shell, and Command is empty.
+	Args        []string `json:",omitempty"`
 	User        string
 	Description string
 	// Kit and N name the kit that declared the step and its place in that kit's list (from 1).
@@ -160,17 +162,20 @@ func (s *Setup) Plan(workdir, cloneTarget string) ([]setupOp, error) {
 		ops = append(ops, staticOp("home", homeDir, f, false))
 	}
 	for i, step := range s.Install {
-		if strings.TrimSpace(step.Command) == "" {
+		inner := []string{"/bin/sh", "-c", step.Command}
+		display := step.Command
+		if len(step.Args) > 0 {
+			inner, display = step.Args, strings.Join(step.Args, " ")
+		} else if strings.TrimSpace(step.Command) == "" {
 			return nil, fmt.Errorf("setup.install[%d] has no command", i)
 		}
-		argv := []string{"/bin/sh", "-c", step.Command}
+		argv := inner
 		if step.Kit != "" && step.N > 0 {
-			argv = []string{"/bin/sh", "-c", installLogScript, "sh",
-				fmt.Sprintf("/var/log/sbx-kits/%s/install-%d.log", safeLogName(step.Kit), step.N),
-				"/bin/sh", "-c", step.Command}
+			argv = append([]string{"/bin/sh", "-c", installLogScript, "sh",
+				fmt.Sprintf("/var/log/sbx-kits/%s/install-%d.log", safeLogName(step.Kit), step.N)}, inner...)
 		}
 		ops = append(ops, setupOp{
-			label: labelOf("install", i, step.Description, step.Command),
+			label: labelOf("install", i, step.Description, display),
 			argv:  argv,
 			user:  orDefault(step.User, "root"),
 		})

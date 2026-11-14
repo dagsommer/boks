@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -154,5 +155,24 @@ func TestPlanKeepsAKitsInstallOutputInTheGuest(t *testing.T) {
 	other := &Setup{Install: []InstallStep{{Command: "make"}}}
 	if plain.fingerprint() != other.fingerprint() {
 		t.Error("the log path changed the setup fingerprint, which would re-run installs on existing sandboxes")
+	}
+}
+
+// An install given as an argument list runs as that argv, with no shell to reinterpret a
+// metacharacter — and its output is still kept in the guest.
+func TestPlanRunsAnInstallArgumentListWithoutAShell(t *testing.T) {
+	args := []string{"tool", "--name", "a b; rm -rf /"}
+	s := &Setup{Install: []InstallStep{{Args: args, Kit: "k", N: 1}}}
+	ops, err := s.Plan("", "")
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("ops = %v, err = %v", ops, err)
+	}
+	argv := ops[0].argv
+	if len(argv) < len(args) || !slices.Equal(argv[len(argv)-len(args):], args) {
+		t.Errorf("argv = %q, want it to end with the list untouched", argv)
+	}
+	bare, _ := (&Setup{Install: []InstallStep{{Args: args}}}).Plan("", "")
+	if !slices.Equal(bare[0].argv, args) {
+		t.Errorf("without a log the argv is %q, want %q", bare[0].argv, args)
 	}
 }

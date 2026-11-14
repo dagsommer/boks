@@ -383,9 +383,17 @@ func validateSetup(s *Setup) error {
 	}
 
 	for i, c := range s.Install {
-		if strings.TrimSpace(c.Command) == "" {
+		if c.Command != "" && len(c.Args) > 0 {
+			return fmt.Errorf("setup.install[%d].command is both a string and a list", i)
+		}
+		if len(c.Args) > 0 {
+			if c.Args[0] == "" {
+				return fmt.Errorf("setup.install[%d].command[0] must not be empty: it is "+
+					"the program to run", i)
+			}
+		} else if strings.TrimSpace(c.Command) == "" {
 			return fmt.Errorf("setup.install[%d].command is required (a shell command "+
-				"string, run with sh -c)", i)
+				"string run with sh -c, or an argument list run without a shell)", i)
 		}
 	}
 

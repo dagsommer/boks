@@ -93,7 +93,7 @@ func Plan(members []Member) []Stage {
 				if user == "" {
 					user = "root"
 				}
-				add(2, s.Name, fmt.Sprintf("run as %s: %s", user, c.Command))
+				add(2, s.Name, fmt.Sprintf("run as %s: %s", user, c.Display()))
 			}
 			for _, f := range s.Setup.Files {
 				note := ""

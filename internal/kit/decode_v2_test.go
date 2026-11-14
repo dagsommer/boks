@@ -555,3 +555,33 @@ func TestUnknownFieldErrorsExplainTheMigration(t *testing.T) {
 		}
 	})
 }
+
+func TestInstallCommandTakesAStringOrAnArgumentList(t *testing.T) {
+	s, _ := mustParse(t, `schemaVersion: "2"
+kind: mixin
+name: lists
+description: install forms
+setup:
+  install:
+    - command: "echo hi | tee /x"
+    - command: [tool, --name, "a b; c"]
+      user: "1000"
+`)
+	in := s.Setup.Install
+	if len(in) != 2 || in[0].Command != "echo hi | tee /x" || len(in[0].Args) != 0 {
+		t.Fatalf("string form = %+v", in)
+	}
+	if in[1].Command != "" || len(in[1].Args) != 3 || in[1].Args[2] != "a b; c" || in[1].User != "1000" {
+		t.Fatalf("list form = %+v", in[1])
+	}
+	if _, _, err := ParseSpec([]byte(`schemaVersion: "2"
+kind: mixin
+name: bad
+description: x
+setup:
+  install:
+    - command: []
+`)); err == nil {
+		t.Error("an empty install command was accepted")
+	}
+}
