@@ -173,6 +173,10 @@ type OAuthProfile struct {
 
 	// Parse reads the provider's own credential document.
 	Parse func(raw []byte) (ImportedTokens, error)
+
+	// Merge returns raw with its token fields replaced, everything else kept. It is what lets
+	// a refreshed pair go back where the agent keeps its login (see WriteHostLogin).
+	Merge func(raw []byte, t ImportedTokens) ([]byte, error)
 }
 
 // ClaudeCodeKeychainService is where Claude Code keeps its subscription credential on macOS.
@@ -235,6 +239,7 @@ var profiles = map[string]OAuthProfile{
 		SentinelLength: 108,
 		DefaultSource:  claudeCodeDefaultSource,
 		Parse:          parseClaudeCode,
+		Merge:          mergeClaudeCode,
 	},
 }
 

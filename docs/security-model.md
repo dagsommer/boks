@@ -777,6 +777,17 @@ proxy is the only way out.
   is logged in again. Every adopted login follows, including ones stored before this existed;
   only one read with `--from`, from standard input or from another Keychain account is marked
   not to, so a deliberately different account is never swapped for the host's.
+
+  The other order is covered too. When Boks is the one that refreshes — the stored token has
+  expired and the host's login is no newer — it writes the new pair back to the host's login
+  (the same Keychain item, or `~/.claude/.credentials.json`), replacing only `accessToken`,
+  `refreshToken` and `expiresAt`. Before 2026-11 it did not, and a refresh by Boks retired the
+  refresh token the agent on the host was holding, so the user was asked to log in again on
+  their own machine. The write happens only if the host still holds the refresh token Boks
+  spent: if the agent has refreshed or the user has logged in since, that login is newer and
+  is left alone. On macOS it goes through `security -i` with the document on standard input,
+  not as an argument, which any process on the machine could read. A write that fails is
+  logged and does not fail the request; the agent on the host then may ask for a login.
 - **A login that is dead is forwarded, not refused.** If no current token can be had, the
   request goes out with the guest's own sentinel, the origin answers 401, and the agent asks for
   a login — which is captured on the host like a first one. This replaced a 502 on 2026-10-03,

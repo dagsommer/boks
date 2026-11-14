@@ -769,6 +769,25 @@ func (s *Session) startProxy(spec Spec, engine *policy.Engine, logger io.Writer)
 		return secret.ReadHostLogin(ctx, profile)
 	})
 
+	// And the other order: a pair this process refreshes goes back to the host's login, or the
+	// agent on the host is left holding a refresh token that was just retired.
+	injector.SetHostWriter(func(ctx context.Context, service string, from secret.Value, fresh secret.OAuthTokens) {
+		record, ok := spec.OAuth[service]
+		if !ok {
+			return
+		}
+		profile := secret.HostProfileFor(record)
+		if profile == "" {
+			return
+		}
+		switch wrote, err := secret.WriteHostLogin(ctx, profile, from, fresh); {
+		case err != nil && !errors.Is(err, secret.ErrNotFound):
+			fmt.Fprintf(logger, "boks: refreshed the %s login but could not write it back to the host's copy (%v); the agent on this machine may ask you to log in again\n", service, err)
+		case wrote:
+			fmt.Fprintf(logger, "boks: wrote the refreshed %s login back to the host's copy\n", service)
+		}
+	})
+
 	// The authority is opened only when a credential rule justifies it. A sandbox with no
 	// injection configured never terminates anything and has no reason to touch a signing
 	// key.

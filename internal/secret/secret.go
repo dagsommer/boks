@@ -487,6 +487,9 @@ type Injector struct {
 	// Code's Keychain item — which is where a stored copy goes stale from. See
 	// SetHostSource.
 	hostSource HostSource
+	// hostWriter, when set, is told of every pair this injector refreshed itself, so it can
+	// go back to the host's login. See SetHostWriter.
+	hostWriter HostWriter
 	skew       time.Duration
 	now        func() time.Time
 
@@ -568,6 +571,29 @@ func (i *Injector) SetHostSource(s HostSource) {
 		return
 	}
 	i.hostSource = s
+}
+
+// HostWriter puts a pair this injector obtained by refreshing back where the agent keeps its
+// login. from is the refresh token the pair was obtained with. It reports its own failures:
+// a login that could not be written back is no reason to fail the request that caused the
+// refresh.
+type HostWriter func(ctx context.Context, service string, from Value, fresh OAuthTokens)
+
+// SetHostWriter makes the injector write what it refreshes back to the host's login. A
+// refresh retires the refresh token it spent, and the agent on the host may be holding that
+// very one: without this, every refresh Boks makes logs the user out of the agent on their
+// own machine. SetHostSource covers the other order, when the host refreshed first.
+func (i *Injector) SetHostWriter(w HostWriter) {
+	if i == nil {
+		return
+	}
+	i.hostWriter = w
+}
+
+func (i *Injector) writeBack(ctx context.Context, c Credential, from Value, fresh OAuthTokens) {
+	if i.hostWriter != nil && !from.IsZero() && !fresh.IsZero() {
+		i.hostWriter(ctx, c.Service, from, fresh)
+	}
 }
 
 // NoHostProfile is the OAuthRecord.HostProfile value that stops a credential following the
@@ -656,6 +682,7 @@ func (i *Injector) recoverFromHost(ctx context.Context, c Credential) (OAuthToke
 	if fresh.Refresh.IsZero() {
 		fresh.Refresh = host.Refresh
 	}
+	i.writeBack(ctx, c, host.Refresh, fresh)
 	adopted, _ := i.adopt(ctx, c, fresh)
 	return adopted, true
 }
@@ -951,6 +978,7 @@ func (i *Injector) refresh(ctx context.Context, c Credential, current OAuthToken
 						if fresh.Refresh.IsZero() {
 							fresh.Refresh = host.Refresh
 						}
+						i.writeBack(ctx, c, host.Refresh, fresh)
 						return i.adopt(ctx, c, fresh)
 					}
 				}
@@ -968,6 +996,7 @@ func (i *Injector) refresh(ctx context.Context, c Credential, current OAuthToken
 		fresh.Refresh = current.Refresh
 	}
 	i.tokens[c.Service] = fresh
+	i.writeBack(ctx, c, current.Refresh, fresh)
 	if i.saver != nil {
 		if err := i.saver.SaveOAuth(ctx, c.Service, fresh); err != nil {
 			// The new pair works and is in memory; failing the request over a storage
