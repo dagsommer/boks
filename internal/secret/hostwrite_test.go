@@ -45,7 +45,8 @@ func TestWriteHostLoginReplacesOnlyTheTokens(t *testing.T) {
 			t.Errorf("the write dropped %s:\n%s", keep, raw)
 		}
 	}
-	if fi, _ := os.Stat(src.Path); fi.Mode().Perm() != 0o600 {
+	// Windows has no permission bits to assert on: it reports 0666 for any writable file.
+	if fi, _ := os.Stat(src.Path); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
 	}
 }
