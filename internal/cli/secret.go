@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -47,7 +48,7 @@ There is no recovery for a forgotten passphrase — that is what encryption mean
 is spelled out wherever the store fails to decrypt.`,
 			strings.Join(knownServices.Names(), ", "), secret.PassphraseEnv),
 	}
-	cmd.AddCommand(newSecretSetCommand(env), newSecretAdoptCommand(env), newSecretLoginCommand(env),
+	cmd.AddCommand(newSecretSetCommand(env), newSecretSetCustomCommand(env), newSecretAdoptCommand(env), newSecretLoginCommand(env),
 		newSecretImportCommand(env), newSecretLsCommand(env), newSecretServicesCommand(env),
 		newSecretRmCommand(env), newSecretResetCommand(env))
 	return cmd
@@ -969,7 +970,9 @@ values. That is deliberate: a plaintext index of which services you hold credent
 useful to somebody who cannot read the credentials themselves.`,
 		Args: noArgs,
 	}
-	var path string
+	var path, hostFilter, envFilter string
+	cmd.Flags().StringVar(&hostFilter, "host", "", "only custom secrets sent to this host")
+	cmd.Flags().StringVar(&envFilter, "env-name", "", "only custom secrets read from this environment variable")
 	storeFlag(cmd, &path)
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
@@ -1008,6 +1011,32 @@ useful to somebody who cannot read the credentials themselves.`,
 		for _, e := range entries {
 			kind, where := "key", "nothing until a --inject rule names it"
 			switch {
+			case e.Custom:
+				kind = "custom"
+				v, err := store.Lookup(cmd.Context(), e.Name)
+				if err != nil {
+					where = "unreadable: " + err.Error()
+					break
+				}
+				c, err := secret.DecodeCustom(v.Reveal())
+				if err != nil {
+					where = "unreadable: " + err.Error()
+					break
+				}
+				if hostFilter != "" && !slices.Contains(c.Hosts, hostFilter) ||
+					envFilter != "" && c.Env != envFilter {
+					continue
+				}
+				held := c.Placeholder
+				if c.Env != "" {
+					held = "$" + c.Env + " = " + c.Placeholder
+				}
+				where = strings.Join(c.Hosts, ", ") + "  (" + held + ")"
+				if sandbox, _ := secret.SplitScopedName(e.Name); sandbox != "" {
+					where += "  for sandbox " + sandbox + " only"
+				}
+			case hostFilter != "" || envFilter != "":
+				continue
 			case e.OAuth:
 				kind = "oauth"
 				record, err := store.LookupOAuthRecord(cmd.Context(), e.Name)
@@ -1096,14 +1125,20 @@ func newSecretRmCommand(env Env) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rm [flags] NAME",
 		Short: "Remove a credential",
-		Args: func(cmd *cobra.Command, args []string) error {
-			if len(args) != 1 {
-				return usagef("a secret name is required")
-			}
-			return nil
-		},
+		Long: `Removes a credential by the name 'boks secret ls' shows. A custom secret can instead be
+named by its placeholder, with --placeholder, as 'sbx secret rm --placeholder' does.`,
 	}
-	var path string
+	var path, placeholder string
+	cmd.Flags().StringVar(&placeholder, "placeholder", "", "remove the custom secret holding this placeholder")
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if placeholder != "" && len(args) == 0 {
+			return nil
+		}
+		if len(args) != 1 || placeholder != "" {
+			return usagef("a secret name is required, or --placeholder alone")
+		}
+		return nil
+	}
 	storeFlag(cmd, &path)
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
@@ -1111,10 +1146,35 @@ func newSecretRmCommand(env Env) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if err := store.Delete(args[0]); err != nil {
+		target := ""
+		if len(args) == 1 {
+			target = args[0]
+		} else {
+			entries, err := store.Entries()
+			if err != nil {
+				return explainSecretFailure(store.Path(), err)
+			}
+			for _, e := range entries {
+				if !e.Custom {
+					continue
+				}
+				v, err := store.Lookup(cmd.Context(), e.Name)
+				if err != nil {
+					continue
+				}
+				if c, err := secret.DecodeCustom(v.Reveal()); err == nil && c.Placeholder == placeholder {
+					target = e.Name
+					break
+				}
+			}
+			if target == "" {
+				return fmt.Errorf("no custom secret holds the placeholder %q", placeholder)
+			}
+		}
+		if err := store.Delete(target); err != nil {
 			return explainSecretFailure(store.Path(), err)
 		}
-		fmt.Fprintf(env.Stdout, "removed %q\n", args[0])
+		fmt.Fprintf(env.Stdout, "removed %q\n", target)
 		return nil
 	}
 	return cmd

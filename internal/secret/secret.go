@@ -161,6 +161,12 @@ type Inject struct {
 	Scheme Scheme
 	// Username is the user part for basic auth, and is meaningless otherwise.
 	Username string
+	// Substitute makes this a placeholder rule rather than a header rule: nothing is set, and
+	// wherever the credential's placeholder appears in a request header on this domain it is
+	// replaced with the secret. This is how sbx's custom secrets work, and it is what lets two
+	// secrets share a host: each is swapped only where its own placeholder is. A request that
+	// carries no placeholder is left exactly as the guest wrote it.
+	Substitute bool
 }
 
 // Validate rejects rules that could not attach a credential correctly, or that could
@@ -174,6 +180,9 @@ func (r Inject) Validate() error {
 	}
 	if r.Format != "" && r.Scheme != "" {
 		return fmt.Errorf("domain %s sets both a format and a scheme; they are alternatives", r.Domain)
+	}
+	if r.Substitute {
+		return nil
 	}
 	if r.Scheme != "" {
 		if r.Scheme != SchemeBearer && r.Scheme != SchemeBasic {
@@ -231,6 +240,9 @@ func (r Inject) headerValue(v Value) string {
 }
 
 func (r Inject) String() string {
+	if r.Substitute {
+		return r.Domain.String() + " → the placeholder, wherever it appears in a request header"
+	}
 	out := r.Domain.String() + " → " + r.header() + ": " + r.effectiveFormat()
 	if r.Scheme == SchemeBasic && r.Username != "" {
 		out += "  (user " + r.Username + ")"
@@ -382,6 +394,9 @@ func parseAttachment(attach string) (Inject, error) {
 	if attach == "" {
 		return Inject{}, errors.New("no attachment; use bearer, basic[:user], a header name, or header:format")
 	}
+	if strings.EqualFold(attach, "substitute") {
+		return Inject{Substitute: true}, nil
+	}
 	head, tail, hasTail := strings.Cut(attach, ":")
 	switch strings.ToLower(strings.TrimSpace(head)) {
 	case string(SchemeBearer):
@@ -496,6 +511,11 @@ type Injector struct {
 	// hostChecked is when a credential with no usable token last looked at the host's
 	// login; see hostRecheckInterval.
 	hostChecked map[string]time.Time
+
+	// customMu guards customValues: custom secrets resolved from a stored envelope (a --ref
+	// or --command is run once, not once per request).
+	customMu     sync.Mutex
+	customValues map[string]string
 
 	// mu guards tokens and serialises refreshes. It is held across the exchange on
 	// purpose: several concurrent requests to a resource host must produce one refresh,
@@ -841,6 +861,30 @@ func (i *Injector) Apply(ctx context.Context, t policy.Target, h http.Header, fl
 			if !r.Domain.Match(t) {
 				continue
 			}
+			if r.Substitute {
+				// Only a request that carries this credential's placeholder needs the
+				// secret, so only that one asks the store for it.
+				if c.Placeholder == "" || !headersCarry(h, c.Placeholder) {
+					continue
+				}
+				v, err := i.provider.Lookup(ctx, c.Service)
+				if err != nil {
+					if errors.Is(err, ErrNotFound) {
+						return nil, fmt.Errorf("secret %q is configured for %s but is not in the store; add it with 'boks secret set-custom'", c.Service, t.Host)
+					}
+					return nil, fmt.Errorf("looking up secret %q for %s: %w", c.Service, t.Host, err)
+				}
+				if v.IsZero() {
+					return nil, fmt.Errorf("secret %q is empty", c.Service)
+				}
+				real, err := i.customValue(ctx, c.Service, v)
+				if err != nil {
+					return nil, err
+				}
+				substituteHeaders(h, c.Placeholder, real)
+				matched = true
+				continue
+			}
 			if !matched {
 				matched = true
 			}
@@ -1084,4 +1128,79 @@ func validHeaderName(name string) error {
 		}
 	}
 	return nil
+}
+
+// headersCarry reports whether a request header holds the placeholder, either as written or
+// inside the base64 of a Basic credential (git over HTTPS sends user:token that way).
+func headersCarry(h http.Header, placeholder string) bool {
+	for _, values := range h {
+		for _, v := range values {
+			if strings.Contains(v, placeholder) || basicCarries(v, placeholder) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func basicCarries(v, placeholder string) bool {
+	raw, ok := decodeBasic(v)
+	return ok && strings.Contains(raw, placeholder)
+}
+
+func decodeBasic(v string) (string, bool) {
+	rest, ok := strings.CutPrefix(v, "Basic ")
+	if !ok {
+		return "", false
+	}
+	b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(rest))
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+// substituteHeaders replaces the placeholder with the secret in every header value.
+func substituteHeaders(h http.Header, placeholder, value string) {
+	for name, values := range h {
+		for i, v := range values {
+			switch {
+			case strings.Contains(v, placeholder):
+				values[i] = strings.ReplaceAll(v, placeholder, value)
+			default:
+				if raw, ok := decodeBasic(v); ok && strings.Contains(raw, placeholder) {
+					values[i] = "Basic " + base64.StdEncoding.EncodeToString(
+						[]byte(strings.ReplaceAll(raw, placeholder, value)))
+				}
+			}
+		}
+		h[name] = values
+	}
+}
+
+// customValue is the real value behind a looked-up secret: the value itself, or, for a stored
+// custom-secret envelope, what it resolves to — once, then remembered.
+func (i *Injector) customValue(ctx context.Context, service string, v Value) (string, error) {
+	raw := v.Reveal()
+	if !IsCustom(raw) {
+		return raw, nil
+	}
+	i.customMu.Lock()
+	defer i.customMu.Unlock()
+	if cached, ok := i.customValues[service]; ok {
+		return cached, nil
+	}
+	c, err := DecodeCustom(raw)
+	if err != nil {
+		return "", fmt.Errorf("secret %q: %w", service, err)
+	}
+	real, err := c.Resolve(ctx)
+	if err != nil {
+		return "", fmt.Errorf("secret %q: %w", service, err)
+	}
+	if i.customValues == nil {
+		i.customValues = map[string]string{}
+	}
+	i.customValues[service] = real
+	return real, nil
 }

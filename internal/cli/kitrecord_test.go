@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -107,7 +108,7 @@ func TestRecordedKitCredentialsStayBehindTheStoredApproval(t *testing.T) {
 	f := &policyFlags{stdin: strings.NewReader("a\n"), stderr: &stderr}
 	f.adoptRecordedKits("box", rec, &bytes.Buffer{}, &stderr)
 	f.stdin = nil // `start` and `exec` have no terminal to hand the gate
-	plan, err := f.planCredentials(nil)
+	plan, err := f.planCredentials(context.Background(), (nil), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +129,7 @@ func TestRecordedKitCredentialsStayBehindTheStoredApproval(t *testing.T) {
 	if err := approvals.save(); err != nil {
 		t.Fatal(err)
 	}
-	plan, err = f.planCredentials(nil)
+	plan, err = f.planCredentials(context.Background(), (nil), "")
 	if err != nil {
 		t.Fatal(err)
 	}

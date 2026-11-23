@@ -244,7 +244,7 @@ func (s *KeyringStore) Entries() ([]Entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, Entry{Name: name, OAuth: IsOAuth(stored)})
+		entries = append(entries, Entry{Name: name, OAuth: IsOAuth(stored), Custom: IsCustom(stored)})
 	}
 	if len(lost) > 0 {
 		return entries, fmt.Errorf("%w: %s", ErrIndexDrift, strings.Join(lost, ", "))

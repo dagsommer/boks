@@ -208,6 +208,18 @@ echo -n "$TOKEN" | ./bin/boks secret set my-internal-api
                --guest-credential 'my-internal-api=MY_API_KEY=placeholder' shell .
 ```
 
+For sbx's custom secrets there is `boks secret set-custom`, which stores the hosts and the
+environment variable with the value and gives the guest a generated `sbx-cs-…` placeholder.
+The proxy replaces that placeholder wherever it appears in a request header (a Basic
+credential's base64 too) on those hosts, so two secrets can share a host and each is swapped
+only where its own placeholder is. Setting the same hosts and variable again rotates the value
+and keeps the placeholder. The value can come from stdin, `--ref` (via `op read`) or `--command`;
+`--sandbox` scopes it; `boks secret ls --host/--env-name` filters and `rm --placeholder` removes.
+
+```bash
+printf '%s' "$TOKEN" | ./bin/boks secret set-custom --host '**.ghe.example.com' --env GH_TOKEN --value-stdin
+```
+
 Two of the eleven — `cursor` and `droid` — are known by name and carry **no rule**: neither
 vendor documents the host their CLI sends its key to, and Boks will not guess, because a
 guessed rule ships your placeholder to the real API instead of your credential. Asking for one

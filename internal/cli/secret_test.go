@@ -58,7 +58,7 @@ func TestSecretSetForAKnownServiceNeedsNoInject(t *testing.T) {
 
 	// And a run of an agent that uses it picks it up with no flags at all.
 	flags := (&policyFlags{}).forAgent(mustAgent(t, "claude"))
-	plan, err := flags.planCredentials(store)
+	plan, err := flags.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestInjectOverridesTheRegistry(t *testing.T) {
 		inject: []string{"anthropic@api.internal.example.com=Authorization:token %s"},
 		guest:  []string{"anthropic=ANTHROPIC_API_KEY=my-own-placeholder"},
 	}
-	plan, err := flags.planCredentials(store)
+	plan, err := flags.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestNoSecretsLeavesTheStoreOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	flags := policyFlags{noSecrets: true}
-	plan, err := flags.planCredentials(store)
+	plan, err := flags.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestAnUnknownNameIsStoredAndNotAttached(t *testing.T) {
 		}
 	}
 	var flags policyFlags
-	plan, err := flags.planCredentials(store)
+	plan, err := flags.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestALoginTakesPrecedenceOverAStoredKeyAtRunTime(t *testing.T) {
 	storeLogin(t, store, "claude-code", "api.anthropic.com")
 
 	flags := (&policyFlags{}).forAgent(mustAgent(t, "claude"))
-	plan, err := flags.planCredentials(store)
+	plan, err := flags.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +492,7 @@ func TestNothingAboutAServiceCredentialLeaksTheValue(t *testing.T) {
 	surfaces = append(surfaces, ls)
 
 	var flags policyFlags
-	plan, err := flags.planCredentials(store)
+	plan, err := flags.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestAnUnreadableStoreDoesNotFailARunThatAskedForNothing(t *testing.T) {
 
 	var stderr strings.Builder
 	var flags policyFlags
-	plan, _, err := flags.resolveCredentials(context.Background(), &stderr)
+	plan, _, err := flags.resolveCredentials(context.Background(), "", &stderr)
 	if err != nil {
 		t.Fatalf("a run with no credential flags failed over the store: %v", err)
 	}
@@ -546,7 +546,7 @@ func TestAnUnreadableStoreDoesNotFailARunThatAskedForNothing(t *testing.T) {
 
 	// A run that named a credential still fails, with the way out.
 	flags = policyFlags{inject: []string{"anthropic@api.anthropic.com=x-api-key"}}
-	if _, _, err := flags.resolveCredentials(context.Background(), &stderr); err == nil {
+	if _, _, err := flags.resolveCredentials(context.Background(), "", &stderr); err == nil {
 		t.Error("a run that named a credential succeeded without one")
 	} else if !strings.Contains(err.Error(), "boks secret reset --force") {
 		t.Errorf("the failure gives no way out:\n%v", err)
@@ -564,7 +564,7 @@ func TestNoPassphraseMeansNoStoredCredentials(t *testing.T) {
 
 	var stderr strings.Builder
 	var flags policyFlags
-	plan, _, err := flags.resolveCredentials(context.Background(), &stderr)
+	plan, _, err := flags.resolveCredentials(context.Background(), "", &stderr)
 	if err != nil {
 		t.Fatalf("a run without a passphrase failed: %v", err)
 	}
@@ -575,7 +575,7 @@ func TestNoPassphraseMeansNoStoredCredentials(t *testing.T) {
 	// Naming one still fails, and says which variable is missing. The keyring is off for
 	// this whole test — see the top of it — so the missing thing really is the passphrase.
 	flags = policyFlags{inject: []string{"x@api.example.com=bearer"}}
-	if _, _, err := flags.resolveCredentials(context.Background(), &stderr); err == nil {
+	if _, _, err := flags.resolveCredentials(context.Background(), "", &stderr); err == nil {
 		t.Fatal("a credential rule was accepted with no store to read it from")
 	} else if !strings.Contains(err.Error(), secret.PassphraseEnv) {
 		t.Errorf("the failure does not name the passphrase variable:\n%v", err)
@@ -645,7 +645,7 @@ func TestStoredCredentialsGoOnlyToTheAgentsThatUseThem(t *testing.T) {
 		{"codex", []string{"github"}},
 	} {
 		flags := (&policyFlags{}).forAgent(mustAgent(t, c.agent))
-		plan, err := flags.planCredentials(store)
+		plan, err := flags.planCredentials(context.Background(), (store), "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -657,7 +657,7 @@ func TestStoredCredentialsGoOnlyToTheAgentsThatUseThem(t *testing.T) {
 
 	// A credential named on the command line is the user's choice, whatever the agent.
 	flags := (&policyFlags{oauth: []string{"claude-code"}}).forAgent(mustAgent(t, "shell"))
-	plan, err := flags.planCredentials(store)
+	plan, err := flags.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,5 +679,66 @@ func TestAgentCredentialsAreKnownServices(t *testing.T) {
 			}
 			t.Errorf("agent %s lists %q, which is neither a known service nor a login Boks can adopt", a.Name, name)
 		}
+	}
+}
+
+// The two-token layout of the UDI v2 kits: two custom secrets on the same GHE hosts, one with an
+// env var and a generated placeholder, one with neither, told apart only by placeholder.
+func TestCustomSecretsPlanForSharedHosts(t *testing.T) {
+	store := secretStore(t)
+	for _, tc := range []struct{ env, placeholder, value string }{
+		{"COPILOT_GITHUB_TOKEN", "github_pat_{rand}", "COPILOT"},
+		{"", "gho_sbxproxymanaged000000000000000000000", "REPO"},
+	} {
+		args := []string{"secret", "set-custom", "--value-stdin", "--host", "api.ghe.example.com",
+			"--host", "ghe.example.com", "--placeholder", tc.placeholder}
+		if tc.env != "" {
+			args = append(args, "--env", tc.env)
+		}
+		if _, _, err := runCLI(t, tc.value, args...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+	plan, err := (&policyFlags{}).planCredentials(context.Background(), store, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds, err := secret.ParseCredentials(plan.inject, plan.guest)
+	if err != nil {
+		t.Fatalf("the plan does not parse: %v\ninject=%v\nguest=%v", err, plan.inject, plan.guest)
+	}
+	if len(creds) != 2 {
+		t.Fatalf("want two credentials, got %d: %v", len(creds), plan.inject)
+	}
+	byEnv := map[string]secret.Credential{}
+	for _, c := range creds {
+		byEnv[c.EnvName] = c
+		if !c.Inject[0].Substitute || c.Placeholder == "" {
+			t.Errorf("%s is not a placeholder rule: %+v", c.Service, c)
+		}
+	}
+	if !strings.HasPrefix(byEnv["COPILOT_GITHUB_TOKEN"].Placeholder, "github_pat_") {
+		t.Errorf("copilot placeholder = %q", byEnv["COPILOT_GITHUB_TOKEN"].Placeholder)
+	}
+	if byEnv[""].Placeholder != "gho_sbxproxymanaged000000000000000000000" {
+		t.Errorf("repo placeholder = %q", byEnv[""].Placeholder)
+	}
+	for _, v := range []string{"COPILOT", "REPO"} {
+		if strings.Contains(strings.Join(plan.inject, " ")+strings.Join(plan.guest, " "), v+"\n") {
+			t.Errorf("a value leaked into the plan")
+		}
+	}
+
+	// A secret scoped to another sandbox is not part of this one's plan.
+	if _, _, err := runCLI(t, "X", "secret", "set-custom", "--value-stdin", "--sandbox", "other",
+		"--host", "x.example.com", "--env", "X_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+	plan, err = (&policyFlags{}).planCredentials(context.Background(), store, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(plan.guest, " "), "X_TOKEN") {
+		t.Error("another sandbox's custom secret is in this plan")
 	}
 }

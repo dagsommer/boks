@@ -1633,6 +1633,8 @@ useful to somebody who cannot read the credentials themselves.
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--env-name string` |  | only custom secrets read from this environment variable |
+| `--host string` |  | only custom secrets sent to this host |
 | `--store string` |  | encrypted store file |
 
 ### boks secret reset
@@ -1666,8 +1668,12 @@ Remove a credential
 boks secret rm [flags] NAME
 ```
 
+Removes a credential by the name 'boks secret ls' shows. A custom secret can instead be
+named by its placeholder, with --placeholder, as 'sbx secret rm --placeholder' does.
+
 | Flag | Default | Meaning |
 |---|---|---|
+| `--placeholder string` |  | remove the custom secret holding this placeholder |
 | `--store string` |  | encrypted store file |
 
 ### boks secret services
@@ -1719,6 +1725,48 @@ boks secret set --value-stdin my-internal-api < token.txt
 | `--store string` |  | encrypted store file |
 | `--value string` |  | the credential; omit to read it from stdin |
 | `--value-stdin` |  | read the credential from stdin, whole and without a prompt, even on a terminal |
+
+### boks secret set-custom
+
+Store a credential for hosts and an env var, with a generated placeholder
+
+```
+boks secret set-custom [flags]
+```
+
+Stores a credential keyed on the hosts it may be sent to and the environment variable the
+guest reads it from (--env is optional: a kit may already put the placeholder in the guest's
+environment itself). Inside the sandbox that variable holds a placeholder, generated unless
+\--placeholder gives one ('github_pat_{rand}' keeps a vendor prefix); wherever the placeholder appears in a request header on one of the hosts, the host
+proxy replaces it with the real value. Headers only, never bodies. The guest never sees the value.
+
+Setting the same hosts and variable again replaces the value and keeps the placeholder, so a
+rotated token needs nothing changed in a sandbox that already holds it.
+
+The value comes from the prompt, --value-stdin, --ref (read with 'op read') or --command (run on
+the host from an empty temporary directory, once per sandbox start). A custom secret applies to
+every sandbox unless --sandbox scopes it. Like any credential, it makes the hosts it names ones
+whose TLS boks terminates, and it is not an allow rule: the host still has to be reachable.
+
+\--host takes the same patterns as network rules: *.example.com covers every subdomain
+(**.example.com is accepted as the same thing).
+
+```
+printf '%s' "$API_KEY" | boks secret set-custom --host api.example.com --env API_KEY --value-stdin
+  boks secret set-custom --sandbox web --host npm.pkg.github.com --env NODE_AUTH_TOKEN --command 'gh auth token'
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--command string` |  | resolve the value by running this host command |
+| `--env string` |  | the environment variable the guest reads the placeholder from |
+| `--host stringArray` |  | a host the secret may be sent to (repeatable) |
+| `--placeholder string` |  | what the guest holds instead; {rand} becomes random text, as in 'github_pat_{rand}' (default sbx-cs-{rand}) |
+| `--ref string` |  | resolve the value from a reference such as op://Vault/Item/field |
+| `--sandbox string` |  | scope this secret to one sandbox |
+| `--store string` |  | encrypted store file |
+| `--value string` |  | the credential; omit to be prompted. Visible in the process list |
+| `--value-stdin` |  | read the credential from stdin |
 
 ## boks start
 

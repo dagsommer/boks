@@ -411,7 +411,7 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 	if err != nil {
 		return enforce.Spec{}, err
 	}
-	credentials, oauth, err := f.resolveCredentials(ctx, stderr)
+	credentials, oauth, err := f.resolveCredentials(ctx, name, stderr)
 	if err != nil {
 		return enforce.Spec{}, err
 	}
@@ -439,7 +439,13 @@ func (f *policyFlags) enforceSpec(ctx context.Context, name, address string, mod
 					"Or for this sandbox only: boks secret set %s --sandbox %s",
 					service, err, service, service, name)
 			}
-			secrets[service] = value.Reveal()
+			real := value.Reveal()
+			if secret.IsCustom(real) {
+				if real, err = resolveCustomValue(ctx, real); err != nil {
+					return enforce.Spec{}, fmt.Errorf("credential %q: %w", service, err)
+				}
+			}
+			secrets[service] = real
 		}
 	}
 

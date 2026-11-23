@@ -78,7 +78,7 @@ Point a client at it with HTTP_PROXY/HTTPS_PROXY. Nothing is wired into 'boks ru
 		// The records are re-read below, from the store this command opens for itself:
 		// `boks proxy` keeps the store rather than handing values to another process, so
 		// it has no use for the copy resolveCredentials made.
-		plan, _, err := flags.resolveCredentials(cmd.Context(), env.Stderr)
+		plan, _, err := flags.resolveCredentials(cmd.Context(), "", env.Stderr)
 		if err != nil {
 			return err
 		}

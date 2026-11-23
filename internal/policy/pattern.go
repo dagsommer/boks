@@ -69,6 +69,10 @@ func ParsePattern(s string) (Pattern, error) {
 		prefix = prefix.Masked()
 		return Pattern{kind: patternPrefix, prefix: prefix, text: prefix.String()}, nil
 	}
+	// "**.example.com" is sbx's spelling of a multi-label wildcard; here "*." already is one.
+	if strings.HasPrefix(text, "**.") {
+		text = text[1:]
+	}
 	if strings.HasPrefix(text, "*.") {
 		rest := text[2:]
 		if strings.Contains(rest, "*") {

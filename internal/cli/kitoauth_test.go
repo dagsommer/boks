@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -263,7 +264,7 @@ func TestPlanCredentialsAppliesAnApprovedKitLogin(t *testing.T) {
 	f.kitSpec = kitWith(kitOAuthCredential())
 	f.approveKit = true
 
-	plan, err := f.planCredentials(store)
+	plan, err := f.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +295,7 @@ func TestPlanCredentialsLeavesAnUnapprovedOrUnstoredKitLoginOut(t *testing.T) {
 	f.kitSpec = kitWith(kitOAuthCredential())
 
 	// Not approved, and no terminal to ask on.
-	plan, err := f.planCredentials(store)
+	plan, err := f.planCredentials(context.Background(), (store), "")
 	if err != nil || len(plan.oauth) != 0 || len(plan.kitOAuth) != 0 {
 		t.Fatalf("unapproved: %+v, %v", plan, err)
 	}
@@ -302,7 +303,7 @@ func TestPlanCredentialsLeavesAnUnapprovedOrUnstoredKitLoginOut(t *testing.T) {
 	// Approved, but nothing is stored under the name: noted, and the run goes on.
 	f.approveKit = true
 	empty := secretStore(t)
-	plan, err = f.planCredentials(empty)
+	plan, err = f.planCredentials(context.Background(), (empty), "")
 	if err != nil || len(plan.oauth) != 0 || len(plan.notStored) != 1 {
 		t.Fatalf("not stored: %+v, %v", plan, err)
 	}
@@ -322,7 +323,7 @@ func TestPlanCredentialsUserOAuthFlagWinsOverTheKit(t *testing.T) {
 	f.approveKit = true
 	f.oauth = []string{"ghe-login"}
 
-	plan, err := f.planCredentials(store)
+	plan, err := f.planCredentials(context.Background(), (store), "")
 	if err != nil {
 		t.Fatal(err)
 	}

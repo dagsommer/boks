@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -135,12 +136,12 @@ func TestPlanCredentialsGivesAnUnapprovedKitCredentialNoGuestVariable(t *testing
 		APIKey: &kit.APIKey{Name: "GHE_TOKEN", ProxyManaged: true,
 			Inject: []kit.APIKeyInject{{Domain: "ghe.example", Scheme: "bearer"}}},
 	}}}
-	plan, err := f.planCredentials(nil)
+	plan, err := f.planCredentials(context.Background(), (nil), "")
 	if err != nil || len(plan.inject) != 0 || len(plan.guest) != 0 {
 		t.Fatalf("unapproved: %+v, %v", plan, err)
 	}
 	f.approveKit = true
-	plan, err = f.planCredentials(nil)
+	plan, err = f.planCredentials(context.Background(), (nil), "")
 	if err != nil || len(plan.inject) != 1 || len(plan.guest) != 1 {
 		t.Fatalf("approved: %+v, %v", plan, err)
 	}

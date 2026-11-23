@@ -180,8 +180,9 @@ func (s *FileStore) SaveOAuth(_ context.Context, name string, tokens OAuthTokens
 
 // Entry is one stored credential, named and classified. It never carries a value.
 type Entry struct {
-	Name  string
-	OAuth bool
+	Name   string
+	OAuth  bool
+	Custom bool
 }
 
 // Entries lists the stored credentials with their kind, sorted. Names and kinds only: there
@@ -195,7 +196,7 @@ func (s *FileStore) Entries() ([]Entry, error) {
 	}
 	out := make([]Entry, 0, len(m))
 	for name, v := range m {
-		out = append(out, Entry{Name: name, OAuth: IsOAuth(v)})
+		out = append(out, Entry{Name: name, OAuth: IsOAuth(v), Custom: IsCustom(v)})
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].Name < out[b].Name })
 	return out, nil

@@ -65,7 +65,7 @@ type credentialPlan struct {
 // stored credentials to attach", and failing `boks run` over a store the user was not asking
 // for would be the wrong trade. A run that *did* name a credential still fails, later and by
 // name, when the value it needs cannot be read.
-func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error) {
+func (f *policyFlags) planCredentials(ctx context.Context, store secret.Store, sandbox string) (credentialPlan, error) {
 	// A kit's credentials are rendered into --inject's own grammar and prepended, so the
 	// user's flags come last and therefore win: --inject is how someone overrides what a
 	// kit asked for, and a kit must not be able to override the person running it.
@@ -153,6 +153,16 @@ func (f *policyFlags) planCredentials(store secret.Store) (credentialPlan, error
 		plan.oauth = append(plan.oauth, k.service)
 		plan.adopted = append(plan.adopted, k.service+" (oauth, from the kit)")
 	}
+
+	// Custom secrets (boks secret set-custom) carry their own hosts, variable and placeholder,
+	// so like a known service they apply without being named.
+	cInject, cGuest, cAdopted, err := customPlan(ctx, store, entries, sandbox)
+	if err != nil {
+		return plan, err
+	}
+	plan.inject = append(plan.inject, cInject...)
+	plan.guest = append(plan.guest, cGuest...)
+	plan.adopted = append(plan.adopted, cAdopted...)
 
 	for _, e := range entries {
 		if named[e.Name] {
@@ -330,7 +340,7 @@ func openSecretStoreIfAvailable(path string) (secret.Store, error) {
 // and not quiet: a user whose passphrase is wrong is running without the credentials they
 // think they have, and finding that out from a 401 inside a sandbox is worse than a line of
 // stderr.
-func (f *policyFlags) resolveCredentials(ctx context.Context, stderr io.Writer) (credentialPlan, map[string]secret.OAuthRecord, error) {
+func (f *policyFlags) resolveCredentials(ctx context.Context, sandbox string, stderr io.Writer) (credentialPlan, map[string]secret.OAuthRecord, error) {
 	asked := len(f.inject) > 0 || len(f.guest) > 0 || len(f.oauth) > 0
 	store, err := openSecretStoreIfAvailable("")
 	if err != nil {
@@ -351,7 +361,7 @@ func (f *policyFlags) resolveCredentials(ctx context.Context, stderr io.Writer) 
 		return credentialPlan{}, nil, fmt.Errorf("credential rules need the secret store, but it is not available")
 	}
 
-	plan, err := f.planCredentials(store)
+	plan, err := f.planCredentials(ctx, store, sandbox)
 	if err != nil {
 		if asked {
 			return credentialPlan{}, nil, explainSecretFailure(storePath(store), err)
