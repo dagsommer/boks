@@ -35,6 +35,27 @@ hand-written entry that stands in for a history from before the first tag.
 
 <!-- release-notes: generated entries are inserted directly below this line -->
 
+## v0.2.1 — 2026-11-23
+
+[Commits](https://github.com/dagsommer/boks/compare/v0.2.0...v0.2.1), 8 of them.
+
+### Added
+
+- setup.install command may be an argument list, run without a shell
+- close upstream connections whose peer stops acknowledging (~30s)
+- a destination ending in a slash is a directory, created if missing
+- refuse a sandbox name that differs from another only in case; docs: sbx v0.53.0 catch-up
+- set-custom, custom secrets swapped by placeholder, as in sbx
+
+### Fixed
+
+- write a refreshed login back to the host's copy
+- HTTP rule paths and query names/values ignore case, as in sbx 0.53
+
+### Tests
+
+- skip Unix-only expectations on Windows (modes, /bin/sh)
+
 ## v0.2.0 — 2026-11-05
 
 [Commits](https://github.com/dagsommer/boks/compare/v0.1.40...v0.2.0), 43 of them.
